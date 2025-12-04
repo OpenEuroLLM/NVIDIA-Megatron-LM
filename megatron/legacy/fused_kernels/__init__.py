@@ -4,6 +4,7 @@ import os
 import pathlib
 import subprocess
 
+import torch
 from torch.utils import cpp_extension
 
 # Setting this param to a list has a problem of generating different
@@ -15,43 +16,46 @@ os.environ["TORCH_CUDA_ARCH_LIST"] = ""
 
 
 def load(args):
-
-    # Check if cuda 11 is installed for compute capability 8.0
-    cc_flag = []
-    _, bare_metal_major, bare_metal_minor = _get_cuda_bare_metal_version(
-        cpp_extension.CUDA_HOME
-    )
-    if int(bare_metal_major) >= 11:
-        cc_flag.append('-gencode')
-        cc_flag.append('arch=compute_80,code=sm_80')
-        if int(bare_metal_minor) >= 8:
-            cc_flag.append('-gencode')
-            cc_flag.append('arch=compute_90,code=sm_90')
-
-    # Build path
-    srcpath = pathlib.Path(__file__).parent.absolute()
-    buildpath = srcpath / "build"
-    _create_build_dir(buildpath)
-
-    # Helper function to build the kernels.
-    def _cpp_extention_load_helper(name, sources, extra_cuda_flags):
-        return cpp_extension.load(
-            name=name,
-            sources=sources,
-            build_directory=buildpath,
-            extra_cflags=[
-                "-O3",
-            ],
-            extra_cuda_cflags=[
-                "-O3",
-                "-gencode",
-                "arch=compute_70,code=sm_70",
-                "--use_fast_math",
-            ]
-            + extra_cuda_flags
-            + cc_flag,
-            verbose=(args.rank == 0),
+    
+    if torch.cuda.get_device_name(0).find("AMD") == 0:
+        return None
+    else:
+        # Check if cuda 11 is installed for compute capability 8.0
+        cc_flag = []
+        _, bare_metal_major, bare_metal_minor = _get_cuda_bare_metal_version(
+            cpp_extension.CUDA_HOME
         )
+        if int(bare_metal_major) >= 11:
+            cc_flag.append('-gencode')
+            cc_flag.append('arch=compute_80,code=sm_80')
+            if int(bare_metal_minor) >= 8:
+                cc_flag.append('-gencode')
+                cc_flag.append('arch=compute_90,code=sm_90')
+
+        # Build path
+        srcpath = pathlib.Path(__file__).parent.absolute()
+        buildpath = srcpath / "build"
+        _create_build_dir(buildpath)
+
+        # Helper function to build the kernels.
+        def _cpp_extention_load_helper(name, sources, extra_cuda_flags):
+            return cpp_extension.load(
+                name=name,
+                sources=sources,
+                build_directory=buildpath,
+                extra_cflags=[
+                    "-O3",
+                ],
+                extra_cuda_cflags=[
+                    "-O3",
+                    "-gencode",
+                    "arch=compute_70,code=sm_70",
+                    "--use_fast_math",
+                ]
+                + extra_cuda_flags
+                + cc_flag,
+                verbose=(args.rank == 0),
+            )
 
 
 def _get_cuda_bare_metal_version(cuda_dir):
