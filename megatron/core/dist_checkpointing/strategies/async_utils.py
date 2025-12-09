@@ -211,7 +211,8 @@ class TemporalAsyncCaller(AsyncCaller):
         end_sync = time()
         logger.debug(f"rank: {rank}, takes {end_sync - start_sync} to finish D2H ")
 
-        ctx = mp.get_context('fork')
+        # Use 'spawn' instead of 'fork' to avoid segfaults with ROCm/CUDA contexts
+        ctx = mp.get_context('spawn')
         self.start_time = time()
         self.process = ctx.Process(
             target=async_req.async_fn, args=async_fn_args, kwargs=async_req.async_fn_kwargs
