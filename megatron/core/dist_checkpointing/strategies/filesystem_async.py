@@ -263,7 +263,10 @@ class FileSystemWriterAsync(FileSystemWriter):
         logger = logging.getLogger(__name__)
         w_start = time()
         write_results_or_exc: Union[dict, Exception] = dict()
-        ctx = mp.get_context("fork")
+        # Use 'spawn' instead of 'fork' to avoid segfaults with ROCm/CUDA contexts
+        # Fork doesn't properly copy GPU contexts to child processes
+        ctx = mp.get_context("spawn")
+        # ctx = mp.get_context("fork")
         local_results_queue = ctx.Queue()
         count_queue = ctx.JoinableQueue()
         p_list = []
