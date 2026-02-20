@@ -1396,6 +1396,8 @@ def load_args_from_checkpoint(
     _set_arg('ffn_hidden_size')
     _set_arg('seq_length')
     _set_arg('num_attention_heads')
+    _set_arg('qk_layernorm', force=True)
+    _set_arg('norm_epsilon', force=True)
     _set_arg('num_query_groups', force=True)
     _set_arg('group_query_attention', force=True)
     _set_arg('kv_channels')
