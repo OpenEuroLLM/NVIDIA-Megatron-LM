@@ -1620,6 +1620,13 @@ def training_log(
                 "mem-max-allocated-bytes", mem_stats["allocated_bytes.all.peak"], iteration
             )
             writer.add_scalar("mem-allocated-count", mem_stats["allocation.all.current"], iteration)
+            if wandb_writer:
+                wandb_writer.log({
+                    "mem-reserved-bytes": mem_stats["reserved_bytes.all.current"],
+                    "mem-allocated-bytes": mem_stats["allocated_bytes.all.current"],
+                    "mem-max-allocated-bytes": mem_stats["allocated_bytes.all.peak"],
+                    "mem-allocated-count": mem_stats["allocation.all.current"],
+                }, iteration)
     if args.num_experts is not None:
         moe_loss_scale = 1 / get_num_microbatches()
         track_names = []
@@ -1671,6 +1678,8 @@ def training_log(
         )
 
         one_logger_utils.track_e2e_metrics(args.log_throughput, throughput)
+        
+        tokens_per_second_per_gpu = (batch_size * args.seq_length) / (elapsed_time_per_iteration * args.world_size)
 
         if args.log_timers_to_tensorboard:
             if writer:
@@ -1687,13 +1696,19 @@ def training_log(
         log_string += ' elapsed time per iteration (ms): {:.1f} |'.format(
             elapsed_time_per_iteration * 1000.0
         )
+        free_gpu_memory, total_gpu_memory = torch.cuda.mem_get_info()
+        mem_usages = 1 - free_gpu_memory / total_gpu_memory
+        log_string += " mem usages: {:.4f} |".format(mem_usages)
         if args.log_throughput:
             log_string += f' throughput per GPU (TFLOP/s/GPU): {throughput:.1f} |'
+            log_string += f' Tokens per second per GPU (Tok/s/GPU): {tokens_per_second_per_gpu:.1f} |'
             if args.log_timers_to_tensorboard:
                 if writer:
-                    writer.add_scalar('throughput', throughput, iteration)
+                    writer.add_scalar('TFLOPS', throughput, iteration)
+                    writer.add_scalar({'Tokens per second per GPU': tokens_per_second_per_gpu}, iteration)
                 if wandb_writer:
-                    wandb_writer.log({'throughput': throughput}, iteration)
+                    wandb_writer.log({'TFLOPS': throughput}, iteration)
+                    wandb_writer.log({'Tokens per second per GPU': tokens_per_second_per_gpu}, iteration)
         if args.log_energy:
             energy = (energy_monitor.lap() / total_iterations) / args.world_size
             power = energy / elapsed_time_per_iteration
