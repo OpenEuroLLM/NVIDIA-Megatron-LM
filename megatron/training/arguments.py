@@ -1859,6 +1859,21 @@ def _set_rope_extension_config(args, config):
             or args.max_position_embeddings
         )
 
+        # Pre-compute LongRoPE mscale so attention.py can apply it via
+        # _yarn_get_concentration_factor_from_config().
+        from megatron.core.models.common.embeddings.longrope_rotary_pos_embedding import (
+            _calc_mscale,
+        )
+
+        scale_ratio = args.max_position_embeddings / float(
+            config.longrope_original_max_position_embeddings
+        )
+        config.longrope_mscale = _calc_mscale(
+            scale_ratio,
+            config.longrope_magnitude_scaling_policy,
+            config.longrope_original_max_position_embeddings,
+        )
+
 
 def _add_transformer_engine_args(parser):
     group = parser.add_argument_group(title='Transformer-Engine')
