@@ -2057,7 +2057,7 @@ def training_log(
             if args.log_timers_to_tensorboard:
                 if writer:
                     writer.add_scalar('TFLOPS', throughput, iteration)
-                    writer.add_scalar({'Tokens per second per GPU': tokens_per_second_per_gpu}, iteration)
+                    writer.add_scalar('Tokens per second per GPU', tokens_per_second_per_gpu, iteration)
                 if wandb_writer:
                     wandb_writer.log({'TFLOPS': throughput}, iteration)
                     wandb_writer.log({'Tokens per second per GPU': tokens_per_second_per_gpu}, iteration)
@@ -2351,7 +2351,9 @@ def checkpoint_and_decide_exit(
             return True
 
     # Regular save (persistent and non-persistent).
-    if args.save and args.save_interval and iteration % args.save_interval == 0:
+    if args.save and args.save_interval and \
+        (iteration % args.save_interval == 0 or \
+        iteration in set(args.save_extra_steps)):
         save_checkpoint_and_time(
             iteration,
             model,
