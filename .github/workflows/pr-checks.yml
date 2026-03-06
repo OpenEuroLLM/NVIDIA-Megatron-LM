@@ -86,9 +86,10 @@ jobs:
           ruff format --check megatron/ --diff
 
   # -----------------------------------------------------------------------
-  # Job 3: Install megatron-core (without heavy GPU deps) and verify the
-  # package can be imported without crashing.
-  # Uses pip with the minimal dependency set (torch CPU-only build).
+  # Job 3: Install megatron-core and verify the package can be imported.
+  # All declared dependencies are installed normally. The only special
+  # handling is forcing the CPU-only PyTorch wheel (~250 MB vs ~3 GB for
+  # CUDA) by providing the PyTorch CPU index as an extra source.
   # -----------------------------------------------------------------------
   import-check:
     name: Import check (megatron.core)
@@ -102,12 +103,12 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install PyTorch (CPU only, lightweight)
+      - name: Install megatron-core with all dependencies (CPU PyTorch)
+        # --extra-index-url makes pip prefer CPU wheels for torch/torchvision
+        # while resolving all other declared deps (numpy, packaging, etc.) normally.
         run: |
-          pip install torch --index-url https://download.pytorch.org/whl/cpu
-
-      - name: Install megatron-core (base dependencies only)
-        run: pip install -e . --no-deps
+          pip install -e . \
+            --extra-index-url https://download.pytorch.org/whl/cpu
 
       - name: Verify top-level import
         run: |
