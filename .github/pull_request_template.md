@@ -1,54 +1,25 @@
-- [ ] I, the PR author, have personally reviewed every line of this PR.
+# What does this PR do?
+<!-- One paragraph overview of the change and why it is needed. -->
 
-# What does this PR do ?
-<!-- Add a one line overview of what this PR aims to accomplish. -->
+## Type of change
+- [ ] Bug fix
+- [ ] New feature
+- [ ] Refactor / code cleanup
+- [ ] Documentation
+- [ ] CI / tooling
 
-:warning: For major changes (either in lines of code or in its impact), please make sure to first share a design doc with the team. If you're unsure what's the best way to do so, contact @NVIDIA/mcore-oncall.
+## Changes summary
+<!-- Bullet-point list of the concrete changes made. -->
+-
 
-## Issue tracking
+## Testing
+<!-- Describe how you tested this change. -->
+- [ ] I ran the relevant unit tests locally (`pytest tests/unit_tests/`)
+- [ ] I verified the change works end-to-end on a real training run
+- [ ] No automated test covers this yet — I have verified it manually
 
-For PRs from open-source community contributors:
-
-- **New features**: a linked issue is **required**. Please open a [feature request](https://github.com/NVIDIA/Megatron-LM/issues/new?template=feature_request.md) and reference it here before submitting the PR.
-- **Small updates (bug fixes, minor improvements)**: a linked issue is **recommended** and will accelerate the PR review process.
-
-Linked issue: <!-- e.g. Fixes #1234 / Related to #1234 -->
-
-## Contribution process
-
-### Pre-checks
-
-- [ ] I have added relevant unit tests
-- [ ] I have added relevant functional tests
-- [ ] I have added proper typing to my code [Typing guidelines](https://docs.python.org/3/library/typing.html)
-- [ ] I have added relevant documentation
-- [ ] I have run the [autoformatter.sh](https://github.com/NVIDIA/Megatron-LM/blob/main/tools/autoformat.sh) on my PR
-
-### Code review
-
-Feel free to message or comment @NVIDIA/mcore-oncall to help accelerate your merge into main. The less complex your PR is, the faster it will be approved and merged!
-
-All PRs start as **draft**. If you open a non-draft PR, it will be automatically converted to draft.
-
-#### Step 1: Mark PR as "Ready for Review"
-
-1. When your PR is ready, click **Ready for Review**.
-2. An oncall reviewer is auto-assigned and expert reviewers are notified based on your changes.
-   - Some PRs may jump straight to step 2. This is determined by `.github/CODEOWNERS`.
-
-:warning: Only mark as ready once merge-conflicts are resolved and the CI is passing.
-Final Review might get declined if these requirements are not fulfilled.
-
-#### Step 2: Final Review
-
-For PRs that change `megatron/core`, once all expert reviewers have approved, the `Final Review` label is applied **automatically** and final reviewers are assigned.
-
-For PRs outside `megatron/core`, this step is skipped.
-
-#### Step 3: Approved
-
-Once all required reviewers have approved, the `Approved` label is applied **automatically**.
-
-### Merge
-
-Any member of [mcore-engineers](https://github.com/orgs/NVIDIA/teams/mcore-engineers) will be able to merge your PR.
+## Checklist
+- [ ] Code follows the project style (`ruff check megatron/` passes locally)
+- [ ] New functionality includes tests, or I have explained why tests are not feasible
+- [ ] Type hints are added for new public functions/classes
+- [ ] I have rebased on the latest `main` and resolved any conflicts
