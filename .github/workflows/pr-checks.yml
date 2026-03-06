@@ -14,6 +14,10 @@ on:
   pull_request:
     branches:
       - main
+  # Allows manual triggering from the GitHub Actions tab (Actions → PR Checks → Run workflow).
+  # Useful for testing the workflow itself without opening a real PR.
+  # When triggered manually, the syntax-check job will find no changed files and skip gracefully.
+  workflow_dispatch:
 
 jobs:
   # -----------------------------------------------------------------------
