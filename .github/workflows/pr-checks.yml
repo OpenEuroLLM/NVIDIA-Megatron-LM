@@ -1,0 +1,110 @@
+# Lightweight PR quality checks for fork of NVIDIA/Megatron-LM.
+# Runs on every pull request targeting main.
+# Does NOT require GPUs or NVIDIA infrastructure.
+#
+# Checks performed:
+#   1. Python syntax validation of all changed .py files
+#   2. Linting with ruff (warnings only — does not block merge)
+#   3. Format check with ruff (warnings only — does not block merge)
+#   4. Import check: verifies megatron.core can be imported after install
+
+name: PR Checks
+
+on:
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  # -----------------------------------------------------------------------
+  # Job 1: Validate Python syntax of every .py file changed in this PR.
+  # This is a hard gate — broken syntax means broken code, always block.
+  # -----------------------------------------------------------------------
+  syntax-check:
+    name: Syntax check (changed files)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Compile-check all changed Python files
+        run: |
+          git fetch origin main
+          CHANGED=$(git diff --name-only origin/main...HEAD -- '*.py')
+          if [ -z "$CHANGED" ]; then
+            echo "No Python files changed, skipping syntax check."
+            exit 0
+          fi
+          echo "Checking syntax for:"
+          echo "$CHANGED"
+          echo "$CHANGED" | xargs python -m py_compile
+          echo "All files passed syntax check."
+
+  # -----------------------------------------------------------------------
+  # Job 2: Lint and format check with ruff.
+  # Configured as warnings-only: failures are annotated on the PR diff
+  # but do NOT block merging (continue-on-error: true).
+  # To promote these to blocking gates, set continue-on-error: false.
+  # -----------------------------------------------------------------------
+  lint:
+    name: Lint (ruff — warnings only)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install ruff
+        # Pin to the same version declared in pyproject.toml [dependency-groups.linting]
+        run: pip install "ruff~=0.9.0"
+
+      - name: Run ruff linter
+        continue-on-error: true
+        run: |
+          echo "::notice::Linting violations are warnings only and do not block this PR."
+          ruff check megatron/ --output-format=github
+
+      - name: Run ruff format check
+        continue-on-error: true
+        run: |
+          echo "::notice::Formatting violations are warnings only and do not block this PR."
+          ruff format --check megatron/ --diff
+
+  # -----------------------------------------------------------------------
+  # Job 3: Install megatron-core (without heavy GPU deps) and verify the
+  # package can be imported without crashing.
+  # Uses pip with the minimal dependency set (torch CPU-only build).
+  # -----------------------------------------------------------------------
+  import-check:
+    name: Import check (megatron.core)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install PyTorch (CPU only, lightweight)
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install megatron-core (base dependencies only)
+        run: pip install -e . --no-deps
+
+      - name: Verify top-level import
+        run: |
+          python -c "import megatron.core; print('megatron.core imported successfully')"
