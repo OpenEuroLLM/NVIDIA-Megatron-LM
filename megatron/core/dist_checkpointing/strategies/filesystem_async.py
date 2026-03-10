@@ -487,7 +487,21 @@ class FileSystemWriterAsync(FileSystemWriter):
             with msc.open(path, "wb") as metadata_file:
                 pickle.dump(metadata, metadata_file)
         else:
+            # Preserve custom attrs (e.g. mcore_data, all_local_plans) that
+            # PyTorch's FileSystemWriter.finish() strips via dataclasses.replace().
+            extra_attrs = {
+                k: v for k, v in vars(metadata).items()
+                if k not in metadata.__dataclass_fields__
+            }
             super().finish(metadata, results)
+            if extra_attrs:
+                metadata_path = os.path.join(self.checkpoint_dir, ".metadata")
+                with open(metadata_path, 'rb') as metadata_file:
+                    saved_metadata = pickle.load(metadata_file)
+                for key, value in extra_attrs.items():
+                    setattr(saved_metadata, key, value)
+                with open(metadata_path, 'wb') as metadata_file:
+                    pickle.dump(saved_metadata, metadata_file)
 
     def prepare_local_plan(self, plan: SavePlan) -> SavePlan:
         """
