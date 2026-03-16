@@ -19,7 +19,7 @@ from megatron.training.dist_signal_handler import DistributedSignalHandler
 def build_pretraining_data_loader(dataset, consumed_samples):
     """Build dataloader given an input dataset."""
 
-    if dataset is None:
+    if dataset is None or len(dataset) == 0:
         return None
     args = get_args()
 
