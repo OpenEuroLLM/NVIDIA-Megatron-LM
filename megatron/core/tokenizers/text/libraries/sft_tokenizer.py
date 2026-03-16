@@ -12,6 +12,8 @@ try:
 except ModuleNotFoundError:
     HAVE_TRANSFORMERS = False
 
+from megatron.core.tokenizers.vision.libraries.multimodal_tokenizer import llama3p1_chat_template
+
 
 # fmt: off
 nemotron_h_aligned_custom_template = """{% for message in messages %}{% if message['role'] == 'system' %}{{ '<SPECIAL_10>System\n' + message['content'].strip() + '\n' }}{% elif message['role'] == 'user' %}{{ '<SPECIAL_11>User\n' + message['content'].strip() + '\n' + '<SPECIAL_11>Assistant\n' }}{% elif message['role'] == 'assistant' %}{{ message['content'].strip() + '\n' }}{% endif %}{% endfor %}""" # pylint: disable=line-too-long
@@ -81,6 +83,15 @@ class SFTTokenizer:
                 pad_token_id=tokenizer.convert_tokens_to_ids("<SPECIAL_233>"),
                 custom_chat_template=nemotron_h_aligned_custom_template,
                 has_bos=False,
+                has_system_role=True,
+            )
+        elif prompt_format == "llama3p1":
+            # "<|start_header_id|>assistant<|end_header_id|>\n\n" is the 4-token assistant prefix.
+            self._prompt_config = PromptConfig(
+                assistant_prefix_len=4,
+                pad_token_id=tokenizer.convert_tokens_to_ids("<|finetune_right_pad_id|>"),
+                custom_chat_template=llama3p1_chat_template,
+                has_bos=True,
                 has_system_role=True,
             )
         elif prompt_format == "identity":
