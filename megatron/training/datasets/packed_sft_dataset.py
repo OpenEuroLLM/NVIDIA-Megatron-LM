@@ -5,11 +5,13 @@ Each JSONL line must have:
     "tokens":    List[int]  — pre-tokenised token IDs, length == seq_len
     "loss_mask": List[int]  — 1 for assistant tokens, 0 for prompt/pad/EOD
 
-Position IDs and attention mask are built at load time using the standard
-get_ltor_masks_and_position_ids() helper, which resets at EOD boundaries when
---reset-position-ids / --reset-attention-mask are set.  This gives each
-packed conversation the correct rotary position embeddings and prevents
-attention from bleeding across conversation boundaries.
+Position IDs are built here by scanning for EOD tokens and resetting the
+counter to 0 after each one.  This is required for two reasons:
+  1. RoPE correctness — each conversation must start at position 0, not
+     continue from wherever the previous conversation ended.
+  2. Attention boundary enforcement — Megatron's varlen flash-attention path
+     (--reset-attention-mask) detects sequence boundaries from position-id
+     resets, not from an explicit mask passed by the dataloader.
 """
 from typing import Any, Dict, Optional
 
@@ -89,11 +91,16 @@ class PackedSFTDataset(MegatronDataset):
         labels       = tokens[1:].contiguous()    # [seq_len - 1]
         loss_mask    = loss_mask[1:].contiguous()  # align with labels
 
-        # Position IDs — reset_position_ids is handled downstream by
-        # get_ltor_masks_and_position_ids() in the pretraining data path.
-        # We emit a simple 0..N-1 range here; the pretraining collation
-        # code will overwrite it when --reset-position-ids is set.
-        position_ids = torch.arange(seq_len - 1, dtype=torch.long)
+        # Build position IDs with EOD-based reset.
+        # After each EOD token the counter resets to 0 so that the next
+        # conversation starts at position 0.  This is what Megatron's varlen
+        # flash-attention path uses to detect conversation boundaries.
+        eod_id = self.config.tokenizer.eod
+        pos, pos_ids = 0, []
+        for t in input_tokens.tolist():
+            pos_ids.append(pos)
+            pos = 0 if t == eod_id else pos + 1
+        position_ids = torch.tensor(pos_ids, dtype=torch.long)
 
         return {
             "tokens":       input_tokens,
