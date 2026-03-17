@@ -283,11 +283,10 @@ def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
 
 
 def core_gpt_dataset_config_from_args(args):
-    if args.legacy_tokenizer or args.sft:
+    if args.legacy_tokenizer or args.sft or args.packed_sft:
+        # SFTTokenizer and HuggingFaceTokenizer are only supported by the training
+        # tokenizer path; route through get_tokenizer() for all three cases.
         tokenizer = get_tokenizer()
-    elif args.packed_sft:
-        # Pre-packed data: tokens already computed; tokenizer not used by dataset.
-        tokenizer = build_tokenizer(args)
     else:
         tokenizer = build_tokenizer(args)
 
