@@ -170,9 +170,14 @@ class SFTDataset(MegatronDataset):
         loss_mask[labels == pad] = 0.0  # Mask paddings
         loss_mask[labels == IGNORE_INDEX] = 0.0  # mask prompts
 
-        # TODO(duncan): Optionally create an attention mask
-        assert not self.config.create_attention_mask and not self.config.reset_attention_mask
-        # attention_mask = None
+        if self.config.create_attention_mask:
+            attention_mask = torch.tril(
+                torch.ones((max_seq_len, max_seq_len))
+            ).unsqueeze(0)
+            # Convert attention mask to binary:
+            attention_mask = attention_mask < 0.5
+        else:
+            attention_mask = None
 
         assert len(cu_seqlens) >= 2
         cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32)
