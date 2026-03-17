@@ -95,14 +95,9 @@ class PackedSFTDataset(MegatronDataset):
         # code will overwrite it when --reset-position-ids is set.
         position_ids = torch.arange(seq_len - 1, dtype=torch.long)
 
-        ret = {
-            "tokens":      input_tokens,
-            "labels":      labels,
-            "loss_mask":   loss_mask,
+        return {
+            "tokens":       input_tokens,
+            "labels":       labels,
+            "loss_mask":    loss_mask,
             "position_ids": position_ids,
         }
-
-        if self.config.create_attention_mask:
-            ret["attention_mask"] = None  # built by collation / model
-
-        return ret
