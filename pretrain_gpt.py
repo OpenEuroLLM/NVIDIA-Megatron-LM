@@ -42,6 +42,7 @@ from megatron.training import (
 from megatron.training.datasets.sft_dataset import SFTDataset
 from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank, get_mtp_ranks
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.datasets.packed_sft_dataset import PackedSFTDataset
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,
@@ -284,6 +285,9 @@ def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
 def core_gpt_dataset_config_from_args(args):
     if args.legacy_tokenizer or args.sft:
         tokenizer = get_tokenizer()
+    elif args.packed_sft:
+        # Pre-packed data: tokens already computed; tokenizer not used by dataset.
+        tokenizer = build_tokenizer(args)
     else:
         tokenizer = build_tokenizer(args)
 
@@ -359,9 +363,10 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
 
     config = core_gpt_dataset_config_from_args(args)
 
-
     is_packed_sequence = False
-    if args.sft:
+    if args.packed_sft:
+        dataset_type = PackedSFTDataset
+    elif args.sft:
         dataset_type = SFTDataset
         is_packed_sequence = True  # SFT always uses packed sequence
     else:
