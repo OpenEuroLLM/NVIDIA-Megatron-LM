@@ -2,8 +2,12 @@
 """PackedSFTDataset — loads pre-packed SFT sequences produced by pack_sft_data.py.
 
 Each JSONL line must have:
-    "tokens":    List[int]  — pre-tokenised token IDs, length == seq_len
-    "loss_mask": List[int]  — 1 for assistant tokens, 0 for prompt/pad/EOD
+    "tokens":    List[int]  — pre-tokenised token IDs, length == seq_len + 1
+    "loss_mask": List[int]  — 1 for assistant tokens, 0 for prompt/pad/EOD; length == seq_len + 1
+
+The extra token is needed for the standard LM shift (input=tokens[:-1],
+labels=tokens[1:]), producing exactly seq_len tokens — which must be
+divisible by TP size for sequence-parallel reduce-scatter.
 
 Position IDs are built here by scanning for EOD tokens and resetting the
 counter to 0 after each one.  This is required for two reasons:
@@ -84,11 +88,10 @@ class PackedSFTDataset(MegatronDataset):
         seq_len = len(tokens)
 
         # Standard LM shift: predict token[i+1] from token[i].
-        # The packed JSONL already has full-length sequences (seq_len tokens),
-        # so we store seq_len+1 and slice here — but since we only have seq_len,
-        # we shift by dropping the last input token and first label token.
-        input_tokens = tokens[:-1].contiguous()   # [seq_len - 1]
-        labels       = tokens[1:].contiguous()    # [seq_len - 1]
+        # The packed JSONL stores seq_len+1 tokens so that after the shift
+        # we get exactly seq_len tokens, which must be divisible by TP size.
+        input_tokens = tokens[:-1].contiguous()   # [seq_len]
+        labels       = tokens[1:].contiguous()    # [seq_len]
         loss_mask    = loss_mask[1:].contiguous()  # align with labels
 
         # Build position IDs with EOD-based reset.
