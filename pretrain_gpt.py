@@ -28,6 +28,7 @@ from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, Moc
 from megatron.core.enums import ModelType
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.models.gpt import GPTModel
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.utils import get_attr_wrapped_model, get_thd_batch_on_this_cp_rank, get_batch_on_this_hybrid_cp_rank, StragglerDetector
@@ -61,6 +62,34 @@ except ImportError:
     has_nvidia_modelopt = False
 
 stimer = StragglerDetector()
+
+
+def _build_packed_seq_params(position_ids):
+    """Build PackedSeqParams for varlen flash attention from position_ids.
+
+    Position IDs reset to 0 at each document boundary (EOD).  We detect
+    those resets to compute cu_seqlens for TE's THD-format flash attention,
+    which enforces cross-document attention isolation at zero overhead.
+
+    Args:
+        position_ids: [batch=1, seq_len] int64 tensor on CUDA.
+
+    Returns:
+        PackedSeqParams with qkv_format='thd'.
+    """
+    pos = position_ids[0]                          # [seq_len]
+    starts = (pos == 0).nonzero(as_tuple=True)[0]  # indices where a doc begins
+    cu_seqlens = torch.cat([starts, pos.new_tensor([pos.size(0)])])
+    cu_seqlens = cu_seqlens.to(torch.int32)
+    seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
+    max_seqlen = seqlens.max().item()
+    return PackedSeqParams(
+        qkv_format='thd',
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_kv=cu_seqlens,
+        max_seqlen_q=max_seqlen,
+        max_seqlen_kv=max_seqlen,
+    )
 
 
 def get_batch(data_iterator, vp_stage: Optional[int] = None):
@@ -249,6 +278,10 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
         tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params = get_batch(data_iterator, vp_stage)
     timers('batch-generator').stop()
 
+    # Build PackedSeqParams for varlen flash attention (document isolation).
+    if args.packed_sft and position_ids is not None:
+        packed_seq_params = _build_packed_seq_params(position_ids)
+
     with stimer:
         if args.use_legacy_models:
             output_tensor = model(tokens, position_ids, attention_mask, labels=labels)
@@ -262,7 +295,8 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                 return schedule_plan, partial(loss_func, loss_mask, model=model)
             else:
                 output_tensor = model(
-                    tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask, packed_seq_params=packed_seq_params
+                    tokens, position_ids, attention_mask, labels=labels,
+                    loss_mask=loss_mask, packed_seq_params=packed_seq_params,
                 )
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
