@@ -16,3 +16,4 @@ onelogger.err
 runs/
 /test_cases/
 **/dist/
+*events.out.tfevents.*
