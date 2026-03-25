@@ -2262,7 +2262,8 @@ def train(
                 active=args.profile_step_end - args.profile_step_start,
                 repeat=1,
             ),
-            on_trace_ready=torch.profiler.tensorboard_trace_handler(args.tensorboard_dir),
+            activities=[torch.profiler.ProfilerActivity.CUDA, torch.profiler.ProfilerActivity.CPU],
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(dir_name=args.tensorboard_dir,worker_name=str(os.environ['SLURM_PROCID']),use_gzip=True),
             record_shapes=True,
             with_stack=True,
         )
