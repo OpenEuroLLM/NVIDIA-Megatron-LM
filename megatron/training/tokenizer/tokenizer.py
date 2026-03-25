@@ -144,6 +144,7 @@ class _HuggingFaceTokenizer(MegatronLegacyTokenizer):
         self._tokenizer = transformers.AutoTokenizer.from_pretrained(
             pretrained_model_name_or_path=pretrained_model_name_or_path,
             trust_remote_code=trust_remote_code,
+            local_files_only=True,
             **kwargs
         )
         self._vocab = self._tokenizer.get_vocab()
