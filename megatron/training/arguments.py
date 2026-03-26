@@ -1314,6 +1314,15 @@ def core_transformer_config_from_args(args, config_class=None):
 
     kw_args['inference_sampling_seed'] = args.seed
 
+    # RoPE fusion: always disable for YaRN/LongRoPE (fused kernels ignore mscale)
+    if getattr(args, "position_embedding_type", "learned_absolute") in ("yarn", "longrope"):
+        kw_args['apply_rope_fusion'] = False
+
+    # Return config.
+    # Note: YaRN and LongRoPE parameters for non-MLA models are set on the config
+    # object after construction, since they are not TransformerConfig dataclass fields.
+    # See the _set_rope_extension_config() call after config construction.
+
     # handle quantization config
     # NOTE: Kitchen arguments are only added to the namespace when
     # Kitchen library is available.
@@ -1326,7 +1335,67 @@ def core_transformer_config_from_args(args, config_class=None):
 
 
     # Return config.
-    return config_class(**kw_args)
+    config = config_class(**kw_args)
+
+    # Set YaRN / LongRoPE extension parameters on config after construction.
+    # These are not TransformerConfig dataclass fields (they are used by GPTModel
+    # via getattr on the config object), matching the pattern used by model_builder.py.
+    _set_rope_extension_config(args, config)
+
+    return config
+
+
+def _set_rope_extension_config(args, config):
+    """Set RoPE extension parameters on the config object for non-MLA models.
+
+    YaRN and LongRoPE parameters are stored as dynamic attributes on the config,
+    not as TransformerConfig dataclass fields. GPTModel reads them via getattr().
+    """
+    pos_emb_type = getattr(args, "position_embedding_type", "learned_absolute")
+
+    if pos_emb_type == "yarn":
+        config.yarn_rotary_scaling_factor = getattr(args, 'yarn_scaling_factor', 1.0)
+        config.yarn_original_max_position_embeddings = (
+            getattr(args, 'yarn_original_max_position_embeddings', None)
+            or args.max_position_embeddings
+        )
+        config.yarn_beta_fast = getattr(args, 'yarn_beta_fast', 32.0)
+        config.yarn_beta_slow = getattr(args, 'yarn_beta_slow', 1.0)
+        config.yarn_mscale = getattr(args, 'yarn_mscale', 1.0)
+        config.yarn_mscale_all_dim = getattr(args, 'yarn_mscale_all_dim', 0.0)
+        config.yarn_correction_range_round_to_int = getattr(
+            args, 'yarn_correction_range_round_to_int', True
+        )
+
+    elif pos_emb_type == "longrope":
+        if getattr(args, 'longrope_rescale_factors_path', None) is None:
+            raise ValueError(
+                "--longrope-rescale-factors-path is required when "
+                "--position-embedding-type=longrope"
+            )
+        config.longrope_rescale_factors_path = args.longrope_rescale_factors_path
+        config.longrope_magnitude_scaling_policy = getattr(
+            args, 'longrope_magnitude_scaling_policy', "su"
+        )
+        config.longrope_original_max_position_embeddings = (
+            getattr(args, 'longrope_original_max_position_embeddings', None)
+            or args.max_position_embeddings
+        )
+
+        # Pre-compute LongRoPE mscale so attention.py can apply it via
+        # _yarn_get_concentration_factor_from_config().
+        from megatron.core.models.common.embeddings.longrope_rotary_pos_embedding import (
+            _calc_mscale,
+        )
+
+        scale_ratio = args.max_position_embeddings / float(
+            config.longrope_original_max_position_embeddings
+        )
+        config.longrope_mscale = _calc_mscale(
+            scale_ratio,
+            config.longrope_magnitude_scaling_policy,
+            config.longrope_original_max_position_embeddings,
+        )
 
 
 def _add_transformer_engine_args(parser):
@@ -1618,7 +1687,8 @@ def _add_network_size_args(parser):
                        help='Maximum number of position embeddings to use. '
                        'This is the size of position embedding.')
     group.add_argument('--position-embedding-type', type=str, default='learned_absolute',
-                        choices=['learned_absolute', 'rope', 'mrope', 'relative', 'none'],
+                        choices=['learned_absolute', 'rope', 'mrope', 'yarn', 'longrope',
+                                 'relative', 'none'],
                         help='Position embedding type.')
     group.add_argument('--relative-attention-num-buckets', type=int, default=32,
                         help='Number of buckets for relative position embeddings.')
@@ -1654,6 +1724,32 @@ def _add_network_size_args(parser):
                        dest='add_position_embedding')
     group.add_argument('--mrope-section', nargs='+', type=int, default=None,
                        help='Multimodal rope section is for channel dimension, empty by default.')
+    # YaRN RoPE options (for non-MLA models using --position-embedding-type yarn)
+    group.add_argument('--yarn-scaling-factor', type=float, default=1.0,
+                       help='YaRN scaling factor = target_ctx / original_ctx.')
+    group.add_argument('--yarn-original-max-position-embeddings', type=int, default=None,
+                       help='Original max position embeddings for YaRN. '
+                            'Defaults to --max-position-embeddings if not provided.')
+    group.add_argument('--yarn-beta-fast', type=float, default=32.0,
+                       help='YaRN beta_fast parameter.')
+    group.add_argument('--yarn-beta-slow', type=float, default=1.0,
+                       help='YaRN beta_slow parameter.')
+    group.add_argument('--yarn-mscale', type=float, default=1.0,
+                       help='YaRN mscale parameter.')
+    group.add_argument('--yarn-mscale-all-dim', type=float, default=0.0,
+                       help='YaRN mscale_all_dim parameter.')
+    group.add_argument('--yarn-correction-range-round-to-int', action='store_true',
+                       default=True,
+                       help='Whether to round YaRN correction range bounds to integer.')
+    # LongRoPE options (for --position-embedding-type longrope)
+    group.add_argument('--longrope-rescale-factors-path', type=str, default=None,
+                       help='Path to LongRoPE rescale factors file (.txt, .csv, .npy, .pt). '
+                            'Required when --position-embedding-type=longrope.')
+    group.add_argument('--longrope-magnitude-scaling-policy', type=str, default='su',
+                       help='LongRoPE magnitude scaling policy: "su", "yarn", or a float literal.')
+    group.add_argument('--longrope-original-max-position-embeddings', type=int, default=None,
+                       help='Original (pre-extended) context length for LongRoPE scaling. '
+                            'Defaults to --max-position-embeddings if not provided.')
     group.add_argument('--make-vocab-size-divisible-by', type=int, default=128,
                        help='Pad the vocab size to be divisible by this value.'
                        'This is added for computational efficieny reasons.')

@@ -11,6 +11,7 @@ from megatron.core.config_logger import has_config_logger_enabled, log_config_to
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.common.embeddings import YarnRotaryEmbedding
+from megatron.core.models.common.embeddings import LongRoPERotaryEmbedding
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import (
     MultimodalRotaryEmbedding,
@@ -91,7 +92,7 @@ class GPTModel(LanguageModule):
         parallel_output: bool = True,
         share_embeddings_and_output_weights: bool = False,
         position_embedding_type: Literal[
-            'learned_absolute', 'rope', 'mrope', 'yarn', 'none'
+            'learned_absolute', 'rope', 'mrope', 'yarn', 'longrope', 'none'
         ] = 'learned_absolute',
         rotary_percent: float = 1.0,
         rotary_base: int = 10000,
@@ -181,6 +182,25 @@ class GPTModel(LanguageModule):
                     self.config, "yarn_correction_range_round_to_int"
                 ),
                 use_cpu_initialization=self.config.use_cpu_initialization,
+            )
+        elif self.position_embedding_type == 'longrope':
+            self.rotary_pos_emb = LongRoPERotaryEmbedding(
+                kv_channels=self.config.kv_channels,
+                rotary_percent=rotary_percent,
+                rescale_factors_path=getattr(
+                    self.config, "longrope_rescale_factors_path"
+                ),
+                max_position_embeddings=max_sequence_length,
+                original_max_position_embeddings=getattr(
+                    self.config, "longrope_original_max_position_embeddings"
+                ),
+                magnitude_scaling_policy=getattr(
+                    self.config, "longrope_magnitude_scaling_policy", "su"
+                ),
+                rotary_interleaved=self.config.rotary_interleaved,
+                rotary_base=self.rotary_base,
+                use_cpu_initialization=self.config.use_cpu_initialization,
+                cp_group=self.pg_collection.cp,
             )
         elif self.position_embedding_type == 'mrope' and not self.config.multi_latent_attention:
             self.rotary_pos_emb = MultimodalRotaryEmbedding(
@@ -355,6 +375,17 @@ class GPTModel(LanguageModule):
                 raise NotImplementedError(
                     "Flash decoding uses precomputed cos and sin for RoPE, not implemented in "
                     "YarnRotaryEmbedding yet."
+                )
+        elif self.position_embedding_type == 'longrope':
+            if self.training or not self.config.flash_decode:
+                rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
+                    inference_context, self.decoder, decoder_input, self.config, packed_seq_params
+                )
+                rotary_pos_emb, _ = self.rotary_pos_emb(rotary_seq_len)
+            else:
+                raise NotImplementedError(
+                    "Flash decoding uses precomputed cos and sin for RoPE, not implemented in "
+                    "LongRoPERotaryEmbedding yet."
                 )
         elif self.position_embedding_type == 'mrope' and not self.config.multi_latent_attention:
             if self.training or not self.config.flash_decode:

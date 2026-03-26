@@ -253,4 +253,6 @@ def _yarn_get_concentration_factor_from_config(config: TransformerConfig) -> flo
             getattr(config, "yarn_mscale", None),
             getattr(config, "yarn_mscale_all_dim", None),
         )
+    if hasattr(config, "longrope_mscale"):
+        return config.longrope_mscale
     return 1.0
