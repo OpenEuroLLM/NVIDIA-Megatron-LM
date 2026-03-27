@@ -1,4 +1,3 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 # Based on Microsoft LongRoPE reference (MIT License) - logic adapted for Megatron-LM integration.
 
 from __future__ import annotations
