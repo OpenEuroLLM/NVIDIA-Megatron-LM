@@ -676,6 +676,11 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
         else:
             iter_finalize_fn()
 
+    # Barrier so last rank waits for rank 0 to write latest_checkpointed_iteration.txt
+    # before wandb_finalize_fn tries to add it to the artifact (avoids "Path is not a file").
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
+
     # Additional callback for one_logger (last rank)
     if not torch.distributed.is_initialized() \
        or is_last_rank():
