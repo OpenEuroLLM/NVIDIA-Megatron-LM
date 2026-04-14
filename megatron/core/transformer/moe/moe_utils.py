@@ -1181,57 +1181,95 @@ def track_moe_metrics(
         torch.distributed.all_reduce(util_values, group=dp_group, op=torch.distributed.ReduceOp.AVG)
 
         # Compute per-layer stats; skip layers that received no tokens (non-MoE layers).
-        cv_list, active_list, max_frac_list = [], [], []
+        cv_pct_list, active_list, max_frac_list, entropy_list, e_eff_list, dead_count_list = (
+            [], [], [], [], [], []
+        )
+        # Accumulate all W&B per-layer data into one dict to avoid multiple log() calls at the
+        # same step (each commit-on-call would overwrite the previous layer's data in W&B).
+        wandb_layer_log: dict = {}
+        if per_layer_logging and wandb_writer:
+            try:
+                import wandb as _wandb
+                _have_wandb = True
+            except ImportError:
+                _have_wandb = False
+        else:
+            _have_wandb = False
+
         for i in range(util_values.shape[0]):
             counts = util_values[i]
             total = counts.sum().item()
             if total == 0:
                 continue
             fractions = counts / total
-            cv = (fractions.std() / (fractions.mean() + 1e-8)).item()
+            # CV as a percentage (community convention: CV% = std/mean * 100)
+            cv_pct = (fractions.std() / (fractions.mean() + 1e-8)).item() * 100.0
             active_frac = (counts > 0).float().mean().item()
             max_frac = fractions.max().item()
-            cv_list.append(cv)
+            dead_count = int((counts == 0).sum().item())
+            # Shannon entropy in nats; clamp to avoid log(0)
+            p = fractions.clamp(min=1e-12)
+            entropy = (-(p * p.log()).sum()).item()
+            e_eff = math.exp(entropy)  # effective expert count for this layer
+
+            cv_pct_list.append(cv_pct)
             active_list.append(active_frac)
             max_frac_list.append(max_frac)
+            entropy_list.append(entropy)
+            e_eff_list.append(e_eff)
+            dead_count_list.append(dead_count)
 
             if per_layer_logging:
                 if writer is not None:
-                    writer.add_scalar(f'moe/expert_cv_layer_{i}', cv, iteration)
+                    writer.add_scalar(f'moe/expert_cv_pct_layer_{i}', cv_pct, iteration)
                     writer.add_scalar(f'moe/expert_active_frac_layer_{i}', active_frac, iteration)
                     writer.add_scalar(f'moe/expert_max_frac_layer_{i}', max_frac, iteration)
+                    writer.add_scalar(f'moe/expert_entropy_layer_{i}', entropy, iteration)
+                    writer.add_scalar(f'moe/expert_e_eff_layer_{i}', e_eff, iteration)
                     writer.add_histogram(f'moe/tokens_per_expert_layer_{i}', counts.cpu(), iteration)
-                if wandb_writer:
-                    try:
-                        import wandb as _wandb
-                        hist = _wandb.Histogram(counts.cpu().numpy())
-                    except ImportError:
-                        hist = None
-                    layer_log = {
-                        f'moe/expert_cv_layer_{i}': cv,
-                        f'moe/expert_active_frac_layer_{i}': active_frac,
-                        f'moe/expert_max_frac_layer_{i}': max_frac,
-                    }
-                    if hist is not None:
-                        layer_log[f'moe/tokens_per_expert_layer_{i}'] = hist
-                    wandb_writer.log(layer_log, iteration)
+                if _have_wandb:
+                    wandb_layer_log[f'moe/expert_cv_pct_layer_{i}'] = cv_pct
+                    wandb_layer_log[f'moe/expert_active_frac_layer_{i}'] = active_frac
+                    wandb_layer_log[f'moe/expert_max_frac_layer_{i}'] = max_frac
+                    wandb_layer_log[f'moe/expert_entropy_layer_{i}'] = entropy
+                    wandb_layer_log[f'moe/expert_e_eff_layer_{i}'] = e_eff
+                    wandb_layer_log[f'moe/tokens_per_expert_layer_{i}'] = _wandb.Histogram(
+                        counts.cpu().numpy()
+                    )
 
-        if cv_list:
-            mean_cv = sum(cv_list) / len(cv_list)
+        if cv_pct_list:
+            mean_cv_pct = sum(cv_pct_list) / len(cv_pct_list)
             mean_active = sum(active_list) / len(active_list)
             mean_max_frac = sum(max_frac_list) / len(max_frac_list)
+            mean_entropy = sum(entropy_list) / len(entropy_list)
+            min_entropy = min(entropy_list)       # canary: worst layer
+            e_eff_at_min = math.exp(min_entropy)  # effective experts in the worst layer
+            total_dead = sum(dead_count_list)      # dead experts summed across all MoE layers
             if total_loss_dict is not None:
-                total_loss_dict['expert_cv'] = torch.tensor(mean_cv)
+                total_loss_dict['expert_cv_pct'] = torch.tensor(mean_cv_pct)
+                total_loss_dict['expert_min_entropy'] = torch.tensor(min_entropy)
+                total_loss_dict['expert_e_eff_at_min'] = torch.tensor(e_eff_at_min)
             if writer is not None:
-                writer.add_scalar('moe/expert_cv', mean_cv, iteration)
+                writer.add_scalar('moe/expert_cv_pct', mean_cv_pct, iteration)
                 writer.add_scalar('moe/expert_active_frac', mean_active, iteration)
                 writer.add_scalar('moe/expert_max_frac', mean_max_frac, iteration)
+                writer.add_scalar('moe/expert_mean_entropy', mean_entropy, iteration)
+                writer.add_scalar('moe/expert_min_entropy', min_entropy, iteration)
+                writer.add_scalar('moe/expert_e_eff_at_min', e_eff_at_min, iteration)
+                writer.add_scalar('moe/expert_dead_count', total_dead, iteration)
             if wandb_writer:
+                # Merge per-layer data (scalars + histograms) and aggregates into one log() call
+                # so all metrics land at the same step without commits clobbering each other.
                 wandb_writer.log(
                     {
-                        'moe/expert_cv': mean_cv,
+                        **wandb_layer_log,
+                        'moe/expert_cv_pct': mean_cv_pct,
                         'moe/expert_active_frac': mean_active,
                         'moe/expert_max_frac': mean_max_frac,
+                        'moe/expert_mean_entropy': mean_entropy,
+                        'moe/expert_min_entropy': min_entropy,
+                        'moe/expert_e_eff_at_min': e_eff_at_min,
+                        'moe/expert_dead_count': total_dead,
                     },
                     iteration,
                 )
