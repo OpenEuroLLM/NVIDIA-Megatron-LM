@@ -41,6 +41,7 @@ except ImportError:
 
 # MOE logging
 _MOE_LAYER_WISE_LOGGING_TRACKER: dict = {}
+_MOE_EXPERT_UTILIZATION_TRACKER: dict = {}
 
 
 def switch_load_balancing_loss_func(
@@ -905,6 +906,7 @@ def clear_aux_losses_tracker() -> None:
     tracker = get_moe_layer_wise_logging_tracker()
     for name in tracker:
         tracker[name]["values"].zero_()
+    clear_expert_utilization_tracker()
 
 
 def reduce_aux_losses_tracker_across_ranks(
@@ -1046,6 +1048,84 @@ def track_moe_metrics(
                         iteration,
                     )
 
+    # Expert utilization logging
+    util_tracker = get_expert_utilization_tracker()
+    if 'values' in util_tracker:
+        util_values = util_tracker['values']  # [num_layers, num_experts]
+
+        # Collect across pipeline parallel stages.
+        if pg_collection is None:
+            pp_group = parallel_state.get_pipeline_model_parallel_group()
+            dp_group = parallel_state.get_data_parallel_group(
+                with_context_parallel=False, partial_data_parallel=False
+            )
+        else:
+            pp_group = pg_collection.pp
+            dp_group = pg_collection.dp
+
+        torch.distributed.all_reduce(util_values, group=pp_group)
+        # Sum over TP+CP ranks so each rank reflects the full token picture.
+        if util_tracker.get('reduce_group') is not None:
+            torch.distributed.all_reduce(util_values, group=util_tracker['reduce_group'])
+        # Average over data-parallel ranks for consistent reporting.
+        torch.distributed.all_reduce(util_values, group=dp_group, op=torch.distributed.ReduceOp.AVG)
+
+        # Compute per-layer stats; skip layers that received no tokens (non-MoE layers).
+        cv_list, active_list, max_frac_list = [], [], []
+        for i in range(util_values.shape[0]):
+            counts = util_values[i]
+            total = counts.sum().item()
+            if total == 0:
+                continue
+            fractions = counts / total
+            cv = (fractions.std() / (fractions.mean() + 1e-8)).item()
+            active_frac = (counts > 0).float().mean().item()
+            max_frac = fractions.max().item()
+            cv_list.append(cv)
+            active_list.append(active_frac)
+            max_frac_list.append(max_frac)
+
+            if per_layer_logging:
+                if writer is not None:
+                    writer.add_scalar(f'moe/expert_cv_layer_{i}', cv, iteration)
+                    writer.add_scalar(f'moe/expert_active_frac_layer_{i}', active_frac, iteration)
+                    writer.add_scalar(f'moe/expert_max_frac_layer_{i}', max_frac, iteration)
+                    writer.add_histogram(f'moe/tokens_per_expert_layer_{i}', counts.cpu(), iteration)
+                if wandb_writer:
+                    try:
+                        import wandb as _wandb
+                        hist = _wandb.Histogram(counts.cpu().numpy())
+                    except ImportError:
+                        hist = None
+                    layer_log = {
+                        f'moe/expert_cv_layer_{i}': cv,
+                        f'moe/expert_active_frac_layer_{i}': active_frac,
+                        f'moe/expert_max_frac_layer_{i}': max_frac,
+                    }
+                    if hist is not None:
+                        layer_log[f'moe/tokens_per_expert_layer_{i}'] = hist
+                    wandb_writer.log(layer_log, iteration)
+
+        if cv_list:
+            mean_cv = sum(cv_list) / len(cv_list)
+            mean_active = sum(active_list) / len(active_list)
+            mean_max_frac = sum(max_frac_list) / len(max_frac_list)
+            if total_loss_dict is not None:
+                total_loss_dict['expert_cv'] = torch.tensor(mean_cv)
+            if writer is not None:
+                writer.add_scalar('moe/expert_cv', mean_cv, iteration)
+                writer.add_scalar('moe/expert_active_frac', mean_active, iteration)
+                writer.add_scalar('moe/expert_max_frac', mean_max_frac, iteration)
+            if wandb_writer:
+                wandb_writer.log(
+                    {
+                        'moe/expert_cv': mean_cv,
+                        'moe/expert_active_frac': mean_active,
+                        'moe/expert_max_frac': mean_max_frac,
+                    },
+                    iteration,
+                )
+
     clear_aux_losses_tracker()
 
 
@@ -1104,6 +1184,48 @@ def get_moe_layer_wise_logging_tracker() -> dict:
     """Return the moe layer wise tracker."""
     global _MOE_LAYER_WISE_LOGGING_TRACKER
     return _MOE_LAYER_WISE_LOGGING_TRACKER
+
+
+def get_expert_utilization_tracker() -> dict:
+    """Return the expert utilization tracker."""
+    global _MOE_EXPERT_UTILIZATION_TRACKER
+    return _MOE_EXPERT_UTILIZATION_TRACKER
+
+
+def save_to_expert_utilization_tracker(
+    tokens_per_expert: torch.Tensor,
+    layer_number: int,
+    num_layers: int,
+    reduce_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> None:
+    """Accumulate per-expert token counts for utilization logging.
+
+    Called every forward pass from the router. The actual distributed reduction and
+    logging happen at logging intervals inside track_moe_metrics().
+
+    Args:
+        tokens_per_expert: Local token counts per expert, shape [num_experts].
+        layer_number: 1-indexed layer number.
+        num_layers: Total number of layers (used to size the tracker on first call).
+        reduce_group: Process group for sum-reduction at logging time (e.g. tp_cp_group).
+    """
+    if layer_number is None:
+        return
+    tracker = get_expert_utilization_tracker()
+    if 'values' not in tracker:
+        num_experts = tokens_per_expert.shape[0]
+        tracker['values'] = torch.zeros(
+            num_layers, num_experts, device=tokens_per_expert.device, dtype=torch.float32
+        )
+        tracker['reduce_group'] = reduce_group
+    tracker['values'][layer_number - 1] += tokens_per_expert.detach().float()
+
+
+def clear_expert_utilization_tracker() -> None:
+    """Zero out the expert utilization tracker without deallocating the buffer."""
+    tracker = get_expert_utilization_tracker()
+    if 'values' in tracker:
+        tracker['values'].zero_()
 
 
 @internal_api

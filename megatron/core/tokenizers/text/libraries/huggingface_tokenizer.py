@@ -63,7 +63,7 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
             include_special_tokens: when True, converting text to ids will include special
                 tokens / prompt tokens (if any), yielding self.tokenizer(text).input_ids
         """
-
+        use_fast = True
         try:
             # this logic deals with different huggingface tokenizers having different args
             if vocab_file is None:
