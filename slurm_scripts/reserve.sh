@@ -4,9 +4,9 @@ salloc --bell \
     --ntasks-per-node=$2 \
     --time=$3 \
     -J $4 \
-    --partition=$5 \
-    --account=project_462000963 \
-    --gpus-per-node=8 \
-    --cpus-per-task=7 \
+    --gpus-per-node=4 \
+    --partition=booster \
+    --account=e-sta-openeurollm \
     --mem=0 \
     --exclusive \
+    --comment="NVIDIA_POWER_LIMIT=900,900"

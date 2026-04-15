@@ -16,3 +16,4 @@ runs/
 /test_cases/
 **/dist/
 *events.out.tfevents.*
+slurm_scripts/*debug*
