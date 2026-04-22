@@ -84,6 +84,8 @@ class GatedDeltaNet(MegatronModule):
         use_qk_l2norm: bool = True,
         A_init_range: Tuple[float, float] = (1, 16),
         pg_collection: ProcessGroupCollection = None,
+        cp_comm_type: Optional[str] = None,
+        pp_layer_offset: Optional[int] = None,
     ):
         """
         Args:
@@ -97,6 +99,10 @@ class GatedDeltaNet(MegatronModule):
             A_init_range: The initialization range for the attention weights.
             pg_collection: The required process groups to use for tensor model parallel and context
                 parallel.
+            cp_comm_type: Passed by ``TransformerLayer`` when context parallel is enabled (same as
+                ``Attention``). GDN uses ``pg_collection`` collectives instead of TE-style
+                ``cp_comm_type`` routing; accepted for API compatibility.
+            pp_layer_offset: Optional PP offset from ``TransformerLayer``; unused in GDN today.
         """
 
         if not HAVE_FLA:
