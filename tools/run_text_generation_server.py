@@ -22,9 +22,6 @@ from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
-from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
-    InferenceWrapperConfig,
-)
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
@@ -43,6 +40,7 @@ sys.path.append(
 from megatron.core import mpu
 from megatron.training import get_args, get_model, get_tokenizer
 from megatron.training.checkpointing import load_checkpoint
+from megatron.training.arguments import parse_and_validate_args
 from megatron.training.initialize import initialize_megatron
 
 
@@ -63,27 +61,15 @@ def get_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngi
 
     tokenizer = get_tokenizer()
 
-    inference_wrapper_config = InferenceWrapperConfig(
-        hidden_size=args.hidden_size,
-        inference_batch_times_seqlen_threshold=args.inference_batch_times_seqlen_threshold,
-        fp32_residual_connection=args.fp32_residual_connection,
-        params_dtype=args.params_dtype,
-        padded_vocab_size=args.padded_vocab_size,
-        inference_max_seq_length=args.inference_max_seq_length,
-        inference_max_requests=args.inference_max_batch_size,
-        nccl_all_reduce_for_prefill=args.nccl_all_reduce_for_prefill,
-        moe_pad_experts_for_cuda_graph_inference = args.moe_pad_experts_for_cuda_graph_inference
-    )
-    inference_context = StaticInferenceContext.from_config(inference_wrapper_config)
+    inference_context = StaticInferenceContext(args.inference_max_requests, args.inference_max_sequence_length)
     inference_wrapped_model = GPTInferenceWrapper(
-        model, inference_wrapper_config, inference_context
+        model, inference_context
     )
     text_generation_controller = TextGenerationController(
         inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer
     )
     return StaticInferenceEngine(
         text_generation_controller=text_generation_controller,
-        max_batch_size=args.inference_max_batch_size,
     )
 
 
@@ -113,7 +99,7 @@ def add_text_generate_args(parser):
         metavar='N',
         type=str,
         nargs='+',
-        help='Input prompts with each prompt within quotes and seperated by space',
+        help='Input prompts with each prompt within quotes and separated by space',
     )
     group.add_argument(
         "--max-batch-size",
@@ -128,7 +114,7 @@ def add_text_generate_args(parser):
 @torch.inference_mode()
 def main(model_type: str = "gpt"):
     """Runs the text generation server with the specified model type."""
-    initialize_megatron(
+    parse_and_validate_args(
         extra_args_provider=add_text_generate_args,
         args_defaults={
             'no_load_rng': True,
@@ -136,6 +122,7 @@ def main(model_type: str = "gpt"):
             'exit_on_missing_checkpoint': True,
         },
     )
+    initialize_megatron()
     args = get_args()
     if args.num_layers_per_virtual_pipeline_stage is not None:
         print("Interleaved pipeline schedule is not yet supported for text generation.")
@@ -165,14 +152,6 @@ def main(model_type: str = "gpt"):
     assert len(model) == 1, "Above condition should have caught this"
     model = model[0]
     model.eval()
-
-    if args.max_batch_size is not None:
-        assert args.inference_max_batch_size is not None
-        args.inference_max_batch_size = max(args.inference_max_batch_size, args.max_batch_size)
-        warnings.warn(
-            "`--max-batch-size` has been deprecated in favor of `--inference-max-requests`, "
-            f"setting maximum batch size to {args.inference_max_batch_size}"
-        )
 
     inference_engine = get_inference_engine(args, model)
 

@@ -17,3 +17,10 @@ runs/
 **/dist/
 *events.out.tfevents.*
 slurm_scripts/*debug*
+
+# Sphinx documentation
+docs/_build
+docs/apidocs
+
+# Git worktrees
+.worktrees/
