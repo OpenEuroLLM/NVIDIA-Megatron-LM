@@ -9,6 +9,7 @@
 #SBATCH --exclusive
 #SBATCH --account=e-sta-openeurollm
 #SBATCH --output logs/latest.log
+#SBATCH --network=sharp
 
 set -euo pipefail
 set -x
@@ -180,6 +181,7 @@ TRAIN_ARGS=(
   --disable-bias-linear
   --no-check-for-nan-in-loss-and-grad
   --rerun-mode disabled
+  --use-sharp
 )
 
 MODEL_ARGS=(
