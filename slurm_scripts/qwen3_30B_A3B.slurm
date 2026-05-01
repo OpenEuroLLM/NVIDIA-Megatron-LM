@@ -1,340 +1,341 @@
 #!/bin/bash
-#SBATCH --job-name=test_meglm-qwen3-30B_A3B
-#SBATCH --cpus-per-task=7
-#SBATCH --ntasks-per-node=8
+#SBATCH --job-name=moe_qwen3
+#SBATCH --gpus-per-node=4
+#SBATCH --ntasks-per-node=1
 #SBATCH --nodes=4
-#SBATCH --mem=480G
-#SBATCH --partition=dev-g
-#SBATCH --time=01:00:00
+#SBATCH --mem=0
+#SBATCH --partition=booster
+#SBATCH --time=01:30:00
 #SBATCH --exclusive
-#SBATCH --gpus-per-node=8
-#SBATCH --account=project_462000963
-#SBATCH --output logs/%x-%j.log
+#SBATCH --account=e-sta-openeurollm
+#SBATCH --output logs/latest.log
 
-# Bash "strict mode"
-# (see http://redsymbol.net/articles/unofficial-bash-strict-mode/)
 set -euo pipefail
+set -x
 
-# Compilers in the container
-export CC=gcc-12
-export CXX=g++-12
+module purge
 
-# PATHS
-BASE_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
-export MEGATRON_PATH="/scratch/${SLURM_JOB_ACCOUNT:-project_462000963}/users/${USER}/frameworks/NVIDIA-Megatron-LM"
-OUTPUT_DIR="$BASE_DIR/output"
-CHECKPOINT_PATH="$OUTPUT_DIR/checkpoints"
-TENSORBOARD_DIR="$OUTPUT_DIR/tensorboard/${SLURM_JOB_NAME:-local}-${SLURM_JOBID:-0}"
+for ARG in "$@"; do
+  case "$ARG" in
+    *=*)
+      KEY="${ARG%%=*}"
+      VALUE="${ARG#*=}"
+      export "$KEY"="$VALUE"
+      ;;
+    *)
+      echo "Ignoring arg '$ARG' (expected KEY=VALUE)" >&2
+      ;;
+  esac
+done
 
-mkdir -p "$CHECKPOINT_PATH"    # This needs to exist
+# ------------------------------
+# Defaults (override via KEY=VALUE)
+# ------------------------------
+: "${MODEL_SIZE:=30B}"
 
-export PYTHONWARNINGS=ignore
-export LOGLEVEL=ERROR
-export CUDA_DEVICE_MAX_CONNECTIONS=1    # Needed for sequence parallelism
-if [[ -n "${SLURM_JOB_NODELIST:-}" ]]; then
-    export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
-else
-    export MASTER_ADDR=localhost
-fi
-export MASTER_PORT=9999
-export WORLD_SIZE=${WORLD_SIZE:-${SLURM_NTASKS:-32}}
-
-# PERFORMANCE FLAGS
-export OMP_NUM_THREADS=1
-#export HSA_ENABLE_SDMA=0
-#export NCCL_NCHANNELS_PER_PEER=32
-#export NCCL_MIN_NCHANNELS=$NCCL_NCHANNELS_PER_PEER
-
-# DATA
-DATA_PATH="/scratch/project_462000963/users/vitiugin/data_tok/oellm/hplt/fin_Latn/fin_Latn"
-DATA_CACHE_PATH="/flash/project_462000963/users/${USER}/megatron_cache/"
-TOKENIZER_MODEL="openeurollm/tokenizer-256k"
-export TOKENIZERS_PARALLELISM=false
-
-PROFILE=0
-RECOMPUTATION=1
-SEQ_LENGTH=4096
-GLOBAL_BATCH_SIZE=2048
-MICRO_BATCH_SIZE=1
-
-# Parallelism defaults (override via environment when sweeping).
-TP_SIZE=${TP_SIZE:-1}
-PP_SIZE=${PP_SIZE:-2}
-CP_SIZE=${CP_SIZE:-1}
-EP_SIZE=${EP_SIZE:-8}
-EXPERT_TP_SIZE=${EXPERT_TP_SIZE:-$TP_SIZE}
-PARALLEL_ORDER=${PARALLEL_ORDER:-tp-cp-ep-dp-pp}
-
-# Model constants used by parallel sweep safeguards.
-NUM_LAYERS=48
-NUM_ATTENTION_HEADS=32
-NUM_QUERY_GROUPS=4
-NUM_EXPERTS=128
-
-# Optional candidate lists for safe sweep dry-runs.
-TP_CANDIDATES=(${TP_CANDIDATES:-1 2 4 8})
-PP_CANDIDATES=(${PP_CANDIDATES:-1 2 4 8})
-CP_CANDIDATES=(${CP_CANDIDATES:-1})
-EP_CANDIDATES=(${EP_CANDIDATES:-1 2 4 8 16})
-
-validate_parallel_combo() {
-    local tp=$1
-    local pp=$2
-    local cp=$3
-    local ep=$4
-    local etp=$5
-
-    if (( tp < 1 || pp < 1 || cp < 1 || ep < 1 || etp < 1 )); then
-        return 1
-    fi
-
-    # Megatron: world_size must be divisible by tp * pp * cp.
-    local model_size=$((tp * pp * cp))
-    if (( WORLD_SIZE % model_size != 0 )); then
-        return 1
-    fi
-
-    # Megatron core parallel-state: world_size must be divisible by etp * ep * pp.
-    local expert_model_size=$((etp * ep * pp))
-    if (( WORLD_SIZE % expert_model_size != 0 )); then
-        return 1
-    fi
-
-    # Megatron args validation / transformer config checks.
-    if (( NUM_LAYERS % pp != 0 )); then
-        return 1
-    fi
-    if (( NUM_ATTENTION_HEADS % tp != 0 )); then
-        return 1
-    fi
-    if (( NUM_QUERY_GROUPS % tp != 0 )); then
-        return 1
-    fi
-    if (( cp > 1 )) && (( SEQ_LENGTH % (2 * cp) != 0 )); then
-        return 1
-    fi
-    if (( ep > 1 )) && (( NUM_EXPERTS % ep != 0 )); then
-        return 1
-    fi
-
-    # Megatron core rank-ordering constraint when order does not end with pp.
-    if [[ "$PARALLEL_ORDER" != *pp ]]; then
-        local dp_size=$((WORLD_SIZE / model_size))
-        local expert_dp_size=$((WORLD_SIZE / expert_model_size))
-        if (( pp > 1 )) && (( dp_size != expert_dp_size )); then
-            return 1
-        fi
-    fi
-
-    return 0
-}
-
-print_valid_parallel_combos() {
-    local found=0
-    echo "Valid parallel tuples (tp pp cp ep etp dp expert_dp):"
-    for tp in "${TP_CANDIDATES[@]}"; do
-        for pp in "${PP_CANDIDATES[@]}"; do
-            for cp in "${CP_CANDIDATES[@]}"; do
-                for ep in "${EP_CANDIDATES[@]}"; do
-                    local etp=$tp
-                    if validate_parallel_combo "$tp" "$pp" "$cp" "$ep" "$etp"; then
-                        local model_size=$((tp * pp * cp))
-                        local expert_model_size=$((etp * ep * pp))
-                        local dp_size=$((WORLD_SIZE / model_size))
-                        local expert_dp_size=$((WORLD_SIZE / expert_model_size))
-                        echo "  $tp $pp $cp $ep $etp $dp_size $expert_dp_size"
-                        found=1
-                    fi
-                done
-            done
-        done
-    done
-
-    if (( found == 0 )); then
-        echo "No valid combinations found for provided candidate lists."
-        return 1
-    fi
-    return 0
-}
-
-if [[ "${LIST_VALID_PARALLEL_COMBOS:-0}" == "1" ]]; then
-    print_valid_parallel_combos
-    exit 0
-fi
-
-if ! validate_parallel_combo "$TP_SIZE" "$PP_SIZE" "$CP_SIZE" "$EP_SIZE" "$EXPERT_TP_SIZE"; then
-    echo "Invalid parallel configuration: tp=${TP_SIZE} pp=${PP_SIZE} cp=${CP_SIZE} ep=${EP_SIZE} etp=${EXPERT_TP_SIZE}"
-    echo "Set LIST_VALID_PARALLEL_COMBOS=1 to print only valid combinations for your candidate lists."
+case "$MODEL_SIZE" in
+  235B)
+    : "${TP:=2}"
+    : "${PP:=8}"
+    : "${EP:=16}"
+    : "${VPP:=4}"
+    ;;
+  30B)
+    : "${TP:=1}"
+    : "${PP:=2}"
+    : "${EP:=4}"
+    : "${VPP:=1}"
+    ;;
+  *)
+    echo "Unknown MODEL_SIZE=$MODEL_SIZE" >&2
     exit 1
+    ;;
+esac
+
+: "${SEQ_LENGTH:=4096}"
+: "${GBS:=2048}"
+: "${MBS:=2}"
+: "${TRAIN_ITERS:=15}"
+: "${NUM_WORKERS:=8}"
+: "${CPUS_PER_TASK:=288}"
+: "${FP8:=0}"
+: "${DISPATCHER:=flex}"               # This needs to be flex for deepep/hybridep
+: "${D_BACKEND:=hybridep}"
+: "${NUM_SMS:=16}"                    # GPU Streaming multiprocessors for deepep/hybridep
+: "${ENABLE_MOE_OVERLAP:=0}"          # --overlap-moe-expert-parallel-comm + --delay-wgrad-compute
+: "${CUDA_MAX_CONNECTIONS:=1}"        # set >1 when enabling overlap
+: "${GC_INTERVAL:=5}"
+: "${NUMA_BIND:=node}"
+: "${COMMENT:=""}"
+: "${PROFILE:=0}"
+: "${CPU_OFFLOAD:=0}"
+: "${WANDB:=1}"
+: "${WANDB_PROJECT:=qwen3-30B-A2B-scaling-jupiter}"
+
+# SHARP runtime env
+export WANDB_MODE="offline"
+export SHARP_SMX_SOCK_ADDR_FAMILY=ipv4
+export NCCL_SOCKET_FAMILY=AF_INET
+
+# Distributed
+export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
+export MASTER_PORT=${MASTER_PORT:-9999}
+export WORLD_SIZE=$((SLURM_GPUS_PER_NODE * SLURM_NNODES))
+
+export OMP_NUM_THREADS=1
+export PYTHONWARNINGS=ignore
+
+export NCCL_DEBUG=${NCCL_DEBUG:-INFO}
+export NCCL_DEBUG_SUBSYS=${NCCL_DEBUG_SUBSYS:-INIT}
+export NCCL_DEBUG_FILE=${NCCL_DEBUG_FILE:-"logs/nccl/node-%h.log"}
+
+export CUDA_DEVICE_MAX_CONNECTIONS=$CUDA_MAX_CONNECTIONS
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+export NVTE_CPU_OFFLOAD_V1=1
+#export NCCL_NVLS_ENABLE=0
+#export NVTE_DEBUG=1
+#export NVTE_DEBUG_LEVEL=2
+#export NVTE_NORM_FWD_USE_CUDNN=0
+#export NVTE_NORM_BWD_USE_CUDNN=0
+
+# ------------------------------
+# Model config
+# ------------------------------
+if [[ "$MODEL_SIZE" == "235B" ]]; then
+  MODEL=qwen3-235B-A22B
+  NLAYERS=94
+  NHIDDEN=4096
+  NHEADS=64
+  FFN_HIDDEN_SIZE=12288
+  NUM_QUERY_GROUPS=4
+  NUM_EXPERTS=128
+  MOE_FFN_SIZE=1536
+  KV_CHANNELS=128
+elif [[ "$MODEL_SIZE" == "30B" ]]; then
+  MODEL=qwen3-30B-A2B
+  NLAYERS=48
+  NHIDDEN=2048
+  NHEADS=32
+  FFN_HIDDEN_SIZE=6144
+  NUM_QUERY_GROUPS=4
+  NUM_EXPERTS=128
+  MOE_FFN_SIZE=768
+  KV_CHANNELS=128
+else
+  echo "Unknown MODEL_SIZE=$MODEL_SIZE" >&2
+  exit 1
 fi
 
+# ------------------------------
+# Paths
+# ------------------------------
+SLURM_JOB_NAME="JUPITER_${MODEL}_TP${TP}_PP${PP}_VPP_${VPP}_EP${EP}_GBS_${GBS}_MBS${MBS}_NN${SLURM_NNODES}_${COMMENT}"
+OUTPUT_DIR="/e/project1/e-sta-openeurollm/komulainen1_jupiter/output/MEGLM/distributed-training-benchmarking"
+LOG_FILE="${OUTPUT_DIR}/${SLURM_JOB_NAME}.log"
+TENSORBOARD_PATH="$OUTPUT_DIR/$SLURM_JOB_NAME/tensorboard/"
+DATA_CACHE_PATH="/e/scratch/e-sta-openeurollm/komulainen1_jupiter/data/cache"
+DATA_PATH="/e/project1/e-sta-openeurollm/komulainen1_jupiter/data/fineweb-10BT/fineweb-10BT_text_document"
+TOKENIZER_MODEL="/e/project1/e-sta-openeurollm/komulainen1_jupiter/hf_cache/hub/models--openeurollm--tokenizer-256k/snapshots/ac1ce776f8a78fc7aa96dfc91ffc1ae6966b2fa1"
+
+# ------------------------------
+# Args
+# ------------------------------
 OPTIMIZER_ARGS=(
-    --optimizer adam
-    --adam-beta1 0.9
-    --adam-beta2 0.95
-    --adam-eps 1e-8
-    --lr 3e-4
-    --min-lr 3e-5
-    --lr-decay-style cosine
-    --clip-grad 1.0
-    --weight-decay 1e-1
+  --no-load-optim
+  --use-distributed-optimizer
+  --optimizer adam
+  --adam-beta1 0.9
+  --adam-beta2 0.95
+  --adam-eps 1e-8
+  --lr 3e-4
+  --min-lr 3e-5
+  --lr-decay-style cosine
+  --clip-grad 1.0
+  --weight-decay 1e-1
 )
+
 DATA_ARGS=(
-    --data-cache-path "$DATA_CACHE_PATH"
-    --tokenizer-type HuggingFaceTokenizer
-    --tokenizer-model "$TOKENIZER_MODEL"
-    --data-path "$DATA_PATH"
-    --num-workers 4
-    --vocab-size 256000
+  --data-cache-path "$DATA_CACHE_PATH"
+  --tokenizer-type HuggingFaceTokenizer
+  --data-path "$DATA_PATH"
+  --tokenizer-model "$TOKENIZER_MODEL"
+  --num-workers "$NUM_WORKERS"
+  --vocab-size 256000
+  --no-mmap-bin-files
+  --no-create-attention-mask-in-dataloader
+  --manual-gc
+  --manual-gc-interval $GC_INTERVAL
+)
+
+TRAIN_ARGS=(
+  --micro-batch-size "$MBS"
+  --global-batch-size "$GBS"
+  --bf16
+  --train-iters "$TRAIN_ITERS"
+  --eval-interval 999
+  --eval-iters 0
+  --distributed-timeout-minutes 30
+  --use-flash-attn
+  --disable-gloo-process-groups             # Gloo process groups are needed only for saving dist optimizer states. GLOO_SOCKET_IFNAME=ib0 is also needed
+  --disable-bias-linear
+  --no-check-for-nan-in-loss-and-grad
+  --rerun-mode disabled
 )
 
 MODEL_ARGS=(
-    --use-mcore-models
-    --disable-bias-linear
-    --max-position-embeddings 32768
-    --num-layers $NUM_LAYERS
-    --hidden-size 2048
-    --ffn-hidden-size 6144
-    --num-attention-heads $NUM_ATTENTION_HEADS
-    --init-method-std 0.01
-    --attention-dropout 0.0
-    --hidden-dropout 0.0
-    --qk-layernorm
-    --normalization RMSNorm
-    --norm-epsilon 1e-06
-    --position-embedding-type rope
-    --swiglu
-    --untie-embeddings-and-output-weights
-    --group-query-attention
-    --num-query-groups $NUM_QUERY_GROUPS
-    --no-masked-softmax-fusion
-    --no-position-embedding
-    --rotary-base 1000000
-    --micro-batch-size $MICRO_BATCH_SIZE
-    --global-batch-size $GLOBAL_BATCH_SIZE
-    --bf16
-    --kv-channels 128
-    --rerun-mode disabled
-    --disable-gloo-process-groups
+  --attention-dropout 0.0
+  --hidden-dropout 0.0
+  --qk-layernorm
+  --normalization RMSNorm
+  --norm-epsilon 1e-06
+  --position-embedding-type rope
+  --swiglu
+  --group-query-attention
+  --rotary-base 1000000
+  --num-query-groups "$NUM_QUERY_GROUPS"
+  --kv-channels "$KV_CHANNELS"
+  --num-layers "$NLAYERS"
+  --ffn-hidden-size "$FFN_HIDDEN_SIZE"
+  --hidden-size "$NHIDDEN"
+  --num-attention-heads "$NHEADS"
+  --seq-length "$SEQ_LENGTH"
+  --max-position-embeddings "$SEQ_LENGTH"
+  --untie-embeddings-and-output-weights
 )
 
 MOE_ARGS=(
-    --moe-ffn-hidden-size 768
-    --moe-router-load-balancing-type aux_loss
-    --moe-aux-loss-coeff 0.001
-    --moe-grouped-gemm
-    --moe-token-dispatcher-type allgather
-    --moe-router-force-load-balancing
-    --num-experts $NUM_EXPERTS
-    --moe-router-topk 8
-    --moe-router-dtype fp64
+  --num-experts "$NUM_EXPERTS"
+  --moe-ffn-hidden-size "$MOE_FFN_SIZE"
+  --moe-router-load-balancing-type aux_loss
+  --moe-aux-loss-coeff 0.001
+  --moe-router-topk 8
+  --moe-router-dtype fp32
+  --moe-grouped-gemm
+  --moe-permute-fusion
+  --moe-router-force-load-balancing
+  --moe-token-dispatcher-type "$DISPATCHER"
+  --moe-flex-dispatcher-backend "$D_BACKEND"
+  --moe-hybridep-num-sms "$NUM_SMS"
+  --moe-deepep-num-sms  "$NUM_SMS"
 )
 
-MODEL_ARGS+=(
-    --use-flash-attn
-    --attention-softmax-in-fp32
-    --seq-length $SEQ_LENGTH
-    --train-iters 5
-    --eval-iters 1
-    --no-gradient-accumulation-fusion
-    --no-bias-dropout-fusion
-    --no-rope-fusion
-    --distributed-timeout-minutes 30
-    --overlap-grad-reduce
-    --overlap-param-gather
+RECOMPUTE_ARGS=(
+  --recompute-granularity full 
+  --recompute-method uniform 
+  --recompute-num-layers 1
+)
+
+FUSED_KERNEL_ARGS=(
+  --cross-entropy-loss-fusion
+  --cross-entropy-fusion-impl te
+  --moe-router-fusion
+  --overlap-grad-reduce
+  --overlap-param-gather
 )
 
 OUTPUT_ARGS=(
-    --tensorboard-dir "$TENSORBOARD_DIR"
-    --tensorboard-queue-size 5
-    --log-throughput
-    --log-progress
-    --log-interval 1
-    --log-memory-to-tensorboard
-    --log-world-size-to-tensorboard
+  --log-throughput
+  --log-interval 1
+  --log-timers-to-tensorboard
+  --tensorboard-dir "$TENSORBOARD_PATH"
+  --tensorboard-queue-size 100
 )
+
+if [ "$WANDB" == "1" ]; then
+    OUTPUT_ARGS+=(
+        --wandb-project "$WANDB_PROJECT"
+        --wandb-save-dir "$OUTPUT_DIR/$SLURM_JOB_NAME"
+        --wandb-exp-name "$SLURM_JOB_NAME"
+        --wandb-entity openeurollm-project
+    )
+fi
 
 PARALLEL_ARGS=(
-    --pipeline-model-parallel-size $PP_SIZE
-    --expert-model-parallel-size $EP_SIZE
-    --expert-tensor-parallel-size $EXPERT_TP_SIZE
-    --use-distributed-optimizer
-    --context-parallel-size $CP_SIZE
-    --tensor-model-parallel-size $TP_SIZE
+  --tensor-model-parallel-size "$TP"
+  --pipeline-model-parallel-size "$PP"
+  --expert-model-parallel-size "$EP"
+  --expert-tensor-parallel-size 1
 )
 
-if (( TP_SIZE > 1 )); then
-    PARALLEL_ARGS+=(--sequence-parallel)
+if [[ "$ENABLE_MOE_OVERLAP" == "1" ]]; then
+  MOE_ARGS+=( --overlap-moe-expert-parallel-comm --delay-wgrad-compute )
 fi
 
-if [ "$RECOMPUTATION" = "1" ]; then
-    MODEL_ARGS+=(
-        --recompute-activations
-        --recompute-granularity selective
-    )
+if (( VPP > 1 )); then
+  PARALLEL_ARGS+=( --num-layers-per-virtual-pipeline-stage "$VPP" )
 fi
 
-if [ "$PROFILE" = "1" ]; then
-    PROFILE_ARGS=(
+# FP8 args
+FP8_ARGS=(
+  --fp8-format hybrid
+  --fp8-recipe blockwise
+  --fp8-param-gather
+)
+
+# PYTORCH PROFILER ARGS
+PROFILE_ARGS=(
     --profile
-        --use-pytorch-profiler
-        --profile-ranks 0
-        --profile-step-start 5
-        --profile-step-end 7
-    --record-memory-history
-    --memory-snapshot-path "${TENSORBOARD_DIR}/memory_snapshot.pickle"
-    )
-else
-    PROFILE_ARGS=()
-fi
-
-CHECKPOINT_ARGS=(
-#    --async-save    # requires --ckpt-format torch_dist
-#    --load "$CHECKPOINT_PATH"
-#    --save "$CHECKPOINT_PATH"
-#    --save-interval $SAVE_INTERVAL
+    --use-pytorch-profiler
+    --profile-step-start 4
+    --profile-step-end 5
+    --profile-ranks 0 1 2 3
 )
 
-COMMAND=" \
-    pretrain_gpt.py \
-    "${MODEL_ARGS[@]}" \
-    "${OPTIMIZER_ARGS[@]}" \
-    "${PARALLEL_ARGS[@]}" \
-    "${OUTPUT_ARGS[@]}" \
-    "${CHECKPOINT_ARGS[@]}" \
-    "${DATA_ARGS[@]}" \
-    "${PROFILE_ARGS[@]}" \
-    "${MOE_ARGS[@]}" \
-"
+OFFLOAD_ARGS=(
+  --fine-grained-activation-offloading
+  --offload-modules expert_fc1 core_attn
+)
 
-#SINGULARITY ENVIRONMENT
-export CONTAINER=/scratch/project_462000394/containers/for-turkunlp-team/lumi-pytorch-rocm-6.2.4-python-3.12-pytorch-v2.7.1-te-dockerhash-560b76ceab56.sif
-export SINGULARITY_BIND=/boot/config-6.4.0-150600.23.73_15.0.14-cray_shasta_c,/scratch/project_462000963/,/projappl/project_462000963/,/flash/project_462000963/,/var/spool/slurmd
-echo "CONTAINER" $CONTAINER
+# ------------------------------
+# Command assembly
+# ------------------------------
+CMD=(
+  pretrain_gpt.py
+  "${MODEL_ARGS[@]}"
+  "${OPTIMIZER_ARGS[@]}"
+  "${PARALLEL_ARGS[@]}"
+  "${OUTPUT_ARGS[@]}"
+  "${DATA_ARGS[@]}"
+  "${MOE_ARGS[@]}"
+  "${FUSED_KERNEL_ARGS[@]}"
+  "${TRAIN_ARGS[@]}"
+  "${RECOMPUTE_ARGS[@]}"
+)
 
-export PWD=(`pwd -P`)
+if [[ "$FP8" == "1" ]]; then
+  CMD+=( "${FP8_ARGS[@]}" )
+fi
+if [[ "$PROFILE" == "1" ]]; then
+  CMD+=( "${PROFILE_ARGS[@]}" )
+fi
+if [[ "$CPU_OFFLOAD" == "1" ]]; then
+  CMD+=( "${OFFLOAD_ARGS[@]}" )
+fi
 
-# Mask to bind tasks to CPUs for one thread per core
-c="fe"
-BIND_MASK="0x${c}000000000000,0x${c}00000000000000,0x${c}0000,0x${c}000000,0x${c},0x${c}00,0x${c}00000000,0x${c}0000000000"
+export CONTAINER="/e/project1/e-sta-openeurollm/container/nemo_26.04.sif"
+export APPTAINER_BINDPATH="/e/project1/e-sta-openeurollm"
+export APPTAINERENV_TRITON_LIBCUDA_PATH="/usr/local/cuda/compat/lib.real"
+export APPTAINERENV_TRITON_HOME="/tmp/triton_cache"
 
-# srun error handling:
-# --wait=60: wait 60 sec after the first task terminates before terminating all remaining tasks
-# --kill-on-bad-exit=1: terminate a step if any task exits with a non-zero exit code
-# --network=disable_rdzv_get: An alternative rendezvous protocol designed by HPE spesifically for AI workloads
+# Disable slurm's cpu bind with --cpu-bind="none" probably needed incase we use torchrun --numa-binding - To be confirmed
+SRUN_ARGS=(
+  --wait=60
+  --kill-on-bad-exit=1
+  --jobid "$SLURM_JOB_ID"
+  --cpus-per-task="$CPUS_PER_TASK"
+  --cpu-bind="none"
+)
 
-SRUN_ARGS=" \
-    --wait=60 \
-    --kill-on-bad-exit=1 \
-    --jobid $SLURM_JOB_ID \
-    --cpu-bind=mask_cpu:$BIND_MASK \
-    "
+LAUNCHER=(
+  python -u -m torch.distributed.run
+  --nproc_per_node "$SLURM_GPUS_PER_NODE"
+  --nnodes "$SLURM_NNODES"
+  --node_rank '${SLURM_PROCID}'
+  --rdzv_endpoint "$MASTER_ADDR:$MASTER_PORT"
+  --rdzv_backend c10d
+  --max_restarts 0
+  --tee 3
+  --numa-binding "node"
+)
 
-srun $SRUN_ARGS \
-    singularity exec \
-    -B $PWD \
-    $CONTAINER \
-    ./slurm_scripts/launcher.sh \
-    $COMMAND
-
-echo "END $SLURM_JOBID: $(date)"
+srun "${SRUN_ARGS[@]}" apptainer exec --writable-tmpfs --nv "$CONTAINER" bash -lc "${LAUNCHER[*]} ${CMD[*]}" 2>&1 | tee "$LOG_FILE"

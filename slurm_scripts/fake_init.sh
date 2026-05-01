@@ -2,23 +2,30 @@ export MEGATRON_PATH=.
 export PYTHONPATH=$MEGATRON_PATH
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
-TP=${TP:-4}
+TP=${TP:-2}
 PP=${PP:-8}
-EP=${EP:-8}
-VPP=${VPP:-2}
-MBS=${MBS:-4}
+EP=${EP:-16}
+VPP=${VPP:-6}
+MBS=${MBS:-2}
 GBS=${GBS:-2048}
 
-export WORLD_SIZE=256
+export WORLD_SIZE=128
 export RANK=0
 export CONTAINER="/e/project1/laionize/luukkonen1/container_cachedir/nemo-v26.02-nemotron3-super.sif"
 export APPTAINER_BINDPATH="/e/project1/e-sta-openeurollm"
 export APPTAINERENV_TRITON_LIBCUDA_PATH="/usr/local/cuda/compat/lib.real"
 
 apptainer exec --nv $CONTAINER python $MEGATRON_PATH/pretrain_gpt.py \
-  --fp8-param-gather \
-  --fp8-recipe blockwise \
+  --fine-grained-activation-offloading \
+  --offload-modules expert_fc1 core_attn \
   --fp8-format hybrid \
+  --fp8-recipe blockwise \
+  --fp8-param-gather \
+  --moe-router-padding-for-quantization \
+  --use-precision-aware-optimizer \
+  --exp-avg-dtype bf16 \
+  --exp-avg-sq-dtype bf16 \
+  --moe-router-dtype fp32 \
   --recompute-granularity selective \
   --recompute-modules moe_act layernorm \
   --distributed-timeout-minutes 60 \
@@ -30,7 +37,7 @@ apptainer exec --nv $CONTAINER python $MEGATRON_PATH/pretrain_gpt.py \
   --expert-tensor-parallel-size 1 \
   --use-distributed-optimizer \
   --no-create-attention-mask-in-dataloader \
-  --use-mcore-models \
+  --attention-softmax-in-fp32 \
   --sequence-parallel \
   --use-flash-attn \
   --disable-bias-linear \
@@ -41,15 +48,14 @@ apptainer exec --nv $CONTAINER python $MEGATRON_PATH/pretrain_gpt.py \
   --data-cache-path /tmp/data-cache \
   --mock-data \
   --tokenizer-type NullTokenizer \
-  --vocab-size 262000 \
-  --split 99,1,0 \
+  --vocab-size 256000 \
+  --split 100,0,0 \
   --no-mmap-bin-files \
-  --num-workers 6 \
+  --num-workers 2 \
   --untie-embeddings-and-output-weights \
   --position-embedding-type rope \
   --rotary-percent 1.0 \
   --rotary-base 1000000 \
-  --rotary-seq-len-interpolation-factor 1 \
   --normalization RMSNorm \
   --swiglu \
   --norm-epsilon 1e-06 \
@@ -59,8 +65,10 @@ apptainer exec --nv $CONTAINER python $MEGATRON_PATH/pretrain_gpt.py \
   --num-attention-heads 64 \
   --group-query-attention \
   --num-query-groups 4 \
+  --kv-channels 128 \
   --qk-layernorm \
   --seq-length 4096 \
+  --no-load-optim \
   --max-position-embeddings 4096 \
   --attention-dropout 0.0 \
   --hidden-dropout 0.0 \
@@ -84,23 +92,19 @@ apptainer exec --nv $CONTAINER python $MEGATRON_PATH/pretrain_gpt.py \
   --moe-permute-fusion \
   --eval-iters 32 \
   --eval-interval 500 \
-  --finetune \
   --auto-detect-ckpt-format \
   --no-ckpt-fully-parallel-save \
-  --dist-ckpt-strictness log_all \
   --init-method-std 0.02 \
-  --log-timers-to-tensorboard \
-  --log-memory-to-tensorboard \
-  --log-num-zeros-in-grad \
-  --log-params-norm \
-  --log-validation-ppl-to-tensorboard \
   --log-throughput \
   --log-interval 1 \
   --bf16 \
   --account-for-embedding-in-pipeline-split \
   --account-for-loss-in-pipeline-split \
   --moe-router-force-load-balancing \
+  --cross-entropy-loss-fusion \
+  --cross-entropy-fusion-impl te \
   --exit-interval 5 \
   --fake-process-group \
   --record-memory-history \
-  --memory-snapshot-path ./qwen3_235b_TP${TP}_PP${PP}_EP${EP}_VPP${VPP}.pickle
+  --use-sharp \
+  --memory-snapshot-path ./qwen3_235b_TP${TP}_PP${PP}_EP${EP}_VPP${VPP}_MBS${MBS}_.pickle

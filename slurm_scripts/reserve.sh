@@ -9,4 +9,3 @@ salloc --bell \
     --account=e-sta-openeurollm \
     --mem=0 \
     --exclusive \
-    --comment="NVIDIA_POWER_LIMIT=900,900"
