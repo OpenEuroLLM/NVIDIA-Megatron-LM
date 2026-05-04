@@ -3,9 +3,10 @@
 
 set -euo pipefail
 
-NODES=(2 4 8 16 32 64 128 256)
+NODES=(4 8 16 32 64 128 256)
+BASE_GBS=64
 SLURM_SCRIPT="slurm_scripts/qwen3_30B_A3B.slurm"
 
-for N in "${NODES[@]}"; do
-  NUM_SMS=40 VPP=2 FP=8 MBS=4 COMMENT="strong_scaling_FP8" sbatch --nodes="$N" "$SLURM_SCRIPT"
+for N in "${NODES[@]}"; do  
+  GBS=$((BASE_GBS * N)) COMMENT="fp8_weak_scaling_scaling" sbatch --nodes="$N" "$SLURM_SCRIPT"
 done

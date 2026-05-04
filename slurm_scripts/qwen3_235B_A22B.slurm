@@ -45,7 +45,7 @@ case "$MODEL_SIZE" in
     : "${TP:=1}"
     : "${PP:=2}"
     : "${EP:=4}"
-    : "${VPP:=1}"
+    : "${VPP:=2}"
     ;;
   *)
     echo "Unknown MODEL_SIZE=$MODEL_SIZE" >&2
@@ -54,23 +54,23 @@ case "$MODEL_SIZE" in
 esac
 
 : "${SEQ_LENGTH:=4096}"
-: "${GBS:=2048}"
+: "${GBS:=4096}"
 : "${MBS:=1}"
-: "${TRAIN_ITERS:=20}"
+: "${TRAIN_ITERS:=15}"
 : "${NUM_WORKERS:=8}"
 : "${CPUS_PER_TASK:=288}"
 : "${FP8:=1}"
 : "${DISPATCHER:=flex}"               # This needs to be flex for deepep/hybridep
 : "${D_BACKEND:=hybridep}"
-: "${NUM_SMS:=22}"                    # GPU Streaming multiprocessors for deepep/hybridep
-: "${ENABLE_MOE_OVERLAP:=1}"          # --overlap-moe-expert-parallel-comm + --delay-wgrad-compute
-: "${CUDA_MAX_CONNECTIONS:=16}"        # set >1 when enabling overlap
-: "${GC_INTERVAL:=5}"
+: "${NUM_SMS:=16}"                    # GPU Streaming multiprocessors for deepep/hybridep
+: "${ENABLE_MOE_OVERLAP:=0}"          # --overlap-moe-expert-parallel-comm + --delay-wgrad-compute
+: "${CUDA_MAX_CONNECTIONS:=8}"        # set >1 when enabling overlap
+: "${GC_INTERVAL:=10}"
 : "${NUMA_BIND:=node}"
 : "${COMMENT:=""}"
 : "${PROFILE:=0}"
 : "${CPU_OFFLOAD:=0}"
-: "${ENABLE_WANDB:=1}"
+: "${WANDB:=1}"
 : "${WANDB_PROJECT:=qwen3-235B-A22B-scaling-jupiter}"
 
 # SHARP runtime env
@@ -86,9 +86,14 @@ export WORLD_SIZE=$((SLURM_GPUS_PER_NODE * SLURM_NNODES))
 export OMP_NUM_THREADS=1
 export PYTHONWARNINGS=ignore
 
+export NCCL_DEBUG=${NCCL_DEBUG:-INFO}
+export NCCL_DEBUG_SUBSYS=${NCCL_DEBUG_SUBSYS:-INIT}
+export NCCL_DEBUG_FILE=${NCCL_DEBUG_FILE:-"logs/nccl/node-%h.log"}
+
 export CUDA_DEVICE_MAX_CONNECTIONS=$CUDA_MAX_CONNECTIONS
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 export NVTE_CPU_OFFLOAD_V1=1
+export TORCH_NCCL_SHOW_EAGER_INIT_P2P_SERIALIZATION_WARNING="FALSE" # Supresses the warnings that stem from VPP and megatron's handling of process groups
 #export NCCL_NVLS_ENABLE=0
 #export NVTE_DEBUG=1
 #export NVTE_DEBUG_LEVEL=2
@@ -127,8 +132,8 @@ fi
 # Paths
 # ------------------------------
 SLURM_JOB_NAME="JUPITER_${MODEL}_TP${TP}_PP${PP}_VPP_${VPP}_EP${EP}_GBS_${GBS}_MBS${MBS}_NN${SLURM_NNODES}_${COMMENT}"
-LOG_FILE="logs/${SLURM_JOB_NAME}.log"
 OUTPUT_DIR="/e/project1/e-sta-openeurollm/komulainen1_jupiter/output/MEGLM/distributed-training-benchmarking"
+LOG_FILE="${OUTPUT_DIR}/${SLURM_JOB_NAME}.log"
 TENSORBOARD_PATH="$OUTPUT_DIR/$SLURM_JOB_NAME/tensorboard/"
 DATA_CACHE_PATH="/e/scratch/e-sta-openeurollm/komulainen1_jupiter/data/cache"
 DATA_PATH="/e/project1/e-sta-openeurollm/komulainen1_jupiter/data/fineweb-10BT/fineweb-10BT_text_document"
@@ -180,9 +185,9 @@ TRAIN_ARGS=(
   --use-flash-attn
   --disable-gloo-process-groups             # Gloo process groups are needed only for saving dist optimizer states. GLOO_SOCKET_IFNAME=ib0 is also needed
   --disable-bias-linear
-  --use-sharp
   --no-check-for-nan-in-loss-and-grad
   --rerun-mode disabled
+  --use-sharp
 )
 
 MODEL_ARGS=(
@@ -242,7 +247,7 @@ OUTPUT_ARGS=(
   --tensorboard-queue-size 100
 )
 
-if [ "$ENABLE_WANDB" -eq 1 ]; then
+if [ "$WANDB" == "1" ]; then
     OUTPUT_ARGS+=(
         --wandb-project "$WANDB_PROJECT"
         --wandb-save-dir "$OUTPUT_DIR/$SLURM_JOB_NAME"
@@ -269,12 +274,12 @@ if (( VPP > 1 )); then
   PARALLEL_ARGS+=( --num-layers-per-virtual-pipeline-stage "$VPP" )
 fi
 
+
 # FP8 args
 FP8_ARGS=(
   --fp8-format hybrid
   --fp8-recipe blockwise
   --fp8-param-gather
-  --moe-router-padding-for-quantization
 )
 
 # PYTORCH PROFILER ARGS
@@ -283,7 +288,7 @@ PROFILE_ARGS=(
     --use-pytorch-profiler
     --profile-step-start 4
     --profile-step-end 5
-    --profile-ranks 0 3
+    --profile-ranks 0 1 2 3
 )
 
 OFFLOAD_ARGS=(
@@ -316,7 +321,6 @@ fi
 if [[ "$CPU_OFFLOAD" == "1" ]]; then
   CMD+=( "${OFFLOAD_ARGS[@]}" )
 fi
-
 
 export CONTAINER="/e/project1/e-sta-openeurollm/container/nemo_26.04.sif"
 export APPTAINER_BINDPATH="/e/project1/e-sta-openeurollm"

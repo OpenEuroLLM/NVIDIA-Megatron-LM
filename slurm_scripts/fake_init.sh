@@ -1,45 +1,82 @@
+set -euo pipefail
+set -x
 export MEGATRON_PATH=.
 export PYTHONPATH=$MEGATRON_PATH
-export CUDA_DEVICE_MAX_CONNECTIONS=1
+export CUDA_DEVICE_MAX_CONNECTIONS=8
 
+MODEL_SIZE=${MODEL_SIZE:-30B}
+
+case "$MODEL_SIZE" in
+235B)
 TP=${TP:-2}
 PP=${PP:-8}
 EP=${EP:-16}
 VPP=${VPP:-6}
-MBS=${MBS:-2}
-GBS=${GBS:-2048}
+NLAYERS=${NLAYERS:-94}
+NHIDDEN=${NHIDDEN:-4096}
+NHEADS=${NHEADS:-64}
+FFN_HIDDEN_SIZE=${FFN_HIDDEN_SIZE:-12288}
+NUM_EXPERTS=${NUM_EXPERTS:-128}
+MOE_FFN_SIZE=${MOE_FFN_SIZE:-1536}
+#
+#--account-for-embedding-in-pipeline-split \
+#--account-for-loss-in-pipeline-split \
+;;
+30B)
+TP=${TP:-1}
+PP=${PP:-2}
+EP=${EP:-4}
+VPP=${VPP:-1}
+NLAYERS=${NLAYERS:-48}
+NHIDDEN=${NHIDDEN:-2048}
+NHEADS=${NHEADS:-32}
+FFN_HIDDEN_SIZE=${FFN_HIDDEN_SIZE:-6144}
+NUM_EXPERTS=${NUM_EXPERTS:-128}
+MOE_FFN_SIZE=${MOE_FFN_SIZE:-768}
+;;
+*)
+echo "Unknown MODEL_SIZE=$MODEL_SIZE" >&2
+exit 1
+;;
+esac
 
+MBS=${MBS:-1}
+GBS=${GBS:-4096}
+
+VPP_ARG=()
+if [[ "${PP}" -gt 1 ]]; then
+  VPP_ARG=(--num-layers-per-virtual-pipeline-stage "${VPP}")
+fi
+
+export NVTE_CPU_OFFLOAD_V1=1
 export WORLD_SIZE=128
 export RANK=0
-export CONTAINER="/e/project1/laionize/luukkonen1/container_cachedir/nemo-v26.02-nemotron3-super.sif"
+export CONTAINER="/e/project1/e-sta-openeurollm/container/nemo_26.04.sif"
 export APPTAINER_BINDPATH="/e/project1/e-sta-openeurollm"
 export APPTAINERENV_TRITON_LIBCUDA_PATH="/usr/local/cuda/compat/lib.real"
 
 apptainer exec --nv $CONTAINER python $MEGATRON_PATH/pretrain_gpt.py \
-  --fine-grained-activation-offloading \
-  --offload-modules expert_fc1 core_attn \
+  --use-flash-attn \
   --fp8-format hybrid \
   --fp8-recipe blockwise \
   --fp8-param-gather \
-  --moe-router-padding-for-quantization \
   --use-precision-aware-optimizer \
-  --exp-avg-dtype bf16 \
-  --exp-avg-sq-dtype bf16 \
+  --exp-avg-dtype fp8 \
+  --exp-avg-sq-dtype fp8 \
   --moe-router-dtype fp32 \
-  --recompute-granularity selective \
-  --recompute-modules moe_act layernorm \
+  --recompute-granularity full \
+  --recompute-method uniform \
+  --recompute-num-layers 1 \
   --distributed-timeout-minutes 60 \
   --tensor-model-parallel-size $TP \
   --pipeline-model-parallel-size $PP \
   --expert-model-parallel-size $EP \
-  --num-layers-per-virtual-pipeline-stage $VPP \
+  "${VPP_ARG[@]}" \
   --context-parallel-size 1 \
   --expert-tensor-parallel-size 1 \
   --use-distributed-optimizer \
   --no-create-attention-mask-in-dataloader \
   --attention-softmax-in-fp32 \
-  --sequence-parallel \
-  --use-flash-attn \
   --disable-bias-linear \
   --micro-batch-size $MBS \
   --global-batch-size $GBS \
@@ -51,7 +88,7 @@ apptainer exec --nv $CONTAINER python $MEGATRON_PATH/pretrain_gpt.py \
   --vocab-size 256000 \
   --split 100,0,0 \
   --no-mmap-bin-files \
-  --num-workers 2 \
+  --num-workers 8 \
   --untie-embeddings-and-output-weights \
   --position-embedding-type rope \
   --rotary-percent 1.0 \
@@ -59,10 +96,10 @@ apptainer exec --nv $CONTAINER python $MEGATRON_PATH/pretrain_gpt.py \
   --normalization RMSNorm \
   --swiglu \
   --norm-epsilon 1e-06 \
-  --num-layers 94 \
-  --hidden-size 4096 \
-  --ffn-hidden-size 12288 \
-  --num-attention-heads 64 \
+  --num-layers $NLAYERS \
+  --hidden-size $NHIDDEN \
+  --ffn-hidden-size $FFN_HIDDEN_SIZE \
+  --num-attention-heads $NHEADS \
   --group-query-attention \
   --num-query-groups 4 \
   --kv-channels 128 \
@@ -81,8 +118,8 @@ apptainer exec --nv $CONTAINER python $MEGATRON_PATH/pretrain_gpt.py \
   --lr-decay-style cosine \
   --adam-beta1 0.9 \
   --adam-beta2 0.95 \
-  --num-experts 128 \
-  --moe-ffn-hidden-size 1536 \
+  --num-experts $NUM_EXPERTS \
+  --moe-ffn-hidden-size $MOE_FFN_SIZE \
   --moe-router-load-balancing-type aux_loss \
   --moe-router-topk 8 \
   --moe-router-pre-softmax \
@@ -98,13 +135,10 @@ apptainer exec --nv $CONTAINER python $MEGATRON_PATH/pretrain_gpt.py \
   --log-throughput \
   --log-interval 1 \
   --bf16 \
-  --account-for-embedding-in-pipeline-split \
-  --account-for-loss-in-pipeline-split \
   --moe-router-force-load-balancing \
   --cross-entropy-loss-fusion \
   --cross-entropy-fusion-impl te \
   --exit-interval 5 \
   --fake-process-group \
   --record-memory-history \
-  --use-sharp \
-  --memory-snapshot-path ./qwen3_235b_TP${TP}_PP${PP}_EP${EP}_VPP${VPP}_MBS${MBS}_.pickle
+  --memory-snapshot-path ./qwen3_${MODEL_SIZE}_TP${TP}_PP${PP}_EP${EP}_VPP${VPP}_MBS${MBS}_.pickle

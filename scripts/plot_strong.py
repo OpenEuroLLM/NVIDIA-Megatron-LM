@@ -24,17 +24,19 @@ GPUS_PER_NODE = 4
 # }
 # GAS=128
 EXPERIMENTS = {
-    128: "/e/project1/e-sta-openeurollm/komulainen1_jupiter/frameworks/NVIDIA-Megatron-LM/logs/JUPITER_qwen3-235B-A22B_TP2_PP8_VPP_4_EP16_GBS_2048_MBS1_NN32_strong_scaling.log",
-    256: "/e/project1/e-sta-openeurollm/komulainen1_jupiter/frameworks/NVIDIA-Megatron-LM/logs/JUPITER_qwen3-235B-A22B_TP2_PP8_VPP_4_EP16_GBS_2048_MBS1_NN64_strong_scaling.log",
-    512: "/e/project1/e-sta-openeurollm/komulainen1_jupiter/frameworks/NVIDIA-Megatron-LM/logs/JUPITER_qwen3-235B-A22B_TP2_PP8_VPP_4_EP16_GBS_2048_MBS1_NN128_strong_scaling.log",
-    1024: "/e/project1/e-sta-openeurollm/komulainen1_jupiter/frameworks/NVIDIA-Megatron-LM/logs/JUPITER_qwen3-235B-A22B_TP2_PP8_VPP_4_EP16_GBS_2048_MBS1_NN256_strong_scaling.log",
+    16: "../../output/MEGLM/distributed-training-benchmarking/JUPITER_qwen3-30B-A2B_TP1_PP2_VPP_2_EP4_GBS_4096_MBS4_NN4_fp8_strong_scaling.log",
+    32: "../../output/MEGLM/distributed-training-benchmarking/JUPITER_qwen3-30B-A2B_TP1_PP2_VPP_2_EP4_GBS_4096_MBS4_NN8_fp8_strong_scaling.log",
+    64: "../../output/MEGLM/distributed-training-benchmarking/JUPITER_qwen3-30B-A2B_TP1_PP2_VPP_2_EP4_GBS_4096_MBS4_NN16_fp8_strong_scaling.log",
+    128: "../../output/MEGLM/distributed-training-benchmarking/JUPITER_qwen3-30B-A2B_TP1_PP2_VPP_2_EP4_GBS_4096_MBS4_NN32_fp8_strong_scaling.log",
+    256: "../../output/MEGLM/distributed-training-benchmarking/JUPITER_qwen3-30B-A2B_TP1_PP2_VPP_2_EP4_GBS_4096_MBS4_NN64_fp8_strong_scaling.log",
+    512: "../../output/MEGLM/distributed-training-benchmarking/JUPITER_qwen3-30B-A2B_TP1_PP2_VPP_2_EP4_GBS_4096_MBS4_NN128_fp8_strong_scaling.log",
+    1024: "../../output/MEGLM/distributed-training-benchmarking/JUPITER_qwen3-30B-A2B_TP1_PP2_VPP_2_EP4_GBS_4096_MBS4_NN256_fp8_strong_scaling.log",
 }
 
 # Output filename for the combined figure (None = show interactively).
-OUTPUT_FILE = "qwen3_235B-A22B_jupiter_strong_scaling.png"
+MODEL="Qwen3-30B-A3B"
+OUTPUT_FILE = f"{MODEL}_jupiter_strong_scaling.png"
 
-# Title for the top (token throughput) bar chart.
-PLOT_TITLE = "Token Throughput Megatron Qwen 3 235B A22B (TP 2, PP 8, EP 16, VP 4, GBS 2048, MBS 2)"
 
 _TFLOPS_RE    = re.compile(r"wandb:\s+TFLOPS\s+([\d.]+)")
 _TOK_GPU_RE   = re.compile(r"wandb:\s+Tokens per second per GPU\s+([\d.]+)")
@@ -42,6 +44,9 @@ _BS_RE        = re.compile(r"wandb:\s+batch-size\s+(\d+)")
 _ITER_TIME_RE = re.compile(r"wandb:\s+iteration-time\s+([\d.]+)")
 
 _WORLD_SIZE_RE = re.compile(r"using world size:\s*(\d+)")
+
+# Title for the top (token throughput) bar chart.
+PLOT_TITLE = f"Token Throughput Megatron {MODEL} (PP 2, EP 4, VP 2, GBS 4096, MBS 4)"
 
 
 def parse_log(path: str) -> dict:
@@ -89,7 +94,7 @@ def main():
     pd.DataFrame({"nodes": [r["world_size"] // GPUS_PER_NODE for r in records.values()],
                   "tflops_per_gpu": [r["tflops_per_gpu"] for r in records.values()],
                   "tok_per_s_per_gpu": [r["tok_per_s_per_gpu"] for r in records.values()],
-    }).to_csv("MoE-235B-strong-scaling.csv", index=False)
+    }).to_csv(f"{MODEL}-strong-scaling.csv", index=False)
     # Baseline for efficiency: smallest GPU count
     baseline_gpus  = gpu_counts[0]
     baseline_tok_s = records[baseline_gpus]["tok_per_s"]
