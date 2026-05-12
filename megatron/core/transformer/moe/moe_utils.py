@@ -42,6 +42,7 @@ except ImportError:
 # MOE logging
 _MOE_LAYER_WISE_LOGGING_TRACKER: dict = {}
 _MOE_EXPERT_UTILIZATION_TRACKER: dict = {}
+_MOE_ROUTER_STATS_TRACKER: dict = {}
 
 
 def switch_load_balancing_loss_func(
@@ -907,6 +908,7 @@ def clear_aux_losses_tracker() -> None:
     for name in tracker:
         tracker[name]["values"].zero_()
     clear_expert_utilization_tracker()
+    clear_router_stats_tracker()
 
 
 def reduce_aux_losses_tracker_across_ranks(
@@ -1071,9 +1073,7 @@ def track_moe_metrics(
         torch.distributed.all_reduce(util_values, group=dp_group, op=torch.distributed.ReduceOp.AVG)
 
         # Compute per-layer stats; skip layers that received no tokens (non-MoE layers).
-        cv_pct_list, active_list, max_frac_list, entropy_list, e_eff_list, dead_count_list = (
-            [], [], [], [], [], []
-        )
+        cv_pct_list, max_frac_list, entropy_list, dead_count_list = [], [], [], []
         # Accumulate all W&B per-layer data into one dict to avoid multiple log() calls at the
         # same step (each commit-on-call would overwrite the previous layer's data in W&B).
         wandb_layer_log: dict = {}
@@ -1094,58 +1094,45 @@ def track_moe_metrics(
             fractions = counts / total
             # CV as a percentage (community convention: CV% = std/mean * 100)
             cv_pct = (fractions.std() / (fractions.mean() + 1e-8)).item() * 100.0
-            active_frac = (counts > 0).float().mean().item()
             max_frac = fractions.max().item()
             dead_count = int((counts == 0).sum().item())
             # Shannon entropy in nats; clamp to avoid log(0)
             p = fractions.clamp(min=1e-12)
             entropy = (-(p * p.log()).sum()).item()
-            e_eff = math.exp(entropy)  # effective expert count for this layer
 
             cv_pct_list.append(cv_pct)
-            active_list.append(active_frac)
             max_frac_list.append(max_frac)
             entropy_list.append(entropy)
-            e_eff_list.append(e_eff)
             dead_count_list.append(dead_count)
 
             if per_layer_logging:
                 if writer is not None:
                     writer.add_scalar(f'moe/expert_cv_pct_layer_{i}', cv_pct, iteration)
-                    writer.add_scalar(f'moe/expert_active_frac_layer_{i}', active_frac, iteration)
                     writer.add_scalar(f'moe/expert_max_frac_layer_{i}', max_frac, iteration)
                     writer.add_scalar(f'moe/expert_entropy_layer_{i}', entropy, iteration)
-                    writer.add_scalar(f'moe/expert_e_eff_layer_{i}', e_eff, iteration)
                     writer.add_histogram(f'moe/tokens_per_expert_layer_{i}', counts.cpu(), iteration)
                 if _have_wandb:
                     wandb_layer_log[f'moe/expert_cv_pct_layer_{i}'] = cv_pct
-                    wandb_layer_log[f'moe/expert_active_frac_layer_{i}'] = active_frac
                     wandb_layer_log[f'moe/expert_max_frac_layer_{i}'] = max_frac
                     wandb_layer_log[f'moe/expert_entropy_layer_{i}'] = entropy
-                    wandb_layer_log[f'moe/expert_e_eff_layer_{i}'] = e_eff
                     wandb_layer_log[f'moe/tokens_per_expert_layer_{i}'] = _wandb.Histogram(
                         counts.cpu().numpy()
                     )
 
         if cv_pct_list:
             mean_cv_pct = sum(cv_pct_list) / len(cv_pct_list)
-            mean_active = sum(active_list) / len(active_list)
             mean_max_frac = sum(max_frac_list) / len(max_frac_list)
             mean_entropy = sum(entropy_list) / len(entropy_list)
-            min_entropy = min(entropy_list)       # canary: worst layer
-            e_eff_at_min = math.exp(min_entropy)  # effective experts in the worst layer
-            total_dead = sum(dead_count_list)      # dead experts summed across all MoE layers
+            min_entropy = min(entropy_list)  # canary: worst layer
+            total_dead = sum(dead_count_list)  # dead experts summed across all MoE layers
             if total_loss_dict is not None:
                 total_loss_dict['expert_cv_pct'] = torch.tensor(mean_cv_pct)
                 total_loss_dict['expert_min_entropy'] = torch.tensor(min_entropy)
-                total_loss_dict['expert_e_eff_at_min'] = torch.tensor(e_eff_at_min)
             if writer is not None:
                 writer.add_scalar('moe/expert_cv_pct', mean_cv_pct, iteration)
-                writer.add_scalar('moe/expert_active_frac', mean_active, iteration)
                 writer.add_scalar('moe/expert_max_frac', mean_max_frac, iteration)
                 writer.add_scalar('moe/expert_mean_entropy', mean_entropy, iteration)
                 writer.add_scalar('moe/expert_min_entropy', min_entropy, iteration)
-                writer.add_scalar('moe/expert_e_eff_at_min', e_eff_at_min, iteration)
                 writer.add_scalar('moe/expert_dead_count', total_dead, iteration)
             if wandb_writer:
                 # Merge per-layer data (scalars + histograms) and aggregates into one log() call
@@ -1154,12 +1141,104 @@ def track_moe_metrics(
                     {
                         **wandb_layer_log,
                         'moe/expert_cv_pct': mean_cv_pct,
-                        'moe/expert_active_frac': mean_active,
                         'moe/expert_max_frac': mean_max_frac,
                         'moe/expert_mean_entropy': mean_entropy,
                         'moe/expert_min_entropy': min_entropy,
-                        'moe/expert_e_eff_at_min': e_eff_at_min,
                         'moe/expert_dead_count': total_dead,
+                    },
+                    iteration,
+                )
+
+    # Router soft-distribution stats logging
+    rs_tracker = get_router_stats_tracker()
+    if 'sum_max_prob' in rs_tracker:
+        sum_max_prob = rs_tracker['sum_max_prob']        # [num_layers]
+        sum_token_entropy = rs_tracker['sum_token_entropy']
+        sum_logits = rs_tracker['sum_logits']            # [num_layers, num_experts]
+        token_count = rs_tracker['token_count']          # [num_layers]
+
+        # PP reduction
+        if pg_collection is None:
+            pp_group = parallel_state.get_pipeline_model_parallel_group()
+            dp_group = parallel_state.get_data_parallel_group(
+                with_context_parallel=False, partial_data_parallel=False
+            )
+        else:
+            pp_group = pg_collection.pp
+            dp_group = pg_collection.dp
+
+        for t in (sum_max_prob, sum_token_entropy, sum_logits, token_count):
+            torch.distributed.all_reduce(t, group=pp_group)
+        # TP/CP reduction
+        if rs_tracker.get('reduce_group') is not None:
+            for t in (sum_max_prob, sum_token_entropy, sum_logits, token_count):
+                torch.distributed.all_reduce(t, group=rs_tracker['reduce_group'])
+        # DP average
+        for t in (sum_max_prob, sum_token_entropy, sum_logits, token_count):
+            torch.distributed.all_reduce(t, group=dp_group, op=torch.distributed.ReduceOp.AVG)
+
+        _have_wandb_rs = False
+        if per_layer_logging and wandb_writer:
+            try:
+                import wandb as _wandb_rs
+                _have_wandb_rs = True
+            except ImportError:
+                pass
+
+        mean_max_prob_list, mean_token_entropy_list = [], []
+        wandb_rs_log: dict = {}
+        for i in range(sum_max_prob.shape[0]):
+            cnt = token_count[i].item()
+            if cnt == 0:
+                continue
+            mean_max_prob_i = (sum_max_prob[i] / cnt).item()
+            mean_token_entropy_i = (sum_token_entropy[i] / cnt).item()
+            mean_logit_i = (sum_logits[i] / cnt).cpu()  # [E]
+            logit_spread_i = mean_logit_i.std().item()
+
+            mean_max_prob_list.append(mean_max_prob_i)
+            mean_token_entropy_list.append(mean_token_entropy_i)
+
+            if per_layer_logging:
+                if writer is not None:
+                    writer.add_scalar(
+                        f'moe/router_mean_max_prob_layer_{i}', mean_max_prob_i, iteration
+                    )
+                    writer.add_scalar(
+                        f'moe/router_mean_token_entropy_layer_{i}',
+                        mean_token_entropy_i,
+                        iteration,
+                    )
+                    writer.add_scalar(
+                        f'moe/expert_logit_spread_layer_{i}', logit_spread_i, iteration
+                    )
+                    writer.add_histogram(
+                        f'moe/expert_mean_logit_layer_{i}', mean_logit_i, iteration
+                    )
+                if _have_wandb_rs:
+                    wandb_rs_log[f'moe/router_mean_max_prob_layer_{i}'] = mean_max_prob_i
+                    wandb_rs_log[f'moe/router_mean_token_entropy_layer_{i}'] = (
+                        mean_token_entropy_i
+                    )
+                    wandb_rs_log[f'moe/expert_logit_spread_layer_{i}'] = logit_spread_i
+                    wandb_rs_log[f'moe/expert_mean_logit_layer_{i}'] = _wandb_rs.Histogram(
+                        mean_logit_i.numpy()
+                    )
+
+        if mean_max_prob_list:
+            agg_mean_max_prob = sum(mean_max_prob_list) / len(mean_max_prob_list)
+            agg_mean_token_entropy = sum(mean_token_entropy_list) / len(mean_token_entropy_list)
+            if writer is not None:
+                writer.add_scalar('moe/router_mean_max_prob', agg_mean_max_prob, iteration)
+                writer.add_scalar(
+                    'moe/router_mean_token_entropy', agg_mean_token_entropy, iteration
+                )
+            if wandb_writer:
+                wandb_writer.log(
+                    {
+                        **wandb_rs_log,
+                        'moe/router_mean_max_prob': agg_mean_max_prob,
+                        'moe/router_mean_token_entropy': agg_mean_token_entropy,
                     },
                     iteration,
                 )
@@ -1264,6 +1343,65 @@ def clear_expert_utilization_tracker() -> None:
     tracker = get_expert_utilization_tracker()
     if 'values' in tracker:
         tracker['values'].zero_()
+
+
+def get_router_stats_tracker() -> dict:
+    """Return the router stats tracker."""
+    global _MOE_ROUTER_STATS_TRACKER
+    return _MOE_ROUTER_STATS_TRACKER
+
+
+def save_to_router_stats_tracker(
+    sum_max_prob: torch.Tensor,
+    sum_token_entropy: torch.Tensor,
+    sum_logits: torch.Tensor,
+    token_count: torch.Tensor,
+    layer_number: int,
+    num_layers: int,
+    reduce_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> None:
+    """Accumulate per-layer router statistics for logging.
+
+    Called every forward pass from the router alongside save_to_expert_utilization_tracker.
+    Distributed reduction and logging happen at logging intervals inside track_moe_metrics().
+
+    Args:
+        sum_max_prob: Sum of per-token max softmax probabilities, scalar tensor.
+        sum_token_entropy: Sum of per-token H(softmax(logits)), scalar tensor.
+        sum_logits: Sum of logits across valid tokens, shape [num_experts].
+        token_count: Number of valid (non-padding) tokens, scalar tensor.
+        layer_number: 1-indexed layer number.
+        num_layers: Total number of layers (used to size the tracker on first call).
+        reduce_group: Process group for sum-reduction at logging time (e.g. tp_cp_group).
+    """
+    if layer_number is None:
+        return
+    tracker = get_router_stats_tracker()
+    if 'sum_max_prob' not in tracker:
+        num_experts = sum_logits.shape[0]
+        device = sum_logits.device
+        tracker['sum_max_prob'] = torch.zeros(num_layers, device=device, dtype=torch.float32)
+        tracker['sum_token_entropy'] = torch.zeros(num_layers, device=device, dtype=torch.float32)
+        tracker['sum_logits'] = torch.zeros(
+            num_layers, num_experts, device=device, dtype=torch.float32
+        )
+        tracker['token_count'] = torch.zeros(num_layers, device=device, dtype=torch.float32)
+        tracker['reduce_group'] = reduce_group
+    idx = layer_number - 1
+    tracker['sum_max_prob'][idx] += sum_max_prob.detach().float()
+    tracker['sum_token_entropy'][idx] += sum_token_entropy.detach().float()
+    tracker['sum_logits'][idx] += sum_logits.detach().float()
+    tracker['token_count'][idx] += token_count.detach().float()
+
+
+def clear_router_stats_tracker() -> None:
+    """Zero out the router stats tracker without deallocating the buffers."""
+    tracker = get_router_stats_tracker()
+    if 'sum_max_prob' in tracker:
+        tracker['sum_max_prob'].zero_()
+        tracker['sum_token_entropy'].zero_()
+        tracker['sum_logits'].zero_()
+        tracker['token_count'].zero_()
 
 
 @internal_api
