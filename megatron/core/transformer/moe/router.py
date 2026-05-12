@@ -18,6 +18,7 @@ from megatron.core.transformer.moe.moe_utils import (
     router_gating_linear,
     save_to_aux_losses_tracker,
     save_to_expert_utilization_tracker,
+    save_to_router_stats_tracker,
     sinkhorn,
     switch_load_balancing_loss_func,
     topk_routing_with_score_function,
@@ -703,6 +704,33 @@ class TopKRouter(Router):
             num_layers,
             reduce_group=self.tp_cp_group,
         )
+
+        # Track router soft-distribution statistics (confidence, entropy, logit bias).
+        with torch.no_grad():
+            soft = torch.softmax(logits.float(), dim=-1)  # [T, E]
+            max_probs = soft.max(dim=-1).values           # [T]
+            token_entropy = -(soft * soft.clamp(min=1e-12).log()).sum(dim=-1)  # [T]
+            if padding_mask is not None:
+                valid = ~padding_mask
+                save_to_router_stats_tracker(
+                    max_probs[valid].sum(),
+                    token_entropy[valid].sum(),
+                    logits.float()[valid].sum(dim=0),
+                    valid.float().sum(),
+                    self.layer_number,
+                    num_layers,
+                    reduce_group=self.tp_cp_group,
+                )
+            else:
+                save_to_router_stats_tracker(
+                    max_probs.sum(),
+                    token_entropy.sum(),
+                    logits.float().sum(dim=0),
+                    torch.tensor(float(logits.shape[0]), device=logits.device),
+                    self.layer_number,
+                    num_layers,
+                    reduce_group=self.tp_cp_group,
+                )
 
         return probs, routing_map
 
