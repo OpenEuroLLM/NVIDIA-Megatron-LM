@@ -463,6 +463,7 @@ def append_to_progress_log(string, barrier=True):
     if barrier:
         torch.distributed.barrier()
     if torch.distributed.get_rank() == 0:
+        os.makedirs(os.path.dirname(progress_log_filename), exist_ok=True)
         with open_file(progress_log_filename, 'a') as f:
             job_id = os.getenv('SLURM_JOB_ID', '')
             num_gpus = args.world_size
