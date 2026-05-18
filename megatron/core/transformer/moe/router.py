@@ -653,11 +653,17 @@ class TopKRouter(Router):
         self._apply_expert_bias(routing_map, padding_mask=padding_mask)
 
         # Track per-expert token counts for utilization logging.
+        # Exclude padding tokens so this metric is consistent with the soft-distribution
+        # router stats below (both denominators are "valid tokens").
         num_layers = self.config.num_layers
         if self.config.mtp_num_layers is not None:
             num_layers += self.config.mtp_num_layers
+        if padding_mask is not None:
+            tokens_per_expert = routing_map[~padding_mask].sum(dim=0).float()
+        else:
+            tokens_per_expert = routing_map.sum(dim=0).float()
         save_to_expert_utilization_tracker(
-            routing_map.sum(dim=0).float(),
+            tokens_per_expert,
             self.layer_number,
             num_layers,
             reduce_group=self.tp_cp_group,
