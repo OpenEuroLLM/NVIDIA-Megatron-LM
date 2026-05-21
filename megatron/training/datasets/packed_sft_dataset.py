@@ -99,11 +99,11 @@ class PackedSFTDataset(MegatronDataset):
         # conversation starts at position 0.  This is what Megatron's varlen
         # flash-attention path uses to detect conversation boundaries.
         eod_id = self.config.tokenizer.eod
-        pos, pos_ids = 0, []
-        for t in input_tokens.tolist():
-            pos_ids.append(pos)
-            pos = 0 if t == eod_id else pos + 1
-        position_ids = torch.tensor(pos_ids, dtype=torch.long)
+        eod_positions = (input_tokens == eod_id).nonzero(as_tuple=True)[0]
+        position_ids = torch.arange(len(input_tokens), dtype=torch.long)
+        for eod_pos in eod_positions:
+            offset = position_ids[eod_pos] + 1
+            position_ids[eod_pos + 1:] -= offset
 
         return {
             "tokens":       input_tokens,
