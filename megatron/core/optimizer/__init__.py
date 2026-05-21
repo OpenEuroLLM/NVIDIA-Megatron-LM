@@ -89,6 +89,50 @@ from .optimizer_config import (
 logger = logging.getLogger(__name__)
 
 
+def _parse_layer_list(spec: str) -> set:
+    """Parse a layer-index spec string into a set of ints.
+
+    Accepts comma-separated integers and/or inclusive lo-hi ranges::
+
+        "5"        → {5}
+        "0-4"      → {0, 1, 2, 3, 4}
+        "0,2,5-8"  → {0, 2, 5, 6, 7, 8}
+    """
+    indices: set = set()
+    for part in spec.split(','):
+        part = part.strip()
+        if '-' in part:
+            lo, hi = part.split('-', 1)
+            indices.update(range(int(lo), int(hi) + 1))
+        else:
+            indices.add(int(part))
+    return indices
+
+
+def _parse_router_lr_spec(spec: str) -> list:
+    """Parse a ``--router-lr`` value into a list of ``(layer_indices_or_None, lr)`` tuples.
+
+    Two formats are accepted:
+
+    * Plain float string – ``"3e-5"`` → ``[(None, 3e-5)]``
+      Matches all router parameters regardless of layer.
+    * Per-layer-group spec – ``"0-4:3e-5,5-34:0,35-39:3e-5"``
+      → ``[({0,1,2,3,4}, 3e-5), ({5,...,34}, 0.0), ({35,...,39}, 3e-5)]``
+      Each token is ``<layer-range>:<lr>`` using the same range syntax as
+      :func:`_parse_layer_list`. Groups with ``lr=0`` cause the matching router
+      weights to be frozen (``requires_grad=False``) by ``model_provider.py``
+      before the optimizer is constructed.
+    """
+    try:
+        return [(None, float(spec))]
+    except ValueError:
+        groups = []
+        for part in spec.split(','):
+            layer_spec, lr_str = part.strip().rsplit(':', 1)
+            groups.append((_parse_layer_list(layer_spec), float(lr_str)))
+        return groups
+
+
 def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, ParamGroupOverride]:
     """Get standard config overrides for the optimizer, handling decoupled LR and common wd skips.
 
@@ -123,6 +167,33 @@ def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, Par
         if config.decoupled_min_lr is not None:
             decoupled_lr_config["min_lr"] = config.decoupled_min_lr
         config_overrides[decoupled_param_key] = decoupled_lr_config
+
+    if config.router_lr_spec is not None:
+        router_groups = _parse_router_lr_spec(config.router_lr_spec)
+        router_min_lr = config.router_min_lr
+        for group_idx, (layer_indices, lr) in enumerate(router_groups):
+            if lr == 0.0:
+                # These layers were frozen via requires_grad=False in model_provider.py
+                # before the optimizer was constructed; _get_param_groups skips them
+                # automatically, so no ParamKey entry is needed here.
+                continue
+            if layer_indices is None:
+                pred = ParamWithNamePredicate(
+                    name="router_lr_uniform",
+                    fn=lambda param, name: ".mlp.router." in name,
+                )
+            else:
+                pred = ParamWithNamePredicate(
+                    name=f"router_lr_group_{group_idx}",
+                    fn=lambda param, name, ids=layer_indices: (
+                        ".mlp.router." in name
+                        and any(f".layers.{i}." in name for i in ids)
+                    ),
+                )
+            router_lr_override: ParamGroupOverride = {"max_lr": lr}
+            if router_min_lr is not None:
+                router_lr_override["min_lr"] = router_min_lr
+            config_overrides[ParamKey(with_name_predicate=pred)] = router_lr_override
 
     return config_overrides
 

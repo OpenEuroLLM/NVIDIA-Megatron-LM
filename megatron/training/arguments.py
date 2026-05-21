@@ -2648,6 +2648,17 @@ def _add_learning_rate_args(parser):
     group.add_argument('--decoupled-min-lr', type=float, default=None,
                        help='Minimum value for learning rate for the input and output layer. The scheduler'
                        'clip values below this threshold')
+    group.add_argument('--router-lr', type=str, default=None,
+                       dest='router_lr_spec',
+                       help='Learning rate for MoE router parameters (*.mlp.router.weight). '
+                       'Accepts a plain float ("3e-5") for a uniform LR across all routers, '
+                       'or a per-layer-group spec ("0-4:3e-5,5-34:0,35-39:3e-5") where each '
+                       'token is a layer range and its LR separated by ":". '
+                       'LR=0 for a group freezes those router weights '
+                       '(requires_grad=False, no optimizer state allocated).')
+    group.add_argument('--router-min-lr', type=float, default=None,
+                       help='LR floor applied to all non-frozen router param groups. '
+                       'Defaults to the global --min-lr if unset.')
 
     return parser
 

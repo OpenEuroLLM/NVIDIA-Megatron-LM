@@ -159,6 +159,20 @@ class OptimizerConfig:
        below this threshold.
     """
 
+    router_lr_spec: Optional[str] = None
+    """Learning rate spec for MoE router parameters (*.mlp.router.weight).
+       Formats:
+         "3e-5"                        uniform LR for all routers
+         "0"                           freeze all routers (requires_grad=False)
+         "0-4:3e-5,5-34:0,35-39:3e-5" per-layer-group; LR=0 groups are frozen
+       Router weights with lr>0 are placed in dedicated optimizer param group(s)
+       separate from the rest of the model. Useful for CPT where router stability
+       matters independently of the main model LR.
+    """
+
+    router_min_lr: Optional[float] = None
+    """LR floor for all non-frozen router param groups. Defaults to global min_lr if unset."""
+
     weight_decay: float = 0.01
     """Weight decay coefficient for L2 regularization."""
 

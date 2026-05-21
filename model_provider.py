@@ -60,7 +60,26 @@ def model_provider(
         # [ModelOpt]: Use custom builder + spec when modelopt is enabled
         model_builder = modelopt_gpt_mamba_builder
 
-    return model_builder(args, pre_process, post_process, vp_stage, config=config, pg_collection=pg_collection)
+    model = model_builder(args, pre_process, post_process, vp_stage, config=config, pg_collection=pg_collection)
+
+    router_lr_spec = getattr(args, 'router_lr_spec', None)
+    if router_lr_spec is not None:
+        from megatron.core.optimizer import _parse_router_lr_spec
+        groups = _parse_router_lr_spec(router_lr_spec)
+        frozen_count = 0
+        for layer_indices, lr in groups:
+            if lr != 0.0:
+                continue
+            for i, layer in enumerate(model.decoder.layers):
+                if layer_indices is not None and i not in layer_indices:
+                    continue
+                if hasattr(layer, 'mlp') and hasattr(layer.mlp, 'router'):
+                    layer.mlp.router.weight.requires_grad = False
+                    frozen_count += 1
+        if frozen_count:
+            print_rank_0(f"[router_lr] frozen {frozen_count} router layer(s) with lr=0")
+
+    return model
 
 
 def count_parameters_in_layer(model, layer_name):
