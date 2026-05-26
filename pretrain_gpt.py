@@ -297,6 +297,9 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                 )
                 return schedule_plan, partial(loss_func, loss_mask, model=model)
             else:
+                # Bypass THD to use standard causal attention (no document isolation)
+                if args.packed_sft:
+                    packed_seq_params = None
                 output_tensor = model(
                     tokens, position_ids, attention_mask, labels=labels,
                     loss_mask=loss_mask, packed_seq_params=packed_seq_params,
