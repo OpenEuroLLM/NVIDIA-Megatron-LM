@@ -611,10 +611,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             self._set_proj_residual(residual)
 
         # Self attention.
-        if torch.distributed.get_rank() == 0 and packed_seq_params is not None:
+        if torch.distributed.get_rank() == 0 and self.layer_number <= 3:
             import sys
             print(f"[DEBUG TransformerLayer] layer={self.layer_number} BEFORE self_attention "
-                  f"input={input_layernorm_output.shape}", flush=True, file=sys.stderr)
+                  f"input={input_layernorm_output.shape} packed={packed_seq_params is not None}", flush=True, file=sys.stderr)
         nvtx_range_push(suffix="self_attention")
         attention_output_with_bias = self.self_attention(
             input_layernorm_output,
@@ -629,7 +629,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             sequence_len_offset=sequence_len_offset,
         )
         nvtx_range_pop(suffix="self_attention")
-        if torch.distributed.get_rank() == 0 and packed_seq_params is not None:
+        if torch.distributed.get_rank() == 0 and self.layer_number <= 3:
             import sys
             print(f"[DEBUG TransformerLayer] layer={self.layer_number} AFTER self_attention",
                   flush=True, file=sys.stderr)
@@ -709,8 +709,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         self-attention, cross-attention (if applicable), and feed-forward operations.
         """
         hidden_states, context = self._forward_attention(*args, **kwargs)
-        packed_seq_params = kwargs.get("packed_seq_params", None)
-        if torch.distributed.get_rank() == 0 and packed_seq_params is not None:
+        if torch.distributed.get_rank() == 0 and self.layer_number <= 3:
             import sys
             print(f"[DEBUG TransformerLayer] layer={self.layer_number} BEFORE MLP",
                   flush=True, file=sys.stderr)

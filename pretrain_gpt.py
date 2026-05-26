@@ -310,6 +310,9 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                 # DEBUG: bypass THD to test if standard attention works at 131072
                 if args.packed_sft:
                     packed_seq_params = None
+                if torch.distributed.get_rank() == 0 and args.packed_sft:
+                    import sys
+                    print(f"[DEBUG] calling model with packed_seq_params={packed_seq_params}", flush=True, file=sys.stderr)
                 output_tensor = model(
                     tokens, position_ids, attention_mask, labels=labels,
                     loss_mask=loss_mask, packed_seq_params=packed_seq_params,
