@@ -303,9 +303,9 @@ class GatedDeltaNet(MegatronModule):
             # TODO: support inference
             raise NotImplementedError("GDN does not support inference for now.")
 
+        cu_seqlens = None
         if packed_seq_params is not None:
-            # TODO: support packed sequence
-            raise NotImplementedError("GDN does not support packed sequence for now.")
+            cu_seqlens = packed_seq_params.cu_seqlens_q  # [num_seqs + 1], int32
 
         # Input projection
         nvtx_range_push(suffix="in_proj")
@@ -371,7 +371,37 @@ class GatedDeltaNet(MegatronModule):
             if self.conv_bias
             else None
         )
-        if self.config.deterministic_mode:
+        if cu_seqlens is not None:
+            seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+            qkv_seqs = qkv.split(seqlens, dim=1)  # list of [1, L_i, conv_dim]
+            qkv_out_seqs = []
+            for qkv_i in qkv_seqs:
+                if self.config.deterministic_mode:
+                    qkv_i = qkv_i.transpose(1, 2).contiguous()  # b, s, d -> b, d, s
+                    conv_out = F.conv1d(
+                        input=qkv_i,
+                        weight=conv1d_weight,
+                        bias=conv1d_bias,
+                        stride=self.conv1d.stride,
+                        padding=self.conv1d.padding,
+                        dilation=self.conv1d.dilation,
+                        groups=self.conv_dim_local_tp // self.cp_size,
+                    )
+                    qkv_i = self.act_fn(conv_out[..., : qkv_i.shape[-1]])
+                    qkv_i = qkv_i.transpose(1, 2)  # b, d, s -> b, s, d
+                else:
+                    assert self.activation in ["silu", "swish"]
+                    qkv_i, _ = causal_conv1d(
+                        x=qkv_i,
+                        weight=conv1d_weight.squeeze(1),  # d, 1, w -> d, w
+                        bias=conv1d_bias,
+                        activation=self.activation,
+                        initial_state=None,
+                        output_final_state=False,
+                    )
+                qkv_out_seqs.append(qkv_i)
+            qkv = torch.cat(qkv_out_seqs, dim=1)  # [1, total_tokens, conv_dim]
+        elif self.config.deterministic_mode:
             qkv = qkv.transpose(1, 2).contiguous()  # b, s, d -> b, d, s
             conv_out = F.conv1d(
                 input=qkv,  # Torch-native only accept [b, d, s] format input
@@ -413,16 +443,35 @@ class GatedDeltaNet(MegatronModule):
         nvtx_range_pop(suffix="g_and_beta")
 
         nvtx_range_push(suffix="gated_delta_rule")
-        core_attn_out, last_recurrent_state = self.gated_delta_rule(
-            query,
-            key,
-            value,
-            g=g,
-            beta=beta,
-            initial_state=None,
-            output_final_state=False,
-            use_qk_l2norm_in_kernel=False,
-        )
+        if cu_seqlens is not None:
+            seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+            q_seqs    = query.split(seqlens, dim=1)
+            k_seqs    = key.split(seqlens, dim=1)
+            v_seqs    = value.split(seqlens, dim=1)
+            g_seqs    = g.split(seqlens, dim=1)
+            beta_seqs = beta.split(seqlens, dim=1)
+            out_seqs  = []
+            for q_i, k_i, v_i, g_i, b_i in zip(q_seqs, k_seqs, v_seqs, g_seqs, beta_seqs):
+                out_i, _ = self.gated_delta_rule(
+                    q_i, k_i, v_i,
+                    g=g_i, beta=b_i,
+                    initial_state=None,
+                    output_final_state=False,
+                    use_qk_l2norm_in_kernel=False,
+                )
+                out_seqs.append(out_i)
+            core_attn_out = torch.cat(out_seqs, dim=1)  # [1, total_tokens, num_v_heads, v_head_dim]
+        else:
+            core_attn_out, last_recurrent_state = self.gated_delta_rule(
+                query,
+                key,
+                value,
+                g=g,
+                beta=beta,
+                initial_state=None,
+                output_final_state=False,
+                use_qk_l2norm_in_kernel=False,
+            )
         nvtx_range_pop(suffix="gated_delta_rule")
 
         # RMSNorm
