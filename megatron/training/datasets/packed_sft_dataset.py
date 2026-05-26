@@ -95,11 +95,17 @@ class PackedSFTDataset(MegatronDataset):
         loss_mask    = loss_mask[1:].contiguous()  # align with labels
 
         # Build position IDs with EOD-based reset.
-        # After each EOD token the counter resets to 0 so that the next
-        # conversation starts at position 0.  This is what Megatron's varlen
-        # flash-attention path uses to detect conversation boundaries.
+        # After each conversation boundary the counter resets to 0 so that
+        # the next conversation starts at position 0.  Only the *first* EOD
+        # in each consecutive run triggers a reset — trailing padding tokens
+        # (which reuse the EOD token ID) are grouped into one sequence
+        # instead of creating hundreds of 1-token sequences that cripple
+        # varlen flash attention throughput.
         eod_id = self.config.tokenizer.eod
-        eod_positions = (input_tokens == eod_id).nonzero(as_tuple=True)[0]
+        eod_mask = (input_tokens == eod_id)
+        first_eod = eod_mask.clone()
+        first_eod[1:] &= ~eod_mask[:-1]
+        eod_positions = first_eod.nonzero(as_tuple=True)[0]
         position_ids = torch.arange(len(input_tokens), dtype=torch.long)
         for eod_pos in eod_positions:
             offset = position_ids[eod_pos] + 1
