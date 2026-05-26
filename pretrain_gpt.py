@@ -285,6 +285,16 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
         tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params = get_batch(data_iterator, vp_stage)
     timers('batch-generator').stop()
 
+    if torch.distributed.get_rank() == 0 and args.packed_sft:
+        import sys
+        print(f"[DEBUG forward_step] tokens={tokens.shape if tokens is not None else None} "
+              f"position_ids={position_ids.shape if position_ids is not None else None} "
+              f"packed_seq_params={packed_seq_params is not None}", flush=True, file=sys.stderr)
+        if packed_seq_params is not None:
+            print(f"[DEBUG forward_step] cu_seqlens_q={packed_seq_params.cu_seqlens_q.shape} "
+                  f"max_seqlen_q={packed_seq_params.max_seqlen_q} "
+                  f"qkv_format={packed_seq_params.qkv_format}", flush=True, file=sys.stderr)
+
     with stimer:
         if args.use_legacy_models:
             output_tensor = model(tokens, position_ids, attention_mask, labels=labels)
