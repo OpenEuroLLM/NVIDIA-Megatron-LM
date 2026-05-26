@@ -3490,6 +3490,10 @@ def _add_kitchen_quantization_arguments(parser: argparse.ArgumentParser):
 def _add_sft_args(parser):
     group = parser.add_argument_group(title='sft')
     group.add_argument('--sft', action="store_true", help='Megatron SFT training')
+    group.add_argument('--legacy-tokenizer', action="store_true",
+                       help='Route tokenizer construction through get_tokenizer() instead of '
+                            'build_tokenizer(). Required when using SFTTokenizer or '
+                            'HuggingFaceTokenizer outside of SFT mode.')
     group.add_argument('--packed-sft', action="store_true",
                        help='Use pre-packed SFT sequences produced by pack_sft_data.py. '
                             'Compatible with --reset-position-ids and --reset-attention-mask.')
