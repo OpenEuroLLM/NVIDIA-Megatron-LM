@@ -105,9 +105,18 @@ class PackedSFTDataset(MegatronDataset):
             offset = position_ids[eod_pos] + 1
             position_ids[eod_pos + 1:] -= offset
 
+        # Derive cu_seqlens and max_seqlen from position ID resets.
+        starts = (position_ids == 0).nonzero(as_tuple=True)[0]
+        cu_seqlens = torch.cat([starts, torch.tensor([len(position_ids)])])
+        cu_seqlens = cu_seqlens.to(torch.int32)
+        seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
+        max_seqlen = seqlens.max()
+
         return {
             "tokens":       input_tokens,
             "labels":       labels,
             "loss_mask":    loss_mask,
             "position_ids": position_ids,
+            "cu_seqlens":   cu_seqlens.unsqueeze(0),
+            "max_seqlen":   max_seqlen.unsqueeze(0),
         }

@@ -152,7 +152,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     args = get_args()
     config = core_transformer_config_from_args(args)
     # TODO: this is pretty hacky, find a better way
-    is_packed_sequence = get_args().sft  # SFT always uses packed sequence
+    is_packed_sequence = get_args().sft or get_args().packed_sft
     if not is_first_or_last_pipeline_stage(vp_stage) and not is_packed_sequence and (
     (not mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage))):
         return None, None, None, None, None, None
@@ -285,10 +285,6 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
         tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params = get_batch(data_iterator, vp_stage)
     timers('batch-generator').stop()
 
-    # Build PackedSeqParams for varlen flash attention (document isolation).
-    if args.packed_sft and position_ids is not None:
-        packed_seq_params = _build_packed_seq_params(position_ids)
-
     with stimer:
         if args.use_legacy_models:
             output_tensor = model(tokens, position_ids, attention_mask, labels=labels)
@@ -406,6 +402,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
     is_packed_sequence = False
     if args.packed_sft:
         dataset_type = PackedSFTDataset
+        is_packed_sequence = True
     elif args.sft:
         dataset_type = SFTDataset
         is_packed_sequence = True  # SFT always uses packed sequence
