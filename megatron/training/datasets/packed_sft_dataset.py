@@ -117,6 +117,6 @@ class PackedSFTDataset(MegatronDataset):
             "labels":       labels,
             "loss_mask":    loss_mask,
             "position_ids": position_ids,
-            "cu_seqlens":   cu_seqlens.unsqueeze(0),
-            "max_seqlen":   max_seqlen.unsqueeze(0),
+            "cu_seqlens":   cu_seqlens,
+            "max_seqlen":   max_seqlen,
         }
