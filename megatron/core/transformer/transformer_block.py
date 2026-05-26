@@ -818,11 +818,6 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     else:
                         inner_quantization_context = nullcontext()
 
-                    if torch.distributed.get_rank() == 0 and l_no < 3:
-                        import sys
-                        print(f"[DEBUG layer] l_no={l_no} layer_type={type(layer).__name__} "
-                              f"hidden={hidden_states.shape} packed={packed_seq_params is not None} BEFORE", flush=True, file=sys.stderr)
-
                     with self.offload_context, inner_quantization_context:
                         hidden_states, context = layer(
                             hidden_states=hidden_states,
@@ -839,9 +834,6 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             sequence_len_offset=sequence_len_offset,
                             padding_mask=padding_mask,
                         )
-
-                    if torch.distributed.get_rank() == 0 and l_no < 3:
-                        print(f"[DEBUG layer] l_no={l_no} AFTER", flush=True, file=sys.stderr)
 
                     if (
                         torch.is_grad_enabled()
