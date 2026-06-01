@@ -79,6 +79,19 @@ def model_provider(
         if frozen_count:
             print_rank_0(f"[router_lr] frozen {frozen_count} router layer(s) with lr=0")
 
+    freeze_layers_spec = getattr(args, 'freeze_layers', None)
+    if freeze_layers_spec is not None:
+        from megatron.core.optimizer import _parse_layer_list
+        frozen_layer_indices = _parse_layer_list(freeze_layers_spec)
+        frozen_param_count = 0
+        for i, layer in enumerate(model.decoder.layers):
+            if i not in frozen_layer_indices:
+                continue
+            for param in layer.parameters():
+                param.requires_grad_(False)
+                frozen_param_count += 1
+        print_rank_0(f"[freeze_layers] froze {frozen_param_count} params in layers {freeze_layers_spec}")
+
     return model
 
 

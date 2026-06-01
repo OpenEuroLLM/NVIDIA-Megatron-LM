@@ -2659,6 +2659,13 @@ def _add_learning_rate_args(parser):
     group.add_argument('--router-min-lr', type=float, default=None,
                        help='LR floor applied to all non-frozen router param groups. '
                        'Defaults to the global --min-lr if unset.')
+    group.add_argument('--freeze-layers', type=str, default=None,
+                       dest='freeze_layers',
+                       help='Freeze all parameters in the specified decoder layer range. '
+                       'Accepts a layer-range string using the same syntax as --router-lr '
+                       '(e.g. "5-34" or "5,6,7,10-20"). Matching layers have all their '
+                       'parameters set to requires_grad=False before the optimizer is '
+                       'constructed, so no optimizer state is allocated for them.')
 
     return parser
 
