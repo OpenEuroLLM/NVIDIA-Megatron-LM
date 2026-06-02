@@ -18,6 +18,8 @@ except ModuleNotFoundError:
 nemotron_h_aligned_custom_template = """{% for message in messages %}{% if message['role'] == 'system' %}{{ '<SPECIAL_10>System\n' + message['content'].strip() + '\n' }}{% elif message['role'] == 'user' %}{{ '<SPECIAL_11>User\n' + message['content'].strip() + '\n' + '<SPECIAL_11>Assistant\n' }}{% elif message['role'] == 'assistant' %}{{ message['content'].strip() + '\n' }}{% endif %}{% endfor %}""" # pylint: disable=line-too-long
 nemotron_nano_v2_custom_template = """{% for message in messages %}{% set content = message['content'] %}{% if message['role'] == 'system' %}{{ '<SPECIAL_10>System\n' + content.replace('/think', '').replace('/no_think', '').strip() + '\n' }}{% elif message['role'] == 'user' %}{{ '<SPECIAL_11>User\n' + content.replace('/think', '').replace('/no_think', '').strip() + '\n' }}{% elif message['role'] == 'assistant' %}{{ '<SPECIAL_11>Assistant\n' + content.strip() + '\n<SPECIAL_12>\n' }}{% endif %}{% endfor %}""" # pylint: disable=line-too-long
 identity_template = """{% for message in messages %}{{ message['content'] }}{% endfor %}"""
+qwen3p5_reasoning_template = """{% for message in messages %}{% if message['role'] == 'system' %}{{ '<|im_start|>system\n' + message['content'] + '<|im_end|>\n' }}{% elif message['role'] == 'user' %}{{ '<|im_start|>user\n' + message['content'] + '<|im_end|>\n' }}{% elif message['role'] == 'assistant' %}{% set content = message['content'] %}{% set reasoning_content = '' %}{% if message.reasoning_content is string %}{% set reasoning_content = message.reasoning_content %}{% elif '</think>' in content %}{% set reasoning_content = content.split('</think>')[0].split('<think>')[-1] %}{% set content = content.split('</think>')[-1].lstrip('\n') %}{% endif %}{{ '<|im_start|>assistant\n<think>\n' + reasoning_content + '\n</think>\n\n' + content + '<|im_end|>\n' }}{% endif %}{% endfor %}"""  # pylint: disable=line-too-long
+qwen3p5_no_reasoning_template = """{% for message in messages %}{% if message['role'] == 'system' %}{{ '<|im_start|>system\n' + message['content'] + '<|im_end|>\n' }}{% elif message['role'] == 'user' %}{{ '<|im_start|>user\n' + message['content'] + '<|im_end|>\n' }}{% elif message['role'] == 'assistant' %}{{ '<|im_start|>assistant\n' + message['content'] + '<|im_end|>\n' }}{% endif %}{% endfor %}"""  # pylint: disable=line-too-long
 # fmt: on
 
 
@@ -115,6 +117,28 @@ class SFTTokenizer:
                 ),
                 custom_chat_template=tokenizer.chat_template,
                 has_bos=tokenizer.bos_token_id is not None,
+                has_system_role=True,
+            )
+        elif prompt_format == "qwen3p5-reasoning":
+            # Qwen 3.5 reasoning format - always includes <think>...</think> block.
+            # Assistant prefix "<|im_start|>assistant\n" is 3 tokens.
+            # Loss is computed starting from <think>, so the model learns to predict it.
+            self._prompt_config = PromptConfig(
+                assistant_prefix_len=3,
+                pad_token_id=tokenizer.convert_tokens_to_ids("<|endoftext|>"),
+                custom_chat_template=qwen3p5_reasoning_template,
+                has_bos=False,
+                has_system_role=True,
+            )
+        elif prompt_format == "qwen3p5-no-reasoning":
+            # Qwen 3.5 non-reasoning format - no thinking tokens.
+            # Assistant prefix "<|im_start|>assistant\n" is 3 tokens.
+            # Loss is computed starting from the answer content.
+            self._prompt_config = PromptConfig(
+                assistant_prefix_len=3,
+                pad_token_id=tokenizer.convert_tokens_to_ids("<|endoftext|>"),
+                custom_chat_template=qwen3p5_no_reasoning_template,
+                has_bos=False,
                 has_system_role=True,
             )
         else:
