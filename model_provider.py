@@ -89,8 +89,14 @@ def model_provider(
                 continue
             for param in layer.parameters():
                 param.requires_grad_(False)
-                frozen_param_count += 1
-        print_rank_0(f"[freeze_layers] froze {frozen_param_count} params in layers {freeze_layers_spec}")
+                frozen_param_count += param.numel()
+        if 0 in frozen_layer_indices and hasattr(model, 'embedding'):
+            for param in model.embedding.parameters():
+                param.requires_grad_(False)
+                frozen_param_count += param.numel()
+            print_rank_0("[freeze_layers] also froze embedding (layer 0 is frozen; "
+                         "stops backward pass at first trainable layer)")
+        print_rank_0(f"[freeze_layers] froze {frozen_param_count:,} params in layers {freeze_layers_spec}")
 
     return model
 
