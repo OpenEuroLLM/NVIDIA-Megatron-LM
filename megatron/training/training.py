@@ -2268,7 +2268,7 @@ def training_log(
             if args.log_timers_to_tensorboard:
                 if writer:
                     writer.add_scalar('TFLOPS', throughput, iteration)
-                    writer.add_scalar({'Tokens per second per GPU': tokens_per_second_per_gpu}, iteration)
+                    writer.add_scalar('Tokens per second per GPU', tokens_per_second_per_gpu, iteration)
                 if wandb_writer:
                     wandb_writer.log({'TFLOPS': throughput}, iteration)
                     wandb_writer.log({'Tokens per second per GPU': tokens_per_second_per_gpu}, iteration)
