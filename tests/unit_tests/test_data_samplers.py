@@ -126,6 +126,37 @@ def _collect_global_batches_from_dataloader(
     return global_batches
 
 
+def _collect_rank_samples(
+    *,
+    total_samples=1024,
+    consumed_samples=0,
+    micro_batch_size=2,
+    global_batch_size=64,
+    data_parallel_rank,
+    data_parallel_size,
+    data_sharding=True,
+    data_sharding_strategy='data_parallel',
+    data_sharding_virtual_shards=None,
+):
+    sampler = MegatronPretrainingRandomSampler(
+        DummyDataset(),
+        total_samples=total_samples,
+        consumed_samples=consumed_samples,
+        micro_batch_size=micro_batch_size,
+        global_batch_size=global_batch_size,
+        data_parallel_rank=data_parallel_rank,
+        data_parallel_size=data_parallel_size,
+        data_sharding=data_sharding,
+        data_sharding_strategy=data_sharding_strategy,
+        data_sharding_virtual_shards=data_sharding_virtual_shards,
+    )
+
+    samples = []
+    for microbatch in sampler:
+        samples.extend(microbatch)
+    return samples
+
+
 def test_data_parallel_data_sharding_global_batches_depend_on_data_parallel_size():
     dp4_batches = _collect_global_batches(data_parallel_size=4)
     dp8_batches = _collect_global_batches(data_parallel_size=8)
@@ -216,6 +247,70 @@ def test_virtual_data_sharding_respects_consumed_samples():
     assert dp4_batches == dp8_batches
 
 
+def test_virtual_data_sharding_drops_incomplete_final_global_batch():
+    active_samples = 1024
+    total_samples = active_samples + 7
+    data_parallel_size = 4
+    samples = []
+
+    for data_parallel_rank in range(data_parallel_size):
+        samples.extend(
+            _collect_rank_samples(
+                total_samples=total_samples,
+                data_parallel_rank=data_parallel_rank,
+                data_parallel_size=data_parallel_size,
+                data_sharding_strategy='virtual',
+            )
+        )
+
+    assert len(samples) == active_samples
+    assert set(samples) == set(range(active_samples))
+
+
+def test_virtual_data_sharding_resumes_inside_global_batch_without_off_by_one():
+    consumed_samples = 3 * 2 * 4
+    data_parallel_size = 4
+    local_consumed_samples = consumed_samples // data_parallel_size
+
+    for data_parallel_rank in range(data_parallel_size):
+        full_epoch_samples = _collect_rank_samples(
+            total_samples=1024 + 7,
+            data_parallel_rank=data_parallel_rank,
+            data_parallel_size=data_parallel_size,
+            data_sharding_strategy='virtual',
+        )
+        resumed_samples = _collect_rank_samples(
+            total_samples=1024 + 7,
+            consumed_samples=consumed_samples,
+            data_parallel_rank=data_parallel_rank,
+            data_parallel_size=data_parallel_size,
+            data_sharding_strategy='virtual',
+        )
+
+        assert resumed_samples == full_epoch_samples[local_consumed_samples:]
+
+
+def test_virtual_data_sharding_rolls_epoch_after_dropped_remainder():
+    total_samples = 1024 + 7
+    consumed_samples = 1024
+    sampler = MegatronPretrainingRandomSampler(
+        DummyDataset(),
+        total_samples=total_samples,
+        consumed_samples=consumed_samples,
+        micro_batch_size=2,
+        global_batch_size=64,
+        data_parallel_rank=0,
+        data_parallel_size=4,
+        data_sharding=True,
+        data_sharding_strategy='virtual',
+    )
+
+    microbatch = next(iter(sampler))
+
+    assert sampler.epoch == 1
+    assert all(idx < consumed_samples for idx in microbatch)
+
+
 def test_virtual_data_sharding_is_data_parallel_invariant_through_dataloader():
     dp4_batches = _collect_global_batches_from_dataloader(
         data_parallel_size=4,
@@ -244,6 +339,14 @@ def test_virtual_data_sharding_rejects_zero_virtual_shards():
             data_parallel_size=4,
             data_sharding_strategy='virtual',
             data_sharding_virtual_shards=0,
+        )
+
+
+def test_data_parallel_data_sharding_rejects_virtual_shards():
+    with pytest.raises(AssertionError, match='requires virtual data sharding'):
+        _collect_global_batches(
+            data_parallel_size=4,
+            data_sharding_virtual_shards=16,
         )
 
 

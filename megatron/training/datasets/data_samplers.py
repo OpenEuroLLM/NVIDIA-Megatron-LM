@@ -306,10 +306,25 @@ class MegatronPretrainingRandomSampler:
         self.data_sharding_strategy = data_sharding_strategy
         self.data_sharding_virtual_shards = data_sharding_virtual_shards
         self.micro_batch_times_data_parallel_size = self.micro_batch_size * data_parallel_size
+
+        # Sanity checks.
+        assert self.total_samples > 0, 'no sample to consume: {}'.format(self.total_samples)
+        assert self.micro_batch_size > 0
+        assert data_parallel_size > 0
+        assert (
+            self.data_parallel_rank < data_parallel_size
+        ), 'data_parallel_rank should be smaller than data size: {}, ' '{}'.format(
+            self.data_parallel_rank, data_parallel_size
+        )
         assert self.data_sharding_strategy in (
             'data_parallel',
             'virtual',
         ), 'data_sharding_strategy must be "data_parallel" or "virtual".'
+        if self.data_sharding_virtual_shards is not None:
+            assert self.data_sharding_strategy == 'virtual', (
+                'data_sharding_virtual_shards requires virtual data sharding.'
+            )
+
         if self.data_sharding_strategy == 'virtual':
             assert self.data_sharding, 'Virtual data sharding requires data sharding.'
             assert self.global_batch_size is not None, (
@@ -338,16 +353,6 @@ class MegatronPretrainingRandomSampler:
         else:
             self.virtual_shards = None
             self.last_batch_size = self.total_samples % self.micro_batch_times_data_parallel_size
-
-        # Sanity checks.
-        assert self.total_samples > 0, 'no sample to consume: {}'.format(self.total_samples)
-        assert self.micro_batch_size > 0
-        assert data_parallel_size > 0
-        assert (
-            self.data_parallel_rank < data_parallel_size
-        ), 'data_parallel_rank should be smaller than data size: {}, ' '{}'.format(
-            self.data_parallel_rank, data_parallel_size
-        )
 
     def __len__(self):
         return self.total_samples
