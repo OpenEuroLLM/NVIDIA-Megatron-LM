@@ -31,8 +31,8 @@ def _collect_global_batches(
     data_parallel_size,
     num_global_batches=4,
     data_sharding=True,
-    data_sharding_dp_invariant=False,
-    data_sharding_dp_invariant_lanes=None,
+    data_sharding_strategy='data_parallel',
+    data_sharding_virtual_shards=None,
 ):
     microbatches_per_global_batch = global_batch_size // (
         micro_batch_size * data_parallel_size
@@ -48,8 +48,8 @@ def _collect_global_batches(
             data_parallel_rank=data_parallel_rank,
             data_parallel_size=data_parallel_size,
             data_sharding=data_sharding,
-            data_sharding_dp_invariant=data_sharding_dp_invariant,
-            data_sharding_dp_invariant_lanes=data_sharding_dp_invariant_lanes,
+            data_sharding_strategy=data_sharding_strategy,
+            data_sharding_virtual_shards=data_sharding_virtual_shards,
         )
         iterator = iter(sampler)
         rank_microbatches.append(
@@ -80,8 +80,8 @@ def _collect_global_batches_from_dataloader(
     data_parallel_size,
     num_global_batches=4,
     data_sharding=True,
-    data_sharding_dp_invariant=False,
-    data_sharding_dp_invariant_lanes=None,
+    data_sharding_strategy='data_parallel',
+    data_sharding_virtual_shards=None,
 ):
     microbatches_per_global_batch = global_batch_size // (
         micro_batch_size * data_parallel_size
@@ -98,8 +98,8 @@ def _collect_global_batches_from_dataloader(
             data_parallel_rank=data_parallel_rank,
             data_parallel_size=data_parallel_size,
             data_sharding=data_sharding,
-            data_sharding_dp_invariant=data_sharding_dp_invariant,
-            data_sharding_dp_invariant_lanes=data_sharding_dp_invariant_lanes,
+            data_sharding_strategy=data_sharding_strategy,
+            data_sharding_virtual_shards=data_sharding_virtual_shards,
         )
         dataloader = torch.utils.data.DataLoader(
             dataset,
@@ -126,7 +126,7 @@ def _collect_global_batches_from_dataloader(
     return global_batches
 
 
-def test_physical_data_sharding_global_batches_depend_on_data_parallel_size():
+def test_data_parallel_data_sharding_global_batches_depend_on_data_parallel_size():
     dp4_batches = _collect_global_batches(data_parallel_size=4)
     dp8_batches = _collect_global_batches(data_parallel_size=8)
 
@@ -140,126 +140,126 @@ def test_no_data_sharding_global_batches_are_data_parallel_invariant():
     assert dp4_batches == dp8_batches
 
 
-def test_dp_invariant_data_sharding_defaults_lanes_to_global_batch_size():
+def test_virtual_data_sharding_defaults_virtual_shards_to_global_batch_size():
     dp4_batches = _collect_global_batches(
         data_parallel_size=4,
-        data_sharding_dp_invariant=True,
+        data_sharding_strategy='virtual',
     )
     dp8_batches = _collect_global_batches(
         data_parallel_size=8,
-        data_sharding_dp_invariant=True,
+        data_sharding_strategy='virtual',
     )
 
     assert dp4_batches == dp8_batches
 
 
-def test_dp_invariant_data_sharding_supports_explicit_virtual_lanes():
+def test_virtual_data_sharding_supports_explicit_virtual_shards():
     dp4_batches = _collect_global_batches(
         data_parallel_size=4,
-        data_sharding_dp_invariant=True,
-        data_sharding_dp_invariant_lanes=16,
+        data_sharding_strategy='virtual',
+        data_sharding_virtual_shards=16,
     )
     dp8_batches = _collect_global_batches(
         data_parallel_size=8,
-        data_sharding_dp_invariant=True,
-        data_sharding_dp_invariant_lanes=16,
+        data_sharding_strategy='virtual',
+        data_sharding_virtual_shards=16,
     )
 
     assert dp4_batches == dp8_batches
 
 
-def test_dp_invariant_lanes_can_preserve_existing_physical_sharding_stream():
+def test_virtual_shards_can_preserve_existing_physical_sharding_stream():
     physical_dp8_batches = _collect_global_batches(
         data_parallel_size=8,
         num_global_batches=1024 // 64,
     )
-    invariant_dp4_batches = _collect_global_batches(
+    virtual_dp4_batches = _collect_global_batches(
         data_parallel_size=4,
         num_global_batches=1024 // 64,
-        data_sharding_dp_invariant=True,
-        data_sharding_dp_invariant_lanes=8,
+        data_sharding_strategy='virtual',
+        data_sharding_virtual_shards=8,
     )
 
-    assert physical_dp8_batches == invariant_dp4_batches
+    assert physical_dp8_batches == virtual_dp4_batches
 
 
-def test_dp_invariant_lanes_preserve_existing_physical_stream_at_consumed_offset():
+def test_virtual_shards_preserve_existing_physical_stream_at_consumed_offset():
     consumed_samples = 3 * 64
     physical_dp8_batches = _collect_global_batches(
         consumed_samples=consumed_samples,
         data_parallel_size=8,
         num_global_batches=(1024 - consumed_samples) // 64,
     )
-    invariant_dp4_batches = _collect_global_batches(
+    virtual_dp4_batches = _collect_global_batches(
         consumed_samples=consumed_samples,
         data_parallel_size=4,
         num_global_batches=(1024 - consumed_samples) // 64,
-        data_sharding_dp_invariant=True,
-        data_sharding_dp_invariant_lanes=8,
+        data_sharding_strategy='virtual',
+        data_sharding_virtual_shards=8,
     )
 
-    assert physical_dp8_batches == invariant_dp4_batches
+    assert physical_dp8_batches == virtual_dp4_batches
 
 
-def test_dp_invariant_data_sharding_respects_consumed_samples():
+def test_virtual_data_sharding_respects_consumed_samples():
     dp4_batches = _collect_global_batches(
         consumed_samples=3 * 64,
         data_parallel_size=4,
-        data_sharding_dp_invariant=True,
+        data_sharding_strategy='virtual',
     )
     dp8_batches = _collect_global_batches(
         consumed_samples=3 * 64,
         data_parallel_size=8,
-        data_sharding_dp_invariant=True,
+        data_sharding_strategy='virtual',
     )
 
     assert dp4_batches == dp8_batches
 
 
-def test_dp_invariant_data_sharding_is_data_parallel_invariant_through_dataloader():
+def test_virtual_data_sharding_is_data_parallel_invariant_through_dataloader():
     dp4_batches = _collect_global_batches_from_dataloader(
         data_parallel_size=4,
-        data_sharding_dp_invariant=True,
+        data_sharding_strategy='virtual',
     )
     dp8_batches = _collect_global_batches_from_dataloader(
         data_parallel_size=8,
-        data_sharding_dp_invariant=True,
+        data_sharding_strategy='virtual',
     )
 
     assert dp4_batches == dp8_batches
 
 
-def test_dp_invariant_data_sharding_requires_data_sharding():
+def test_virtual_data_sharding_requires_data_sharding():
     with pytest.raises(AssertionError, match='requires data sharding'):
         _collect_global_batches(
             data_parallel_size=4,
             data_sharding=False,
-            data_sharding_dp_invariant=True,
+            data_sharding_strategy='virtual',
         )
 
 
-def test_dp_invariant_data_sharding_rejects_zero_lanes():
+def test_virtual_data_sharding_rejects_zero_virtual_shards():
     with pytest.raises(AssertionError, match='greater than zero'):
         _collect_global_batches(
             data_parallel_size=4,
-            data_sharding_dp_invariant=True,
-            data_sharding_dp_invariant_lanes=0,
+            data_sharding_strategy='virtual',
+            data_sharding_virtual_shards=0,
         )
 
 
-def test_dp_invariant_data_sharding_requires_lanes_to_divide_global_batch_size():
+def test_virtual_data_sharding_requires_virtual_shards_to_divide_global_batch_size():
     with pytest.raises(AssertionError, match='global_batch_size must be divisible'):
         _collect_global_batches(
             data_parallel_size=4,
-            data_sharding_dp_invariant=True,
-            data_sharding_dp_invariant_lanes=10,
+            data_sharding_strategy='virtual',
+            data_sharding_virtual_shards=10,
         )
 
 
-def test_dp_invariant_data_sharding_requires_lanes_divisible_by_data_parallel_size():
+def test_virtual_data_sharding_requires_virtual_shards_divisible_by_data_parallel_size():
     with pytest.raises(AssertionError, match='must be divisible by data_parallel_size'):
         _collect_global_batches(
             data_parallel_size=8,
-            data_sharding_dp_invariant=True,
-            data_sharding_dp_invariant_lanes=4,
+            data_sharding_strategy='virtual',
+            data_sharding_virtual_shards=4,
         )

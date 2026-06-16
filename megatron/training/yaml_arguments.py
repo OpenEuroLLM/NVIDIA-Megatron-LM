@@ -173,49 +173,53 @@ def validate_yaml(args, defaults={}):
 
     if args.dataloader_type is None:
         args.dataloader_type = 'single'
-    if not hasattr(args, 'data_sharding_dp_invariant'):
-        args.data_sharding_dp_invariant = False
-    if not hasattr(args, 'data_sharding_dp_invariant_lanes'):
-        args.data_sharding_dp_invariant_lanes = None
-    if args.data_sharding_dp_invariant_lanes is not None:
-        assert args.data_sharding_dp_invariant, (
-            'data_sharding_dp_invariant_lanes requires data_sharding_dp_invariant'
+    if not hasattr(args, 'data_sharding_strategy'):
+        args.data_sharding_strategy = 'data_parallel'
+    if not hasattr(args, 'data_sharding_virtual_shards'):
+        args.data_sharding_virtual_shards = None
+    assert args.data_sharding_strategy in (
+        'data_parallel',
+        'virtual',
+    ), 'data_sharding_strategy must be "data_parallel" or "virtual"'
+    if args.data_sharding_virtual_shards is not None:
+        assert args.data_sharding_strategy == 'virtual', (
+            'data_sharding_virtual_shards requires data_sharding_strategy: virtual'
         )
-    if args.data_sharding_dp_invariant:
+    if args.data_sharding_strategy == 'virtual':
         assert args.data_sharding, (
-            'data_sharding_dp_invariant requires data sharding'
+            'data_sharding_strategy: virtual requires data sharding'
         )
         assert args.dataloader_type == 'cyclic', (
-            'data_sharding_dp_invariant only applies to the cyclic dataloader'
+            'data_sharding_strategy: virtual only applies to the cyclic dataloader'
         )
-        lanes = (
-            args.data_sharding_dp_invariant_lanes
-            if args.data_sharding_dp_invariant_lanes is not None
+        virtual_shards = (
+            args.data_sharding_virtual_shards
+            if args.data_sharding_virtual_shards is not None
             else args.global_batch_size
         )
-        assert lanes > 0, 'data_sharding_dp_invariant_lanes must be greater than zero'
-        assert args.global_batch_size % lanes == 0, (
-            'global_batch_size must be divisible by data_sharding_dp_invariant_lanes'
+        assert virtual_shards > 0, 'data_sharding_virtual_shards must be greater than zero'
+        assert args.global_batch_size % virtual_shards == 0, (
+            'global_batch_size must be divisible by data_sharding_virtual_shards'
         )
-        assert lanes % args.data_parallel_size == 0, (
-            'data_sharding_dp_invariant_lanes must be divisible by data_parallel_size'
+        assert virtual_shards % args.data_parallel_size == 0, (
+            'data_sharding_virtual_shards must be divisible by data_parallel_size'
         )
-        lane_desc = (
-            str(args.data_sharding_dp_invariant_lanes)
-            if args.data_sharding_dp_invariant_lanes is not None
+        virtual_shard_desc = (
+            str(args.data_sharding_virtual_shards)
+            if args.data_sharding_virtual_shards is not None
             else 'effective global batch size'
         )
         if args.rank == 0:
             print(
-                'using DP-invariant data sharding with {} virtual lanes. '
+                'using virtual data sharding with {} virtual shards. '
                 'Global batch contents are invariant to data_parallel_size for fixed seed, '
-                'global batch size, and consumed samples.'.format(lane_desc),
+                'global batch size, and consumed samples.'.format(virtual_shard_desc),
                 flush=True,
             )
     elif args.data_sharding and args.dataloader_type == 'cyclic':
         if args.rank == 0:
             print(
-                'using physical data sharding. DP-invariant data sharding is not enabled; '
+                'using data-parallel data sharding. Virtual data sharding is not enabled; '
                 'changes to data_parallel_size will affect cyclic sampler behavior.',
                 flush=True,
             )

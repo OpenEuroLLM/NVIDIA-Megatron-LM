@@ -75,8 +75,8 @@ def build_pretraining_data_loader(dataset, consumed_samples):
             data_parallel_rank=mpu.get_data_parallel_rank(),
             data_parallel_size=mpu.get_data_parallel_world_size(),
             data_sharding=args.data_sharding,
-            data_sharding_dp_invariant=args.data_sharding_dp_invariant,
-            data_sharding_dp_invariant_lanes=args.data_sharding_dp_invariant_lanes,
+            data_sharding_strategy=args.data_sharding_strategy,
+            data_sharding_virtual_shards=args.data_sharding_virtual_shards,
         )
     else:
         raise Exception('{} dataloader type is not supported.'.format(args.dataloader_type))
@@ -291,8 +291,8 @@ class MegatronPretrainingRandomSampler:
         data_parallel_rank,
         data_parallel_size,
         data_sharding,
-        data_sharding_dp_invariant=False,
-        data_sharding_dp_invariant_lanes=None,
+        data_sharding_strategy='data_parallel',
+        data_sharding_virtual_shards=None,
     ):
         # Keep a copy of input params for later use.
         self.dataset = dataset
@@ -303,36 +303,40 @@ class MegatronPretrainingRandomSampler:
         self.data_parallel_rank = data_parallel_rank
         self.data_parallel_size = data_parallel_size
         self.data_sharding = data_sharding
-        self.data_sharding_dp_invariant = data_sharding_dp_invariant
-        self.data_sharding_dp_invariant_lanes = data_sharding_dp_invariant_lanes
+        self.data_sharding_strategy = data_sharding_strategy
+        self.data_sharding_virtual_shards = data_sharding_virtual_shards
         self.micro_batch_times_data_parallel_size = self.micro_batch_size * data_parallel_size
-        if self.data_sharding_dp_invariant:
-            assert self.data_sharding, 'DP-invariant data sharding requires data sharding.'
+        assert self.data_sharding_strategy in (
+            'data_parallel',
+            'virtual',
+        ), 'data_sharding_strategy must be "data_parallel" or "virtual".'
+        if self.data_sharding_strategy == 'virtual':
+            assert self.data_sharding, 'Virtual data sharding requires data sharding.'
             assert self.global_batch_size is not None, (
-                'global_batch_size must be provided for DP-invariant data sharding.'
+                'global_batch_size must be provided for virtual data sharding.'
             )
             assert self.global_batch_size > 0
             assert self.global_batch_size % self.micro_batch_times_data_parallel_size == 0, (
                 'global_batch_size must be divisible by '
-                'micro_batch_size * data_parallel_size for DP-invariant data sharding.'
+                'micro_batch_size * data_parallel_size for virtual data sharding.'
             )
-            self.dp_invariant_lanes = (
-                self.data_sharding_dp_invariant_lanes
-                if self.data_sharding_dp_invariant_lanes is not None
+            self.virtual_shards = (
+                self.data_sharding_virtual_shards
+                if self.data_sharding_virtual_shards is not None
                 else self.global_batch_size
             )
             assert (
-                self.dp_invariant_lanes > 0
-            ), 'data_sharding_dp_invariant_lanes must be greater than zero.'
-            assert self.global_batch_size % self.dp_invariant_lanes == 0, (
-                'global_batch_size must be divisible by data_sharding_dp_invariant_lanes.'
+                self.virtual_shards > 0
+            ), 'data_sharding_virtual_shards must be greater than zero.'
+            assert self.global_batch_size % self.virtual_shards == 0, (
+                'global_batch_size must be divisible by data_sharding_virtual_shards.'
             )
-            assert self.dp_invariant_lanes % self.data_parallel_size == 0, (
-                'data_sharding_dp_invariant_lanes must be divisible by data_parallel_size.'
+            assert self.virtual_shards % self.data_parallel_size == 0, (
+                'data_sharding_virtual_shards must be divisible by data_parallel_size.'
             )
             self.last_batch_size = self.total_samples % self.global_batch_size
         else:
-            self.dp_invariant_lanes = None
+            self.virtual_shards = None
             self.last_batch_size = self.total_samples % self.micro_batch_times_data_parallel_size
 
         # Sanity checks.
@@ -359,8 +363,8 @@ class MegatronPretrainingRandomSampler:
 
         # data sharding and random sampling
         if self.data_sharding:
-            if self.data_sharding_dp_invariant:
-                idx_range = self._build_dp_invariant_sharded_idx_range(
+            if self.data_sharding_strategy == 'virtual':
+                idx_range = self._build_virtual_sharded_idx_range(
                     active_total_samples, current_epoch_samples
                 )
             else:
@@ -392,13 +396,13 @@ class MegatronPretrainingRandomSampler:
                 yield batch
                 batch = []
 
-    def _build_dp_invariant_sharded_idx_range(self, active_total_samples, current_epoch_samples):
-        lanes = self.dp_invariant_lanes
-        samples_per_lane_per_batch = self.global_batch_size // lanes
-        lane_bucket_size = active_total_samples // lanes
+    def _build_virtual_sharded_idx_range(self, active_total_samples, current_epoch_samples):
+        virtual_shards = self.virtual_shards
+        samples_per_shard_per_batch = self.global_batch_size // virtual_shards
+        shard_bucket_size = active_total_samples // virtual_shards
         num_global_batches = active_total_samples // self.global_batch_size
 
-        assert lane_bucket_size == num_global_batches * samples_per_lane_per_batch
+        assert shard_bucket_size == num_global_batches * samples_per_shard_per_batch
         assert current_epoch_samples % self.micro_batch_times_data_parallel_size == 0
 
         global_batch_offset = current_epoch_samples // self.global_batch_size
@@ -408,18 +412,20 @@ class MegatronPretrainingRandomSampler:
 
         g = torch.Generator()
         g.manual_seed(self.epoch)
-        random_idx = torch.randperm(lane_bucket_size, generator=g).tolist()
+        random_idx = torch.randperm(shard_bucket_size, generator=g).tolist()
 
-        rank_lanes = range(self.data_parallel_rank, lanes, self.data_parallel_size)
+        rank_virtual_shards = range(
+            self.data_parallel_rank, virtual_shards, self.data_parallel_size
+        )
         idx_range = []
         for global_batch_idx in range(global_batch_offset, num_global_batches):
-            bucket_offset = global_batch_idx * samples_per_lane_per_batch
-            for lane in rank_lanes:
-                start_idx = lane * lane_bucket_size
+            bucket_offset = global_batch_idx * samples_per_shard_per_batch
+            for virtual_shard in rank_virtual_shards:
+                start_idx = virtual_shard * shard_bucket_size
                 idx_range.extend(
                     start_idx + idx
                     for idx in random_idx[
-                        bucket_offset : bucket_offset + samples_per_lane_per_batch
+                        bucket_offset : bucket_offset + samples_per_shard_per_batch
                     ]
                 )
 
