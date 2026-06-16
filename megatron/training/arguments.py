@@ -1093,6 +1093,49 @@ def validate_args(args, defaults={}):
 
     if args.dataloader_type is None:
         args.dataloader_type = 'single'
+    if args.data_sharding_dp_invariant_lanes is not None:
+        assert args.data_sharding_dp_invariant, (
+            '--data-sharding-dp-invariant-lanes requires --data-sharding-dp-invariant'
+        )
+    if args.data_sharding_dp_invariant:
+        assert args.data_sharding, (
+            '--data-sharding-dp-invariant requires data sharding; remove --no-data-sharding'
+        )
+        assert args.dataloader_type == 'cyclic', (
+            '--data-sharding-dp-invariant only applies to the cyclic dataloader'
+        )
+        lanes = (
+            args.data_sharding_dp_invariant_lanes
+            if args.data_sharding_dp_invariant_lanes is not None
+            else args.global_batch_size
+        )
+        assert lanes > 0, '--data-sharding-dp-invariant-lanes must be greater than zero'
+        assert args.global_batch_size % lanes == 0, (
+            'global_batch_size must be divisible by data_sharding_dp_invariant_lanes'
+        )
+        assert lanes % args.data_parallel_size == 0, (
+            'data_sharding_dp_invariant_lanes must be divisible by data_parallel_size'
+        )
+        lane_desc = (
+            str(args.data_sharding_dp_invariant_lanes)
+            if args.data_sharding_dp_invariant_lanes is not None
+            else 'effective global batch size'
+        )
+        print_rank_0(
+            'using DP-invariant data sharding with {} virtual lanes. '
+            'Global batch contents are invariant to data_parallel_size for fixed seed, '
+            'global batch size, and consumed samples.'.format(lane_desc)
+        )
+    elif args.data_sharding and args.dataloader_type == 'cyclic':
+        print_rank_0(
+            'using physical data sharding. DP-invariant data sharding is not enabled; '
+            'changes to data_parallel_size will affect cyclic sampler behavior.'
+        )
+    elif not args.data_sharding and args.dataloader_type == 'cyclic':
+        print_rank_0(
+            'data sharding disabled for cyclic dataloader; using global random permutation '
+            'strided across data-parallel ranks.'
+        )
 
     # data
     assert args.num_dataset_builder_threads > 0
@@ -3134,6 +3177,14 @@ def _add_vision_args(parser):
     group.add_argument('--no-data-sharding', action='store_false',
                        help='Disable data sharding.',
                        dest='data_sharding')
+    group.add_argument('--data-sharding-dp-invariant', action='store_true',
+                       help='Use fixed virtual data-sharding lanes so cyclic sampler '
+                       'global batch contents are invariant to data parallel size. '
+                       'Requires data sharding.')
+    group.add_argument('--data-sharding-dp-invariant-lanes', type=int, default=None,
+                       help='Number of fixed virtual lanes to use with '
+                       '--data-sharding-dp-invariant. Defaults to the effective '
+                       'global batch size for each dataloader split.')
     group.add_argument('--head-lr-mult', type=float, default=1.0,
                        help='learning rate multiplier for head during finetuning')
 

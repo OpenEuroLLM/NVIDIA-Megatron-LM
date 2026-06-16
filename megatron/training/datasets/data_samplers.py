@@ -71,9 +71,12 @@ def build_pretraining_data_loader(dataset, consumed_samples):
             total_samples=len(dataset),
             consumed_samples=consumed_samples,
             micro_batch_size=micro_batch_size,
+            global_batch_size=global_batch_size,
             data_parallel_rank=mpu.get_data_parallel_rank(),
             data_parallel_size=mpu.get_data_parallel_world_size(),
             data_sharding=args.data_sharding,
+            data_sharding_dp_invariant=args.data_sharding_dp_invariant,
+            data_sharding_dp_invariant_lanes=args.data_sharding_dp_invariant_lanes,
         )
     else:
         raise Exception('{} dataloader type is not supported.'.format(args.dataloader_type))
@@ -284,20 +287,53 @@ class MegatronPretrainingRandomSampler:
         total_samples,
         consumed_samples,
         micro_batch_size,
+        global_batch_size,
         data_parallel_rank,
         data_parallel_size,
         data_sharding,
+        data_sharding_dp_invariant=False,
+        data_sharding_dp_invariant_lanes=None,
     ):
         # Keep a copy of input params for later use.
         self.dataset = dataset
         self.total_samples = total_samples
         self.consumed_samples = consumed_samples
         self.micro_batch_size = micro_batch_size
+        self.global_batch_size = global_batch_size
         self.data_parallel_rank = data_parallel_rank
         self.data_parallel_size = data_parallel_size
         self.data_sharding = data_sharding
+        self.data_sharding_dp_invariant = data_sharding_dp_invariant
+        self.data_sharding_dp_invariant_lanes = data_sharding_dp_invariant_lanes
         self.micro_batch_times_data_parallel_size = self.micro_batch_size * data_parallel_size
-        self.last_batch_size = self.total_samples % self.micro_batch_times_data_parallel_size
+        if self.data_sharding_dp_invariant:
+            assert self.data_sharding, 'DP-invariant data sharding requires data sharding.'
+            assert self.global_batch_size is not None, (
+                'global_batch_size must be provided for DP-invariant data sharding.'
+            )
+            assert self.global_batch_size > 0
+            assert self.global_batch_size % self.micro_batch_times_data_parallel_size == 0, (
+                'global_batch_size must be divisible by '
+                'micro_batch_size * data_parallel_size for DP-invariant data sharding.'
+            )
+            self.dp_invariant_lanes = (
+                self.data_sharding_dp_invariant_lanes
+                if self.data_sharding_dp_invariant_lanes is not None
+                else self.global_batch_size
+            )
+            assert (
+                self.dp_invariant_lanes > 0
+            ), 'data_sharding_dp_invariant_lanes must be greater than zero.'
+            assert self.global_batch_size % self.dp_invariant_lanes == 0, (
+                'global_batch_size must be divisible by data_sharding_dp_invariant_lanes.'
+            )
+            assert self.dp_invariant_lanes % self.data_parallel_size == 0, (
+                'data_sharding_dp_invariant_lanes must be divisible by data_parallel_size.'
+            )
+            self.last_batch_size = self.total_samples % self.global_batch_size
+        else:
+            self.dp_invariant_lanes = None
+            self.last_batch_size = self.total_samples % self.micro_batch_times_data_parallel_size
 
         # Sanity checks.
         assert self.total_samples > 0, 'no sample to consume: {}'.format(self.total_samples)
@@ -323,16 +359,21 @@ class MegatronPretrainingRandomSampler:
 
         # data sharding and random sampling
         if self.data_sharding:
-            bucket_size = (
-                self.total_samples // self.micro_batch_times_data_parallel_size
-            ) * self.micro_batch_size
-            bucket_offset = current_epoch_samples // self.data_parallel_size
-            start_idx = self.data_parallel_rank * bucket_size
+            if self.data_sharding_dp_invariant:
+                idx_range = self._build_dp_invariant_sharded_idx_range(
+                    active_total_samples, current_epoch_samples
+                )
+            else:
+                bucket_size = (
+                    self.total_samples // self.micro_batch_times_data_parallel_size
+                ) * self.micro_batch_size
+                bucket_offset = current_epoch_samples // self.data_parallel_size
+                start_idx = self.data_parallel_rank * bucket_size
 
-            g = torch.Generator()
-            g.manual_seed(self.epoch)
-            random_idx = torch.randperm(bucket_size, generator=g).tolist()
-            idx_range = [start_idx + x for x in random_idx[bucket_offset:]]
+                g = torch.Generator()
+                g.manual_seed(self.epoch)
+                random_idx = torch.randperm(bucket_size, generator=g).tolist()
+                idx_range = [start_idx + x for x in random_idx[bucket_offset:]]
         else:
             full_bucket_size = (self.total_samples // self.micro_batch_size) * self.micro_batch_size
             full_bucket_offset = current_epoch_samples
@@ -350,3 +391,38 @@ class MegatronPretrainingRandomSampler:
                 self.consumed_samples += self.micro_batch_times_data_parallel_size
                 yield batch
                 batch = []
+
+    def _build_dp_invariant_sharded_idx_range(self, active_total_samples, current_epoch_samples):
+        lanes = self.dp_invariant_lanes
+        samples_per_lane_per_batch = self.global_batch_size // lanes
+        lane_bucket_size = active_total_samples // lanes
+        num_global_batches = active_total_samples // self.global_batch_size
+
+        assert lane_bucket_size == num_global_batches * samples_per_lane_per_batch
+        assert current_epoch_samples % self.micro_batch_times_data_parallel_size == 0
+
+        global_batch_offset = current_epoch_samples // self.global_batch_size
+        consumed_in_global_batch = current_epoch_samples % self.global_batch_size
+        assert consumed_in_global_batch % self.data_parallel_size == 0
+        local_offset_in_global_batch = consumed_in_global_batch // self.data_parallel_size
+
+        g = torch.Generator()
+        g.manual_seed(self.epoch)
+        random_idx = torch.randperm(lane_bucket_size, generator=g).tolist()
+
+        rank_lanes = range(self.data_parallel_rank, lanes, self.data_parallel_size)
+        idx_range = []
+        for global_batch_idx in range(global_batch_offset, num_global_batches):
+            bucket_offset = global_batch_idx * samples_per_lane_per_batch
+            for lane in rank_lanes:
+                start_idx = lane * lane_bucket_size
+                idx_range.extend(
+                    start_idx + idx
+                    for idx in random_idx[
+                        bucket_offset : bucket_offset + samples_per_lane_per_batch
+                    ]
+                )
+
+        if local_offset_in_global_batch:
+            idx_range = idx_range[local_offset_in_global_batch:]
+        return idx_range

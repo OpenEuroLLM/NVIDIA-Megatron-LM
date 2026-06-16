@@ -173,6 +173,59 @@ def validate_yaml(args, defaults={}):
 
     if args.dataloader_type is None:
         args.dataloader_type = 'single'
+    if not hasattr(args, 'data_sharding_dp_invariant'):
+        args.data_sharding_dp_invariant = False
+    if not hasattr(args, 'data_sharding_dp_invariant_lanes'):
+        args.data_sharding_dp_invariant_lanes = None
+    if args.data_sharding_dp_invariant_lanes is not None:
+        assert args.data_sharding_dp_invariant, (
+            'data_sharding_dp_invariant_lanes requires data_sharding_dp_invariant'
+        )
+    if args.data_sharding_dp_invariant:
+        assert args.data_sharding, (
+            'data_sharding_dp_invariant requires data sharding'
+        )
+        assert args.dataloader_type == 'cyclic', (
+            'data_sharding_dp_invariant only applies to the cyclic dataloader'
+        )
+        lanes = (
+            args.data_sharding_dp_invariant_lanes
+            if args.data_sharding_dp_invariant_lanes is not None
+            else args.global_batch_size
+        )
+        assert lanes > 0, 'data_sharding_dp_invariant_lanes must be greater than zero'
+        assert args.global_batch_size % lanes == 0, (
+            'global_batch_size must be divisible by data_sharding_dp_invariant_lanes'
+        )
+        assert lanes % args.data_parallel_size == 0, (
+            'data_sharding_dp_invariant_lanes must be divisible by data_parallel_size'
+        )
+        lane_desc = (
+            str(args.data_sharding_dp_invariant_lanes)
+            if args.data_sharding_dp_invariant_lanes is not None
+            else 'effective global batch size'
+        )
+        if args.rank == 0:
+            print(
+                'using DP-invariant data sharding with {} virtual lanes. '
+                'Global batch contents are invariant to data_parallel_size for fixed seed, '
+                'global batch size, and consumed samples.'.format(lane_desc),
+                flush=True,
+            )
+    elif args.data_sharding and args.dataloader_type == 'cyclic':
+        if args.rank == 0:
+            print(
+                'using physical data sharding. DP-invariant data sharding is not enabled; '
+                'changes to data_parallel_size will affect cyclic sampler behavior.',
+                flush=True,
+            )
+    elif not args.data_sharding and args.dataloader_type == 'cyclic':
+        if args.rank == 0:
+            print(
+                'data sharding disabled for cyclic dataloader; using global random permutation '
+                'strided across data-parallel ranks.',
+                flush=True,
+            )
 
     # Consumed tokens.
     args.consumed_train_samples = 0
@@ -439,4 +492,3 @@ def load_yaml(yaml_path):
             getattr(config_namespace, "global_batch_size", None) is not None
         )
         return config_namespace
-
