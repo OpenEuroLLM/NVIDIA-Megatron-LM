@@ -216,6 +216,19 @@ try:
 except ImportError:
     HAVE_TORCH_MEMORY_SAVER = False
 
+_PAGE_SIZE = os.sysconf('SC_PAGE_SIZE') if hasattr(os, 'sysconf') else 4096
+
+
+def _get_cpu_rss_mb():
+    """Return current process RSS in MiB via /proc/self/statm (Linux-only, zero-overhead)."""
+    try:
+        with open('/proc/self/statm', 'r') as f:
+            resident_pages = int(f.read().split()[1])
+        return resident_pages * _PAGE_SIZE / (1024 * 1024)
+    except (OSError, IndexError, ValueError):
+        return 0.0
+
+
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.num_microbatches_calculator import (
     destroy_num_microbatches_calculator,
@@ -2154,12 +2167,15 @@ def training_log(
                 "mem-max-allocated-bytes", mem_stats["allocated_bytes.all.peak"], iteration
             )
             writer.add_scalar("mem-allocated-count", mem_stats["allocation.all.current"], iteration)
+            cpu_rss_mb = _get_cpu_rss_mb()
+            writer.add_scalar("cpu-rss-MiB", cpu_rss_mb, iteration)
             if wandb_writer:
                 wandb_writer.log({
                     "mem-reserved-bytes": mem_stats["reserved_bytes.all.current"],
                     "mem-allocated-bytes": mem_stats["allocated_bytes.all.current"],
                     "mem-max-allocated-bytes": mem_stats["allocated_bytes.all.peak"],
                     "mem-allocated-count": mem_stats["allocation.all.current"],
+                    "cpu-rss-MiB": cpu_rss_mb,
                 }, iteration)
         if args.log_max_attention_logit:
             writer.add_scalar('max_attention_logit', max_attention_logit, iteration)
@@ -2262,6 +2278,7 @@ def training_log(
         free_gpu_memory, total_gpu_memory = torch.cuda.mem_get_info()
         mem_usages = 1 - free_gpu_memory / total_gpu_memory
         log_string += " mem usages: {:.4f} |".format(mem_usages)
+        log_string += " cpu rss (MiB): {:.0f} |".format(_get_cpu_rss_mb())
         if args.log_throughput:
             log_string += f' throughput per GPU (TFLOP/s/GPU): {throughput:.1f} |'
             log_string += f' Tokens per second per GPU (Tok/s/GPU): {tokens_per_second_per_gpu:.1f} |'
