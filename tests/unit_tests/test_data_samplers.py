@@ -267,7 +267,7 @@ def test_virtual_data_sharding_drops_incomplete_final_global_batch():
     assert set(samples) == set(range(active_samples))
 
 
-def test_virtual_data_sharding_resumes_inside_global_batch_without_off_by_one():
+def test_virtual_data_sharding_handles_consumed_samples_inside_global_batch_without_off_by_one():
     consumed_samples = 3 * 2 * 4
     data_parallel_size = 4
     local_consumed_samples = consumed_samples // data_parallel_size
@@ -279,7 +279,7 @@ def test_virtual_data_sharding_resumes_inside_global_batch_without_off_by_one():
             data_parallel_size=data_parallel_size,
             data_sharding_strategy='virtual',
         )
-        resumed_samples = _collect_rank_samples(
+        offset_samples = _collect_rank_samples(
             total_samples=1024 + 7,
             consumed_samples=consumed_samples,
             data_parallel_rank=data_parallel_rank,
@@ -287,7 +287,7 @@ def test_virtual_data_sharding_resumes_inside_global_batch_without_off_by_one():
             data_sharding_strategy='virtual',
         )
 
-        assert resumed_samples == full_epoch_samples[local_consumed_samples:]
+        assert offset_samples == full_epoch_samples[local_consumed_samples:]
 
 
 def test_virtual_data_sharding_rolls_epoch_after_dropped_remainder():
