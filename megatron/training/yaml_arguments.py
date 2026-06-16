@@ -173,6 +173,60 @@ def validate_yaml(args, defaults={}):
 
     if args.dataloader_type is None:
         args.dataloader_type = 'single'
+    if not hasattr(args, 'data_sharding_strategy'):
+        args.data_sharding_strategy = 'data_parallel'
+    if not hasattr(args, 'data_sharding_virtual_shards'):
+        args.data_sharding_virtual_shards = None
+    assert args.data_sharding_strategy in (
+        'data_parallel',
+        'virtual',
+    ), 'data_sharding_strategy must be "data_parallel" or "virtual"'
+    if args.data_sharding_virtual_shards is not None:
+        assert args.data_sharding_strategy == 'virtual', (
+            'data_sharding_virtual_shards requires data_sharding_strategy: virtual'
+        )
+    if args.data_sharding_strategy == 'virtual':
+        assert args.data_sharding, (
+            'data_sharding_strategy: virtual requires data sharding'
+        )
+        assert args.dataloader_type == 'cyclic', (
+            'data_sharding_strategy: virtual only applies to the cyclic dataloader'
+        )
+        virtual_shards = (
+            args.data_sharding_virtual_shards
+            if args.data_sharding_virtual_shards is not None
+            else args.global_batch_size
+        )
+        assert virtual_shards > 0, 'data_sharding_virtual_shards must be greater than zero'
+        assert args.global_batch_size % virtual_shards == 0, (
+            'global_batch_size must be divisible by data_sharding_virtual_shards'
+        )
+        virtual_shard_desc = (
+            str(args.data_sharding_virtual_shards)
+            if args.data_sharding_virtual_shards is not None
+            else 'effective global batch size'
+        )
+        if args.rank == 0:
+            print(
+                'using virtual data sharding with {} virtual shards. '
+                'Global batch contents are invariant to data_parallel_size for fixed seed, '
+                'global batch size, and consumed samples.'.format(virtual_shard_desc),
+                flush=True,
+            )
+    elif args.data_sharding and args.dataloader_type == 'cyclic':
+        if args.rank == 0:
+            print(
+                'using data-parallel data sharding. Virtual data sharding is not enabled; '
+                'changes to data_parallel_size will affect cyclic sampler behavior.',
+                flush=True,
+            )
+    elif not args.data_sharding and args.dataloader_type == 'cyclic':
+        if args.rank == 0:
+            print(
+                'data sharding disabled for cyclic dataloader; using global random permutation '
+                'strided across data-parallel ranks.',
+                flush=True,
+            )
 
     # Consumed tokens.
     args.consumed_train_samples = 0
@@ -439,4 +493,3 @@ def load_yaml(yaml_path):
             getattr(config_namespace, "global_batch_size", None) is not None
         )
         return config_namespace
-

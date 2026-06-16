@@ -71,9 +71,12 @@ def build_pretraining_data_loader(dataset, consumed_samples):
             total_samples=len(dataset),
             consumed_samples=consumed_samples,
             micro_batch_size=micro_batch_size,
+            global_batch_size=global_batch_size,
             data_parallel_rank=mpu.get_data_parallel_rank(),
             data_parallel_size=mpu.get_data_parallel_world_size(),
             data_sharding=args.data_sharding,
+            data_sharding_strategy=args.data_sharding_strategy,
+            data_sharding_virtual_shards=args.data_sharding_virtual_shards,
         )
     else:
         raise Exception('{} dataloader type is not supported.'.format(args.dataloader_type))
@@ -284,20 +287,25 @@ class MegatronPretrainingRandomSampler:
         total_samples,
         consumed_samples,
         micro_batch_size,
+        global_batch_size,
         data_parallel_rank,
         data_parallel_size,
         data_sharding,
+        data_sharding_strategy='data_parallel',
+        data_sharding_virtual_shards=None,
     ):
         # Keep a copy of input params for later use.
         self.dataset = dataset
         self.total_samples = total_samples
         self.consumed_samples = consumed_samples
         self.micro_batch_size = micro_batch_size
+        self.global_batch_size = global_batch_size
         self.data_parallel_rank = data_parallel_rank
         self.data_parallel_size = data_parallel_size
         self.data_sharding = data_sharding
+        self.data_sharding_strategy = data_sharding_strategy
+        self.data_sharding_virtual_shards = data_sharding_virtual_shards
         self.micro_batch_times_data_parallel_size = self.micro_batch_size * data_parallel_size
-        self.last_batch_size = self.total_samples % self.micro_batch_times_data_parallel_size
 
         # Sanity checks.
         assert self.total_samples > 0, 'no sample to consume: {}'.format(self.total_samples)
@@ -308,6 +316,40 @@ class MegatronPretrainingRandomSampler:
         ), 'data_parallel_rank should be smaller than data size: {}, ' '{}'.format(
             self.data_parallel_rank, data_parallel_size
         )
+        assert self.data_sharding_strategy in (
+            'data_parallel',
+            'virtual',
+        ), 'data_sharding_strategy must be "data_parallel" or "virtual".'
+        if self.data_sharding_virtual_shards is not None:
+            assert self.data_sharding_strategy == 'virtual', (
+                'data_sharding_virtual_shards requires virtual data sharding.'
+            )
+
+        if self.data_sharding_strategy == 'virtual':
+            assert self.data_sharding, 'Virtual data sharding requires data sharding.'
+            assert self.global_batch_size is not None, (
+                'global_batch_size must be provided for virtual data sharding.'
+            )
+            assert self.global_batch_size > 0
+            assert self.global_batch_size % self.micro_batch_times_data_parallel_size == 0, (
+                'global_batch_size must be divisible by '
+                'micro_batch_size * data_parallel_size for virtual data sharding.'
+            )
+            self.virtual_shards = (
+                self.data_sharding_virtual_shards
+                if self.data_sharding_virtual_shards is not None
+                else self.global_batch_size
+            )
+            assert (
+                self.virtual_shards > 0
+            ), 'data_sharding_virtual_shards must be greater than zero.'
+            assert self.global_batch_size % self.virtual_shards == 0, (
+                'global_batch_size must be divisible by data_sharding_virtual_shards.'
+            )
+            self.last_batch_size = self.total_samples % self.global_batch_size
+        else:
+            self.virtual_shards = None
+            self.last_batch_size = self.total_samples % self.micro_batch_times_data_parallel_size
 
     def __len__(self):
         return self.total_samples
@@ -323,16 +365,21 @@ class MegatronPretrainingRandomSampler:
 
         # data sharding and random sampling
         if self.data_sharding:
-            bucket_size = (
-                self.total_samples // self.micro_batch_times_data_parallel_size
-            ) * self.micro_batch_size
-            bucket_offset = current_epoch_samples // self.data_parallel_size
-            start_idx = self.data_parallel_rank * bucket_size
+            if self.data_sharding_strategy == 'virtual':
+                idx_range = self._build_virtual_sharded_idx_range(
+                    active_total_samples, current_epoch_samples
+                )
+            else:
+                bucket_size = (
+                    self.total_samples // self.micro_batch_times_data_parallel_size
+                ) * self.micro_batch_size
+                bucket_offset = current_epoch_samples // self.data_parallel_size
+                start_idx = self.data_parallel_rank * bucket_size
 
-            g = torch.Generator()
-            g.manual_seed(self.epoch)
-            random_idx = torch.randperm(bucket_size, generator=g).tolist()
-            idx_range = [start_idx + x for x in random_idx[bucket_offset:]]
+                g = torch.Generator()
+                g.manual_seed(self.epoch)
+                random_idx = torch.randperm(bucket_size, generator=g).tolist()
+                idx_range = [start_idx + x for x in random_idx[bucket_offset:]]
         else:
             full_bucket_size = (self.total_samples // self.micro_batch_size) * self.micro_batch_size
             full_bucket_offset = current_epoch_samples
@@ -350,3 +397,51 @@ class MegatronPretrainingRandomSampler:
                 self.consumed_samples += self.micro_batch_times_data_parallel_size
                 yield batch
                 batch = []
+
+    def _build_virtual_sharded_idx_range(self, active_total_samples, current_epoch_samples):
+        virtual_shards = self.virtual_shards
+        samples_per_shard_per_batch = self.global_batch_size // virtual_shards
+        samples_per_rank_per_batch = self.global_batch_size // self.data_parallel_size
+        shard_bucket_size = active_total_samples // virtual_shards
+        num_global_batches = active_total_samples // self.global_batch_size
+
+        assert shard_bucket_size == num_global_batches * samples_per_shard_per_batch
+        assert samples_per_rank_per_batch % self.micro_batch_size == 0
+        assert current_epoch_samples % self.micro_batch_times_data_parallel_size == 0
+
+        global_batch_offset = current_epoch_samples // self.global_batch_size
+        consumed_in_global_batch = current_epoch_samples % self.global_batch_size
+        assert consumed_in_global_batch % self.data_parallel_size == 0
+        local_offset_in_global_batch = consumed_in_global_batch // self.data_parallel_size
+
+        g = torch.Generator()
+        g.manual_seed(self.epoch)
+        random_idx = torch.randperm(shard_bucket_size, generator=g).tolist()
+
+        # Partition each virtual global batch by current DP rank. This lets ranks
+        # either group virtual shards or split a virtual shard while preserving
+        # global-batch contents for a fixed virtual shard count.
+        rank_batch_start = self.data_parallel_rank * samples_per_rank_per_batch
+        rank_batch_end = rank_batch_start + samples_per_rank_per_batch
+        first_virtual_shard = rank_batch_start // samples_per_shard_per_batch
+        last_virtual_shard = (rank_batch_end - 1) // samples_per_shard_per_batch
+
+        idx_range = []
+        for global_batch_idx in range(global_batch_offset, num_global_batches):
+            bucket_offset = global_batch_idx * samples_per_shard_per_batch
+            for virtual_shard in range(first_virtual_shard, last_virtual_shard + 1):
+                shard_batch_start = virtual_shard * samples_per_shard_per_batch
+                shard_batch_end = shard_batch_start + samples_per_shard_per_batch
+                overlap_start = max(rank_batch_start, shard_batch_start) - shard_batch_start
+                overlap_end = min(rank_batch_end, shard_batch_end) - shard_batch_start
+                shard_start_idx = virtual_shard * shard_bucket_size
+                idx_range.extend(
+                    shard_start_idx + idx
+                    for idx in random_idx[
+                        bucket_offset + overlap_start : bucket_offset + overlap_end
+                    ]
+                )
+
+        if local_offset_in_global_batch:
+            idx_range = idx_range[local_offset_in_global_batch:]
+        return idx_range

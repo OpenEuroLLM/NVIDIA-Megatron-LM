@@ -1093,6 +1093,46 @@ def validate_args(args, defaults={}):
 
     if args.dataloader_type is None:
         args.dataloader_type = 'single'
+    if args.data_sharding_virtual_shards is not None:
+        assert args.data_sharding_strategy == 'virtual', (
+            '--data-sharding-virtual-shards requires --data-sharding-strategy virtual'
+        )
+    if args.data_sharding_strategy == 'virtual':
+        assert args.data_sharding, (
+            '--data-sharding-strategy virtual requires data sharding; remove --no-data-sharding'
+        )
+        assert args.dataloader_type == 'cyclic', (
+            '--data-sharding-strategy virtual only applies to the cyclic dataloader'
+        )
+        virtual_shards = (
+            args.data_sharding_virtual_shards
+            if args.data_sharding_virtual_shards is not None
+            else args.global_batch_size
+        )
+        assert virtual_shards > 0, '--data-sharding-virtual-shards must be greater than zero'
+        assert args.global_batch_size % virtual_shards == 0, (
+            'global_batch_size must be divisible by data_sharding_virtual_shards'
+        )
+        virtual_shard_desc = (
+            str(args.data_sharding_virtual_shards)
+            if args.data_sharding_virtual_shards is not None
+            else 'effective global batch size'
+        )
+        print_rank_0(
+            'using virtual data sharding with {} virtual shards. '
+            'Global batch contents are invariant to data_parallel_size for fixed seed, '
+            'global batch size, and consumed samples.'.format(virtual_shard_desc)
+        )
+    elif args.data_sharding and args.dataloader_type == 'cyclic':
+        print_rank_0(
+            'using data-parallel data sharding. Virtual data sharding is not enabled; '
+            'changes to data_parallel_size will affect cyclic sampler behavior.'
+        )
+    elif not args.data_sharding and args.dataloader_type == 'cyclic':
+        print_rank_0(
+            'data sharding disabled for cyclic dataloader; using global random permutation '
+            'strided across data-parallel ranks.'
+        )
 
     # data
     assert args.num_dataset_builder_threads > 0
@@ -3134,6 +3174,17 @@ def _add_vision_args(parser):
     group.add_argument('--no-data-sharding', action='store_false',
                        help='Disable data sharding.',
                        dest='data_sharding')
+    group.add_argument('--data-sharding-strategy', type=str, default='data_parallel',
+                       choices=['data_parallel', 'virtual'],
+                       help='Data sharding strategy for cyclic dataloading. '
+                       '"data_parallel" preserves the current behavior and shards by '
+                       'the current data-parallel size. "virtual" uses a fixed number '
+                       'of virtual shards and keeps global batch contents invariant to '
+                       'data-parallel size changes.')
+    group.add_argument('--data-sharding-virtual-shards', type=int, default=None,
+                       help='Number of fixed virtual shards to use with '
+                       '--data-sharding-strategy virtual. Defaults to the effective '
+                       'global batch size for each dataloader split.')
     group.add_argument('--head-lr-mult', type=float, default=1.0,
                        help='learning rate multiplier for head during finetuning')
 
