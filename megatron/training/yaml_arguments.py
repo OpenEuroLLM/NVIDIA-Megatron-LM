@@ -201,9 +201,6 @@ def validate_yaml(args, defaults={}):
         assert args.global_batch_size % virtual_shards == 0, (
             'global_batch_size must be divisible by data_sharding_virtual_shards'
         )
-        assert virtual_shards % args.data_parallel_size == 0, (
-            'data_sharding_virtual_shards must be divisible by data_parallel_size'
-        )
         virtual_shard_desc = (
             str(args.data_sharding_virtual_shards)
             if args.data_sharding_virtual_shards is not None

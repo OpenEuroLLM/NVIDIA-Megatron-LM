@@ -73,6 +73,16 @@ def test_cli_accepts_explicit_virtual_shards(monkeypatch):
     assert args.data_sharding_virtual_shards == 16
 
 
+def test_cli_accepts_virtual_shards_less_than_data_parallel_size(monkeypatch):
+    args = _parse_and_validate_data_sharding_args(
+        monkeypatch,
+        ['--data-sharding-strategy', 'virtual', '--data-sharding-virtual-shards', '4'],
+    )
+
+    assert args.data_sharding_strategy == 'virtual'
+    assert args.data_sharding_virtual_shards == 4
+
+
 def test_cli_rejects_virtual_shards_without_virtual_strategy(monkeypatch):
     with pytest.raises(AssertionError, match='requires --data-sharding-strategy virtual'):
         _parse_and_validate_data_sharding_args(

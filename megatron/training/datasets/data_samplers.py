@@ -346,9 +346,6 @@ class MegatronPretrainingRandomSampler:
             assert self.global_batch_size % self.virtual_shards == 0, (
                 'global_batch_size must be divisible by data_sharding_virtual_shards.'
             )
-            assert self.virtual_shards % self.data_parallel_size == 0, (
-                'data_sharding_virtual_shards must be divisible by data_parallel_size.'
-            )
             self.last_batch_size = self.total_samples % self.global_batch_size
         else:
             self.virtual_shards = None
@@ -404,10 +401,12 @@ class MegatronPretrainingRandomSampler:
     def _build_virtual_sharded_idx_range(self, active_total_samples, current_epoch_samples):
         virtual_shards = self.virtual_shards
         samples_per_shard_per_batch = self.global_batch_size // virtual_shards
+        samples_per_rank_per_batch = self.global_batch_size // self.data_parallel_size
         shard_bucket_size = active_total_samples // virtual_shards
         num_global_batches = active_total_samples // self.global_batch_size
 
         assert shard_bucket_size == num_global_batches * samples_per_shard_per_batch
+        assert samples_per_rank_per_batch % self.micro_batch_size == 0
         assert current_epoch_samples % self.micro_batch_times_data_parallel_size == 0
 
         global_batch_offset = current_epoch_samples // self.global_batch_size
@@ -419,18 +418,27 @@ class MegatronPretrainingRandomSampler:
         g.manual_seed(self.epoch)
         random_idx = torch.randperm(shard_bucket_size, generator=g).tolist()
 
-        rank_virtual_shards = range(
-            self.data_parallel_rank, virtual_shards, self.data_parallel_size
-        )
+        # Partition each virtual global batch by current DP rank. This lets ranks
+        # either group virtual shards or split a virtual shard while preserving
+        # global-batch contents for a fixed virtual shard count.
+        rank_batch_start = self.data_parallel_rank * samples_per_rank_per_batch
+        rank_batch_end = rank_batch_start + samples_per_rank_per_batch
+        first_virtual_shard = rank_batch_start // samples_per_shard_per_batch
+        last_virtual_shard = (rank_batch_end - 1) // samples_per_shard_per_batch
+
         idx_range = []
         for global_batch_idx in range(global_batch_offset, num_global_batches):
             bucket_offset = global_batch_idx * samples_per_shard_per_batch
-            for virtual_shard in rank_virtual_shards:
-                start_idx = virtual_shard * shard_bucket_size
+            for virtual_shard in range(first_virtual_shard, last_virtual_shard + 1):
+                shard_batch_start = virtual_shard * samples_per_shard_per_batch
+                shard_batch_end = shard_batch_start + samples_per_shard_per_batch
+                overlap_start = max(rank_batch_start, shard_batch_start) - shard_batch_start
+                overlap_end = min(rank_batch_end, shard_batch_end) - shard_batch_start
+                shard_start_idx = virtual_shard * shard_bucket_size
                 idx_range.extend(
-                    start_idx + idx
+                    shard_start_idx + idx
                     for idx in random_idx[
-                        bucket_offset : bucket_offset + samples_per_shard_per_batch
+                        bucket_offset + overlap_start : bucket_offset + overlap_end
                     ]
                 )
 

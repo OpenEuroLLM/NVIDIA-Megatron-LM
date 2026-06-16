@@ -30,6 +30,7 @@ def _collect_global_batches(
     global_batch_size=64,
     data_parallel_size,
     num_global_batches=4,
+    preserve_order=False,
     data_sharding=True,
     data_sharding_strategy='data_parallel',
     data_sharding_virtual_shards=None,
@@ -67,7 +68,7 @@ def _collect_global_batches(
         for rank_batches in rank_microbatches:
             for microbatch in rank_batches[start:end]:
                 batch.extend(microbatch)
-        global_batches.append(frozenset(batch))
+        global_batches.append(tuple(batch) if preserve_order else frozenset(batch))
     return global_batches
 
 
@@ -199,37 +200,59 @@ def test_virtual_data_sharding_supports_explicit_virtual_shards():
     assert dp4_batches == dp8_batches
 
 
-def test_virtual_shards_can_preserve_existing_physical_sharding_stream():
-    physical_dp8_batches = _collect_global_batches(
-        data_parallel_size=8,
+@pytest.mark.parametrize(
+    ('old_data_parallel_size', 'new_data_parallel_size'),
+    [
+        (8, 4),
+        (4, 8),
+    ],
+)
+def test_virtual_shards_can_preserve_existing_physical_sharding_stream(
+    old_data_parallel_size, new_data_parallel_size
+):
+    physical_batches = _collect_global_batches(
+        data_parallel_size=old_data_parallel_size,
         num_global_batches=1024 // 64,
+        preserve_order=True,
     )
-    virtual_dp4_batches = _collect_global_batches(
-        data_parallel_size=4,
+    virtual_batches = _collect_global_batches(
+        data_parallel_size=new_data_parallel_size,
         num_global_batches=1024 // 64,
+        preserve_order=True,
         data_sharding_strategy='virtual',
-        data_sharding_virtual_shards=8,
+        data_sharding_virtual_shards=old_data_parallel_size,
     )
 
-    assert physical_dp8_batches == virtual_dp4_batches
+    assert physical_batches == virtual_batches
 
 
-def test_virtual_shards_preserve_existing_physical_stream_at_consumed_offset():
+@pytest.mark.parametrize(
+    ('old_data_parallel_size', 'new_data_parallel_size'),
+    [
+        (8, 4),
+        (4, 8),
+    ],
+)
+def test_virtual_shards_preserve_existing_physical_stream_at_consumed_offset(
+    old_data_parallel_size, new_data_parallel_size
+):
     consumed_samples = 3 * 64
-    physical_dp8_batches = _collect_global_batches(
+    physical_batches = _collect_global_batches(
         consumed_samples=consumed_samples,
-        data_parallel_size=8,
+        data_parallel_size=old_data_parallel_size,
         num_global_batches=(1024 - consumed_samples) // 64,
+        preserve_order=True,
     )
-    virtual_dp4_batches = _collect_global_batches(
+    virtual_batches = _collect_global_batches(
         consumed_samples=consumed_samples,
-        data_parallel_size=4,
+        data_parallel_size=new_data_parallel_size,
         num_global_batches=(1024 - consumed_samples) // 64,
+        preserve_order=True,
         data_sharding_strategy='virtual',
-        data_sharding_virtual_shards=8,
+        data_sharding_virtual_shards=old_data_parallel_size,
     )
 
-    assert physical_dp8_batches == virtual_dp4_batches
+    assert physical_batches == virtual_batches
 
 
 def test_virtual_data_sharding_respects_consumed_samples():
@@ -356,13 +379,4 @@ def test_virtual_data_sharding_requires_virtual_shards_to_divide_global_batch_si
             data_parallel_size=4,
             data_sharding_strategy='virtual',
             data_sharding_virtual_shards=10,
-        )
-
-
-def test_virtual_data_sharding_requires_virtual_shards_divisible_by_data_parallel_size():
-    with pytest.raises(AssertionError, match='must be divisible by data_parallel_size'):
-        _collect_global_batches(
-            data_parallel_size=8,
-            data_sharding_strategy='virtual',
-            data_sharding_virtual_shards=4,
         )
