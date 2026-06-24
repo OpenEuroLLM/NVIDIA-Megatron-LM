@@ -568,28 +568,6 @@ class TopKRouter(Router):
         # Apply Z-Loss
         logits = self.apply_z_loss(logits, padding_mask=padding_mask)
 
-        # Log router logit saturation and routing-sharpness diagnostics.
-        # logsumexp = log(partition function): grows when logit scale/saturation increases.
-        # mean_max_prob: average confidence of the routing decision across tokens, independent of
-        # load balance — a router can be balanced yet highly confident (approaching collapse).
-        with torch.no_grad():
-            _num_layers = self.config.num_layers
-            if self.config.mtp_num_layers is not None:
-                _num_layers += self.config.mtp_num_layers
-            _logits_f32 = logits.float()
-            save_to_aux_losses_tracker(
-                "router_logit_logsumexp",
-                torch.logsumexp(_logits_f32, dim=-1).mean(),
-                self.layer_number,
-                _num_layers,
-            )
-            save_to_aux_losses_tracker(
-                "router_mean_max_prob",
-                torch.softmax(_logits_f32, dim=-1).max(dim=-1).values.mean(),
-                self.layer_number,
-                _num_layers,
-            )
-
         # Calculate probs and routing_map for token dispatching
         if self.routing_type == "sinkhorn":
             probs, routing_map = self.sinkhorn_load_balancing(logits)
