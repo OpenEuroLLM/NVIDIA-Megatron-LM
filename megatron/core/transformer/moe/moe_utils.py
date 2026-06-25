@@ -1040,11 +1040,13 @@ def track_moe_metrics(
             # As a workaround, we log each scalar individually first, then we can create
             # a custom panel to manually group them to a single plot.
             if wandb_writer:
-                wandb_writer.log({f"{name}": loss_list.sum() / num_moe_layers}, iteration)
+                wandb_writer.log(
+                    {f"router-aggregates/{name}": loss_list.sum() / num_moe_layers}, iteration
+                )
                 if per_layer_logging:
                     wandb_writer.log(
                         {
-                            f"moe/{name}_layer_{i}": loss
+                            f"router-layers/{name}_layer_{i}": loss
                             for i, loss in enumerate(loss_list.tolist())
                         },
                         iteration,
@@ -1078,6 +1080,8 @@ def track_moe_metrics(
 
         # Compute per-layer stats; skip layers that received no tokens (non-MoE layers).
         dead_count_list = []
+        max_frac_list = []
+        expert_entropy_list = []
         # Accumulate all W&B per-layer data into one dict to avoid multiple log() calls at the
         # same step (each commit-on-call would overwrite the previous layer's data in W&B).
         wandb_layer_log: dict = {}
@@ -1097,26 +1101,40 @@ def track_moe_metrics(
             entropy = (-(p * p.log()).sum()).item()
 
             dead_count_list.append(dead_count)
+            max_frac_list.append(max_frac)
+            expert_entropy_list.append(entropy)
 
             if per_layer_logging:
                 if writer is not None:
                     writer.add_scalar(f'moe/expert_max_frac_layer_{i}', max_frac, iteration)
-                    writer.add_scalar(f'moe/expert_entropy_pct_layer_{i}', entropy, iteration)
+                    writer.add_scalar(f'moe/expert_entropy_layer_{i}', entropy, iteration)
                 if _have_wandb:
-                    wandb_layer_log[f'moe/expert_max_frac_layer_{i}'] = max_frac
-                    wandb_layer_log[f'moe/expert_entropy_pct_layer_{i}'] = entropy
+                    wandb_layer_log[f'router-layers/expert_max_frac_layer_{i}'] = max_frac
+                    wandb_layer_log[f'router-layers/expert_entropy_layer_{i}'] = entropy
 
         if dead_count_list:
             total_dead = sum(dead_count_list)  # dead experts summed across all MoE layers
+            mean_max_frac = sum(max_frac_list) / len(max_frac_list)
+            agg_max_frac = max(max_frac_list)
+            mean_expert_entropy = sum(expert_entropy_list) / len(expert_entropy_list)
+            agg_max_expert_entropy = max(expert_entropy_list)
             if writer is not None:
                 writer.add_scalar('moe/expert_dead_count', total_dead, iteration)
+                writer.add_scalar('moe/expert_max_frac_mean', mean_max_frac, iteration)
+                writer.add_scalar('moe/expert_max_frac_max', agg_max_frac, iteration)
+                writer.add_scalar('moe/expert_entropy_mean', mean_expert_entropy, iteration)
+                writer.add_scalar('moe/expert_entropy_max', agg_max_expert_entropy, iteration)
             if wandb_writer:
                 # Merge per-layer data (scalars + histograms) and aggregates into one log() call
                 # so all metrics land at the same step without commits clobbering each other.
                 wandb_writer.log(
                     {
                         **wandb_layer_log,
-                        'moe/expert_dead_count': total_dead,
+                        'router-aggregates/expert_dead_count': total_dead,
+                        'router-aggregates/expert_max_frac_mean': mean_max_frac,
+                        'router-aggregates/expert_max_frac_max': agg_max_frac,
+                        'router-aggregates/expert_entropy_mean': mean_expert_entropy,
+                        'router-aggregates/expert_entropy_max': agg_max_expert_entropy,
                     },
                     iteration,
                 )
@@ -1154,6 +1172,7 @@ def track_moe_metrics(
         _have_wandb_rs = per_layer_logging and (wandb_writer is not None)
 
         logit_spread_list = []
+        router_token_entropy_list = []
         wandb_rs_log: dict = {}
         for i in range(sum_max_prob.shape[0]):
             cnt = token_count[i].item()
@@ -1165,6 +1184,7 @@ def track_moe_metrics(
             # Population std: mean_logit_i is the full per-expert vector, not a sample.
             logit_spread_i = mean_logit_i.std(unbiased=False).item()
             logit_spread_list.append(logit_spread_i)
+            router_token_entropy_list.append(mean_token_entropy_i)
 
             if per_layer_logging:
                 if writer is not None:
@@ -1180,14 +1200,19 @@ def track_moe_metrics(
                         f'moe/expert_logit_spread_layer_{i}', logit_spread_i, iteration
                     )
                 if _have_wandb_rs:
-                    wandb_rs_log[f'moe/router_mean_max_prob_layer_{i}'] = mean_max_prob_i
-                    wandb_rs_log[f'moe/router_mean_token_entropy_layer_{i}'] = (
+                    wandb_rs_log[f'router-layers/router_mean_max_prob_layer_{i}'] = mean_max_prob_i
+                    wandb_rs_log[f'router-layers/router_mean_token_entropy_layer_{i}'] = (
                         mean_token_entropy_i
                     )
-                    wandb_rs_log[f'moe/expert_logit_spread_layer_{i}'] = logit_spread_i
+                    wandb_rs_log[f'router-layers/expert_logit_spread_layer_{i}'] = logit_spread_i
 
         if logit_spread_list:
             agg_max_logit_spread = max(logit_spread_list)  # worst-layer canary
+            agg_mean_logit_spread = sum(logit_spread_list) / len(logit_spread_list)
+            agg_mean_router_token_entropy = sum(router_token_entropy_list) / len(
+                router_token_entropy_list
+            )
+            agg_max_router_token_entropy = max(router_token_entropy_list)
             if total_loss_dict is not None:
                 # Surface the worst-layer bias in the train log line.
                 total_loss_dict['expert_logit_spread_max'] = torch.tensor(agg_max_logit_spread)
@@ -1195,11 +1220,31 @@ def track_moe_metrics(
                 writer.add_scalar(
                     'moe/expert_logit_spread_max', agg_max_logit_spread, iteration
                 )
+                writer.add_scalar(
+                    'moe/expert_logit_spread_mean', agg_mean_logit_spread, iteration
+                )
+                writer.add_scalar(
+                    'moe/router_mean_token_entropy_mean',
+                    agg_mean_router_token_entropy,
+                    iteration,
+                )
+                writer.add_scalar(
+                    'moe/router_mean_token_entropy_max',
+                    agg_max_router_token_entropy,
+                    iteration,
+                )
             if wandb_writer:
                 wandb_writer.log(
                     {
                         **wandb_rs_log,
-                        'moe/expert_logit_spread_max': agg_max_logit_spread,
+                        'router-aggregates/expert_logit_spread_max': agg_max_logit_spread,
+                        'router-aggregates/expert_logit_spread_mean': agg_mean_logit_spread,
+                        'router-aggregates/router_mean_token_entropy_mean': (
+                            agg_mean_router_token_entropy
+                        ),
+                        'router-aggregates/router_mean_token_entropy_max': (
+                            agg_max_router_token_entropy
+                        ),
                     },
                     iteration,
                 )
