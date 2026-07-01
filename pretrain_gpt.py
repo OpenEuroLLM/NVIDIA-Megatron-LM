@@ -175,6 +175,8 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             cu_seqlens.dim() == 2 and cu_seqlens.shape[0] == 1
         ), "micro-batch-size must be 1 for packing"
         cu_seqlens = cu_seqlens[0]
+        if cu_seqlens_padded is not None and cu_seqlens_padded.dim() == 2:
+            cu_seqlens_padded = cu_seqlens_padded[0]
         assert max_seqlen.dim() == 1
 
     # For middle pipeline stages with packed sequences, only cu_seqlens and

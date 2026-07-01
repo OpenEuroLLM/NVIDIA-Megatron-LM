@@ -42,10 +42,17 @@ class PackedSFTLowLevelDataset:
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         row = self.dataset[idx]
-        return {
+        out = {
             "tokens":    row["tokens"],
             "loss_mask": row["loss_mask"],
         }
+        # Pass through precomputed packing boundaries when present (aligned
+        # format from pack_sft_data_aligned.py). Required for CP THD attention.
+        if "cu_seqlens" in row:
+            out["cu_seqlens"] = row["cu_seqlens"]
+        if "cu_seqlens_padded" in row:
+            out["cu_seqlens_padded"] = row["cu_seqlens_padded"]
+        return out
 
 
 class PackedSFTDataset(MegatronDataset):
@@ -94,29 +101,45 @@ class PackedSFTDataset(MegatronDataset):
         labels       = tokens[1:].contiguous()    # [seq_len]
         loss_mask    = loss_mask[1:].contiguous()  # align with labels
 
-        # Build position IDs with EOD-based reset.
-        # After each conversation boundary the counter resets to 0 so that
-        # the next conversation starts at position 0.  Only the *first* EOD
-        # in each consecutive run triggers a reset — trailing padding tokens
-        # (which reuse the EOD token ID) are grouped into one sequence
-        # instead of creating hundreds of 1-token sequences that cripple
-        # varlen flash attention throughput.
-        eod_id = self.config.tokenizer.eod
-        eod_mask = (input_tokens == eod_id)
-        first_eod = eod_mask.clone()
-        first_eod[1:] &= ~eod_mask[:-1]
-        eod_positions = first_eod.nonzero(as_tuple=True)[0]
-        position_ids = torch.arange(len(input_tokens), dtype=torch.long)
-        for eod_pos in eod_positions:
-            offset = position_ids[eod_pos] + 1
-            position_ids[eod_pos + 1:] -= offset
+        seq_len_in = len(input_tokens)
 
-        # Derive cu_seqlens and max_seqlen from position ID resets.
-        starts = (position_ids == 0).nonzero(as_tuple=True)[0]
-        cu_seqlens = torch.cat([starts, torch.tensor([len(position_ids)])])
-        cu_seqlens = cu_seqlens.to(torch.int32)
-        seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
-        max_seqlen = seqlens.max()
+        if "cu_seqlens_padded" in row and "cu_seqlens" in row:
+            # Aligned format (pack_sft_data_aligned.py): each conversation block
+            # is padded to a multiple of 2*CP so TE context-parallel THD attention
+            # can split it. cu_seqlens (real, cumulative) and cu_seqlens_padded
+            # (padded, cumulative) are precomputed at pack time. Position IDs reset
+            # at each *physical* (padded) block start so RoPE/attention restart at 0
+            # for every conversation.
+            cu_seqlens = torch.tensor(row["cu_seqlens"], dtype=torch.int32)
+            cu_seqlens_padded = torch.tensor(row["cu_seqlens_padded"], dtype=torch.int32)
+            # cu_seqlens describe the input view (length seq_len_in); the +1 shift
+            # slot is outside all segments. Clamp final boundary to seq_len_in.
+            position_ids = torch.zeros(seq_len_in, dtype=torch.long)
+            pad_starts = cu_seqlens_padded.tolist()
+            for i in range(len(pad_starts) - 1):
+                a = pad_starts[i]
+                b = min(pad_starts[i + 1], seq_len_in)
+                if b > a:
+                    position_ids[a:b] = torch.arange(b - a, dtype=torch.long)
+            seglens_padded = cu_seqlens_padded[1:] - cu_seqlens_padded[:-1]
+            max_seqlen = seglens_padded.max()
+        else:
+            # Legacy format: derive cu_seqlens from EOD-based position resets.
+            eod_id = self.config.tokenizer.eod
+            eod_mask = (input_tokens == eod_id)
+            first_eod = eod_mask.clone()
+            first_eod[1:] &= ~eod_mask[:-1]
+            eod_positions = first_eod.nonzero(as_tuple=True)[0]
+            position_ids = torch.arange(len(input_tokens), dtype=torch.long)
+            for eod_pos in eod_positions:
+                offset = position_ids[eod_pos] + 1
+                position_ids[eod_pos + 1:] -= offset
+            starts = (position_ids == 0).nonzero(as_tuple=True)[0]
+            cu_seqlens = torch.cat([starts, torch.tensor([len(position_ids)])])
+            cu_seqlens = cu_seqlens.to(torch.int32)
+            cu_seqlens_padded = cu_seqlens
+            seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
+            max_seqlen = seqlens.max()
 
         return {
             "tokens":       input_tokens,
@@ -124,5 +147,6 @@ class PackedSFTDataset(MegatronDataset):
             "loss_mask":    loss_mask,
             "position_ids": position_ids,
             "cu_seqlens":   cu_seqlens,
+            "cu_seqlens_padded": cu_seqlens_padded,
             "max_seqlen":   max_seqlen,
         }

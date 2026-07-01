@@ -20,6 +20,23 @@ if TYPE_CHECKING:
     from megatron.core.transformer import TransformerConfig
 
 
+def cat_with_oom_fallback(sub_state_dict):
+    """Merge sharded tensor pieces, falling back to CPU if device-side cat OOMs."""
+    import gc
+    import logging as _logging
+    try:
+        return torch.cat(sub_state_dict)
+    except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+        _logging.getLogger(__name__).warning(
+            f"CUDA OutOfMemoryError encountered during tensors merging."
+            f" Switching to CPU merge. (Error: {e})"
+        )
+        merged_sub_state_dict = torch.cat([t.cpu() for t in sub_state_dict])
+        gc.collect()
+        torch.cuda.empty_cache()
+        return merged_sub_state_dict
+
+
 def get_linear_layer(rows, columns, init_method, perform_initialization=True):
     """Simple linear layer with weight initialization."""
     layer = torch.nn.Linear(rows, columns)
