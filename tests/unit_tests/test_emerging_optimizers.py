@@ -14,6 +14,7 @@ from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.emerging_optimizers import (
     HAVE_EMERGING_OPTIMIZERS,
     TensorParallelAdaptiveMuon,
+    TensorParallelAngularMuown,
     TensorParallelMuon,
     get_supported_coefficient_types,
     validate_coefficient_type,
@@ -1717,3 +1718,343 @@ def test_lion_optimizer_multi_layer_net():
             params_updated += 1
 
     assert params_updated > 0, "At least some parameters should be updated after optimizer step"
+
+
+# ===========================================================================
+# AngularMuown optimizer tests
+# ===========================================================================
+
+
+def test_angular_muown_optimizer_smoke():
+    """Smoke test for TensorParallelAngularMuown optimizer."""
+    torch.manual_seed(123)
+    model = torch.nn.Linear(100, 50, bias=False, dtype=torch.float32, device='cuda')
+    model.requires_grad_(True)
+    model.weight.data.normal_(0, 0.02)
+
+    optimizer = TensorParallelAngularMuown(
+        params=[model.weight],
+        lr=0.01,
+        momentum=0.95,
+        nesterov=True,
+        betas=(0.9, 0.95),
+        adam_eps=1e-8,
+        num_ns_steps=5,
+        coefficient_type="simple",
+        scale_mode="shape_scaling",
+        pg_collection=None,
+        tp_mode="duplicated",
+    )
+
+    assert optimizer is not None
+    assert len(optimizer.param_groups) > 0
+
+    input_tensor = torch.randn(32, 100, dtype=torch.float32, device='cuda')
+    output = model(input_tensor)
+    loss = output.sum()
+    loss.backward()
+
+    original_weight = model.weight.data.clone()
+    optimizer.step()
+
+    assert not torch.equal(
+        model.weight.data, original_weight
+    ), "Weight should be updated after optimizer step"
+
+    # AngularMuown invariant: row norms of W equal |g| (rows of U have unit norm).
+    g = optimizer.state[model.weight]["g"]
+    row_norms = model.weight.data.norm(dim=1, keepdim=True)
+    assert torch.allclose(row_norms, g.abs(), rtol=1e-5, atol=1e-6), (
+        "Row norms of W should equal |g| after a AngularMuown step"
+    )
+
+    optimizer.zero_grad()
+    assert model.weight.grad is None or torch.all(model.weight.grad == 0)
+
+    state_dict = optimizer.state_dict()
+    assert 'state' in state_dict and 'param_groups' in state_dict
+    optimizer.load_state_dict(state_dict)
+
+
+def test_angular_muown_optimizer_rejects_non_2d():
+    """AngularMuown should reject non-2D parameters."""
+    bias_like = torch.nn.Parameter(torch.randn(16, device='cuda'))
+    with pytest.raises(ValueError, match='only supports 2D parameters'):
+        TensorParallelAngularMuown(params=[bias_like], lr=0.01, pg_collection=None)
+
+
+def test_angular_muown_state_dict_round_trip():
+    """state_dict expands per-row states to the weight shape; load collapses them back.
+
+    Exercises the torch_dist-checkpoint-compatibility logic: g/m_g/v_g are stored
+    live as (rows, 1) but saved as the weight's full (rows, cols) so they inherit
+    the weight's sharding metadata. The expanded columns are identical copies and
+    the load round-trip is exact.
+    """
+    torch.manual_seed(0)
+    weight = torch.nn.Parameter(torch.randn(32, 64, dtype=torch.float32, device='cuda') * 0.02)
+    optimizer = TensorParallelAngularMuown(
+        params=[weight], lr=0.01, pg_collection=None, tp_mode="duplicated"
+    )
+    weight.grad = torch.randn_like(weight)
+    optimizer.step()
+
+    rows, cols = weight.shape
+    live_state = optimizer.state[weight]
+    # Live state stays reduced (rows, 1); m_u matches the weight shape.
+    for key in ("g", "m_g", "v_g"):
+        assert live_state[key].shape == (rows, 1)
+    assert live_state["m_u"].shape == (rows, cols)
+
+    saved = optimizer.state_dict()
+    saved_state = saved["state"][0]
+    # Per-row states are expanded to full shape with identical columns.
+    for key in ("g", "m_g", "v_g"):
+        assert saved_state[key].shape == (rows, cols)
+        assert torch.equal(saved_state[key], live_state[key].expand(-1, cols))
+    assert saved_state["m_u"].shape == (rows, cols)
+    # Saving must not mutate the live reduced-shape states.
+    for key in ("g", "m_g", "v_g"):
+        assert live_state[key].shape == (rows, 1)
+
+    # A fresh optimizer loads the expanded checkpoint and collapses it exactly.
+    weight2 = torch.nn.Parameter(weight.detach().clone())
+    optimizer2 = TensorParallelAngularMuown(
+        params=[weight2], lr=0.01, pg_collection=None, tp_mode="duplicated"
+    )
+    optimizer2.load_state_dict(saved)
+    loaded_state = optimizer2.state[weight2]
+    for key in ("g", "m_g", "v_g"):
+        assert loaded_state[key].shape == (rows, 1)
+        assert torch.equal(loaded_state[key], live_state[key])
+    assert torch.equal(loaded_state["m_u"], live_state["m_u"])
+    assert loaded_state["step"] == live_state["step"]
+
+
+def test_angular_muown_optimizer_u_decay_schedules():
+    """U-decay schedule multipliers should decay as configured."""
+    model = torch.nn.Linear(32, 16, bias=False, dtype=torch.float32, device='cuda')
+    model.weight.data.normal_(0, 0.02)
+
+    optimizer = TensorParallelAngularMuown(
+        params=[model.weight],
+        lr=0.01,
+        pg_collection=None,
+        tp_mode="duplicated",
+        u_decay_schedule="poly",
+        u_decay_scale=1.0,
+        u_decay_p=1.0,
+    )
+
+    multipliers = []
+    for _ in range(3):
+        model.weight.grad = torch.randn_like(model.weight)
+        optimizer.step()
+        multipliers.append(optimizer.param_groups[0]["u_lr_multiplier"])
+
+    # (1 + steps_after_warmup) ** -1 evaluated at steps 0, 1, 2.
+    assert multipliers == pytest.approx([1.0, 0.5, 1.0 / 3.0])
+
+    with pytest.raises(ValueError, match="requires u_decay_steps"):
+        TensorParallelAngularMuown(
+            params=[torch.nn.Parameter(torch.randn(8, 8, device='cuda'))],
+            u_decay_schedule="cosine",
+            pg_collection=None,
+        )
+
+
+def test_angular_muown_optimizer_qkv_split():
+    """Test TensorParallelAngularMuown with QKV splitting."""
+    qkv_size = 3 * 64 * 16
+    hidden_size = 1024
+    model = torch.nn.Linear(hidden_size, qkv_size, bias=False, dtype=torch.float32, device='cuda')
+    model.requires_grad_(True)
+    model.weight.data.normal_(0, 0.02)
+    model.weight.is_qkv = True
+
+    optimizer_split = TensorParallelAngularMuown(
+        params=[model.weight],
+        lr=0.01,
+        split_qkv=True,
+        is_qkv_fn=lambda p: getattr(p, 'is_qkv', False),
+        qkv_split_shapes=(64, 64, 64),
+        num_ns_steps=5,
+        pg_collection=None,
+        tp_mode="duplicated",
+    )
+
+    input_tensor = torch.randn(16, hidden_size, dtype=torch.float32, device='cuda')
+    output = model(input_tensor)
+    loss = output.sum()
+    loss.backward()
+
+    original_weight = model.weight.data.clone()
+    optimizer_split.step()
+
+    assert not torch.equal(
+        model.weight.data, original_weight
+    ), "QKV weight should be updated with split_qkv=True"
+
+    g = optimizer_split.state[model.weight]["g"]
+    row_norms = model.weight.data.norm(dim=1, keepdim=True)
+    assert torch.allclose(row_norms, g.abs(), rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.skipif(
+    int(os.getenv('WORLD_SIZE', '1')) == 1, reason="Multi-rank test requires WORLD_SIZE > 1"
+)
+class TestAngularMuownOptimizerMultiRank:
+    """Test class for AngularMuown optimizer with multi-rank setup."""
+
+    @pytest.fixture(autouse=True)
+    def setup_and_teardown(self):
+        """Setup and teardown for each test."""
+        Utils.initialize_model_parallel()
+        yield
+        Utils.destroy_model_parallel()
+
+    def create_ddp_model(self, model):
+        """Wrap model in DDP."""
+        ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
+        return DistributedDataParallel(
+            TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
+        )
+
+    def _make_config(self, **kwargs):
+        return OptimizerConfig(
+            optimizer='angular_muown',
+            lr=0.01,
+            weight_decay=0.01,
+            bf16=True,
+            use_distributed_optimizer=False,
+            angular_muown_momentum=0.95,
+            angular_muown_nesterov=True,
+            angular_muown_fp32_matmul_prec="medium",
+            angular_muown_num_ns_steps=5,
+            angular_muown_scale_mode="shape_scaling",
+            angular_muown_tp_mode="duplicated",
+            **kwargs,
+        )
+
+    def test_get_megatron_optimizer_smoke(self):
+        """Hybrid AngularMuown + Adam optimizer via get_megatron_optimizer."""
+        model = Net().bfloat16().cuda()
+        model.requires_grad_(True)
+        model = self.create_ddp_model(model)
+
+        optimizer = get_megatron_optimizer(
+            config=self._make_config(), model_chunks=[model], use_gloo_process_groups=True
+        )
+
+        assert optimizer is not None
+        assert hasattr(optimizer, 'chained_optimizers'), "Should be a ChainedOptimizer"
+        assert len(optimizer.chained_optimizers) == 2, "Should chain AngularMuown and Adam"
+
+        # Verify the hybrid split: AngularMuown gets only 2D params, Adam gets the rest.
+        inner_types = {}
+        for sub in optimizer.chained_optimizers:
+            inner = sub.optimizer
+            inner_types[type(inner).__name__] = inner
+        assert 'TensorParallelAngularMuown' in inner_types, f"Got {list(inner_types)}"
+        angular_muown_inner = inner_types['TensorParallelAngularMuown']
+        for group in angular_muown_inner.param_groups:
+            for p in group['params']:
+                assert p.ndim == 2, "AngularMuown bucket should only contain 2D params"
+        adam_inner = [v for k, v in inner_types.items() if k != 'TensorParallelAngularMuown'][0]
+        adam_ndims = {p.ndim for g in adam_inner.param_groups for p in g['params']}
+        assert 1 in adam_ndims, "Adam bucket should hold the biases"
+
+        input_tensor = torch.randn(16, 80, dtype=torch.bfloat16, device='cuda')
+        output = model(input_tensor)
+        loss = output.sum()
+        loss.backward()
+
+        original_params = {name: p.data.clone() for name, p in model.named_parameters()}
+        optimizer.step()
+
+        params_updated = sum(
+            0 if torch.equal(p.data, original_params[name]) else 1
+            for name, p in model.named_parameters()
+        )
+        assert params_updated > 0, "Parameters should be updated after optimizer step"
+
+        optimizer.zero_grad()
+        state_dict = optimizer.state_dict()
+        optimizer.load_state_dict(state_dict)
+
+    def test_moe_router_and_experts_routing(self):
+        """Router/gate weights must go to Adam; per-expert 2D weights to AngularMuown."""
+
+        class MoeLikeNet(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.router = nn.Linear(64, 8, bias=False)  # name: router.weight [8, 64]
+                self.gate_weight = nn.Parameter(torch.randn(1, 64))
+                self.experts = nn.ModuleList(nn.Linear(64, 64, bias=False) for _ in range(4))
+                self.proj = nn.Linear(64, 64, bias=True)
+
+        model = MoeLikeNet().bfloat16().cuda()
+        model.requires_grad_(True)
+        model = self.create_ddp_model(model)
+
+        optimizer = get_megatron_optimizer(
+            config=self._make_config(), model_chunks=[model], use_gloo_process_groups=True
+        )
+
+        angular_muown_params, adam_params = set(), set()
+        for sub in optimizer.chained_optimizers:
+            inner = sub.optimizer
+            target = (
+                angular_muown_params if isinstance(inner, TensorParallelAngularMuown) else adam_params
+            )
+            for group in inner.param_groups:
+                for p in group['params']:
+                    # Map main (fp32) params back to model params via shape+id walk.
+                    target.add(p.data_ptr())
+
+        name_to_main_ptr = {
+            name: getattr(p, 'main_param', p).data_ptr()
+            for name, p in model.named_parameters()
+        }
+        assert name_to_main_ptr['module.router.weight'] in adam_params, "router must use Adam"
+        assert name_to_main_ptr['module.gate_weight'] in adam_params, "gate must use Adam"
+        assert name_to_main_ptr['module.proj.bias'] in adam_params, "bias must use Adam"
+        for i in range(4):
+            assert (
+                name_to_main_ptr[f'module.experts.{i}.weight'] in angular_muown_params
+            ), f"expert {i} weight must use AngularMuown"
+        assert name_to_main_ptr['module.proj.weight'] in angular_muown_params
+
+    def test_get_megatron_optimizer_layer_wise(self):
+        """AngularMuown through the layer-wise distributed optimizer (AngularMuownDP path)."""
+        from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
+
+        model = Net().bfloat16().cuda()
+        model.requires_grad_(True)
+        model = self.create_ddp_model(model)
+
+        optimizer = get_megatron_optimizer(
+            config=self._make_config(use_layer_wise_distributed_optimizer=True),
+            model_chunks=[model],
+            use_gloo_process_groups=True,
+        )
+
+        assert isinstance(
+            optimizer, LayerWiseDistributedOptimizer
+        ), "Should return LayerWiseDistributedOptimizer"
+
+        input_tensor = torch.randn(16, 80, dtype=torch.bfloat16, device='cuda')
+        output = model(input_tensor)
+        loss = output.sum()
+        loss.backward()
+
+        update_successful, grad_norm, num_zeros = optimizer.step()
+        assert update_successful, "Optimizer step should be successful"
+
+        # After step + allgather, all ranks must agree on every parameter.
+        for name, p in model.named_parameters():
+            p_max = p.data.clone()
+            torch.distributed.all_reduce(p_max, op=torch.distributed.ReduceOp.MAX)
+            p_min = p.data.clone()
+            torch.distributed.all_reduce(p_min, op=torch.distributed.ReduceOp.MIN)
+            assert torch.equal(p_max, p_min), f"Param {name} diverged across ranks"

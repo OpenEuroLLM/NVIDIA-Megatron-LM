@@ -2338,6 +2338,122 @@ def _add_regularization_args(parser):
                        choices=['adam', 'lion'],
                        help='Optimizer for scalar parameters (embeddings, biases, norms) '
                        'when using muon. Defaults to adam.')
+    group.add_argument(
+        '--angular-muown-momentum',
+        type=float,
+        default=0.95,
+        help='Momentum coefficient for the U-gradient buffer in AngularMuown',
+    )
+    group.add_argument(
+        '--angular-muown-no-nesterov',
+        action='store_false',
+        default=True,
+        dest='angular_muown_nesterov',
+        help='Disable Nesterov-style lookahead for the AngularMuown U update',
+    )
+    group.add_argument(
+        '--angular-muown-beta1',
+        type=float,
+        default=0.9,
+        help='Adam beta1 for the AngularMuown row magnitudes g. Default: 0.9.',
+    )
+    group.add_argument(
+        '--angular-muown-beta2',
+        type=float,
+        default=0.95,
+        help='Adam beta2 for the AngularMuown row magnitudes g. Default: 0.95.',
+    )
+    group.add_argument(
+        '--angular-muown-no-split-qkv',
+        action='store_false',
+        default=True,
+        dest='angular_muown_split_qkv',
+        help='Whether to split fused QKV parameters for AngularMuown orthogonalization',
+    )
+    group.add_argument(
+        '--angular-muown-scale-mode',
+        type=str,
+        default='spectral',
+        choices=['spectral', 'unit_rms_norm', 'shape_scaling'],
+        help='Shape-dependent scale for the AngularMuown U direction. spectral '
+        '(default) matches the Muon recipe convention; shape_scaling '
+        'reproduces the original AngularMuown "ratio" scaling; spectral '
+        'with --angular-muown-extra-scale-factor 0.2 reproduces its "muon" scaling.',
+    )
+    group.add_argument(
+        '--angular-muown-extra-scale-factor',
+        type=float,
+        default=1.0,
+        help='Additional scale factor for the AngularMuown U direction',
+    )
+    group.add_argument(
+        '--angular-muown-fp32-matmul-prec',
+        type=str,
+        default='medium',
+        choices=['low', 'medium', 'high'],
+        help='FP32 matmul precision for the AngularMuown Newton-Schulz iteration',
+    )
+    group.add_argument(
+        '--angular-muown-coefficient-type',
+        type=str,
+        default='simple',
+        help='Newton-Schulz coefficient type for AngularMuown. simple (default) matches '
+        'the coefficients of the original AngularMuown newtonschulz5 backend. Valid '
+        'types are discovered from the installed emerging_optimizers package.',
+    )
+    group.add_argument(
+        '--angular-muown-num-ns-steps',
+        type=int,
+        default=5,
+        help='Number of Newton-Schulz steps for AngularMuown',
+    )
+    group.add_argument(
+        '--angular-muown-tp-mode',
+        type=str,
+        default='blockwise',
+        choices=['blockwise', 'duplicated', 'distributed'],
+        help='How to perform NS calculation for tensor model parallel weights',
+    )
+    group.add_argument(
+        '--angular-muown-u-decay-schedule',
+        type=str,
+        default='poly',
+        choices=['poly', 'cosine'],
+        help='Internal decay schedule for the AngularMuown directional step multiplier',
+    )
+    group.add_argument(
+        '--angular-muown-u-decay-scale',
+        type=float,
+        default=0.001,
+        help='Scale for the poly U-decay schedule '
+        '(1 + scale * steps_after_warmup) ** (-p). '
+        'Set --angular-muown-u-decay-p 0 to disable the decay.',
+    )
+    group.add_argument(
+        '--angular-muown-u-decay-p',
+        type=float,
+        default=1.0,
+        help='Exponent for the poly U-decay schedule',
+    )
+    group.add_argument(
+        '--angular-muown-u-decay-warmup-steps',
+        type=int,
+        default=0,
+        help='Steps before the AngularMuown U-decay schedule begins',
+    )
+    group.add_argument(
+        '--angular-muown-u-decay-steps',
+        type=int,
+        default=None,
+        help='Post-warmup steps over which the cosine U-decay schedule decays '
+        'to --angular-muown-u-decay-min-multiplier (required for cosine)',
+    )
+    group.add_argument(
+        '--angular-muown-u-decay-min-multiplier',
+        type=float,
+        default=0.0,
+        help='Floor of the cosine U-decay schedule',
+    )
     group.add_argument('--lion-beta1', type=float, default=0.95,
                        help='First beta coefficient for Lion optimizer '
                        '(used in sign update). Default: 0.95.')
@@ -2560,7 +2676,7 @@ def _add_training_args(parser):
                        help='use FlashAttention implementation of attention. '
                        'https://arxiv.org/abs/2205.14135')
     group.add_argument('--optimizer', type=str, default='adam',
-                       choices=['adam', 'sgd', 'muon', 'dist_muon', 'lion', 'soap', 'adaptive_muon'],
+                       choices=['adam', 'sgd', 'muon', 'dist_muon', 'lion', 'soap', 'adaptive_muon', 'angular_muown'],
                        help='Optimizer function. '
                             'Note: dist_muon is deprecated; use --optimizer muon '
                             'with --use-distributed-optimizer instead.')
