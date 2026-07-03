@@ -466,10 +466,14 @@ class TensorParallelAngularMuown(TensorParallelMuon):
     projected back to magnitude ``ANGULAR_MUOWN_EPS`` with their proposed sign so the
     explicit ``W = diag(g) @ U`` coordinates stay well-defined.
 
-    Reference:
+    References:
         Florian Hübler, Kai Lion, Antonio Orvieto, Niao He.
         "Muown Implicitly Performs Angular Step-size Decay." arXiv:2606.23637, 2026.
         https://arxiv.org/abs/2606.23637
+
+        Kai Lion, Florian Hübler, Bingcong Li, Antonio Orvieto, Niao He.
+        "Muown: Row-Norm Control for Muon Optimization." arXiv:2605.10797, 2026.
+        https://arxiv.org/abs/2605.10797
     """
 
     def __init__(
