@@ -378,23 +378,66 @@ ANGULAR_MUOWN_ROW_STATE_KEYS = ("g", "m_g", "v_g")
 
 
 @torch.compile
-def _angular_muown_u_gradients(
+def _angular_muown_u_and_grad_g(
     w: torch.Tensor, g: torch.Tensor, grad_w: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return U, dL/dg, and the Riemannian U gradient for W = diag(g) @ U."""
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return U and the row gradient dL/dg for W = diag(g) @ U.
+
+    ``grad_g = <grad_W, U>_row`` is a ``dim=1`` reduction across the columns of
+    each row. Under column tensor-parallel sharding (``partition_dim == 1``)
+    each rank only holds a column slice of every row, so this is a *partial*
+    sum that the caller must all-reduce across the TP group before it is used
+    (both for the Adam-on-``g`` update and for :func:`_angular_muown_grad_u`).
+    For row-sharded / replicated / single-GPU weights it is already global.
+    The all-reduce is kept out of this ``torch.compile`` region on purpose.
+    """
     g_safe = torch.copysign(g.abs().clamp_min(ANGULAR_MUOWN_EPS), g)
     u = w / g_safe
     grad_g = (grad_w * u).sum(dim=1, keepdim=True)
-    grad_u = g * (grad_w - u * grad_g)
-    return u, grad_g, grad_u
+    return u, grad_g
+
+
+@torch.compile
+def _angular_muown_grad_u(
+    u: torch.Tensor, g: torch.Tensor, grad_w: torch.Tensor, grad_g: torch.Tensor
+) -> torch.Tensor:
+    """Return the Riemannian U gradient ``g * (grad_W - U * grad_g)``.
+
+    ``grad_g`` must already be the *global* row gradient (i.e. all-reduced
+    across the TP group when the weight is column-sharded).
+    """
+    return g * (grad_w - u * grad_g)
+
+
+@torch.compile
+def _angular_muown_u_step_norm_sq(u_step: torch.Tensor) -> torch.Tensor:
+    """Return the per-row squared norm of the proposed ``U`` step.
+
+    This is the ``dim=1`` reduction used by the retraction. It is a partial
+    sum-of-squares under column tensor-parallel sharding (``partition_dim == 1``)
+    and must be all-reduced across the TP group before the row-normalization in
+    :func:`_angular_muown_u_recompose`; otherwise it is already the global
+    squared norm. Kept separate from the recompose write so the all-reduce can
+    run outside ``torch.compile``.
+    """
+    return u_step.pow(2).sum(dim=1, keepdim=True)
 
 
 @torch.compile
 def _angular_muown_u_recompose(
-    w: torch.Tensor, g: torch.Tensor, u_step: torch.Tensor, eps: float = ANGULAR_MUOWN_EPS
+    w: torch.Tensor,
+    g: torch.Tensor,
+    u_step: torch.Tensor,
+    u_step_norm_sq: torch.Tensor,
+    eps: float = ANGULAR_MUOWN_EPS,
 ) -> None:
-    """Normalize U rows and write W = diag(g) @ U in place."""
-    u_step_norm = u_step.norm(dim=1, keepdim=True).clamp_min(eps)
+    """Normalize U rows and write W = diag(g) @ U in place.
+
+    ``u_step_norm_sq`` is the (global) per-row squared norm of ``u_step`` from
+    :func:`_angular_muown_u_step_norm_sq`, already all-reduced across the TP
+    group for column-sharded weights.
+    """
+    u_step_norm = u_step_norm_sq.sqrt().clamp_min(eps)
     w.copy_(g * (u_step / u_step_norm))
 
 
@@ -450,7 +493,26 @@ class TensorParallelAngularMuown(TensorParallelMuon):
         scale_mode: Shape-dependent scale mode (see above).
         extra_scale_factor: Additional scalar applied to the ``U`` direction.
         pg_collection: Process group collection for distributed training.
-        tp_mode: Tensor parallel mode ("blockwise", "duplicated", "distributed").
+        tp_mode: Tensor parallel mode ("duplicated" or "distributed"). Both
+            reproduce the single-GPU (global) update; they only differ in how the
+            Newton-Schulz work is laid out (full-matrix on every rank vs sharded
+            with per-step Gram-matrix all-reduces). The ``W = diag(g) @ U``
+            decomposition adds three per-row (``dim=1``) reductions on top of the
+            orthogonalization: the ``g`` seed, the row gradient ``grad_g``, and
+            the ``u_step`` retraction norm. For a **column-sharded** weight
+            (``partition_dim == 1``: RowParallelLinear ``linear_proj`` /
+            ``linear_fc2`` / MoE down-proj) each rank only owns a column slice of
+            every row, so these reductions are all-reduced across the
+            tensor-parallel group; ``g``/``m_g``/``v_g`` stay replicated across
+            column-shard ranks. For a **row-sharded** weight
+            (``partition_dim == 0``: ColumnParallelLinear ``linear_qkv`` /
+            ``linear_fc1`` / MoE up-proj) and for single-GPU, every ``dim=1``
+            reduction is already global, so no all-reduce is performed.
+
+            Muon's ``"blockwise"`` (local per-shard orthogonalization) is
+            rejected: it would make the row geometry local to each column shard,
+            which is a different optimizer than AngularMuown, not the intended
+            behavior.
         u_decay_schedule: Internal decay schedule for the directional step
             multiplier; one of ``"poly"`` or ``"cosine"``.
         u_decay_scale: Scale for the ``"poly"`` schedule
@@ -493,7 +555,7 @@ class TensorParallelAngularMuown(TensorParallelMuon):
         scale_mode: str = "spectral",
         extra_scale_factor: float = 1.0,
         pg_collection: Optional[ProcessGroupCollection] = None,
-        tp_mode: Literal["blockwise", "duplicated", "distributed"] = "blockwise",
+        tp_mode: Literal["duplicated", "distributed"] = "duplicated",
         u_decay_schedule: str = "poly",
         u_decay_scale: float | None = None,
         u_decay_p: float = 1.0,
@@ -507,6 +569,13 @@ class TensorParallelAngularMuown(TensorParallelMuon):
             raise ValueError(f"Invalid beta2: {betas[1]}")
         if adam_eps < 0.0:
             raise ValueError(f"Invalid adam_eps: {adam_eps}")
+        if tp_mode not in ("duplicated", "distributed"):
+            raise ValueError(
+                f"Invalid tp_mode for AngularMuown: {tp_mode!r}. 'blockwise' is not "
+                "supported: local per-shard orthogonalization would make the per-row "
+                "W = diag(g) @ U geometry local to each column shard, which is a "
+                "different optimizer. Choose 'duplicated' or 'distributed'."
+            )
         self._validate_u_decay(
             u_decay_schedule,
             u_decay_scale,
@@ -588,6 +657,41 @@ class TensorParallelAngularMuown(TensorParallelMuon):
             return 1.0
         return (1.0 + self._u_decay_scale * steps_after_warmup) ** (-self._u_decay_p)
 
+    def _tp_row_reduce_group(
+        self, p: torch.Tensor
+    ) -> Optional["torch.distributed.ProcessGroup"]:
+        """Return the TP group to all-reduce per-row scalars over, or ``None``.
+
+        The ``g`` seed, the row gradient ``grad_g``, and the ``u_step``
+        retraction norm are ``dim=1`` reductions across the columns of each row.
+        They are only *partial* (local to a rank) for **column-sharded** weights
+        (``partition_dim == 1``, RowParallelLinear: ``linear_proj`` /
+        ``linear_fc2`` / MoE down-proj), where each rank holds a column slice of
+        every row. In that case they must be summed across the tensor-parallel
+        group (mirroring the group selection in :meth:`orthogonalize`) so that
+        ``g``/``m_g``/``v_g`` stay replicated and the update matches the
+        single-GPU reference.
+
+        Returns ``None`` (no all-reduce, the reduction is already global) when:
+
+          - there is no process-group collection (single-GPU / no TP);
+          - the weight is row-sharded or replicated (``partition_dim != 1``),
+            where each rank already owns complete rows; or
+          - the selected TP group has size 1.
+        """
+        if self.pg_collection is None:
+            return None
+        if getattr(p, "partition_dim", None) != 1:
+            return None
+        tp_group = (
+            self.pg_collection.expt_tp
+            if getattr(p, "expert_tp", False)
+            else self.pg_collection.tp
+        )
+        if get_pg_size(tp_group) <= 1:
+            return None
+        return tp_group
+
     @torch.no_grad()  # type: ignore[misc]
     def _init_group(self, group: dict, skip_non_grad_params: bool = True) -> None:
         """Lazily initialize AngularMuown state (g, m_u, m_g, v_g, step) for 2D params."""
@@ -600,7 +704,16 @@ class TensorParallelAngularMuown(TensorParallelMuon):
             # Zero rows have no direction for U = W / g. Give just those rows the
             # expected row scale of the default linear init so the first U update
             # can create a unit direction without starting Adam's g near zero.
-            w_norm = p.detach().norm(dim=1, keepdim=True)
+            # Seed from the sum-of-squares (not norm) so a column-sharded weight
+            # can all-reduce the partial squared row norms before the sqrt,
+            # yielding the global row magnitude replicated across TP ranks.
+            w_norm_sq = p.detach().pow(2).sum(dim=1, keepdim=True)
+            reduce_group = self._tp_row_reduce_group(p)
+            if reduce_group is not None:
+                torch.distributed.all_reduce(
+                    w_norm_sq, op=torch.distributed.ReduceOp.SUM, group=reduce_group
+                )
+            w_norm = w_norm_sq.sqrt()
             zero_rows = w_norm <= ANGULAR_MUOWN_EPS
             if zero_rows.any():
                 w_norm = torch.where(
@@ -639,7 +752,18 @@ class TensorParallelAngularMuown(TensorParallelMuon):
                 m_g = state["m_g"]
                 v_g = state["v_g"]
 
-                u, grad_g, grad_u = _angular_muown_u_gradients(p, g, p.grad)
+                # For column-sharded weights (partition_dim == 1) the per-row
+                # (dim=1) reductions below are only partial on this rank and must
+                # be summed across the TP group; None otherwise (already global
+                # or an intentional local-shard variant).
+                reduce_group = self._tp_row_reduce_group(p)
+
+                u, grad_g = _angular_muown_u_and_grad_g(p, g, p.grad)
+                if reduce_group is not None:
+                    torch.distributed.all_reduce(
+                        grad_g, op=torch.distributed.ReduceOp.SUM, group=reduce_group
+                    )
+                grad_u = _angular_muown_grad_u(u, g, p.grad, grad_g)
 
                 # Momentum on the Riemannian U gradient (sum convention, as in
                 # the original AngularMuown, not the EMA convention of the base class).
@@ -669,7 +793,15 @@ class TensorParallelAngularMuown(TensorParallelMuon):
                 g_candidate = g.add(g_update, alpha=-lr)
                 g.copy_(torch.copysign(g_candidate.abs().clamp_min(ANGULAR_MUOWN_EPS), g_candidate))
 
-                _angular_muown_u_recompose(p, g, u_step)
+                # Retraction: row-normalize the proposed U step. The row norm is
+                # a dim=1 reduction, so all-reduce the partial squared norms for
+                # column-sharded weights before the sqrt inside recompose.
+                u_step_norm_sq = _angular_muown_u_step_norm_sq(u_step)
+                if reduce_group is not None:
+                    torch.distributed.all_reduce(
+                        u_step_norm_sq, op=torch.distributed.ReduceOp.SUM, group=reduce_group
+                    )
+                _angular_muown_u_recompose(p, g, u_step, u_step_norm_sq)
 
         return None
 

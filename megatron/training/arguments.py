@@ -2410,9 +2410,11 @@ def _add_regularization_args(parser):
     group.add_argument(
         '--angular-muown-tp-mode',
         type=str,
-        default='blockwise',
-        choices=['blockwise', 'duplicated', 'distributed'],
-        help='How to perform NS calculation for tensor model parallel weights',
+        default='duplicated',
+        choices=['duplicated', 'distributed'],
+        help='How to perform NS calculation for tensor model parallel weights '
+        '(both modes reproduce the single-GPU update; blockwise is not supported '
+        'for AngularMuown)',
     )
     group.add_argument(
         '--angular-muown-u-decay-schedule',

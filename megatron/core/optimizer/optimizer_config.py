@@ -365,8 +365,11 @@ class OptimizerConfig:
     angular_muown_num_ns_steps: int = 5
     """The number of iteration steps to use in the Newton-Schulz iteration."""
 
-    angular_muown_tp_mode: str = "blockwise"
-    """How to perform NS calculation for tensor parallel weights. Defaults to "blockwise"."""
+    angular_muown_tp_mode: str = "duplicated"
+    """How to perform NS calculation for tensor parallel weights ("duplicated" or
+    "distributed"; both reproduce the single-GPU update). Muon's "blockwise" is not
+    supported for AngularMuown: local per-shard orthogonalization would make the per-row
+    W = diag(g) @ U geometry local to each column shard, a different optimizer."""
 
     angular_muown_u_decay_schedule: str = "poly"
     """Internal decay schedule for the AngularMuown directional step multiplier

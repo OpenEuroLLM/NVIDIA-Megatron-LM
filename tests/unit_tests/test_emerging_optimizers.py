@@ -2058,3 +2058,126 @@ class TestAngularMuownOptimizerMultiRank:
             p_min = p.data.clone()
             torch.distributed.all_reduce(p_min, op=torch.distributed.ReduceOp.MIN)
             assert torch.equal(p_max, p_min), f"Param {name} diverged across ranks"
+
+
+@pytest.mark.skipif(
+    int(os.getenv('WORLD_SIZE', '1')) == 1, reason="Multi-rank test requires WORLD_SIZE > 1"
+)
+class TestAngularMuownOptimizerColumnParallel:
+    """AngularMuown correctness for column-sharded (partition_dim=1) weights.
+
+    A RowParallelLinear weight (linear_proj / linear_fc2 / MoE down-proj) is
+    sharded along its columns, so every rank holds only a slice of each row.
+    The AngularMuown per-row scalars (``g`` seed, ``grad_g``, ``u_step`` norm)
+    are ``dim=1`` reductions and become partial per rank unless all-reduced
+    across the TP group. These tests shard a weight along ``dim=1`` and assert
+    the ``duplicated``/``distributed`` update reproduces the single-rank
+    (global) reference, which only holds once those reductions are TP-aware.
+    """
+
+    @pytest.fixture(autouse=True)
+    def setup_and_teardown(self):
+        """Set up tensor parallelism across the whole world (up to size 2)."""
+        world = int(os.getenv('WORLD_SIZE', '1'))
+        Utils.initialize_model_parallel(tensor_model_parallel_size=min(world, 2))
+        yield
+        Utils.destroy_model_parallel()
+
+    def _make_optimizer(self, params, mode, pg_collection):
+        # fp32 matmuls (not "medium"/bf16) so the reference vs sharded
+        # comparison is not dominated by bf16 rounding in Newton-Schulz.
+        return TensorParallelAngularMuown(
+            params=params,
+            lr=0.01,
+            momentum=0.95,
+            nesterov=True,
+            betas=(0.9, 0.95),
+            adam_eps=1e-8,
+            num_ns_steps=5,
+            coefficient_type="simple",
+            scale_mode="shape_scaling",
+            fp32_matmul_prec="highest",
+            pg_collection=pg_collection,
+            tp_mode=mode,
+        )
+
+    @pytest.mark.parametrize("mode", ["duplicated", "distributed"])
+    def test_column_sharded_matches_single_rank(self, mode):
+        """A column-sharded (partition_dim=1) update must match the single-rank reference."""
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        tp_group = pg_collection.tp
+        tp_size = torch.distributed.get_world_size(group=tp_group)
+        tp_rank = torch.distributed.get_rank(group=tp_group)
+
+        rows, cols_local = 48, 40
+        cols_full = cols_local * tp_size
+
+        # Identical full weight + grad on every rank (same seed, no rank offset).
+        torch.manual_seed(1234)
+        full_w = torch.randn(rows, cols_full, dtype=torch.float32, device='cuda') * 0.02
+        full_grad = torch.randn(rows, cols_full, dtype=torch.float32, device='cuda')
+
+        # Single-rank (global) reference: no TP, full matrix.
+        ref_w = torch.nn.Parameter(full_w.clone())
+        ref_opt = self._make_optimizer([ref_w], "duplicated", None)
+        ref_w.grad = full_grad.clone()
+        for _ in range(3):
+            ref_opt.step()
+
+        # Column-sharded run: this rank owns the group-rank-th column slice.
+        # newton_schulz_tp all-gathers/cats shards in group-rank order, so the
+        # slice assignment must follow the same order for the round-trip to line up.
+        col = slice(tp_rank * cols_local, (tp_rank + 1) * cols_local)
+        shard_w = torch.nn.Parameter(full_w[:, col].contiguous())
+        shard_w.partition_dim = 1
+        shard_opt = self._make_optimizer([shard_w], mode, pg_collection)
+        shard_grad = full_grad[:, col].contiguous()
+        for _ in range(3):
+            shard_w.grad = shard_grad.clone()
+            shard_opt.step()
+
+        # Gather the column shards back to a full matrix and compare to reference.
+        gathered = [torch.empty_like(shard_w.data) for _ in range(tp_size)]
+        torch.distributed.all_gather(gathered, shard_w.data.contiguous(), group=tp_group)
+        full_result = torch.cat(gathered, dim=1)
+
+        torch.testing.assert_close(
+            full_result,
+            ref_w.data,
+            rtol=1e-3,
+            atol=1e-4,
+            msg=lambda m: f"Column-sharded (mode={mode}) update diverged from single-rank reference\n\n{m}",
+        )
+
+        # The per-row states must be replicated across the column-shard ranks
+        # (identical on every rank) and equal the single-rank reference; this is
+        # what keeps the state_dict expand/collapse round-trip exact under TP.
+        ref_state = ref_opt.state[ref_w]
+        shard_state = shard_opt.state[shard_w]
+        for key in ("g", "m_g", "v_g"):
+            tensor = shard_state[key]
+            t_max = tensor.clone()
+            torch.distributed.all_reduce(t_max, op=torch.distributed.ReduceOp.MAX, group=tp_group)
+            t_min = tensor.clone()
+            torch.distributed.all_reduce(t_min, op=torch.distributed.ReduceOp.MIN, group=tp_group)
+            assert torch.equal(t_max, t_min), f"State '{key}' not replicated across column-shard ranks"
+            torch.testing.assert_close(
+                tensor,
+                ref_state[key],
+                rtol=1e-3,
+                atol=1e-4,
+                msg=lambda m, key=key: f"State '{key}' diverged from single-rank reference\n\n{m}",
+            )
+
+    def test_blockwise_rejected(self):
+        """blockwise is not supported: it would make the row geometry per-shard local.
+
+        With Muon's ``tp_mode="blockwise"`` each column shard would run an
+        independent local update (per-shard ``g`` from the local column norm),
+        which is a different optimizer than AngularMuown, so the constructor
+        must reject it.
+        """
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        w = torch.nn.Parameter(torch.randn(48, 40, dtype=torch.float32, device='cuda'))
+        with pytest.raises(ValueError, match="blockwise"):
+            self._make_optimizer([w], "blockwise", pg_collection)
