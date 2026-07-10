@@ -392,6 +392,17 @@ class OptimizerConfig:
     angular_muown_u_decay_min_multiplier: float = 0.0
     """Floor of the "cosine" U-decay schedule."""
 
+    angular_muown_batched_step: bool = True
+    """Stack same-shape parameters and run the AngularMuown update on the whole
+    stack (batched Newton-Schulz via bmm, batched collectives). Same per-matrix
+    math up to floating-point reduction order, far fewer kernel launches."""
+
+    muon_batched_step: bool = False
+    """Stack same-shape parameters and run the Muon update on the whole stack
+    (batched Newton-Schulz via bmm, foreach weight decay/momentum). Same
+    per-matrix math up to floating-point reduction order in the Newton-Schulz.
+    Off by default to preserve the upstream per-parameter behavior."""
+
     #######################
     # Distributed optimizer
     #######################

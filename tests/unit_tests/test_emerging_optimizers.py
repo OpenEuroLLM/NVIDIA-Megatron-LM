@@ -708,6 +708,72 @@ def test_muon_optimizer_extra_scale_factor():
     ), "Weight should be updated with extra_scale_factor"
 
 
+def test_muon_batched_step_matches_per_param():
+    """The opt-in batched Muon step must reproduce the upstream per-param path.
+
+    Two identical optimizers (batched_step=True vs the default False) over a
+    mix of shapes — same-shape stacks, a singleton batch, and a fused-QKV
+    weight taking the split path — with decoupled weight decay and Nesterov
+    momentum on. With fp32_matmul_prec="highest" the Newton-Schulz runs in
+    fp32, so bmm-vs-mm only differ by fp32 reduction order and tolerances can
+    be tight. Params and momentum buffers are compared after every step.
+    """
+
+    def make_params(seed):
+        torch.manual_seed(seed)
+        spec = [((96, 64), False)] * 3 + [((64, 48), False)] * 2
+        spec += [((128, 64), False), ((96, 64), True)]  # singleton + qkv
+        params = []
+        for shape, is_qkv in spec:
+            p = torch.nn.Parameter(torch.randn(shape, device='cuda') * 0.02)
+            p.is_qkv = is_qkv
+            params.append(p)
+        return params
+
+    def make_opt(params, batched):
+        return TensorParallelMuon(
+            params=params,
+            lr=0.01,
+            momentum=0.95,
+            nesterov=True,
+            weight_decay=0.1,
+            use_decoupled_weight_decay=True,
+            split_qkv=True,
+            is_qkv_fn=lambda p: getattr(p, 'is_qkv', False),
+            qkv_split_shapes=(32, 8, 8),
+            num_ns_steps=5,
+            coefficient_type="simple",
+            fp32_matmul_prec="highest",
+            pg_collection=None,
+            tp_mode="duplicated",
+            batched_step=batched,
+        )
+
+    params_ref = make_params(11)
+    params_batched = make_params(11)
+    opt_ref = make_opt(params_ref, batched=False)
+    opt_batched = make_opt(params_batched, batched=True)
+
+    for step in range(3):
+        torch.manual_seed(200 + step)
+        for p in params_ref:
+            p.grad = torch.randn_like(p) * 1e-3
+        torch.manual_seed(200 + step)
+        for p in params_batched:
+            p.grad = torch.randn_like(p) * 1e-3
+        opt_ref.step()
+        opt_batched.step()
+
+        for p_ref, p_b in zip(params_ref, params_batched):
+            torch.testing.assert_close(p_b, p_ref, rtol=1e-5, atol=1e-7)
+            torch.testing.assert_close(
+                opt_batched.state[p_b]["momentum_buffer"],
+                opt_ref.state[p_ref]["momentum_buffer"],
+                rtol=1e-5,
+                atol=1e-7,
+            )
+
+
 def test_get_supported_coefficient_types_returns_tuple():
     """Test that get_supported_coefficient_types returns a non-empty tuple of strings."""
     supported = get_supported_coefficient_types()
@@ -1898,6 +1964,71 @@ def test_angular_muown_optimizer_qkv_split():
     g = optimizer_split.state[model.weight]["g"]
     row_norms = model.weight.data.norm(dim=1, keepdim=True)
     assert torch.allclose(row_norms, g.abs(), rtol=1e-5, atol=1e-6)
+
+
+def test_angular_muown_batched_step_matches_per_param():
+    """The batched step must reproduce the per-parameter reference path.
+
+    Builds two identical optimizers (one with batched_step=True, one False)
+    over a mix of shapes — several same-shape weights that form stacks, a
+    singleton batch, and a fused-QKV weight taking the split path — and
+    checks params and all optimizer state stay equal across steps. With
+    fp32_matmul_prec="highest" the Newton-Schulz runs in fp32, so bmm-vs-mm
+    only differ by fp32 reduction order and tolerances can be tight.
+    """
+
+    def make_params(seed):
+        torch.manual_seed(seed)
+        spec = [((96, 64), False)] * 3 + [((64, 48), False)] * 2
+        spec += [((128, 64), False), ((96, 64), True)]  # singleton + qkv
+        params = []
+        for shape, is_qkv in spec:
+            p = torch.nn.Parameter(torch.randn(shape, device='cuda') * 0.02)
+            p.is_qkv = is_qkv
+            params.append(p)
+        return params
+
+    def make_opt(params, batched):
+        return TensorParallelAngularMuown(
+            params=params,
+            lr=0.01,
+            momentum=0.95,
+            nesterov=True,
+            betas=(0.9, 0.95),
+            split_qkv=True,
+            is_qkv_fn=lambda p: getattr(p, 'is_qkv', False),
+            qkv_split_shapes=(32, 8, 8),
+            num_ns_steps=5,
+            coefficient_type="simple",
+            fp32_matmul_prec="highest",
+            pg_collection=None,
+            tp_mode="duplicated",
+            u_decay_schedule="poly",
+            u_decay_scale=0.001,
+            batched_step=batched,
+        )
+
+    params_ref = make_params(7)
+    params_batched = make_params(7)
+    opt_ref = make_opt(params_ref, batched=False)
+    opt_batched = make_opt(params_batched, batched=True)
+
+    for step in range(3):
+        torch.manual_seed(100 + step)
+        for p in params_ref:
+            p.grad = torch.randn_like(p) * 1e-3
+        torch.manual_seed(100 + step)
+        for p in params_batched:
+            p.grad = torch.randn_like(p) * 1e-3
+        opt_ref.step()
+        opt_batched.step()
+
+        for p_ref, p_b in zip(params_ref, params_batched):
+            torch.testing.assert_close(p_b, p_ref, rtol=1e-5, atol=1e-7)
+            s_ref, s_b = opt_ref.state[p_ref], opt_batched.state[p_b]
+            assert s_ref["step"] == s_b["step"]
+            for key in ("g", "m_u", "m_g", "v_g"):
+                torch.testing.assert_close(s_b[key], s_ref[key], rtol=1e-5, atol=1e-7)
 
 
 @pytest.mark.skipif(

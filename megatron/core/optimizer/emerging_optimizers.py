@@ -18,7 +18,7 @@ import torch
 from torch.optim.optimizer import ParamsT
 
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.utils import get_pg_size, log_single_rank
+from megatron.core.utils import get_pg_rank, get_pg_size, log_single_rank
 
 from .optimizer_config import ParamKey, ParamPredicate
 
@@ -30,7 +30,12 @@ try:
         OrthogonalizedOptimizer,
         get_muon_scale_factor,
     )
-    from emerging_optimizers.orthogonalized_optimizers.muon_utils import NSCoeffT, newton_schulz_tp
+    from emerging_optimizers.orthogonalized_optimizers.muon_utils import (
+        _COEFFICIENT_SETS,
+        NSCoeffT,
+        get_coefficient_iterator,
+        newton_schulz_tp,
+    )
 
     # It is necessary to import optimizers for the registry to work.
     from emerging_optimizers.scalar_optimizers import Lion  # pylint: disable=unused-import
@@ -154,7 +159,18 @@ _EMERGING_OPTIMIZERS: Dict[str, EmergingOptimizerEntry] = {}
 
 
 class TensorParallelMuon(OrthogonalizedOptimizer):
-    """Tensor Parallel Muon optimizer."""
+    """Tensor Parallel Muon optimizer.
+
+    Args (beyond the OrthogonalizedOptimizer ones):
+        batched_step: Stack same-shape parameters and run the update on the
+            whole stack (batched Newton-Schulz via bmm, batched collectives,
+            horizontally-fused weight decay / momentum via foreach ops). Same
+            per-matrix math as the per-parameter path up to floating-point
+            reduction order in the Newton-Schulz matmuls; far fewer kernel
+            launches, which is what bounds the step with many small (e.g.
+            per-expert) weight matrices. Optimizer state layout is unchanged.
+            Default False (the upstream per-parameter path).
+    """
 
     def __init__(
         self,
@@ -174,6 +190,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         extra_scale_factor: float = 1.0,
         pg_collection: Optional[ProcessGroupCollection] = None,
         tp_mode: Literal["blockwise", "duplicated", "distributed"] = "duplicated",
+        batched_step: bool = False,
     ) -> None:
         if num_ns_steps < 1:
             raise ValueError(f"num_ns_steps must be at least 1, got {num_ns_steps}")
@@ -209,6 +226,15 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         self.split_qkv = split_qkv
         self.is_qkv_fn = is_qkv_fn
         self.qkv_split_shapes = qkv_split_shapes
+
+        # The batched step needs the orthogonalization config directly (the
+        # per-param path only has it captured inside the
+        # scaled_orthogonalize_fn closure below).
+        self.batched_step = batched_step
+        self._num_ns_steps = num_ns_steps
+        self._coefficient_type = coefficient_type
+        self._scale_mode = scale_mode
+        self._extra_scale_factor = extra_scale_factor
 
         weight_decay_method = "decoupled" if use_decoupled_weight_decay else "l2"
         # Use explicit class call instead of super() so that subclasses with
@@ -250,6 +276,12 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         partition_dim = None if self.tp_mode == "blockwise" else getattr(p, "partition_dim", None)
         if partition_dim == -1:
             partition_dim = None
+        # A trivial (size-1) TP group makes the "duplicated"/"distributed" paths
+        # in newton_schulz_tp identities that still pay an all_gather + cat +
+        # chunk (or per-step all-reduces) per parameter. Skip straight to the
+        # local Newton-Schulz; the result is bitwise identical.
+        if partition_dim is not None and (tp_group is None or get_pg_size(tp_group) <= 1):
+            partition_dim = None
 
         if self.split_qkv and self.is_qkv_fn(p):  # type: ignore[misc]
             grad_shape = grad.shape
@@ -276,6 +308,156 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         else:
             grad = self.scaled_orthogonalize_fn(grad, tp_group, partition_dim)
         return grad
+
+    # ------------------------------------------------------------------
+    # Batched step (opt-in via batched_step=True)
+    # ------------------------------------------------------------------
+    #
+    # The upstream per-parameter step launches ~25 kernels per weight matrix
+    # (a 5-step Newton-Schulz is 15 small matmuls); with hundreds of small
+    # (e.g. per-expert) matrices per rank it is CPU/launch-bound. The batched
+    # path fuses weight decay and momentum horizontally across all params of a
+    # group (foreach ops, bitwise-identical per tensor) and runs one batched
+    # Newton-Schulz (bmm/baddbmm) per stack of same-shape parameters.
+
+    def _tp_row_reduce_group(
+        self, p: torch.Tensor
+    ) -> Optional["torch.distributed.ProcessGroup"]:
+        """TP group for per-row reductions; plain Muon has none (see AngularMuown)."""
+        return None
+
+    def _batch_key_for(self, p: torch.Tensor) -> tuple:
+        """Return the grouping key: params in one batch share all step semantics."""
+        if self.pg_collection:
+            tp_group = (
+                self.pg_collection.expt_tp
+                if getattr(p, 'expert_tp', False)
+                else self.pg_collection.tp
+            )
+        else:
+            tp_group = None
+        # Same partition_dim rules as orthogonalize(), including the blockwise
+        # collapse and the trivial-TP short-circuit.
+        partition_dim = None if self.tp_mode == "blockwise" else getattr(p, "partition_dim", None)
+        if partition_dim == -1:
+            partition_dim = None
+        if partition_dim is not None and (tp_group is None or get_pg_size(tp_group) <= 1):
+            partition_dim = None
+        if partition_dim is None:
+            tp_group = None
+        reduce_group = self._tp_row_reduce_group(p)
+        is_qkv = bool(self.split_qkv and self.is_qkv_fn is not None and self.is_qkv_fn(p))
+        return (tuple(p.shape), partition_dim, id(tp_group), id(reduce_group), is_qkv), (
+            tp_group,
+            reduce_group,
+        )
+
+    def _scaled_ns_batched(self, x: torch.Tensor, batch: dict) -> torch.Tensor:
+        """Batched equivalent of the scaled_orthogonalize_fn closure."""
+        partition_dim = batch["partition_dim"]
+        tp_group = batch["tp_group"]
+        size = [x.size(-2), x.size(-1)]
+        if partition_dim is not None:
+            size[partition_dim] *= get_pg_size(tp_group)
+        orth = _batched_newton_schulz(
+            x,
+            steps=self._num_ns_steps,
+            coefficient_type=self._coefficient_type,
+            tp_group=tp_group,
+            partition_dim=partition_dim,
+            tp_mode=self.tp_mode,
+        )
+        scale_factor = get_muon_scale_factor(size[0], size[1], mode=self._scale_mode)
+        return orth * (scale_factor * self._extra_scale_factor)
+
+    def _orthogonalize_batched(self, update: torch.Tensor, batch: dict) -> torch.Tensor:
+        """Batched equivalent of orthogonalize(): QKV-split aware."""
+        if not batch["is_qkv"]:
+            return self._scaled_ns_batched(update, batch)
+
+        # Mirror orthogonalize()'s fused-QKV handling on the stacked dims:
+        # split each matrix's rows into per-query-group q/k/v blocks,
+        # orthogonalize the three stacks, and reassemble.
+        b, rows, cols = update.shape
+        group_rows = sum(self.qkv_split_shapes)
+        num_query_groups = rows // group_rows
+        qkv = torch.split(
+            update.view(b, num_query_groups, group_rows, cols), self.qkv_split_shapes, dim=2
+        )
+        outs = [
+            self._scaled_ns_batched(part.reshape(b, -1, cols), batch).view(
+                b, num_query_groups, -1, cols
+            )
+            for part in qkv
+        ]
+        return torch.cat(outs, dim=2).view(b, rows, cols)
+
+    @torch.no_grad()  # type: ignore[misc]
+    def step(self, closure: Optional[Callable] = None) -> Optional[float]:
+        """Perform one Muon update; batched across same-shape params if enabled."""
+        if not self.batched_step:
+            return OrthogonalizedOptimizer.step(self, closure)
+
+        loss = None if closure is None else closure()
+        for group in self.param_groups:
+            self._init_group(group)
+            self._step_group_batched(group)
+        return loss
+
+    def _step_group_batched(self, group: dict) -> None:
+        """Batched Muon update: same math as OrthogonalizedOptimizer.step."""
+        lr = group["lr"]
+        momentum = group["momentum"]
+        weight_decay = group["weight_decay"]
+        params = [p for p in group["params"] if p.grad is not None]
+        if not params:
+            return
+        grads = [p.grad for p in params]
+
+        # Weight decay, horizontally fused; the same in-place ops (and
+        # rounding) as WeightDecayMixin._apply_weight_decay_inplace.
+        if weight_decay != 0.0:
+            if self.weight_decay_method == "decoupled":
+                torch._foreach_add_(params, params, alpha=-weight_decay * lr)
+            elif self.weight_decay_method == "independent":
+                torch._foreach_add_(params, params, alpha=-weight_decay)
+            elif self.weight_decay_method == "l2":
+                torch._foreach_add_(grads, params, alpha=weight_decay)
+            else:
+                raise ValueError(f"Invalid weight decay method: {self.weight_decay_method}")
+
+        # Momentum buffer update (EMA convention of the base class).
+        momentum_buffers = [self.state[p]["momentum_buffer"] for p in params]
+        torch._foreach_lerp_(momentum_buffers, grads, 1 - momentum)
+        if self.nesterov:
+            updates = torch._foreach_lerp(grads, momentum_buffers, momentum)
+        else:
+            # Read-only below: torch.stack copies and the NS does not mutate.
+            updates = momentum_buffers
+
+        # Group same-shape params and orthogonalize each stack.
+        batches: Dict[tuple, dict] = {}
+        for i, p in enumerate(params):
+            static_key, (tp_group, _) = self._batch_key_for(p)
+            batch = batches.setdefault(
+                static_key,
+                {"tp_group": tp_group, "partition_dim": static_key[1],
+                 "is_qkv": static_key[4], "indices": []},
+            )
+            batch["indices"].append(i)
+
+        for batch in batches.values():
+            idx = batch["indices"]
+            x = torch.stack([updates[i] for i in idx])
+            with eopt_utils.fp32_matmul_precision(self.fp32_matmul_prec):
+                direction = self._orthogonalize_batched(x, batch)
+            batch_params = [params[i] for i in idx]
+            directions = list(direction.unbind(0))
+            for p, d in zip(batch_params, directions):
+                self.pre_weight_update_fn_inplace(p, d)
+            torch._foreach_add_(batch_params, directions, alpha=-lr)
+            for p in batch_params:
+                self.post_weight_update_fn_inplace(p)
 
 
 class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
@@ -383,17 +565,20 @@ def _angular_muown_u_and_grad_g(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return U and the row gradient dL/dg for W = diag(g) @ U.
 
-    ``grad_g = <grad_W, U>_row`` is a ``dim=1`` reduction across the columns of
+    ``grad_g = <grad_W, U>_row`` is a ``dim=-1`` reduction across the columns of
     each row. Under column tensor-parallel sharding (``partition_dim == 1``)
     each rank only holds a column slice of every row, so this is a *partial*
     sum that the caller must all-reduce across the TP group before it is used
     (both for the Adam-on-``g`` update and for :func:`_angular_muown_grad_u`).
     For row-sharded / replicated / single-GPU weights it is already global.
     The all-reduce is kept out of this ``torch.compile`` region on purpose.
+
+    Accepts a single ``(rows, cols)`` weight or a ``(B, rows, cols)`` stack of
+    same-shape weights (with ``g`` of shape ``(B, rows, 1)``).
     """
     g_safe = torch.copysign(g.abs().clamp_min(ANGULAR_MUOWN_EPS), g)
     u = w / g_safe
-    grad_g = (grad_w * u).sum(dim=1, keepdim=True)
+    grad_g = (grad_w * u).sum(dim=-1, keepdim=True)
     return u, grad_g
 
 
@@ -413,14 +598,15 @@ def _angular_muown_grad_u(
 def _angular_muown_u_step_norm_sq(u_step: torch.Tensor) -> torch.Tensor:
     """Return the per-row squared norm of the proposed ``U`` step.
 
-    This is the ``dim=1`` reduction used by the retraction. It is a partial
+    This is the ``dim=-1`` reduction used by the retraction. It is a partial
     sum-of-squares under column tensor-parallel sharding (``partition_dim == 1``)
     and must be all-reduced across the TP group before the row-normalization in
     :func:`_angular_muown_u_recompose`; otherwise it is already the global
     squared norm. Kept separate from the recompose write so the all-reduce can
-    run outside ``torch.compile``.
+    run outside ``torch.compile``. Accepts ``(rows, cols)`` or a batched
+    ``(B, rows, cols)`` stack.
     """
-    return u_step.pow(2).sum(dim=1, keepdim=True)
+    return u_step.pow(2).sum(dim=-1, keepdim=True)
 
 
 @torch.compile
@@ -439,6 +625,91 @@ def _angular_muown_u_recompose(
     """
     u_step_norm = u_step_norm_sq.sqrt().clamp_min(eps)
     w.copy_(g * (u_step / u_step_norm))
+
+
+def _batched_newton_schulz(
+    x: torch.Tensor,
+    steps: int,
+    coefficient_type: str,
+    tp_group: Optional["torch.distributed.ProcessGroup"] = None,
+    partition_dim: int | None = None,
+    tp_mode: Literal["duplicated", "distributed"] = "duplicated",
+    eps: float = 1e-7,
+) -> torch.Tensor:
+    """Newton-Schulz orthogonalization of a ``(B, m, n)`` stack of same-shape matrices.
+
+    Batched (``bmm``/``baddbmm``) equivalent of ``emerging_optimizers``'
+    ``newton_schulz`` / ``newton_schulz_tp``: each matrix in the stack is
+    orthogonalized independently, with exactly the same per-matrix math
+    (per-matrix Frobenius normalization, the same coefficient sets, bf16
+    compute under ``fp32_matmul_prec="medium"``). ``partition_dim`` refers to
+    the *matrix* dims (0 = rows, 1 = cols), i.e. batch dims ``1``/``2``.
+
+    Collectives are batched: ``duplicated`` mode does one all_gather for the
+    whole stack (instead of one per matrix), ``distributed`` mode one Gram
+    all-reduce per NS step for the whole stack.
+    """
+    if x.ndim != 3:
+        raise ValueError(f"Expected a (B, m, n) stack, got shape {tuple(x.shape)}")
+    if x.dtype != torch.float32:
+        raise ValueError(f"Input stack must be float32, got {x.dtype}")
+    if coefficient_type not in _COEFFICIENT_SETS:
+        raise ValueError(
+            f"Unsupported coefficient type for the batched Newton-Schulz: {coefficient_type!r}"
+        )
+
+    tp_size = get_pg_size(tp_group) if tp_group is not None else 1
+    is_tp = partition_dim is not None and tp_size > 1
+
+    if is_tp and tp_mode == "duplicated":
+        # One all_gather for the whole stack, then reassemble the full
+        # matrices by concatenating rank shards along the sharded matrix dim.
+        shards = [torch.empty_like(x) for _ in range(tp_size)]
+        torch.distributed.all_gather(shards, x.contiguous(), group=tp_group)
+        x = torch.cat(shards, dim=partition_dim + 1)
+
+    # Whiten along the smaller dim (mirrors newton_schulz's transpose choice);
+    # in distributed mode the sharded dim stays sharded, so the choice is
+    # dictated by partition_dim exactly as in newton_schulz_tp.
+    if is_tp and tp_mode == "distributed":
+        transpose = partition_dim == 0
+    else:
+        transpose = x.size(-2) > x.size(-1)
+    if transpose:
+        x = x.mT
+
+    # Per-matrix spectral-norm bound via Frobenius normalization.
+    if is_tp and tp_mode == "distributed":
+        x_sq_sum = (x * x).sum(dim=(-2, -1), keepdim=True)
+        torch.distributed.all_reduce(
+            x_sq_sum, op=torch.distributed.ReduceOp.SUM, group=tp_group
+        )
+        X = x / x_sq_sum.sqrt().clamp_min(eps)
+        ns_group = tp_group
+    else:
+        X = torch.nn.functional.normalize(x, p=2, dim=(-2, -1), eps=eps)  # type: ignore[arg-type]
+        ns_group = None
+
+    if torch.get_float32_matmul_precision() == "medium":
+        X = X.to(torch.bfloat16)
+
+    iter_mode = "cycle" if coefficient_type != "polar_express" else "repeat_last"
+    for a, b, c in get_coefficient_iterator(
+        steps, _COEFFICIENT_SETS[coefficient_type], mode=iter_mode
+    ):
+        A = X @ X.mT
+        if ns_group is not None:
+            torch.distributed.all_reduce(A, op=torch.distributed.ReduceOp.SUM, group=ns_group)
+        B = torch.baddbmm(A, A, A, beta=b, alpha=c)
+        X = torch.baddbmm(X, B, X, beta=a, alpha=1.0)
+
+    X = X.to(torch.float32)
+
+    if transpose:
+        X = X.mT
+    if is_tp and tp_mode == "duplicated":
+        X = X.chunk(tp_size, dim=partition_dim + 1)[get_pg_rank(tp_group)]
+    return X
 
 
 class TensorParallelAngularMuown(TensorParallelMuon):
@@ -523,6 +794,13 @@ class TensorParallelAngularMuown(TensorParallelMuon):
         u_decay_steps: Post-warmup steps over which the ``"cosine"`` schedule
             decays from ``1.0`` to ``u_decay_min_multiplier``.
         u_decay_min_multiplier: Floor of the ``"cosine"`` schedule.
+        batched_step: Stack same-shape parameters and run the update on the
+            whole stack (batched Newton-Schulz via bmm, batched collectives,
+            state gathered/scattered through scratch buffers). Same per-matrix
+            math as the per-parameter path up to floating-point reduction
+            order; dramatically fewer kernel launches, which is what bounds
+            the step with many small (e.g. per-expert) weight matrices.
+            Optimizer state layout is unchanged. Default True.
 
     Row magnitudes whose absolute value would fall below ``ANGULAR_MUOWN_EPS`` are
     projected back to magnitude ``ANGULAR_MUOWN_EPS`` with their proposed sign so the
@@ -562,6 +840,7 @@ class TensorParallelAngularMuown(TensorParallelMuon):
         u_decay_warmup_steps: int = 0,
         u_decay_steps: int | None = None,
         u_decay_min_multiplier: float = 0.0,
+        batched_step: bool = True,
     ) -> None:
         if not 0.0 <= betas[0] < 1.0:
             raise ValueError(f"Invalid beta1: {betas[0]}")
@@ -604,6 +883,7 @@ class TensorParallelAngularMuown(TensorParallelMuon):
             extra_scale_factor=extra_scale_factor,
             pg_collection=pg_collection,
             tp_mode=tp_mode,
+            batched_step=batched_step,
         )
 
         self._u_decay_schedule = u_decay_schedule
@@ -612,6 +892,11 @@ class TensorParallelAngularMuown(TensorParallelMuon):
         self._u_decay_warmup_steps = int(u_decay_warmup_steps)
         self._u_decay_steps = None if u_decay_steps is None else int(u_decay_steps)
         self._u_decay_min_multiplier = float(u_decay_min_multiplier)
+
+        # Scratch buffers for the batched step, keyed by (batch key, batch
+        # size). Pure scratch — fully overwritten every step, never
+        # checkpointed.
+        self._batch_buffers: Dict[tuple, dict] = {}
 
         for group in self.param_groups:
             group.setdefault("betas", betas)
@@ -733,77 +1018,209 @@ class TensorParallelAngularMuown(TensorParallelMuon):
 
         for group in self.param_groups:
             self._init_group(group)
-
-            lr = group["lr"]
-            momentum = group["momentum"]
-            beta1, beta2 = group["betas"]
-            adam_eps = group["adam_eps"]
-            group_kwargs = {k: v for k, v in group.items() if k != "params"}
-
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
-
-                state = self.state[p]
-                state["step"] += 1
-                step = state["step"]
-                g = state["g"]
-                m_u = state["m_u"]
-                m_g = state["m_g"]
-                v_g = state["v_g"]
-
-                # For column-sharded weights (partition_dim == 1) the per-row
-                # (dim=1) reductions below are only partial on this rank and must
-                # be summed across the TP group; None otherwise (already global
-                # or an intentional local-shard variant).
-                reduce_group = self._tp_row_reduce_group(p)
-
-                u, grad_g = _angular_muown_u_and_grad_g(p, g, p.grad)
-                if reduce_group is not None:
-                    torch.distributed.all_reduce(
-                        grad_g, op=torch.distributed.ReduceOp.SUM, group=reduce_group
-                    )
-                grad_u = _angular_muown_grad_u(u, g, p.grad, grad_g)
-
-                # Momentum on the Riemannian U gradient (sum convention, as in
-                # the original AngularMuown, not the EMA convention of the base class).
-                m_u.mul_(momentum).add_(grad_u)
-                if self.nesterov:
-                    update = grad_u.add(m_u, alpha=momentum)
-                else:
-                    update = m_u.clone()
-
-                # Orthogonalize (and scale) via the inherited TP/QKV-aware path.
-                with eopt_utils.fp32_matmul_precision(self.fp32_matmul_prec):
-                    direction = self.orthogonalize(p, update, **group_kwargs)
-
-                # Original AngularMuown evaluated the schedule before incrementing its
-                # global step counter, hence `step - 1`.
-                u_multiplier = self._u_lr_multiplier(step - 1)
-                group["u_lr_multiplier"] = u_multiplier
-                u_step = u.add(direction, alpha=-lr * u_multiplier)
-
-                # Adam update on the row magnitudes g, with sign-preserving
-                # projection away from zero.
-                m_g.mul_(beta1).add_(grad_g, alpha=1 - beta1)
-                v_g.mul_(beta2).addcmul_(grad_g, grad_g, value=1 - beta2)
-                bc1 = 1 - beta1**step
-                bc2 = 1 - beta2**step
-                g_update = (m_g / bc1) / (v_g / bc2).sqrt().add_(adam_eps)
-                g_candidate = g.add(g_update, alpha=-lr)
-                g.copy_(torch.copysign(g_candidate.abs().clamp_min(ANGULAR_MUOWN_EPS), g_candidate))
-
-                # Retraction: row-normalize the proposed U step. The row norm is
-                # a dim=1 reduction, so all-reduce the partial squared norms for
-                # column-sharded weights before the sqrt inside recompose.
-                u_step_norm_sq = _angular_muown_u_step_norm_sq(u_step)
-                if reduce_group is not None:
-                    torch.distributed.all_reduce(
-                        u_step_norm_sq, op=torch.distributed.ReduceOp.SUM, group=reduce_group
-                    )
-                _angular_muown_u_recompose(p, g, u_step, u_step_norm_sq)
+            if self.batched_step:
+                self._step_group_batched(group)
+            else:
+                self._step_group(group)
 
         return None
+
+    def _step_group(self, group: dict) -> None:
+        """Reference per-parameter update (one Newton-Schulz launch per weight)."""
+        lr = group["lr"]
+        momentum = group["momentum"]
+        beta1, beta2 = group["betas"]
+        adam_eps = group["adam_eps"]
+        group_kwargs = {k: v for k, v in group.items() if k != "params"}
+
+        for p in group["params"]:
+            if p.grad is None:
+                continue
+
+            state = self.state[p]
+            state["step"] += 1
+            step = state["step"]
+            g = state["g"]
+            m_u = state["m_u"]
+            m_g = state["m_g"]
+            v_g = state["v_g"]
+
+            # For column-sharded weights (partition_dim == 1) the per-row
+            # (dim=-1) reductions below are only partial on this rank and must
+            # be summed across the TP group; None otherwise (already global
+            # or an intentional local-shard variant).
+            reduce_group = self._tp_row_reduce_group(p)
+
+            u, grad_g = _angular_muown_u_and_grad_g(p, g, p.grad)
+            if reduce_group is not None:
+                torch.distributed.all_reduce(
+                    grad_g, op=torch.distributed.ReduceOp.SUM, group=reduce_group
+                )
+            grad_u = _angular_muown_grad_u(u, g, p.grad, grad_g)
+
+            # Momentum on the Riemannian U gradient (sum convention, as in
+            # the original AngularMuown, not the EMA convention of the base class).
+            m_u.mul_(momentum).add_(grad_u)
+            if self.nesterov:
+                update = grad_u.add(m_u, alpha=momentum)
+            else:
+                update = m_u.clone()
+
+            # Orthogonalize (and scale) via the inherited TP/QKV-aware path.
+            with eopt_utils.fp32_matmul_precision(self.fp32_matmul_prec):
+                direction = self.orthogonalize(p, update, **group_kwargs)
+
+            # Original AngularMuown evaluated the schedule before incrementing its
+            # global step counter, hence `step - 1`.
+            u_multiplier = self._u_lr_multiplier(step - 1)
+            group["u_lr_multiplier"] = u_multiplier
+            u_step = u.add(direction, alpha=-lr * u_multiplier)
+
+            # Adam update on the row magnitudes g, with sign-preserving
+            # projection away from zero.
+            m_g.mul_(beta1).add_(grad_g, alpha=1 - beta1)
+            v_g.mul_(beta2).addcmul_(grad_g, grad_g, value=1 - beta2)
+            bc1 = 1 - beta1**step
+            bc2 = 1 - beta2**step
+            g_update = (m_g / bc1) / (v_g / bc2).sqrt().add_(adam_eps)
+            g_candidate = g.add(g_update, alpha=-lr)
+            g.copy_(torch.copysign(g_candidate.abs().clamp_min(ANGULAR_MUOWN_EPS), g_candidate))
+
+            # Retraction: row-normalize the proposed U step. The row norm is
+            # a dim=-1 reduction, so all-reduce the partial squared norms for
+            # column-sharded weights before the sqrt inside recompose.
+            u_step_norm_sq = _angular_muown_u_step_norm_sq(u_step)
+            if reduce_group is not None:
+                torch.distributed.all_reduce(
+                    u_step_norm_sq, op=torch.distributed.ReduceOp.SUM, group=reduce_group
+                )
+            _angular_muown_u_recompose(p, g, u_step, u_step_norm_sq)
+
+    # ------------------------------------------------------------------
+    # Batched step
+    # ------------------------------------------------------------------
+    #
+    # The reference path above launches ~40 kernels + several torch.compile
+    # dispatches per weight matrix; with hundreds of small (expert) matrices
+    # per rank the optimizer step is completely CPU/launch-bound (measured
+    # ~330 ms CPU dispatch vs ~44 ms GPU work per step on moonlight-1B at
+    # TP1/EP4). The batched path groups same-shape parameters, stacks them
+    # into (B, m, n) scratch buffers with a handful of _foreach_copy_ calls,
+    # and performs the identical per-matrix math on the whole stack (the
+    # Newton-Schulz becomes bmm/baddbmm, collectives are batched). Optimizer
+    # state stays per-parameter (checkpoint layout unchanged); it is gathered
+    # into and scattered back out of the scratch buffers each step. Batch
+    # grouping (_batch_key_for) and the batched orthogonalization
+    # (_orthogonalize_batched / _scaled_ns_batched) are inherited from
+    # TensorParallelMuon.
+
+    def _get_batch_buffers(self, key: tuple, batch_size: int, ref: torch.Tensor) -> dict:
+        """Return (allocating once) the stacked scratch buffers for a batch."""
+        cache_key = (key, batch_size)
+        bufs = self._batch_buffers.get(cache_key)
+        if bufs is None:
+            rows, cols = ref.shape
+
+            def _mk(c):
+                buf = torch.empty((batch_size, rows, c), device=ref.device, dtype=torch.float32)
+                return buf, list(buf.unbind(0))
+
+            bufs = {}
+            for name, c in (("w", cols), ("grad", cols), ("m_u", cols),
+                            ("g", 1), ("m_g", 1), ("v_g", 1)):
+                bufs[name], bufs[name + "_views"] = _mk(c)
+            self._batch_buffers[cache_key] = bufs
+        return bufs
+
+    def _step_group_batched(self, group: dict) -> None:
+        """Batched update: same math as :meth:`_step_group`, one launch per stack."""
+        # Group params by step semantics; the Adam bias corrections and the
+        # u-decay multiplier depend on the state step count, so it is part of
+        # the batch key (in practice all params share the same step).
+        batches: Dict[tuple, dict] = {}
+        for p in group["params"]:
+            if p.grad is None:
+                continue
+            state = self.state[p]
+            state["step"] += 1
+            static_key, (tp_group, reduce_group) = self._batch_key_for(p)
+            key = static_key + (state["step"],)
+            batch = batches.setdefault(
+                key,
+                {"params": [], "static_key": static_key, "tp_group": tp_group,
+                 "reduce_group": reduce_group, "partition_dim": static_key[1],
+                 "is_qkv": static_key[4], "step": state["step"]},
+            )
+            batch["params"].append(p)
+        for batch in batches.values():
+            self._step_batch(group, batch)
+
+    def _step_batch(self, group: dict, batch: dict) -> None:
+        """Run one AngularMuown update on a stack of same-shape parameters."""
+        params = batch["params"]
+        states = [self.state[p] for p in params]
+        reduce_group = batch["reduce_group"]
+        lr = group["lr"]
+        momentum = group["momentum"]
+        beta1, beta2 = group["betas"]
+        adam_eps = group["adam_eps"]
+        step = batch["step"]
+
+        bufs = self._get_batch_buffers(batch["static_key"], len(params), params[0])
+        w_b, grad_b = bufs["w"], bufs["grad"]
+        g_b, m_u_b, m_g_b, v_g_b = bufs["g"], bufs["m_u"], bufs["m_g"], bufs["v_g"]
+
+        # Gather params, grads and state into the stacked scratch buffers.
+        torch._foreach_copy_(bufs["w_views"], [p.detach() for p in params])
+        torch._foreach_copy_(bufs["grad_views"], [p.grad for p in params])
+        torch._foreach_copy_(bufs["g_views"], [s["g"] for s in states])
+        torch._foreach_copy_(bufs["m_u_views"], [s["m_u"] for s in states])
+        torch._foreach_copy_(bufs["m_g_views"], [s["m_g"] for s in states])
+        torch._foreach_copy_(bufs["v_g_views"], [s["v_g"] for s in states])
+
+        u, grad_g = _angular_muown_u_and_grad_g(w_b, g_b, grad_b)
+        if reduce_group is not None:
+            torch.distributed.all_reduce(
+                grad_g, op=torch.distributed.ReduceOp.SUM, group=reduce_group
+            )
+        grad_u = _angular_muown_grad_u(u, g_b, grad_b, grad_g)
+
+        m_u_b.mul_(momentum).add_(grad_u)
+        if self.nesterov:
+            update = grad_u.add(m_u_b, alpha=momentum)
+        else:
+            # No aliasing concern: m_u_b is a scratch copy and the NS below
+            # does not mutate its input.
+            update = m_u_b
+
+        with eopt_utils.fp32_matmul_precision(self.fp32_matmul_prec):
+            direction = self._orthogonalize_batched(update, batch)
+
+        u_multiplier = self._u_lr_multiplier(step - 1)
+        group["u_lr_multiplier"] = u_multiplier
+        u_step = u.add(direction, alpha=-lr * u_multiplier)
+
+        m_g_b.mul_(beta1).add_(grad_g, alpha=1 - beta1)
+        v_g_b.mul_(beta2).addcmul_(grad_g, grad_g, value=1 - beta2)
+        bc1 = 1 - beta1**step
+        bc2 = 1 - beta2**step
+        g_update = (m_g_b / bc1) / (v_g_b / bc2).sqrt().add_(adam_eps)
+        g_candidate = g_b.add(g_update, alpha=-lr)
+        g_b.copy_(torch.copysign(g_candidate.abs().clamp_min(ANGULAR_MUOWN_EPS), g_candidate))
+
+        u_step_norm_sq = _angular_muown_u_step_norm_sq(u_step)
+        if reduce_group is not None:
+            torch.distributed.all_reduce(
+                u_step_norm_sq, op=torch.distributed.ReduceOp.SUM, group=reduce_group
+            )
+        _angular_muown_u_recompose(w_b, g_b, u_step, u_step_norm_sq)
+
+        # Scatter updated weights and state back to the per-param tensors.
+        torch._foreach_copy_([p.detach() for p in params], bufs["w_views"])
+        torch._foreach_copy_([s["g"] for s in states], bufs["g_views"])
+        torch._foreach_copy_([s["m_u"] for s in states], bufs["m_u_views"])
+        torch._foreach_copy_([s["m_g"] for s in states], bufs["m_g_views"])
+        torch._foreach_copy_([s["v_g"] for s in states], bufs["v_g_views"])
 
     def state_dict(self) -> dict:
         """Return a checkpoint-friendly state dict with full-shape per-row states.
@@ -902,6 +1319,10 @@ def _muon_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any
 def _adaptive_muon_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any]:
     """Convert OptimizerConfig to TensorParallelAdaptiveMuon constructor kwargs."""
     kwargs = _muon_config_to_kwargs(config, model_chunks, pg_collection)
+    # AdaptiveMuon steps through the upstream AdaptiveMuon.step, which has no
+    # batched path; drop the Muon-level flag rather than passing it to an
+    # __init__ that does not accept it.
+    kwargs.pop("batched_step", None)
     kwargs.update(_kwargs_from_config(TensorParallelAdaptiveMuon, "adaptive_muon", config))
     return kwargs
 
