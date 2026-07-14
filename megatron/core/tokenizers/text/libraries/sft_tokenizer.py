@@ -166,14 +166,16 @@ class SFTTokenizer:
         if not self._prompt_config.has_system_role and conversation[0]["role"] == "system":
             conversation = conversation[1:]
 
-        tokens = self._tokenizer.apply_chat_template(
-            conversation,
-            tokenize=True,
-            add_generation_prompt=add_generation_prompt,
-            return_assistant_token_mask=False,
-            return_tensors="np",
-            chat_template=self._prompt_config.custom_chat_template,
-        )[0]
+        tokens = np.array(
+            self._tokenizer.apply_chat_template(
+                conversation,
+                tokenize=True,
+                add_generation_prompt=add_generation_prompt,
+                return_assistant_token_mask=False,
+                return_dict=True,
+                chat_template=self._prompt_config.custom_chat_template,
+            )["input_ids"]
+        )
 
         if not return_target:
             return tokens
@@ -195,8 +197,9 @@ class SFTTokenizer:
                 assert conversation[turn_idx - 1]["role"].lower() in ("user", "tool")
 
             turn_tokens = self._tokenizer.apply_chat_template(
-                [turn], tokenize=True, chat_template=self._prompt_config.custom_chat_template
-            )
+                [turn], tokenize=True, return_dict=True,
+                chat_template=self._prompt_config.custom_chat_template
+            )["input_ids"]
 
             # There should be only one BOS at the very beginning.
             # After the first turn, skip BOS token.
