@@ -1,7 +1,8 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import os
 from dataclasses import dataclass
-from typing import Dict, List, Union
+from typing import Dict, List, Optional, Union
 
 import numpy as np
 
@@ -21,6 +22,20 @@ identity_template = """{% for message in messages %}{{ message['content'] }}{% e
 qwen3p5_reasoning_template = """{% for message in messages %}{% if message['role'] == 'system' %}{{ '<|im_start|>system\n' + message['content'] + '<|im_end|>\n' }}{% elif message['role'] == 'user' %}{{ '<|im_start|>user\n' + message['content'] + '<|im_end|>\n' }}{% elif message['role'] == 'assistant' %}{% set content = message['content'] %}{% set reasoning_content = '' %}{% if message.reasoning_content is string %}{% set reasoning_content = message.reasoning_content %}{% elif '</think>' in content %}{% set reasoning_content = content.split('</think>')[0].split('<think>')[-1] %}{% set content = content.split('</think>')[-1].lstrip('\n') %}{% endif %}{{ '<|im_start|>assistant\n<think>\n' + reasoning_content + '\n</think>\n\n' + content + '<|im_end|>\n' }}{% endif %}{% endfor %}"""  # pylint: disable=line-too-long
 qwen3p5_no_reasoning_template = """{% for message in messages %}{% if message['role'] == 'system' %}{{ '<|im_start|>system\n' + message['content'] + '<|im_end|>\n' }}{% elif message['role'] == 'user' %}{{ '<|im_start|>user\n' + message['content'] + '<|im_end|>\n' }}{% elif message['role'] == 'assistant' %}{{ '<|im_start|>assistant\n' + message['content'] + '<|im_end|>\n' }}{% endif %}{% endfor %}"""  # pylint: disable=line-too-long
 # fmt: on
+
+# The qwen3p5-tools template is the official Qwen3.5 chat template augmented with
+# {% generation %} markers so return_assistant_tokens_mask yields the SFT loss mask
+# in a single render. It handles reasoning (<think>) and tool calling (tools= kwarg,
+# assistant.tool_calls, role:tool) in one format. Shipped as a sidecar .jinja file
+# because it is far too large to inline readably.
+_QWEN3P5_TOOLS_TEMPLATE_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "qwen3p5_tools_chat_template.jinja"
+)
+
+
+def _load_qwen3p5_tools_template():
+    with open(_QWEN3P5_TOOLS_TEMPLATE_PATH) as f:
+        return f.read()
 
 
 IGNORE_INDEX = -100
@@ -141,13 +156,30 @@ class SFTTokenizer:
                 has_bos=False,
                 has_system_role=True,
             )
+        elif prompt_format == "qwen3p5-tools":
+            # Qwen 3.5 reasoning + tool-calling format. Uses the official Qwen3.5 chat
+            # template (with {% generation %} markers) which renders reasoning (<think>),
+            # tool schemas (tools= kwarg), assistant tool_calls, and role:tool results.
+            # The assistant loss mask comes from return_assistant_tokens_mask, so the
+            # scalar assistant_prefix_len is unused for this format.
+            self._prompt_config = PromptConfig(
+                assistant_prefix_len=0,
+                pad_token_id=tokenizer.convert_tokens_to_ids("<|endoftext|>"),
+                custom_chat_template=_load_qwen3p5_tools_template(),
+                has_bos=False,
+                has_system_role=True,
+            )
         else:
             raise NotImplementedError("unknown SFT prompt format", prompt_format)
 
         self._prompt_format = prompt_format
 
     def tokenize_conversation(
-        self, conversation: List[Dict], return_target: bool, add_generation_prompt: bool
+        self,
+        conversation: List[Dict],
+        return_target: bool,
+        add_generation_prompt: bool,
+        tools: Optional[List[Dict]] = None,
     ):
         """Convert a conversation to tokens.
 
@@ -161,7 +193,20 @@ class SFTTokenizer:
                 ]
             return_target (bool): Return target tokens with system and assistant masked.
             add_generation_prompt (bool): Add assistant prefix to the end.
+            tools (Optional[List[Dict]]): Tool/function schemas, passed to the chat
+                template's ``tools`` argument. Only used by formats whose template
+                supports tool calling (e.g. "qwen3p5-tools"). ``None`` renders exactly
+                like a conversation with no tools.
         """
+        # The qwen3p5-tools format derives the assistant loss mask from the template's
+        # {% generation %} markers via return_assistant_tokens_mask, because its render
+        # is context-dependent (reasoning history, multi-turn tool grouping) and cannot
+        # be reconstructed by the per-turn re-tokenization path used below.
+        if self._prompt_format == "qwen3p5-tools":
+            return self._tokenize_conversation_with_generation_mask(
+                conversation, return_target, add_generation_prompt, tools
+            )
+
         # Skip system message if the tokenizer doesn't have a system role.
         if not self._prompt_config.has_system_role and conversation[0]["role"] == "system":
             conversation = conversation[1:]
@@ -224,6 +269,48 @@ class SFTTokenizer:
 
         assert idx == len(tokens), f"mismatch in target masking the conversation {conversation}"
 
+        return tokens, target
+
+    def _tokenize_conversation_with_generation_mask(
+        self,
+        conversation: List[Dict],
+        return_target: bool,
+        add_generation_prompt: bool,
+        tools: Optional[List[Dict]] = None,
+    ):
+        """Tokenize using the chat template's {% generation %} markers for masking.
+
+        The loss mask is taken directly from ``return_assistant_tokens_mask`` rather than
+        reconstructed by per-turn re-tokenization. This is required for templates whose
+        rendering depends on full conversation context (Qwen3.5 reasoning history and
+        multi-turn tool grouping).
+        """
+        out = self._tokenizer.apply_chat_template(
+            conversation,
+            tools=tools,
+            tokenize=True,
+            add_generation_prompt=add_generation_prompt,
+            return_assistant_tokens_mask=True,
+            return_dict=True,
+            chat_template=self._prompt_config.custom_chat_template,
+        )
+        tokens = np.array(out["input_ids"])
+
+        if not return_target:
+            return tokens
+
+        assistant_mask = np.array(out["assistant_masks"], dtype=bool)
+        if assistant_mask.shape != tokens.shape:
+            raise ValueError(
+                "assistant_masks shape mismatch: "
+                f"{assistant_mask.shape} vs tokens {tokens.shape}"
+            )
+        if not assistant_mask.any():
+            raise ValueError(
+                f"no assistant tokens found in conversation (empty loss mask): {conversation}"
+            )
+        target = tokens.copy()
+        target[~assistant_mask] = IGNORE_INDEX
         return tokens, target
 
     def text_to_ids(self, text: Union[str, List[Dict]]):
