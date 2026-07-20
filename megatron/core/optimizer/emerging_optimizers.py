@@ -732,10 +732,10 @@ class TensorParallelAngularMuown(TensorParallelMuon):
     ``emerging_optimizers``). The shape-dependent scale is applied inside the
     inherited ``scaled_orthogonalize_fn`` via ``get_muon_scale_factor``:
 
-    - ``scale_mode="spectral"`` (default) gives ``sqrt(max(m, n))``, matching
-      the Muon recipe convention.
-    - ``scale_mode="shape_scaling"`` gives ``sqrt(max(1, m / n))``,
+    - ``scale_mode="shape_scaling"`` (default) gives ``sqrt(max(1, m / n))``,
       the original AngularMuown "ratio" scaling.
+    - ``scale_mode="spectral"`` gives ``sqrt(max(m, n))``, matching
+      the Muon recipe convention.
     - ``scale_mode="spectral"`` with ``extra_scale_factor=0.2`` gives the
       standard Muon ``0.2 * sqrt(max(m, n))`` scaling (original "muon" mode).
 
@@ -830,7 +830,7 @@ class TensorParallelAngularMuown(TensorParallelMuon):
         fp32_matmul_prec: str = "medium",
         coefficient_type: str = "simple",
         num_ns_steps: int = 5,
-        scale_mode: str = "spectral",
+        scale_mode: str = "shape_scaling",
         extra_scale_factor: float = 1.0,
         pg_collection: Optional[ProcessGroupCollection] = None,
         tp_mode: Literal["duplicated", "distributed"] = "duplicated",
