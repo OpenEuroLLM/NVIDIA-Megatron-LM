@@ -605,6 +605,13 @@ class GPTModel(LanguageModule):
             hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
         )
 
+        # Final-logit soft-capping (Gemma 2 style): logits <- c * tanh(logits / c).
+        # Elementwise, so it is applied directly on the local tensor-parallel logit shard and
+        # affects both the returned logits and the loss.
+        if self.config.final_logit_softcapping is not None:
+            c = self.config.final_logit_softcapping
+            logits = c * torch.tanh(logits / c)
+
         # Restore sequence parallel execution to the output layer if necessary.
         if sequence_parallel_override:
             assert (

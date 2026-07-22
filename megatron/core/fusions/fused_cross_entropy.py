@@ -86,7 +86,7 @@ def calculate_gradients(
 
 class _VocabParallelCrossEntropy(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, vocab_parallel_logits, target, tp_group):
+    def forward(ctx, vocab_parallel_logits, target, tp_group, return_logsumexp=False):
         """
         Forward implementation for the cross entropy loss.
         """
@@ -113,27 +113,48 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
             predicted_logits_sum_exp_logits, op=torch.distributed.ReduceOp.SUM, group=tp_group
         )
 
+        # Per-token log-normalizer logZ = log(sum_v exp(logit_v)) = log(sum_exp_logits) + logits_max,
+        # where sum_exp_logits is the second half of the (TP all-reduced) concatenated tensor.
+        logsumexp = None
+        if return_logsumexp:
+            split_val = predicted_logits_sum_exp_logits.size()[0] // 2
+            sum_exp_logits = predicted_logits_sum_exp_logits[split_val:]
+            logsumexp = torch.log(sum_exp_logits) + logits_max
+
         exp_logits, loss = calculate_cross_entropy_loss(exp_logits, predicted_logits_sum_exp_logits)
 
         # Store softmax, target-mask and masked-target for backward pass.
         ctx.save_for_backward(exp_logits, target_mask, masked_target_1d)
 
+        if return_logsumexp:
+            return loss, logsumexp
         return loss
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(ctx, grad_output, grad_logsumexp=None):
         """
         Backward implementation for the cross entropy loss.
         """
         # Retreive tensors from the forward path.
         softmax, target_mask, masked_target_1d = ctx.saved_tensors
 
+        # Gradient contribution of logsumexp (output z-loss): d logZ / d logit = softmax.
+        # Snapshot before calculate_gradients modifies softmax in place.
+        logsumexp_grad = (
+            softmax * grad_logsumexp.unsqueeze(dim=-1) if grad_logsumexp is not None else None
+        )
+
         grad_input = calculate_gradients(softmax, grad_output, target_mask, masked_target_1d)
 
-        return grad_input, None, None
+        if logsumexp_grad is not None:
+            grad_input = grad_input + logsumexp_grad.to(grad_input.dtype)
+
+        return grad_input, None, None, None
 
 
-def fused_vocab_parallel_cross_entropy(vocab_parallel_logits, target, tp_group):
+def fused_vocab_parallel_cross_entropy(
+    vocab_parallel_logits, target, tp_group, return_logsumexp=False
+):
     """
     Performs cross entropy loss when logits are split across tensor parallel ranks
 
@@ -143,6 +164,11 @@ def fused_vocab_parallel_cross_entropy(vocab_parallel_logits, target, tp_group):
 
         target: correct vocab ids of dimseion [sequence_length, micro_batch_size]
         tp_group: the tensor parallel group over which to all reduce
+        return_logsumexp: if True, also return the per-token log-normalizer
+            logsumexp(logits, dim=vocab) of shape [sequence_length, batch_size], differentiable
+            w.r.t. the logits (used by the output z-loss).
 
     """
-    return _VocabParallelCrossEntropy.apply(vocab_parallel_logits, target, tp_group)
+    return _VocabParallelCrossEntropy.apply(
+        vocab_parallel_logits, target, tp_group, return_logsumexp
+    )

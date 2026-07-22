@@ -2222,6 +2222,13 @@ def _add_training_args(parser):
     group.add_argument('--cross-entropy-fusion-impl', type=str, default='native',
                        choices=['native', 'te'],
                        help='Implementation of cross entropy loss calculation.')
+    group.add_argument('--final-logit-softcapping', type=float, default=None,
+                       help='If set, soft-cap the final output-layer (LM head) logits with '
+                       'c * tanh(logits / c) where c is this value (e.g. 30.0 as in Gemma 2).')
+    group.add_argument('--output-z-loss-coeff', type=float, default=None,
+                       help='Scaling coefficient for the output (LM head) z-loss, an auxiliary '
+                       'loss coeff * mean(logsumexp(logits) ** 2) that keeps the softmax '
+                       'log-normalizer near zero for stability. A starting value of 1e-4 is recommended.')
     group.add_argument('--use-flash-attn', action='store_true',
                        help='use FlashAttention implementation of attention. '
                        'https://arxiv.org/abs/2205.14135')

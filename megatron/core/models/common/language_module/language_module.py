@@ -129,6 +129,14 @@ class LanguageModule(MegatronModule):
         """
         # [b s] => [s b]
         labels = labels.transpose(0, 1).contiguous()
+
+        # Output (LM head) z-loss keeps the softmax log-normalizer near zero for stability. We
+        # obtain the per-token log-normalizer logZ from the cross entropy kernel where possible
+        # (no extra all-reduce), except the TE-fused kernel which does not expose it.
+        z_loss_coeff = self.config.output_z_loss_coeff
+        need_z_loss = z_loss_coeff is not None and self.training
+        logsumexp = None
+
         if self.config.cross_entropy_loss_fusion:
             if self.config.cross_entropy_fusion_impl == 'te':
                 if te_parallel_cross_entropy is not None:
@@ -148,15 +156,36 @@ class LanguageModule(MegatronModule):
                             f"or set cuda_graph_scope to a value other than 'full_iteration'."
                         )
 
+                    # TE's fused kernel does not return the log-normalizer, so compute it
+                    # separately (one extra TP all-reduce) only when the z-loss is enabled.
+                    # Done before the TE call in case the kernel mutates logits in place.
+                    if need_z_loss:
+                        logsumexp = tensor_parallel.vocab_parallel_logsumexp(
+                            logits, self.pg_collection.tp
+                        )
+
                     loss = te_parallel_cross_entropy(
                         logits, labels, self.pg_collection.tp, is_cg_capturable
                     )
                 else:
                     raise RuntimeError("Trying to use a TE block when it's not present.")
             elif self.config.cross_entropy_fusion_impl == 'native':
-                loss = fused_vocab_parallel_cross_entropy(logits, labels, self.pg_collection.tp)
+                loss = fused_vocab_parallel_cross_entropy(
+                    logits, labels, self.pg_collection.tp, return_logsumexp=need_z_loss
+                )
+                if need_z_loss:
+                    loss, logsumexp = loss
         else:
-            loss = tensor_parallel.vocab_parallel_cross_entropy(logits, labels)
+            loss = tensor_parallel.vocab_parallel_cross_entropy(
+                logits, labels, return_logsumexp=need_z_loss
+            )
+            if need_z_loss:
+                loss, logsumexp = loss
+
+        # Add the per-token output z-loss so the standard token-mean reduction yields
+        # mean(CE) + coeff * mean(logZ**2).
+        if logsumexp is not None:
+            loss = loss + z_loss_coeff * logsumexp**2
 
         # [s b] => [b, s]
         loss = loss.transpose(0, 1).contiguous()
