@@ -27,6 +27,72 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version, make_tp_sharded_tensor_for_checkpoint
 
 
+class OutputZLossLoggingHelper:
+    """Helper for logging the output (LM head) z-loss separately.
+
+    The output z-loss is a pure gradient regularizer and is deliberately kept out of the
+    reported cross-entropy loss. This tracker exposes it as its own metric, analogous to the
+    MoE router z-loss (``save_to_aux_losses_tracker``) and the MTP loss (``MTPLossLoggingHelper``).
+    The tracked quantity is the coefficient-independent ``mean(logsumexp(logits) ** 2)`` so it
+    directly reflects how close the softmax log-normalizer is to zero.
+    """
+
+    tracker = {}
+
+    @staticmethod
+    def save_loss_to_tracker(
+        loss: Tensor, avg_group: torch.distributed.ProcessGroup = None
+    ) -> None:
+        """Accumulate the (detached) per-microbatch z-loss diagnostic."""
+        tracker = OutputZLossLoggingHelper.tracker
+        if "value" not in tracker:
+            tracker["value"] = torch.zeros(1, device=loss.device)
+        tracker["value"] += loss.detach()
+        tracker["avg_group"] = avg_group
+
+    @staticmethod
+    def clean_loss_in_tracker() -> None:
+        """Reset the tracker after logging."""
+        tracker = OutputZLossLoggingHelper.tracker
+        if "value" in tracker:
+            tracker["value"].zero_()
+        tracker["avg_group"] = None
+
+    @staticmethod
+    def reduce_loss_in_tracker() -> None:
+        """Average the accumulated z-loss across the (data-parallel) group."""
+        tracker = OutputZLossLoggingHelper.tracker
+        if "value" not in tracker:
+            return
+        if tracker.get("avg_group") is not None:
+            torch.distributed.all_reduce(
+                tracker["value"], group=tracker["avg_group"], op=torch.distributed.ReduceOp.AVG
+            )
+
+    @staticmethod
+    def track_metrics(
+        loss_scale: float,
+        iteration: int,
+        writer,
+        wandb_writer=None,
+        total_loss_dict=None,
+        name: str = "output_z_loss",
+    ) -> None:
+        """Reduce, log, and clear the output z-loss. Call once per iteration (all ranks)."""
+        OutputZLossLoggingHelper.reduce_loss_in_tracker()
+        tracker = OutputZLossLoggingHelper.tracker
+        if "value" not in tracker:
+            return
+        loss = (tracker["value"] * loss_scale)[0]
+        if total_loss_dict is not None:
+            total_loss_dict[name] = total_loss_dict.get(name, 0.0) + loss
+        if writer is not None:
+            writer.add_scalar(name, loss, iteration)
+        if wandb_writer is not None:
+            wandb_writer.log({name: loss}, iteration)
+        OutputZLossLoggingHelper.clean_loss_in_tracker()
+
+
 class LanguageModule(MegatronModule):
     """Base language module that has common helper functions used across GPT, BERT etc.
 
@@ -117,12 +183,17 @@ class LanguageModule(MegatronModule):
             check_and_set_env_variable("NVTE_FUSED_ATTN", 1, AttnBackend.auto)
             check_and_set_env_variable("NVTE_UNFUSED_ATTN", 1, AttnBackend.auto)
 
-    def compute_language_model_loss(self, labels: Tensor, logits: Tensor) -> Tensor:
+    def compute_language_model_loss(
+        self, labels: Tensor, logits: Tensor, record_z_loss: bool = True
+    ) -> Tensor:
         """Computes the language model loss (Cross entropy across vocabulary)
 
         Args:
             labels (Tensor): The labels of dimension [batch size, seq length]
             logits (Tensor): The final logits returned by the output layer of the transformer model
+            record_z_loss (bool): Whether to record the output z-loss diagnostic to the logging
+                tracker. Set to False for auxiliary heads (e.g. MTP) so only the main LM head's
+                z-loss is logged. Defaults to True.
 
         Returns:
             Tensor: Loss tensor of dimensions [batch size, sequence_length]
@@ -182,10 +253,25 @@ class LanguageModule(MegatronModule):
             if need_z_loss:
                 loss, logsumexp = loss
 
-        # Add the per-token output z-loss so the standard token-mean reduction yields
-        # mean(CE) + coeff * mean(logZ**2).
+        # Add the output z-loss as a pure gradient regularizer: it must shape the
+        # logit gradients but NOT pollute the reported/monitored cross-entropy loss.
+        # Subtracting its own detached value makes the contribution to the loss VALUE
+        # exactly zero, while the gradient (grad = coeff * 2 * logZ * softmax) is
+        # preserved. So the logged "lm loss" stays pure CE and training dynamics are
+        # unchanged vs. adding the raw term.
         if logsumexp is not None:
-            loss = loss + z_loss_coeff * logsumexp**2
+            z_loss = z_loss_coeff * logsumexp**2
+            loss = loss + (z_loss - z_loss.detach())
+
+            # Log the coefficient-independent diagnostic mean(logZ**2) separately (main head
+            # only), so it is observable without polluting the reported cross-entropy loss.
+            if record_z_loss:
+                OutputZLossLoggingHelper.save_loss_to_tracker(
+                    (logsumexp**2).mean(),
+                    avg_group=parallel_state.get_data_parallel_group(
+                        with_context_parallel=True
+                    ),
+                )
 
         # [s b] => [b, s]
         loss = loss.transpose(0, 1).contiguous()

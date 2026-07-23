@@ -557,7 +557,9 @@ class GPTModel(LanguageModule):
                 loss_mask, num_tokens = roll_tensor(
                     loss_mask, shifts=-1, dims=-1, cp_group=self.cp_group
                 )
-                mtp_loss = self.compute_language_model_loss(mtp_labels, mtp_logits)
+                mtp_loss = self.compute_language_model_loss(
+                    mtp_labels, mtp_logits, record_z_loss=False
+                )
                 mtp_loss = loss_mask * mtp_loss
                 if self.training:
                     # TODO(shifangx): remove the use of parallel_state here
