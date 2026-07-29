@@ -787,6 +787,33 @@ def num_floating_point_operations(
                         * v_dim
                     )
                 )
+            elif args.experimental_attention_variant == "mlstm":
+                # Calculate the FLOPs for the mLSTM attention variant.
+                qk_head_dim = args.linear_key_head_dim
+                v_head_dim = args.linear_value_head_dim
+                num_heads = args.linear_num_value_heads
+                qk_dim = qk_head_dim * num_heads
+                v_dim = v_head_dim * num_heads
+                linear_self_attn_term = (
+                    forward_backward_expansion_factor
+                    * fma_expansion_factor
+                    * (
+                        ## in proj (q, k, v, output gate, i/f gates)
+                        args.hidden_size
+                        * (2 * qk_dim + 2 * v_dim + 2 * num_heads)
+                        ## chunkwise mLSTM cell: inter-chunk state update (k v^T)
+                        ## and state readout (q^T C), plus the causal intra-chunk
+                        ## attention term at chunk size L (~L/2 per token).
+                        + num_heads
+                        * (
+                            2 * qk_head_dim * v_head_dim
+                            + args.mlstm_chunk_size * (qk_head_dim + v_head_dim) // 2
+                        )
+                        ## out proj
+                        + args.hidden_size
+                        * v_dim
+                    )
+                )
             else:
                 raise ValueError(
                     "Invalid experimental_attention_variant: "
