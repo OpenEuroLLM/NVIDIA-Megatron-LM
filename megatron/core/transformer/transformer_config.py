@@ -275,7 +275,7 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # attention variant
     ####################
-    experimental_attention_variant: Optional[Literal['gated_delta_net', 'mlstm', 'dsa']] = None
+    experimental_attention_variant: Optional[Literal['gated_delta_net', 'mlstm', 'mamba', 'dsa']] = None
     """Type of attention variant to use. Currently support gated_delta_net, mlstm and dsa."""
 
     ####################
@@ -333,6 +333,10 @@ class TransformerConfig(ModelParallelConfig):
 
     mlstm_gate_soft_cap: Optional[float] = 15.0
     """Soft cap for the mLSTM input/forget gate preactivations. None disables capping."""
+
+    mlstm_igate_bias_init: float = -10.0
+    """Initial value of the mLSTM input-gate bias (filled across all heads). Larger
+    (less negative) values open the input gate earlier in training."""
 
     ####################
     # initialization

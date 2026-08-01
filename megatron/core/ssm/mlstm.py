@@ -87,7 +87,7 @@ class MLSTM(MegatronModule):
         layer_number: int = None,
         bias: bool = False,
         gate_soft_cap: Optional[float] = None,
-        igate_bias_init: float = -10.0,
+        igate_bias_init: Optional[float] = None,
         fgate_bias_init_range: Tuple[float, float] = (3.0, 6.0),
         pg_collection: ProcessGroupCollection = None,
         name: str | None = None,
@@ -100,7 +100,8 @@ class MLSTM(MegatronModule):
             bias: Whether to use bias in the linear layers.
             gate_soft_cap: Soft cap for the i/f gate preactivations. Defaults to
                 config.mlstm_gate_soft_cap.
-            igate_bias_init: Initial value of the input gate bias.
+            igate_bias_init: Initial value of the input gate bias. Defaults to
+                config.mlstm_igate_bias_init.
             fgate_bias_init_range: (low, high) of the linspace initialization of
                 the forget gate bias across heads.
             pg_collection: The required process groups to use for tensor model parallel.
@@ -117,7 +118,9 @@ class MLSTM(MegatronModule):
 
         self.layer_number = layer_number
         self.bias = bias
-        self.igate_bias_init = igate_bias_init
+        self.igate_bias_init = (
+            igate_bias_init if igate_bias_init is not None else config.mlstm_igate_bias_init
+        )
         self.fgate_bias_init_range = fgate_bias_init_range
         assert pg_collection is not None, "pg_collection must be provided for MLSTM"
         self.pg_collection = pg_collection

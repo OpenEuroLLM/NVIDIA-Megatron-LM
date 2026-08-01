@@ -11,6 +11,9 @@ from megatron.core.config_logger import has_config_logger_enabled, log_config_to
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.extensions.transformer_engine import TELMHeadColumnParallelLinear
 from megatron.core.fp8_utils import is_mxfp8_output_proj_active
+from megatron.core.fusions.liger_fused_linear_cross_entropy import (
+    liger_fused_linear_cross_entropy,
+)
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.common.embeddings import YarnRotaryEmbedding
@@ -729,6 +732,23 @@ class GPTModel(LanguageModule):
                 # then back to [S’, B, H] for the output layer.
                 reshaped = hidden_states.squeeze(1).unsqueeze(0)
                 hidden_states = inference_context.last_token_logits(reshaped).unsqueeze(1)
+
+        if self.config.liger_fused_linear_cross_entropy and labels is not None:
+            # Liger fuses the final projection and CE, processing tokens in
+            # chunks instead of materializing [sequence, batch, vocab] logits.
+            # The GPT output layer is bias-free. Scaling hidden states is
+            # therefore exactly equivalent to applying _scale_logits after it.
+            if self.config.mup_output_mult != 1.0:
+                hidden_states = hidden_states * self.config.mup_output_mult
+            weight = output_weight if output_weight is not None else self.output_layer.weight
+            assert weight is not None
+            return liger_fused_linear_cross_entropy(
+                hidden_states,
+                weight,
+                labels,
+                loss_mask,
+                self.config.liger_fused_linear_cross_entropy_chunk_size,
+            )
 
         logits, _ = self.output_layer(
             hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output

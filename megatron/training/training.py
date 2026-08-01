@@ -814,6 +814,35 @@ def num_floating_point_operations(
                         * v_dim
                     )
                 )
+            elif args.experimental_attention_variant == "mamba":
+                # Approximate FLOPs for the Mamba2 (SSD) mixer. Only affects the
+                # reported architecture-aware TFLOP/s (throughput logging), not
+                # training; compare Tok/s/GPU across architectures.
+                headdim = args.mamba_head_dim
+                d_state = args.mamba_state_dim
+                ngroups = args.mamba_num_groups
+                if args.mamba_num_heads is not None:
+                    nheads = args.mamba_num_heads
+                    d_inner = nheads * headdim
+                else:
+                    d_inner = 2 * args.hidden_size  # expand=2 default
+                    nheads = d_inner // headdim
+                d_conv = 4  # MambaMixer default causal-conv width
+                linear_self_attn_term = (
+                    forward_backward_expansion_factor
+                    * fma_expansion_factor
+                    * (
+                        ## in proj (z, x, B, C, dt)
+                        args.hidden_size
+                        * (2 * d_inner + 2 * ngroups * d_state + nheads)
+                        ## conv1d over x, B, C channels
+                        + d_conv * (d_inner + 2 * ngroups * d_state)
+                        ## SSD scan: chunk state update (B x^T) and readout (C h)
+                        + nheads * headdim * d_state * 4
+                        ## out proj
+                        + args.hidden_size * d_inner
+                    )
+                )
             else:
                 raise ValueError(
                     "Invalid experimental_attention_variant: "
