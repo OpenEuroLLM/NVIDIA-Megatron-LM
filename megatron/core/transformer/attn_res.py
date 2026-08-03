@@ -144,17 +144,33 @@ class BlockAttnRes(nn.Module):
         Returns:
             The attended hidden state, ``[s, b, d]``.
         """
-        # V: [k, s, b, d]
-        v = torch.stack(sources, dim=0)
-        # Keys are RMSNormed values (paper Eq. 3): prevents large-magnitude blocks
-        # from dominating the attention weights purely by scale.
-        v_f = v.float()
-        k = v_f * torch.rsqrt(v_f.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-        k = k * self.key_norm_weight.float()
-        # logits[k,s,b] = <q, k>; softmax over the depth axis.
-        logits = torch.einsum("d,ksbd->ksb", self.query.float(), k)
-        weights = torch.softmax(logits, dim=0)
-        return torch.einsum("ksb,ksbd->sbd", weights, v_f).to(v.dtype)
+        # Deliberately never materialize a [k, s, b, d] stack. Doing so copies
+        # k * s * b * d elements on every call, and this runs twice per layer --
+        # at k=9, s=4096, b=16, d=576 that is ~680 MB per call. Instead compute
+        # each source's logit separately (each only [s, b]) and accumulate the
+        # weighted sum in place, so peak extra memory is one [s, b, d] buffer.
+        query = self.query.float()
+        gain = self.key_norm_weight.float()
+
+        logits = []
+        for v in sources:
+            v_f = v.float()
+            # Keys are RMSNormed values (paper Eq. 3): stops large-magnitude
+            # blocks from dominating the weights purely by scale.
+            k = v_f * torch.rsqrt(v_f.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+            logits.append(torch.einsum("sbd,d->sb", k, query * gain))
+
+        # Softmax over depth. The stack here is over [s, b] scalars only.
+        weights = torch.softmax(torch.stack(logits, dim=0), dim=0)
+
+        # Out-of-place accumulation: `add` saves nothing for backward, so the
+        # intermediates are freed as we go and peak memory stays at ~2 buffers.
+        # (An in-place addcmul_ would be marginally cheaper but bumps the
+        # autograd version counter on a tensor still owned by the graph.)
+        out = sources[0].float() * weights[0].unsqueeze(-1)
+        for i in range(1, len(sources)):
+            out = out + sources[i].float() * weights[i].unsqueeze(-1)
+        return out.to(sources[0].dtype)
 
 
 def accumulate_block(

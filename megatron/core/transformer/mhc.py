@@ -235,10 +235,21 @@ class MHCMixer(nn.Module):
         Returns:
             The updated stream state, ``[s, b, n, C]``.
         """
-        mixed = torch.einsum("sbij,sbjc->sbic", h_res.to(streams.dtype), streams)
+        s, b, n, c = streams.shape
         contribution = h_post.to(streams.dtype).unsqueeze(-1) * sublayer_out.unsqueeze(-2)
         if lerp is None:
-            return mixed + contribution
+            # Fuse the stream mix and the write-back into one batched GEMM:
+            # baddbmm computes contribution + h_res @ streams in a single pass,
+            # avoiding a separate full [s, b, n, C] `mixed` tensor and the extra
+            # read/write it costs. mHC is bandwidth-bound in exactly this term
+            # (paper Table 2: I/O grows with n), so removing one traversal of the
+            # widened residual is the cheapest available win.
+            return torch.baddbmm(
+                contribution.reshape(s * b, n, c),
+                h_res.to(streams.dtype).reshape(s * b, n, n),
+                streams.reshape(s * b, n, c),
+            ).view(s, b, n, c)
+        mixed = torch.einsum("sbij,sbjc->sbic", h_res.to(streams.dtype), streams)
         # nGPT composition: the doubly stochastic mix is a *convex combination* of
         # the streams, so even when every input stream is unit norm the mixed
         # result is shorter (equality only when the streams are identical).
