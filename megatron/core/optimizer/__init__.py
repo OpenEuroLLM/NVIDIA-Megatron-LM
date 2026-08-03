@@ -1023,6 +1023,20 @@ def _maybe_attach_weight_normalizer(
 
     unwrapped_step = optimizer.step
 
+    def _sync_normalized_weights_to_main_params() -> None:
+        """Push the normalization into the optimizer's master copies.
+
+        Mixed-precision and distributed optimizers keep fp32 master weights and
+        copy them *into* the model parameters during ``step``. Normalizing only
+        the model parameters afterwards would therefore be undone on the very
+        next step, when the un-normalized masters are copied over again. Copy the
+        normalized values back so the constraint actually persists.
+        """
+        for opt in getattr(optimizer, "chained_optimizers", [optimizer]):
+            copy_fn = getattr(opt, "_copy_model_params_to_main_params", None)
+            if copy_fn is not None:
+                copy_fn()
+
     @wraps(unwrapped_step)
     def step_with_weight_norm(*args: Any, **kwargs: Any) -> Any:
         result = unwrapped_step(*args, **kwargs)
@@ -1031,6 +1045,7 @@ def _maybe_attach_weight_normalizer(
         success = result[0] if isinstance(result, tuple) and len(result) > 0 else True
         if success:
             normalizer.normalize_weights()
+            _sync_normalized_weights_to_main_params()
         return result
 
     optimizer.step = step_with_weight_norm  # type: ignore[method-assign]
