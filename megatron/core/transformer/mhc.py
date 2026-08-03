@@ -47,8 +47,9 @@ import torch.nn.functional as F
 from torch import nn
 
 
-@torch.jit.script
-def sinkhorn_knopp(logits: torch.Tensor, num_iters: int = 20, eps: float = 1e-8) -> torch.Tensor:
+def _sinkhorn_knopp_impl(
+    logits: torch.Tensor, num_iters: int = 20, eps: float = 1e-8
+) -> torch.Tensor:
     """Project a matrix onto the Birkhoff polytope via Sinkhorn-Knopp.
 
     Follows paper Eq. 9: exponentiate to make every entry positive, then
@@ -82,6 +83,41 @@ def sinkhorn_knopp(logits: torch.Tensor, num_iters: int = 20, eps: float = 1e-8)
         m = m / m.sum(dim=-2, keepdim=True).clamp(min=eps)  # columns sum to 1
         m = m / m.sum(dim=-1, keepdim=True).clamp(min=eps)  # rows sum to 1
     return m
+
+
+# The loop is the hot spot: each sweep is ~4 memory-bound elementwise passes over
+# an [s, b, n, n] tensor, so 8 sweeps is ~32 separate kernels per sublayer and
+# ~1150 per forward at 18 layers. Compiling unrolls the loop and fuses it into a
+# handful of kernels, which is the difference between mHC being launch-bound and
+# not. Falls back to eager if Inductor is unavailable (e.g. no libcuda on the
+# compile path), so this can never break a run.
+_sinkhorn_compiled = None
+
+
+def sinkhorn_knopp(logits: torch.Tensor, num_iters: int = 20, eps: float = 1e-8) -> torch.Tensor:
+    """Project a matrix onto the Birkhoff polytope, fusing the Sinkhorn sweeps.
+
+    Thin wrapper over :func:`_sinkhorn_knopp_impl` that compiles it on first use.
+
+    Args:
+        logits: Tensor of shape ``[..., n, n]`` holding the unconstrained scores.
+        num_iters: Number of alternating normalization sweeps.
+        eps: Numerical floor for the divisions.
+
+    Returns:
+        A row-stochastic, approximately doubly stochastic tensor, in fp32.
+    """
+    global _sinkhorn_compiled
+    if _sinkhorn_compiled is None:
+        try:
+            _sinkhorn_compiled = torch.compile(_sinkhorn_knopp_impl, dynamic=False)
+        except Exception:  # pragma: no cover - depends on the runtime
+            _sinkhorn_compiled = _sinkhorn_knopp_impl
+    try:
+        return _sinkhorn_compiled(logits, num_iters, eps)
+    except Exception:  # pragma: no cover - Inductor/Triton unavailable at runtime
+        _sinkhorn_compiled = _sinkhorn_knopp_impl
+        return _sinkhorn_knopp_impl(logits, num_iters, eps)
 
 
 class MHCMixer(nn.Module):
