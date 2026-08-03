@@ -4165,10 +4165,15 @@ def evaluate_and_print_results(
                     writer.add_scalar(
                         '{} validation{} ppl vs samples'.format(key, suffix), ppl, args.consumed_train_samples
                     )
-                if wandb_writer and is_last_rank():
-                    wandb_writer.log(
-                        {'{} validation{}'.format(key, suffix): total_loss_dict[key].item()}, iteration
-                    )
+            # Log validation metrics to W&B independently of the tensorboard
+            # writer: eval-only (skip_train) runs pass write_to_tensorboard=False
+            # -> writer=None, so nesting this under `if writer:` dropped all W&B
+            # val logging for eval-only jobs. Also record PPL.
+            if wandb_writer and is_last_rank():
+                wandb_writer.log(
+                    {'{} validation{}'.format(key, suffix): total_loss_dict[key].item(),
+                     '{} validation{} ppl'.format(key, suffix): ppl}, iteration
+                )
 
         if process_non_loss_data_func is not None and writer and is_last_rank():
             process_non_loss_data_func(collected_non_loss_data, iteration, writer)
