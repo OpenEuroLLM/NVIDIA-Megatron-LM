@@ -459,6 +459,45 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 self.config.ngpt_post_layer_norm_ffn,
             )
 
+        # [Module 9c: depth-wise residual schemes]
+        # mHC widens the residual into n streams mixed by a doubly stochastic
+        # matrix; Block AttnRes replaces the residual with softmax attention over
+        # block summaries. Both need state threaded across layers, which the
+        # enclosing TransformerBlock owns and stashes on `_depth_state` before
+        # each layer call. Mutually exclusive; both default off.
+        self.mhc_attn_mixer = None
+        self.mhc_mlp_mixer = None
+        self.attnres_attn = None
+        self.attnres_mlp = None
+        self._depth_state = None
+        if getattr(self.config, "mhc", False):
+            from megatron.core.transformer.mhc import MHCMixer
+
+            def _make_mixer() -> "MHCMixer":
+                return MHCMixer(
+                    hidden_size=self.config.hidden_size,
+                    expansion_rate=self.config.mhc_expansion_rate,
+                    num_sinkhorn_iters=self.config.mhc_sinkhorn_iters,
+                    alpha_init=self.config.mhc_alpha_init,
+                    res_init=self.config.mhc_res_init,
+                    eps=self.config.layernorm_epsilon,
+                )
+
+            self.mhc_attn_mixer = _make_mixer()
+            self.mhc_mlp_mixer = _make_mixer()
+        elif getattr(self.config, "attn_res", False):
+            from megatron.core.transformer.attn_res import BlockAttnRes
+
+            def _make_attnres() -> "BlockAttnRes":
+                return BlockAttnRes(
+                    hidden_size=self.config.hidden_size,
+                    eps=self.config.layernorm_epsilon,
+                    query_init_std=self.config.attn_res_query_init_std,
+                )
+
+            self.attnres_attn = _make_attnres()
+            self.attnres_mlp = _make_attnres()
+
         self.is_moe_layer = isinstance(self.mlp, MoELayer)
 
         self.recompute_input_layernorm = False
@@ -643,6 +682,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
+        # Depth-wise residual schemes derive this sublayer's input from the shared
+        # state (stream read-out for mHC, depth attention for Block AttnRes)
+        # rather than from the incoming hidden_states.
+        if self._depth_enabled():
+            hidden_states = self._depth_read("attn")
+
         # Optional Input Layer norm
         if self.recompute_input_layernorm:
             self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
@@ -708,6 +753,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             # The remaining residual add is already handled inside the
             # self attention module.
             hidden_states = attention_output_with_bias[0]
+        elif self._depth_enabled():
+            # mHC / Block AttnRes own the residual bookkeeping entirely.
+            hidden_states = self._depth_write("attn", attention_output_with_bias)
         elif self.ngpt_attn_residual is not None:
             # nGPT: LERP toward the normalized attention output instead of adding it.
             hidden_states = self._ngpt_residual(
@@ -780,6 +828,82 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
         return output, context
 
+    def _depth_enabled(self) -> bool:
+        """True when a depth-wise residual scheme (mHC / Block AttnRes) is active."""
+        return self._depth_state is not None and (
+            self.mhc_attn_mixer is not None or self.attnres_attn is not None
+        )
+
+    def _depth_read(self, kind: str) -> Tensor:
+        """Produce this sublayer's input from the depth-wise state.
+
+        For mHC this is the ``H_pre``-weighted read-out of the ``n`` streams; for
+        Block AttnRes it is softmax attention over the block representations.
+
+        Args:
+            kind: ``"attn"`` or ``"mlp"``.
+
+        Returns:
+            A ``[s, b, h]`` tensor to feed into the sublayer's input norm.
+        """
+        state = self._depth_state
+        if self.mhc_attn_mixer is not None:
+            mixer = self.mhc_attn_mixer if kind == "attn" else self.mhc_mlp_mixer
+            h_pre, h_post, h_res = mixer(state.streams)
+            # Stash the coefficients: they are computed from the pre-update stream
+            # state and are reused by the matching _depth_write.
+            state.pending = (mixer, h_pre, h_post, h_res)
+            return mixer.read(state.streams, h_pre)
+        module = self.attnres_attn if kind == "attn" else self.attnres_mlp
+        return module(state.sources())
+
+    def _depth_write(self, kind: str, output_with_bias) -> Tensor:
+        """Fold a sublayer output back into the depth-wise state.
+
+        Args:
+            kind: ``"attn"`` or ``"mlp"``.
+            output_with_bias: ``(output, bias)`` tuple from the sublayer.
+
+        Returns:
+            A ``[s, b, h]`` tensor representing the current hidden state, so the
+            rest of the layer (and the block) sees the usual contract.
+        """
+        from megatron.core.transformer.attn_res import accumulate_block
+        from megatron.core.transformer.mhc import collapse_streams
+
+        if isinstance(output_with_bias, tuple):
+            out, bias = output_with_bias[0], output_with_bias[1]
+        else:
+            out, bias = output_with_bias, None
+        if bias is not None:
+            out = out + bias
+
+        state = self._depth_state
+        # Only compose with the nGPT LERP when explicitly requested for this
+        # scheme; otherwise use the paper's plain additive accumulation.
+        use_lerp = (
+            self.config.mhc_lerp if self.mhc_attn_mixer is not None else (self.config.attn_res_lerp)
+        )
+        lerp = None
+        if use_lerp:
+            lerp = self.ngpt_attn_residual if kind == "attn" else self.ngpt_mlp_residual
+            if lerp is None:
+                raise ValueError(
+                    "mhc_lerp / attn_res_lerp require ngpt=True so the LERP residual "
+                    "modules exist."
+                )
+
+        if self.mhc_attn_mixer is not None:
+            mixer, _h_pre, h_post, h_res = state.pending
+            state.streams = mixer.write(state.streams, out, h_post, h_res, lerp=lerp)
+            state.pending = None
+            return collapse_streams(state.streams)
+
+        accumulate_block(state, out, lerp=lerp)
+        if kind == "mlp" and state.should_seal(self.layer_number):
+            state.seal_block()
+        return state.partial if state.partial is not None else out
+
     def _ngpt_residual(self, residual_module, output_with_bias, residual: Tensor) -> Tensor:
         """Apply an nGPT LERP residual update in place of bias-dropout-add.
 
@@ -843,6 +967,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].
         """
+
+        # Depth-wise residual schemes derive the MLP input from the shared state.
+        if self._depth_enabled():
+            hidden_states = self._depth_read("mlp")
 
         # Optional Layer norm post the cross-attention.
         pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(hidden_states)
@@ -988,6 +1116,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             # The remaining residual add is already handled inside the
             # MLP module.
             hidden_states = mlp_output_with_bias[0]
+        elif self._depth_enabled():
+            # mHC / Block AttnRes own the residual bookkeeping entirely.
+            hidden_states = self._depth_write("mlp", mlp_output_with_bias)
         elif self.ngpt_mlp_residual is not None:
             # nGPT: LERP toward the normalized MLP output instead of adding it.
             hidden_states = self._ngpt_residual(
