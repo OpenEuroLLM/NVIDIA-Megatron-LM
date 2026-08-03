@@ -791,6 +791,68 @@ def num_floating_point_operations(
                         * v_dim
                     )
                 )
+            elif args.experimental_attention_variant == "mlstm":
+                # Calculate the FLOPs for the mLSTM attention variant.
+                qk_head_dim = args.linear_key_head_dim
+                v_head_dim = args.linear_value_head_dim
+                num_heads = args.linear_num_value_heads
+                qk_dim = qk_head_dim * num_heads
+                v_dim = v_head_dim * num_heads
+                linear_self_attn_term = (
+                    forward_backward_expansion_factor
+                    * fma_expansion_factor
+                    * (
+                        ## in proj (q, k, v, output gate, i/f gates)
+                        args.hidden_size
+                        * (2 * qk_dim + 2 * v_dim + 2 * num_heads)
+                        ## optional short depthwise causal conv over q,k,v
+                        + (
+                            args.linear_conv_kernel_dim * (2 * qk_dim + v_dim)
+                            if getattr(args, "mlstm_conv1d", False)
+                            else 0
+                        )
+                        ## chunkwise mLSTM cell: inter-chunk state update (k v^T)
+                        ## and state readout (q^T C), plus the causal intra-chunk
+                        ## attention term at chunk size L (~L/2 per token).
+                        + num_heads
+                        * (
+                            2 * qk_head_dim * v_head_dim
+                            + args.mlstm_chunk_size * (qk_head_dim + v_head_dim) // 2
+                        )
+                        ## out proj
+                        + args.hidden_size
+                        * v_dim
+                    )
+                )
+            elif args.experimental_attention_variant == "mamba":
+                # Approximate FLOPs for the Mamba2 (SSD) mixer. Only affects the
+                # reported architecture-aware TFLOP/s (throughput logging), not
+                # training; compare Tok/s/GPU across architectures.
+                headdim = args.mamba_head_dim
+                d_state = args.mamba_state_dim
+                ngroups = args.mamba_num_groups
+                if args.mamba_num_heads is not None:
+                    nheads = args.mamba_num_heads
+                    d_inner = nheads * headdim
+                else:
+                    d_inner = 2 * args.hidden_size  # expand=2 default
+                    nheads = d_inner // headdim
+                d_conv = 4  # MambaMixer default causal-conv width
+                linear_self_attn_term = (
+                    forward_backward_expansion_factor
+                    * fma_expansion_factor
+                    * (
+                        ## in proj (z, x, B, C, dt)
+                        args.hidden_size
+                        * (2 * d_inner + 2 * ngroups * d_state + nheads)
+                        ## conv1d over x, B, C channels
+                        + d_conv * (d_inner + 2 * ngroups * d_state)
+                        ## SSD scan: chunk state update (B x^T) and readout (C h)
+                        + nheads * headdim * d_state * 4
+                        ## out proj
+                        + args.hidden_size * d_inner
+                    )
+                )
             else:
                 raise ValueError(
                     "Invalid experimental_attention_variant: "
@@ -4115,10 +4177,15 @@ def evaluate_and_print_results(
                     writer.add_scalar(
                         '{} validation{} ppl vs samples'.format(key, suffix), ppl, args.consumed_train_samples
                     )
-                if wandb_writer and is_last_rank():
-                    wandb_writer.log(
-                        {'{} validation{}'.format(key, suffix): total_loss_dict[key].item()}, iteration
-                    )
+            # Log validation metrics to W&B independently of the tensorboard
+            # writer: eval-only (skip_train) runs pass write_to_tensorboard=False
+            # -> writer=None, so nesting this under `if writer:` dropped all W&B
+            # val logging for eval-only jobs. Also record PPL.
+            if wandb_writer and is_last_rank():
+                wandb_writer.log(
+                    {'{} validation{}'.format(key, suffix): total_loss_dict[key].item(),
+                     '{} validation{} ppl'.format(key, suffix): ppl}, iteration
+                )
 
         if process_non_loss_data_func is not None and writer and is_last_rank():
             process_non_loss_data_func(collected_non_loss_data, iteration, writer)

@@ -240,6 +240,22 @@ class ModelParallelConfig:
        from Transformer Engine library is used. Defaults to 'native'.
     """
 
+    liger_fused_linear_cross_entropy: bool = False
+    """Fuse the LM-head projection with Liger-Kernel's chunked cross entropy.
+
+       This avoids materializing full-vocabulary logits, but currently supports
+       only tensor model parallel size one because Liger's implementation is not
+       vocabulary parallel.
+    """
+
+    liger_fused_linear_cross_entropy_chunk_size: int | None = None
+    """Optional power-of-two token chunk size for Liger fused LM-head CE.
+
+       ``None`` preserves Liger's conservative automatic chunking. A larger
+       chunk uses more temporary logits memory but reduces LM-head GEMM and
+       weight-gradient-accumulation launches.
+    """
+
     tp_comm_overlap_disable_qkv: bool = False
     """
        If true, the AllGather -> Gemm overlap for QKV gets disabled
@@ -435,6 +451,22 @@ class ModelParallelConfig:
                 "Use cross_entropy_fusion_impl='native', or disable cross_entropy_loss_fusion.",
                 UserWarning,
                 stacklevel=2,
+            )
+
+        if self.liger_fused_linear_cross_entropy:
+            assert self.tensor_model_parallel_size == 1, (
+                "Liger fused linear cross entropy currently requires "
+                "tensor_model_parallel_size=1; it does not implement a "
+                "vocabulary-parallel softmax."
+            )
+        if self.liger_fused_linear_cross_entropy_chunk_size is not None:
+            assert self.liger_fused_linear_cross_entropy, (
+                "liger_fused_linear_cross_entropy_chunk_size requires "
+                "liger_fused_linear_cross_entropy=True"
+            )
+            chunk_size = self.liger_fused_linear_cross_entropy_chunk_size
+            assert chunk_size > 0 and not (chunk_size & (chunk_size - 1)), (
+                "Liger fused LM-head chunk size must be a positive power of two"
             )
 
         if self.defer_embedding_wgrad_compute and self.pipeline_model_parallel_size == 1:

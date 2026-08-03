@@ -329,6 +329,16 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
             init_process_group_kwargs['backend'] = 'fake'
             init_process_group_kwargs['store'] = store
 
+        # Bind the default process group to this rank's GPU. device_id is
+        # computed above but was NOT forwarded to init_process_group in this MLM
+        # version, so subgroups created later (e.g. the distributed-optimizer
+        # checkpoint save's dp_reshardable gather) guess the device from GLOBAL
+        # rank and target non-existent GPUs on multi-node -> "NCCL Error 3:
+        # internal error" during checkpoint save. Passing device_id binds the
+        # device for the default PG and all inherited subgroups.
+        if not args.fake_process_group and device_id is not None:
+            init_process_group_kwargs['device_id'] = device_id
+
         torch.distributed.init_process_group(**init_process_group_kwargs)
         inprocess_restart.maybe_force_nccl_backend_init(device_id)
 

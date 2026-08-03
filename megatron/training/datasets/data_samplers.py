@@ -3,6 +3,7 @@
 """Dataloaders."""
 
 
+import os
 import random
 
 import numpy as np
@@ -102,6 +103,14 @@ def build_pretraining_data_loader(dataset, consumed_samples):
         extra_kwargs = {"collate_fn": lambda x: x,}
     else:
         extra_kwargs = {}
+    # Optional deeper per-worker prefetch buffer to hide slow shared-FS (GPFS)
+    # mmap read latency, which otherwise stalls the (CUDA-graph) training step
+    # waiting for the next batch. Env-driven so it syncs via PYTHONPATH with no
+    # container rebuild; unset keeps torch's default prefetch_factor=2.
+    if args.num_workers > 0:
+        _pf = os.environ.get("MEGATRON_DATALOADER_PREFETCH_FACTOR")
+        if _pf:
+            extra_kwargs["prefetch_factor"] = int(_pf)
     return torch.utils.data.DataLoader(
         dataset,
         batch_sampler=batch_sampler,

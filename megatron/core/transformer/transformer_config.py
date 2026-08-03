@@ -275,8 +275,8 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # attention variant
     ####################
-    experimental_attention_variant: Optional[Literal['gated_delta_net', 'dsa']] = None
-    """Type of attention variant to use. Currently support gated_delta_net and dsa."""
+    experimental_attention_variant: Optional[Literal['gated_delta_net', 'mlstm', 'mamba', 'dsa']] = None
+    """Type of attention variant to use. Currently support gated_delta_net, mlstm and dsa."""
 
     ####################
     # DSA
@@ -321,6 +321,27 @@ class TransformerConfig(ModelParallelConfig):
 
     linear_num_value_heads: Optional[int] = 32
     """Number of value and gate heads for the gated delta net."""
+
+    ####################
+    # mLSTM
+    ####################
+    mlstm_backend: str = 'chunkwise--triton_xl_chunk'
+    """mlstm_kernels sequence kernel used by the mLSTM attention variant."""
+
+    mlstm_chunk_size: int = 128
+    """Chunk size of the chunkwise-parallel mLSTM kernel. 128 is the fastest on H100/H200."""
+
+    mlstm_gate_soft_cap: Optional[float] = 15.0
+    """Soft cap for the mLSTM input/forget gate preactivations. None disables capping."""
+
+    mlstm_igate_bias_init: float = -10.0
+    """Initial value of the mLSTM input-gate bias (filled across all heads). Larger
+    (less negative) values open the input gate earlier in training."""
+
+    mlstm_conv1d: bool = False
+    """Apply a short depthwise causal conv over q,k,v before the mLSTM cell
+    (xLSTM conv branch / GatedDeltaNet-style, via FLA causal_conv1d). Kernel
+    width is taken from ``linear_conv_kernel_dim``."""
 
     ####################
     # initialization
@@ -1347,6 +1368,26 @@ class TransformerConfig(ModelParallelConfig):
                 f"{self.linear_num_key_heads=} must be a multiple of "
                 f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
             )
+            assert self.linear_num_value_heads % tp_cp_size == 0, (
+                f"{self.linear_num_value_heads=} must be a multiple of "
+                f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
+            )
+        elif self.experimental_attention_variant == "mlstm":
+            assert (
+                self.linear_attention_freq is not None
+            ), "linear_attention_freq must be set for the mlstm attention variant."
+            assert (
+                self.linear_key_head_dim is not None
+            ), "linear_key_head_dim must be set for mlstm."
+            assert (
+                self.linear_value_head_dim is not None
+            ), "linear_value_head_dim must be set for mlstm."
+            assert self.linear_num_key_heads == self.linear_num_value_heads, (
+                f"mlstm requires linear_num_key_heads ({self.linear_num_key_heads}) == "
+                f"linear_num_value_heads ({self.linear_num_value_heads}); the mLSTM kernels "
+                "have no grouped-query mode."
+            )
+            tp_cp_size = self.tensor_model_parallel_size * self.context_parallel_size
             assert self.linear_num_value_heads % tp_cp_size == 0, (
                 f"{self.linear_num_value_heads=} must be a multiple of "
                 f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
