@@ -429,6 +429,36 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # [Module 9: BiasDropoutFusion]
         self.mlp_bda = build_module(submodules.mlp_bda)
 
+        # [Module 9b: nGPT LERP residual]
+        # When enabled, the additive residual (bias-dropout-add) is replaced by a
+        # linear interpolation toward the L2-normalized sublayer output, keeping
+        # the residual stream on the unit hypersphere. Disabled => None => the
+        # standard bias-dropout-add path runs unchanged.
+        self.ngpt_attn_residual = None
+        self.ngpt_mlp_residual = None
+        if getattr(self.config, "ngpt", False):
+            from megatron.core.transformer.ngpt import NGPTResidual
+
+            def _make_residual(lerp_mode: str, post_layer_norm: bool) -> NGPTResidual:
+                return NGPTResidual(
+                    hidden_size=self.config.hidden_size,
+                    alpha_init_value=self.config.ngpt_alpha_init_value,
+                    base_scale=self.config.ngpt_base_scale,
+                    alpha_activation=self.config.ngpt_alpha_activation,
+                    lerp_normalization=lerp_mode,
+                    post_layer_norm=post_layer_norm,
+                    eps=self.config.layernorm_epsilon,
+                )
+
+            self.ngpt_attn_residual = _make_residual(
+                self.config.ngpt_lerp_normalization_attn or self.config.ngpt_lerp_normalization,
+                self.config.ngpt_post_layer_norm_attn,
+            )
+            self.ngpt_mlp_residual = _make_residual(
+                self.config.ngpt_lerp_normalization_ffn or self.config.ngpt_lerp_normalization,
+                self.config.ngpt_post_layer_norm_ffn,
+            )
+
         self.is_moe_layer = isinstance(self.mlp, MoELayer)
 
         self.recompute_input_layernorm = False
@@ -678,6 +708,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             # The remaining residual add is already handled inside the
             # self attention module.
             hidden_states = attention_output_with_bias[0]
+        elif self.ngpt_attn_residual is not None:
+            # nGPT: LERP toward the normalized attention output instead of adding it.
+            hidden_states = self._ngpt_residual(
+                self.ngpt_attn_residual, attention_output_with_bias, residual
+            )
         else:
             with self.bias_dropout_add_exec_handler():
                 hidden_states = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
@@ -744,6 +779,32 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             padding_mask=kwargs.get("padding_mask", None),
         )
         return output, context
+
+    def _ngpt_residual(self, residual_module, output_with_bias, residual: Tensor) -> Tensor:
+        """Apply an nGPT LERP residual update in place of bias-dropout-add.
+
+        The sublayer bias (when present) is folded into the output before the
+        interpolation. Hidden dropout is not applied: on the hypersphere the step
+        size is carried by the learnable ``alpha``, and dropping activations
+        before the L2 normalization would rescale the direction rather than
+        thin it.
+
+        Args:
+            residual_module: The :class:`~megatron.core.transformer.ngpt.NGPTResidual`
+                owning this sublayer's ``alpha``.
+            output_with_bias: ``(output, bias)`` tuple produced by the sublayer.
+            residual: The incoming residual-stream tensor.
+
+        Returns:
+            The updated residual stream.
+        """
+        if isinstance(output_with_bias, tuple):
+            output, bias = output_with_bias[0], output_with_bias[1]
+        else:
+            output, bias = output_with_bias, None
+        if bias is not None:
+            output = output + bias
+        return residual_module(output, residual)
 
     def _forward_pre_mlp_layernorm(self, hidden_states: Tensor):
         from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
@@ -927,6 +988,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             # The remaining residual add is already handled inside the
             # MLP module.
             hidden_states = mlp_output_with_bias[0]
+        elif self.ngpt_mlp_residual is not None:
+            # nGPT: LERP toward the normalized MLP output instead of adding it.
+            hidden_states = self._ngpt_residual(
+                self.ngpt_mlp_residual, mlp_output_with_bias, residual
+            )
         else:
             with self.bias_dropout_add_exec_handler():
                 hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(

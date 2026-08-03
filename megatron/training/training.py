@@ -146,7 +146,11 @@ from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     is_linear_attention_variant,
 )
-from megatron.core.optimizer import get_mup_config_overrides, get_standard_config_overrides
+from megatron.core.optimizer import (
+    get_mup_config_overrides,
+    get_ngpt_config_overrides,
+    get_standard_config_overrides,
+)
 from megatron.core.optimizer.optimizer import param_group_identifier_keys
 from megatron.core.optimizer.optimizer_cuda_graph import OptimizerCudaGraphWrapper
 from megatron.core.optimizer.qk_clip import clip_qk
@@ -1975,6 +1979,14 @@ def setup_model_and_optimizer(
             )
             if mup_overrides:
                 config_overrides = {**(config_overrides or {}), **mup_overrides}
+
+        if getattr(args, "ngpt", False):
+            # nGPT scalers (LERP alphas / per-channel scalers) carry all the
+            # magnitude information once the weight matrices are normalized, so
+            # they get their own lr and weight-decay treatment.
+            ngpt_overrides = get_ngpt_config_overrides(config)
+            if ngpt_overrides:
+                config_overrides = {**(config_overrides or {}), **ngpt_overrides}
 
         optimizer = get_megatron_optimizer(
             config,

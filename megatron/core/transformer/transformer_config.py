@@ -1163,6 +1163,46 @@ class TransformerConfig(ModelParallelConfig):
     insert these joins. This feature is particularly useful when using with full-iteration CUDA
     graphs"""
 
+    ####################
+    # nGPT (normalized transformer on the hypersphere)
+    ####################
+    ngpt: bool = False
+    """Enable nGPT geometry (arXiv:2410.01131): the additive residual is replaced by a LERP
+    toward the L2-normalized sublayer output, keeping hidden states on the unit hypersphere.
+    All other nGPT knobs are inert when this is False, and the model is bit-identical to
+    upstream Megatron."""
+
+    ngpt_lerp_normalization: str = "approx"
+    """How the LERP residual is renormalized. 'approx' is nGPT's closed form assuming an
+    orthogonal update; 'analytic' is the exact factor using cos(theta) between the residual and
+    the sublayer output (full-rank Jacobian); 'direct' applies an explicit L2 normalization;
+    'both', 'direct_ste', 'both_ste' and 'approx_fwd' are ablation variants that decouple the
+    forward normalization from the backward Jacobian."""
+
+    ngpt_lerp_normalization_attn: str = ""
+    """Overrides ngpt_lerp_normalization for the attention residual when non-empty."""
+
+    ngpt_lerp_normalization_ffn: str = ""
+    """Overrides ngpt_lerp_normalization for the MLP residual when non-empty."""
+
+    ngpt_alpha_init_value: float = 0.05
+    """Effective LERP step size (nGPT 'eigen learning rate') at initialization."""
+
+    ngpt_base_scale: float = -1.0
+    """Raw-parameter initialization for the alpha eigen-LR reparameterization.
+    -1 selects 1/sqrt(hidden_size)."""
+
+    ngpt_alpha_activation: str = "abs"
+    """Mapping from the raw alpha parameter to the effective LERP coefficient.
+    'abs' is unbounded (nGPT default); 'half_sigmoid' and 'half_tanh_sq' cap alpha at the
+    principled LERP ceiling of 0.5; 'tanh_smooth_bound' caps it at 0.95."""
+
+    ngpt_post_layer_norm_attn: bool = True
+    """L2-normalize the attention output before the LERP residual update."""
+
+    ngpt_post_layer_norm_ffn: bool = True
+    """L2-normalize the MLP output before the LERP residual update."""
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more

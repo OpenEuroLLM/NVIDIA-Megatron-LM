@@ -2565,10 +2565,59 @@ def _add_training_args(parser):
                        help='use FlashAttention implementation of attention. '
                        'https://arxiv.org/abs/2205.14135')
     group.add_argument('--optimizer', type=str, default='adam',
-                       choices=['adam', 'sgd', 'muon', 'dist_muon', 'lion', 'soap', 'adaptive_muon'],
+                       choices=['adam', 'sgd', 'muon', 'dist_muon', 'lion', 'soap',
+                                'adaptive_muon', 'muown'],
                        help='Optimizer function. '
                             'Note: dist_muon is deprecated; use --optimizer muon '
-                            'with --use-distributed-optimizer instead.')
+                            'with --use-distributed-optimizer instead. '
+                            'muown is Muon with explicit row-magnitude control '
+                            '(arXiv:2605.10797).')
+
+    # Muown (row-norm controlled Muon, arXiv:2605.10797)
+    group.add_argument('--muown-magnitude-lr-scale', type=float, default=1.0,
+                       help='Multiplier on the base lr for the Muown row-magnitude '
+                            '(l-infinity sign) update.')
+    group.add_argument('--muown-momentum', type=float, default=0.95,
+                       help='Momentum for both Muown components (direction and magnitude).')
+    group.add_argument('--no-muown-nesterov', action='store_false',
+                       dest='muown_nesterov',
+                       help='Disable Nesterov lookahead momentum in Muown.')
+    group.add_argument('--muown-num-ns-steps', type=int, default=5,
+                       help='Newton-Schulz iterations for the Muown direction update.')
+    group.add_argument('--muown-scale-mode', type=str, default='spectral',
+                       choices=['spectral', 'unit'],
+                       help='Scaling of the orthogonalized Muown direction update.')
+    group.add_argument('--muown-extra-scale-factor', type=float, default=1.0,
+                       help='Additional multiplier on the Muown direction update.')
+    group.add_argument('--muown-max-row-norm', type=float, default=None,
+                       help='Optional upper clamp on Muown row magnitudes.')
+
+    # nGPT weight normalizer (arXiv:2410.01131)
+    group.add_argument('--weight-normalizer', action='store_true',
+                       help='Renormalize weight matrices after every optimizer step (nGPT). '
+                            'This is what keeps weights, and hence hidden states, on the unit '
+                            'hypersphere when the trunk has no LayerNorm/RMSNorm.')
+    group.add_argument('--weight-normalizer-row-norm-outputs', action='store_false',
+                       dest='weight_normalizer_out_norm_dim_0',
+                       help='Row-normalize output projections instead of column-normalizing '
+                            'them. Column norm (the default) is the strict nGPT convention of '
+                            'normalizing along the embedding dimension, and is also the '
+                            'tensor-parallel-local choice.')
+    group.add_argument('--weight-normalizer-bounded', action='store_true',
+                       help='Project weights onto the ball (shrink-only) rather than pinning '
+                            'every row to the sphere.')
+    group.add_argument('--weight-normalizer-max-norm', type=float, default=1.0,
+                       help='Target row/column norm for the weight normalizer.')
+    group.add_argument('--weight-normalizer-skip-embeddings', action='store_false',
+                       dest='weight_normalizer_normalize_embeddings',
+                       help='Do not normalize the token embedding matrix.')
+    group.add_argument('--weight-normalizer-constrain-head', action='store_false',
+                       dest='weight_normalizer_head_unconstrained',
+                       help='Normalize the LM head too. By default the head is left '
+                            'unconstrained (qwen3-style row growth) and controlled by weight '
+                            'decay instead.')
+    group.add_argument('--weight-normalizer-every-n-steps', type=int, default=1,
+                       help='Run the weight normalizer only every N optimizer steps.')
     group.add_argument('--optimizer-cpu-offload', action='store_true',
                        help='Offload optimizer state to CPU')
     group.add_argument('--optimizer-cuda-graph', action='store_true',
