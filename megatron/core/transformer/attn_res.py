@@ -152,25 +152,35 @@ class BlockAttnRes(nn.Module):
         query = self.query.float()
         gain = self.key_norm_weight.float()
 
+        # Keys are RMSNormed values (paper Eq. 3): stops large-magnitude blocks
+        # from dominating the weights purely by scale. Rather than materializing
+        # the normalized key (a full [s, b, d] tensor that backward would retain
+        # for every source), factor the RMS scale out of the dot product:
+        #   <q, v / rms(v)> == <q, v> / rms(v)
+        # so only [s, b] intermediates are ever built.
+        qg = (query * gain).to(sources[0].dtype)
+        inv_d = 1.0 / self.hidden_size
         logits = []
         for v in sources:
-            v_f = v.float()
-            # Keys are RMSNormed values (paper Eq. 3): stops large-magnitude
-            # blocks from dominating the weights purely by scale.
-            k = v_f * torch.rsqrt(v_f.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-            logits.append(torch.einsum("sbd,d->sb", k, query * gain))
+            dot = torch.einsum("sbd,d->sb", v, qg).float()
+            sq_norm = torch.linalg.vector_norm(v, dim=-1).float().pow(2)
+            logits.append(dot * torch.rsqrt(sq_norm * inv_d + self.eps))
 
         # Softmax over depth. The stack here is over [s, b] scalars only.
         weights = torch.softmax(torch.stack(logits, dim=0), dim=0)
 
-        # Out-of-place accumulation: `add` saves nothing for backward, so the
-        # intermediates are freed as we go and peak memory stays at ~2 buffers.
-        # (An in-place addcmul_ would be marginally cheaper but bumps the
-        # autograd version counter on a tensor still owned by the graph.)
-        out = sources[0].float() * weights[0].unsqueeze(-1)
+        # Accumulate in the *source* dtype, not fp32. `mul` saves both operands
+        # for backward, so upcasting here would retain one fp32 [s, b, d] copy
+        # per source for the whole backward pass -- at k=9 and 36 calls per
+        # forward that is tens of GiB and OOMs a 95 GiB GH200. The weights are
+        # computed in fp32 and only cast at use; a convex combination needs no
+        # extra precision in the values themselves.
+        dtype = sources[0].dtype
+        w = weights.to(dtype)
+        out = sources[0] * w[0].unsqueeze(-1)
         for i in range(1, len(sources)):
-            out = out + sources[i].float() * weights[i].unsqueeze(-1)
-        return out.to(sources[0].dtype)
+            out = out + sources[i] * w[i].unsqueeze(-1)
+        return out
 
 
 def accumulate_block(
