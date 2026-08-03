@@ -192,7 +192,11 @@ class MHCMixer(nn.Module):
 
         # RMSNorm of the flattened state, with the divide-by-norm applied after
         # the projection (paper Eq. 15-16) so the big tensor is touched once.
-        r = flat.float().pow(2).mean(dim=-1, keepdim=True).add(self.eps).sqrt()
+        # vector_norm rather than flat.float().pow(2).mean(...): the latter
+        # retains an fp32 copy of the whole [s, b, n*C] stream state for backward,
+        # which is the largest tensor mHC touches.
+        r = torch.linalg.vector_norm(flat, dim=-1, keepdim=True).float() / (flat.shape[-1] ** 0.5)
+        r = r.clamp(min=self.eps)
         coeffs = torch.matmul(flat, self.phi.to(flat.dtype)).float() / r
 
         pre_raw, post_raw, res_raw = torch.split(coeffs, [n, n, n * n], dim=-1)

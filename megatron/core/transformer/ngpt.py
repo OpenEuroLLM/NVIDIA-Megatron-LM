@@ -253,29 +253,45 @@ class NGPTResidual(nn.Module):
             The updated residual stream, in the dtype of ``residual``.
         """
         input_dtype = residual.dtype
-        alpha = self._alpha_activation_fn(self.alpha.float() * self.alpha_scaler)
+        # Stay in the activation dtype for the [s, b, h] tensors. Upcasting them
+        # to fp32 retains a full fp32 copy of both `hidden_states` and `residual`
+        # for backward (mul/normalize save their operands) -- ~151 MiB each at
+        # s=4096/b=16/h=576, times two per sublayer times every layer, which is
+        # what pinned the nGPT arms near 0.81 memory and OOMed at mbs=32.
+        # Reductions still accumulate in fp32, which is where the precision
+        # actually matters; alpha is a small [h] vector so it stays fp32 and is
+        # cast once.
+        alpha32 = self._alpha_activation_fn(self.alpha.float() * self.alpha_scaler)
+        alpha = alpha32.to(input_dtype)
 
         if self.post_layer_norm:
-            a = F.normalize(hidden_states.float(), p=2, dim=-1, eps=self.eps)
+            # vector_norm saves only its input and output, so no [s, b, h]
+            # temporary is retained (unlike x.float().pow(2).mean(...)).
+            inv = torch.linalg.vector_norm(hidden_states, dim=-1, keepdim=True).clamp(min=self.eps)
+            a = hidden_states / inv
         else:
-            a = hidden_states.float()
+            a = hidden_states
 
-        x = residual.float()
+        x = residual
         mode = self.lerp_normalization
 
         if mode == "analytic":
             # Exact factor for unit-norm x and a; full-rank Jacobian.
-            cos_theta = (x * a).sum(dim=-1, keepdim=True)
+            cos_theta = (x * a).sum(dim=-1, keepdim=True, dtype=torch.float32).to(input_dtype)
             one_minus = 1.0 - alpha
             denom = one_minus.pow(2) + 2.0 * alpha * one_minus * cos_theta + alpha.pow(2)
             out = (x + alpha * (a - x)) * torch.rsqrt(torch.clamp(denom, min=self.eps))
         elif mode == "approx":
-            correct = torch.rsqrt(torch.clamp(1.0 - 2.0 * alpha * (1.0 - alpha), min=self.eps))
+            correct = torch.rsqrt(
+                torch.clamp(1.0 - 2.0 * alpha32 * (1.0 - alpha32), min=self.eps)
+            ).to(input_dtype)
             out = (x + alpha * (a - x)) * correct
         elif mode == "direct":
             out = F.normalize(x + alpha * (a - x), p=2, dim=-1, eps=self.eps)
         elif mode == "both":
-            correct = torch.rsqrt(torch.clamp(1.0 - 2.0 * alpha * (1.0 - alpha), min=self.eps))
+            correct = torch.rsqrt(
+                torch.clamp(1.0 - 2.0 * alpha32 * (1.0 - alpha32), min=self.eps)
+            ).to(input_dtype)
             out = F.normalize((x + alpha * (a - x)) * correct, p=2, dim=-1, eps=self.eps)
         elif mode == "direct_ste":
             # Forward: exact sphere. Backward: identity through h.
@@ -284,13 +300,17 @@ class NGPTResidual(nn.Module):
         elif mode == "both_ste":
             # Forward: exact sphere. Backward: approx scalar Jacobian.
             h = x + alpha * (a - x)
-            correct = torch.rsqrt(torch.clamp(1.0 - 2.0 * alpha * (1.0 - alpha), min=self.eps))
+            correct = torch.rsqrt(
+                torch.clamp(1.0 - 2.0 * alpha32 * (1.0 - alpha32), min=self.eps)
+            ).to(input_dtype)
             h_approx = h * correct
             out = h_approx + (F.normalize(h_approx, p=2, dim=-1, eps=self.eps) - h_approx).detach()
         else:  # approx_fwd
             # Forward: growing norm (approx). Backward: projection Jacobian.
             h = x + alpha * (a - x)
-            correct = torch.rsqrt(torch.clamp(1.0 - 2.0 * alpha * (1.0 - alpha), min=self.eps))
+            correct = torch.rsqrt(
+                torch.clamp(1.0 - 2.0 * alpha32 * (1.0 - alpha32), min=self.eps)
+            ).to(input_dtype)
             h_approx = h * correct
             h_direct = F.normalize(h_approx, p=2, dim=-1, eps=self.eps)
             out = h_direct + (h_approx - h_direct).detach()
