@@ -790,7 +790,12 @@ def _get_megatron_emerging_optimizer(
         eopt_name = bare_name
         use_layer_wise = True
 
-    if not HAVE_EMERGING_OPTIMIZERS:
+    # Optimizers implemented inside Megatron itself do not need the external
+    # package; only the ones whose classes come from it do. Muown lives in
+    # megatron.core.optimizer.muown and is self-contained (it carries its own
+    # Newton-Schulz), so gating it on the package would block it needlessly.
+    _SELF_CONTAINED_EOPTS = ("muown",)
+    if not HAVE_EMERGING_OPTIMIZERS and eopt_name not in _SELF_CONTAINED_EOPTS:
         raise ImportError(
             f"emerging-optimizers package is required for optimizer='{eopt_name}'. "
             "Install it with: pip install emerging-optimizers"
