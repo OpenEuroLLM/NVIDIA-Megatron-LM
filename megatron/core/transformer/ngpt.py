@@ -105,9 +105,8 @@ class EigenLRScaler(nn.Module):
         if base_scale <= 0.0:
             raise ValueError(f"base_scale must be positive, got {base_scale}")
         self.weight = nn.Parameter(torch.full((size,), base_scale, dtype=dtype))
-        self.register_buffer(
-            "scaler", torch.tensor(init_value / base_scale, dtype=dtype), persistent=False
-        )
+        # Python float rather than a 0-dim buffer -- see NGPTResidual.alpha_scaler.
+        self.scaler = float(init_value / base_scale)
         # Consumed by the weight normalizer / optimizer grouping: these are 1-D
         # magnitude parameters and must never be row-normalized.
         self.weight.is_ngpt_scaler = True
@@ -203,11 +202,13 @@ class NGPTResidual(nn.Module):
         # the effective alpha at init is independent of the activation choice.
         target = self._alpha_preact_init_target()
         self.alpha = nn.Parameter(torch.full((hidden_size,), self.base_scale, dtype=torch.float32))
-        self.register_buffer(
-            "alpha_scaler",
-            torch.tensor(target / self.base_scale, dtype=torch.float32),
-            persistent=False,
-        )
+        # Plain Python float, NOT a 0-dim buffer. A scalar tensor here is a real
+        # liability: CUDA graph capture version-bumps it and autograd then raises
+        # "a variable needed for gradient computation has been modified by an
+        # inplace operation", which disabled graphs for every LERP-based arm. As a
+        # float it disappears from the graph and the multiply folds into the
+        # following elementwise op instead of costing its own kernel.
+        self.alpha_scaler = float(target / self.base_scale)
         self.alpha.is_ngpt_scaler = True
 
     def _alpha_preact_init_target(self) -> float:

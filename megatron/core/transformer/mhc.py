@@ -138,9 +138,12 @@ class MHCMixer(nn.Module):
         self.b_post = nn.Parameter(torch.zeros(n))
         self.b_res = nn.Parameter(torch.zeros(n, n))
         # Learnable gates on the dynamic part (paper Eq. 7).
-        self.alpha_pre = nn.Parameter(torch.tensor(alpha_init))
-        self.alpha_post = nn.Parameter(torch.tensor(alpha_init))
-        self.alpha_res = nn.Parameter(torch.tensor(alpha_init))
+        # Shape (1,) not 0-dim: FSDP cannot shard 0-dim parameters, and 0-dim
+        # tensors are the ones CUDA graph capture trips over (see
+        # NGPTResidual.alpha_scaler).
+        self.alpha_pre = nn.Parameter(torch.full((1,), alpha_init))
+        self.alpha_post = nn.Parameter(torch.full((1,), alpha_init))
+        self.alpha_res = nn.Parameter(torch.full((1,), alpha_init))
 
         for p in (
             self.b_pre,
