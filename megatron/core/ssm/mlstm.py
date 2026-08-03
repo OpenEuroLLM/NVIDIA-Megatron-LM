@@ -12,7 +12,16 @@ from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
+
+try:
+    # FLA's Triton causal_conv1d supports arbitrary kernel width (unlike Tri
+    # Dao's CUDA causal_conv1d, which is limited to width 2-4). Shared with the
+    # GatedDeltaNet conv branch.
+    from fla.modules.convolution import causal_conv1d
+except ImportError:
+    causal_conv1d = None
 
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
@@ -204,6 +213,35 @@ class MLSTM(MegatronModule):
         setattr(self.fgate_bias, "tensor_model_parallel", True)
         setattr(self.fgate_bias, "partition_dim", 0)
 
+        # Optional short depthwise causal conv over q,k,v before the mLSTM cell
+        # (xLSTM conv branch / GatedDeltaNet-style). Applied in the post-all-to-all
+        # full-sequence head-sharded regime, so it is CP-safe: the weight is
+        # CP-sliced at runtime exactly like GatedDeltaNet. Width comes from
+        # linear_conv_kernel_dim; FLA's causal_conv1d allows width > 4.
+        self.use_conv1d = bool(getattr(config, "mlstm_conv1d", False))
+        if self.use_conv1d:
+            self.conv_kernel_dim = config.linear_conv_kernel_dim
+            self.conv_activation = "silu"
+            self.conv_dim = self.qk_dim * 2 + self.v_dim
+            self.conv_dim_local_tp = self.conv_dim // self.tp_size
+            # weight shape: [conv_dim, 1, d_conv]; depthwise (groups=channels).
+            self.conv1d = nn.Conv1d(
+                in_channels=self.conv_dim_local_tp,
+                out_channels=self.conv_dim_local_tp,
+                bias=True,
+                kernel_size=self.conv_kernel_dim,
+                groups=self.conv_dim_local_tp,
+                padding=self.conv_kernel_dim - 1,
+                device=torch.cuda.current_device(),
+                dtype=config.params_dtype,
+            )
+            setattr(self.conv1d.weight, "tensor_model_parallel", True)
+            setattr(self.conv1d.weight, "partition_dim", 0)
+            setattr(self.conv1d.bias, "tensor_model_parallel", True)
+            setattr(self.conv1d.bias, "partition_dim", 0)
+        else:
+            self.conv1d = None
+
         # Per-head RMSNorm weight over the value head dim (xLSTM MultiHeadLayerNorm
         # with use_weight=True, use_bias=False; reductions forced to fp32).
         self.out_norm_weight = nn.Parameter(
@@ -337,6 +375,67 @@ class MLSTM(MegatronModule):
             ],
             dim=-1,
         )
+
+        # Short depthwise causal conv over q,k,v (xLSTM conv branch), applied on
+        # the full sequence in the head-sharded regime; CP-slice the weight per
+        # rank exactly like GatedDeltaNet, so no cross-CP-rank conv state is
+        # needed.
+        if self.conv1d is not None:
+            nvtx_range_push(suffix="mlstm_conv1d")
+            qkv = torch.cat([q, k, v], dim=-1)  # b, s, (2*qk + v)/cp
+            qkv_channels_split_sections = [
+                self.qk_dim_local_tp,
+                self.qk_dim_local_tp,
+                self.v_dim_local_tp,
+            ]
+            conv1d_weight = get_parameter_local_cp(
+                self.conv1d.weight,
+                dim=0,
+                cp_group=self.pg_collection.cp,
+                split_sections=qkv_channels_split_sections,
+            )
+            conv1d_bias = get_parameter_local_cp(
+                self.conv1d.bias,
+                dim=0,
+                cp_group=self.pg_collection.cp,
+                split_sections=qkv_channels_split_sections,
+            )
+            if self.config.deterministic_mode:
+                qkv = qkv.transpose(1, 2).contiguous()  # b, s, d -> b, d, s
+                conv_out = F.conv1d(
+                    input=qkv,
+                    weight=conv1d_weight,
+                    bias=conv1d_bias,
+                    stride=self.conv1d.stride,
+                    padding=self.conv1d.padding,
+                    dilation=self.conv1d.dilation,
+                    groups=self.conv_dim_local_tp // self.cp_size,
+                )
+                qkv = F.silu(conv_out[..., :seq_len])
+                qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
+            else:
+                assert causal_conv1d is not None, (
+                    "mlstm_conv1d=True requires flash-linear-attention's causal_conv1d"
+                )
+                qkv, _ = causal_conv1d(
+                    x=qkv,  # FLA conv1d accepts [b, s, d]
+                    weight=conv1d_weight.squeeze(1),  # d, 1, w -> d, w
+                    bias=conv1d_bias,
+                    activation=self.conv_activation,
+                    initial_state=None,
+                    output_final_state=False,
+                    cu_seqlens=None,
+                )
+            q, k, v = torch.split(
+                qkv,
+                [
+                    self.qk_dim_local_tp // self.cp_size,
+                    self.qk_dim_local_tp // self.cp_size,
+                    self.v_dim_local_tp // self.cp_size,
+                ],
+                dim=-1,
+            )
+            nvtx_range_pop(suffix="mlstm_conv1d")
 
         igate_bias_local_cp = get_parameter_local_cp(
             self.igate_bias, dim=0, cp_group=self.pg_collection.cp

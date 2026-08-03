@@ -801,6 +801,12 @@ def num_floating_point_operations(
                         ## in proj (q, k, v, output gate, i/f gates)
                         args.hidden_size
                         * (2 * qk_dim + 2 * v_dim + 2 * num_heads)
+                        ## optional short depthwise causal conv over q,k,v
+                        + (
+                            args.linear_conv_kernel_dim * (2 * qk_dim + v_dim)
+                            if getattr(args, "mlstm_conv1d", False)
+                            else 0
+                        )
                         ## chunkwise mLSTM cell: inter-chunk state update (k v^T)
                         ## and state readout (q^T C), plus the causal intra-chunk
                         ## attention term at chunk size L (~L/2 per token).

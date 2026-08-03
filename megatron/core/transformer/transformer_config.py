@@ -338,6 +338,11 @@ class TransformerConfig(ModelParallelConfig):
     """Initial value of the mLSTM input-gate bias (filled across all heads). Larger
     (less negative) values open the input gate earlier in training."""
 
+    mlstm_conv1d: bool = False
+    """Apply a short depthwise causal conv over q,k,v before the mLSTM cell
+    (xLSTM conv branch / GatedDeltaNet-style, via FLA causal_conv1d). Kernel
+    width is taken from ``linear_conv_kernel_dim``."""
+
     ####################
     # initialization
     ####################
