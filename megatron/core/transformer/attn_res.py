@@ -74,6 +74,29 @@ def _maybe_compile(fn):
     return wrapper
 
 
+def _attn_res_aggregate_loop(query, gain, eps, *sources):
+    """Depth-wise softmax aggregation without stacking the sources.
+
+    The stacked form materializes a [k, s, b, d] tensor whose cost grows with the
+    block count -- enough that attnres8 (9 sources) lost a micro-batch step to it.
+    This form keeps the per-source loop, so peak memory stays at ~2 [s, b, d]
+    buffers, and relies on the compiler to fuse the many small kernels the loop
+    would otherwise launch. torch.compile specializes per source count, and there
+    are only a handful of distinct counts across the model.
+    """
+    qg = (query * gain).to(sources[0].dtype)
+    logits = []
+    for v in sources:
+        dot = torch.einsum("sbd,d->sb", v, qg).float()
+        inv = torch.rsqrt(v.float().pow(2).mean(dim=-1) + eps)
+        logits.append(dot * inv)
+    w = torch.softmax(torch.stack(logits, dim=0), dim=0).to(sources[0].dtype)
+    out = sources[0] * w[0].unsqueeze(-1)
+    for i in range(1, len(sources)):
+        out = out + sources[i] * w[i].unsqueeze(-1)
+    return out
+
+
 def _attn_res_aggregate(
     values: torch.Tensor, query: torch.Tensor, gain: torch.Tensor, eps: float
 ) -> torch.Tensor:
@@ -96,6 +119,7 @@ def _attn_res_aggregate(
 
 
 _attn_res_aggregate_compiled = _maybe_compile(_attn_res_aggregate)
+_attn_res_loop_compiled = _maybe_compile(_attn_res_aggregate_loop)
 
 
 class BlockAttnResState:
@@ -195,8 +219,8 @@ class BlockAttnRes(nn.Module):
         # One fused, compiled aggregation instead of ~2k per-source kernels.
         # Stacking is cheap relative to the launch overhead it removes, and
         # Inductor fuses the norm/softmax/weighted-sum chain into a few kernels.
-        return _attn_res_aggregate_compiled(
-            torch.stack(sources, dim=0), self.query.float(), self.key_norm_weight.float(), self.eps
+        return _attn_res_loop_compiled(
+            self.query.float(), self.key_norm_weight.float(), self.eps, *sources
         )
 
 
