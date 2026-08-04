@@ -14,7 +14,30 @@ Both payloads are therefore ``O(N h)`` per token, which is what makes the block
 count of AttnRes play the same role as mHC's expansion rate.
 
 The block owns one :class:`DepthResidualState` per forward pass and stashes it on
-each layer before calling it. Under pipeline parallelism the payload must also
+each layer before calling it.
+
+.. note:: **CUDA-graph compatibility (outstanding).**
+   Every arm that reaches >200 TFLOP/s at 130M uses CUDA graphs; mHC and Block
+   AttnRes cannot, and that is the dominant remaining cost for them. Two things
+   block capture, one of which is now fixed:
+
+   1. *(fixed)* mHC cached its connection matrices on this object between the
+      layer's read and write halves. The coefficients are now recomputed in the
+      write, which is bit-identical because ``streams`` is unchanged in between.
+   2. *(outstanding)* The layer reaches this object through
+      ``layer._depth_state``, and ``blocks`` is a Python list that grows by
+      ``append``. Capture records tensor *operations*, so the tensor identities
+      read through the attribute are baked in and a replay would run against
+      stale memory.
+
+   The fix for (2) is to allocate the sources once into a fixed
+   ``[N + 1, s, b, h]`` buffer at stable addresses and have each layer write its
+   slice, so replays hit the same memory. Shapes are already static per layer
+   (layer ``i`` always sees the same source count), so no shape specialization is
+   needed -- only the storage and the plumbing. The autograd interaction is the
+   delicate part: slice-writes into a shared buffer must not bump the version
+   counter of a tensor the graph still needs, which is the same failure class as
+   the 0-dim scalar bug fixed earlier in this branch. Under pipeline parallelism the payload must also
 cross stage boundaries; :meth:`DepthResidualState.to_payload` and
 :meth:`DepthResidualState.from_payload` provide the flat tensor for that transfer.
 """
