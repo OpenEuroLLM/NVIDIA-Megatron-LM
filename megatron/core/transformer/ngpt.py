@@ -277,7 +277,11 @@ class NGPTResidual(nn.Module):
 
         if mode == "analytic":
             # Exact factor for unit-norm x and a; full-rank Jacobian.
-            cos_theta = (x * a).sum(dim=-1, keepdim=True, dtype=torch.float32).to(input_dtype)
+            # vecdot fuses the multiply and the reduction, so the full [s, b, h]
+            # product is never materialized. That temporary is the only reason
+            # the analytic mode needs more memory than approx, and it was what
+            # kept these arms one micro-batch step below the others.
+            cos_theta = torch.linalg.vecdot(x, a).unsqueeze(-1)
             one_minus = 1.0 - alpha
             denom = one_minus.pow(2) + 2.0 * alpha * one_minus * cos_theta + alpha.pow(2)
             out = (x + alpha * (a - x)) * torch.rsqrt(torch.clamp(denom, min=self.eps))
