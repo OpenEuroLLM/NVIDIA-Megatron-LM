@@ -38,6 +38,46 @@ LERP_NORMALIZATION_MODES = (
     "approx_fwd",
 )
 
+
+def _maybe_compile(fn):
+    """Compile ``fn`` with Inductor, falling back to eager if unavailable."""
+    state = {"fn": None}
+
+    def wrapper(*args, **kwargs):
+        if state["fn"] is None:
+            try:
+                state["fn"] = torch.compile(fn, dynamic=False)
+            except Exception:  # pragma: no cover - depends on the runtime
+                state["fn"] = fn
+        try:
+            return state["fn"](*args, **kwargs)
+        except Exception:  # pragma: no cover - Inductor unavailable
+            state["fn"] = fn
+            return fn(*args, **kwargs)
+
+    return wrapper
+
+
+def _lerp_analytic(x, a, alpha, eps):
+    """Exact-factor LERP on the sphere, fused.
+
+    Computes ``f * ((1-alpha) x + alpha a)`` with
+    ``f = 1/sqrt((1-alpha)^2 + 2 alpha (1-alpha) cos + alpha^2)``.
+
+    Fused because ``alpha`` is per-channel ``[h]`` while ``cos`` is per-token
+    ``[s,b,1]``: the denominator therefore broadcasts to a full ``[s,b,h]``
+    tensor, and so does its rsqrt. Materializing those is what held this mode one
+    micro-batch step below the ``approx`` mode; Inductor keeps them in registers.
+    """
+    cos_theta = torch.linalg.vecdot(x, a).unsqueeze(-1)
+    one_minus = 1.0 - alpha
+    denom = one_minus * one_minus + 2.0 * alpha * one_minus * cos_theta + alpha * alpha
+    return (x + alpha * (a - x)) * torch.rsqrt(torch.clamp(denom, min=eps))
+
+
+_lerp_analytic_compiled = _maybe_compile(_lerp_analytic)
+
+
 ALPHA_ACTIVATIONS = ("abs", "half_sigmoid", "half_tanh_sq", "tanh_smooth_bound")
 
 
@@ -277,14 +317,7 @@ class NGPTResidual(nn.Module):
 
         if mode == "analytic":
             # Exact factor for unit-norm x and a; full-rank Jacobian.
-            # vecdot fuses the multiply and the reduction, so the full [s, b, h]
-            # product is never materialized. That temporary is the only reason
-            # the analytic mode needs more memory than approx, and it was what
-            # kept these arms one micro-batch step below the others.
-            cos_theta = torch.linalg.vecdot(x, a).unsqueeze(-1)
-            one_minus = 1.0 - alpha
-            denom = one_minus.pow(2) + 2.0 * alpha * one_minus * cos_theta + alpha.pow(2)
-            out = (x + alpha * (a - x)) * torch.rsqrt(torch.clamp(denom, min=self.eps))
+            out = _lerp_analytic_compiled(x, a, alpha, self.eps)
         elif mode == "approx":
             correct = torch.rsqrt(
                 torch.clamp(1.0 - 2.0 * alpha32 * (1.0 - alpha32), min=self.eps)
