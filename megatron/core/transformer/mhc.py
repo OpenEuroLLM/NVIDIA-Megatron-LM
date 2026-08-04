@@ -94,6 +94,26 @@ def _sinkhorn_knopp_impl(
 _sinkhorn_compiled = None
 
 
+def _mhc_coeffs(flat, phi, b_pre, b_post, b_res, a_pre, a_post, a_res, n, eps, iters):
+    """Fused mHC coefficient computation (paper Eq. 7-9).
+
+    Kept as a free function so Inductor can fuse the projection, the RMS scale,
+    the three gated adds and the Sinkhorn sweeps into a handful of kernels
+    instead of ~40 launches per sublayer.
+    """
+    s_, b_, _ = flat.shape
+    r = torch.linalg.vector_norm(flat, dim=-1, keepdim=True).float() / (flat.shape[-1] ** 0.5)
+    coeffs = torch.matmul(flat, phi.to(flat.dtype)).float() / r.clamp(min=eps)
+    pre_raw, post_raw, res_raw = torch.split(coeffs, [n, n, n * n], dim=-1)
+    h_pre = torch.sigmoid(a_pre.float() * pre_raw + b_pre.float())
+    h_post = 2.0 * torch.sigmoid(a_post.float() * post_raw + b_post.float())
+    h_res = a_res.float() * res_raw.view(s_, b_, n, n) + b_res.float()
+    return h_pre, h_post, _sinkhorn_knopp_impl(h_res, iters, 1e-8)
+
+
+_mhc_coeffs_compiled = None
+
+
 def sinkhorn_knopp(logits: torch.Tensor, num_iters: int = 20, eps: float = 1e-8) -> torch.Tensor:
     """Project a matrix onto the Birkhoff polytope, fusing the Sinkhorn sweeps.
 
@@ -223,8 +243,30 @@ class MHCMixer(nn.Module):
             ``(h_pre, h_post, h_res)`` with shapes ``[s, b, n]``, ``[s, b, n]`` and
             ``[s, b, n, n]``, all in fp32.
         """
+        global _mhc_coeffs_compiled
+        if _mhc_coeffs_compiled is None:
+            try:
+                _mhc_coeffs_compiled = torch.compile(_mhc_coeffs, dynamic=False)
+            except Exception:  # pragma: no cover
+                _mhc_coeffs_compiled = _mhc_coeffs
         s, b, n, c = streams.shape
         flat = streams.reshape(s, b, n * c)
+        try:
+            return _mhc_coeffs_compiled(
+                flat,
+                self.phi,
+                self.b_pre,
+                self.b_post,
+                self.b_res,
+                self.alpha_pre,
+                self.alpha_post,
+                self.alpha_res,
+                n,
+                self.eps,
+                self.num_sinkhorn_iters,
+            )
+        except Exception:  # pragma: no cover - Inductor unavailable
+            pass
 
         # RMSNorm of the flattened state, with the divide-by-norm applied after
         # the projection (paper Eq. 15-16) so the big tensor is touched once.

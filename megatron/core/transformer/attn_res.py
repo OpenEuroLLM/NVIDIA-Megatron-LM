@@ -50,6 +50,54 @@ import torch.nn.functional as F
 from torch import nn
 
 
+def _maybe_compile(fn):
+    """Compile ``fn`` with Inductor, falling back to eager if unavailable.
+
+    The depth-wise aggregation is a chain of small per-source kernels run twice
+    per layer, so it is launch-bound rather than compute-bound; fusing it is
+    worth far more than the arithmetic it performs.
+    """
+    state = {"fn": None}
+
+    def wrapper(*args, **kwargs):
+        if state["fn"] is None:
+            try:
+                state["fn"] = torch.compile(fn, dynamic=False)
+            except Exception:  # pragma: no cover - depends on the runtime
+                state["fn"] = fn
+        try:
+            return state["fn"](*args, **kwargs)
+        except Exception:  # pragma: no cover - Inductor/Triton unavailable
+            state["fn"] = fn
+            return fn(*args, **kwargs)
+
+    return wrapper
+
+
+def _attn_res_aggregate(
+    values: torch.Tensor, query: torch.Tensor, gain: torch.Tensor, eps: float
+) -> torch.Tensor:
+    """Softmax-over-depth aggregation of stacked sources.
+
+    Args:
+        values: ``[k, s, b, d]`` stacked attention sources.
+        query: ``[d]`` learnable pseudo-query.
+        gain: ``[d]`` RMSNorm gain applied to the keys.
+        eps: Numerical floor for the RMS scale.
+
+    Returns:
+        ``[s, b, d]`` attended hidden state.
+    """
+    qg = (query * gain).to(values.dtype)
+    dot = torch.einsum("ksbd,d->ksb", values, qg).float()
+    inv = torch.rsqrt(values.float().pow(2).mean(dim=-1) + eps)
+    weights = torch.softmax(dot * inv, dim=0).to(values.dtype)
+    return torch.einsum("ksb,ksbd->sbd", weights, values)
+
+
+_attn_res_aggregate_compiled = _maybe_compile(_attn_res_aggregate)
+
+
 class BlockAttnResState:
     """Mutable depth-wise state threaded through a transformer block.
 
@@ -144,43 +192,12 @@ class BlockAttnRes(nn.Module):
         Returns:
             The attended hidden state, ``[s, b, d]``.
         """
-        # Deliberately never materialize a [k, s, b, d] stack. Doing so copies
-        # k * s * b * d elements on every call, and this runs twice per layer --
-        # at k=9, s=4096, b=16, d=576 that is ~680 MB per call. Instead compute
-        # each source's logit separately (each only [s, b]) and accumulate the
-        # weighted sum in place, so peak extra memory is one [s, b, d] buffer.
-        query = self.query.float()
-        gain = self.key_norm_weight.float()
-
-        # Keys are RMSNormed values (paper Eq. 3): stops large-magnitude blocks
-        # from dominating the weights purely by scale. Rather than materializing
-        # the normalized key (a full [s, b, d] tensor that backward would retain
-        # for every source), factor the RMS scale out of the dot product:
-        #   <q, v / rms(v)> == <q, v> / rms(v)
-        # so only [s, b] intermediates are ever built.
-        qg = (query * gain).to(sources[0].dtype)
-        inv_d = 1.0 / self.hidden_size
-        logits = []
-        for v in sources:
-            dot = torch.einsum("sbd,d->sb", v, qg).float()
-            sq_norm = torch.linalg.vector_norm(v, dim=-1).float().pow(2)
-            logits.append(dot * torch.rsqrt(sq_norm * inv_d + self.eps))
-
-        # Softmax over depth. The stack here is over [s, b] scalars only.
-        weights = torch.softmax(torch.stack(logits, dim=0), dim=0)
-
-        # Accumulate in the *source* dtype, not fp32. `mul` saves both operands
-        # for backward, so upcasting here would retain one fp32 [s, b, d] copy
-        # per source for the whole backward pass -- at k=9 and 36 calls per
-        # forward that is tens of GiB and OOMs a 95 GiB GH200. The weights are
-        # computed in fp32 and only cast at use; a convex combination needs no
-        # extra precision in the values themselves.
-        dtype = sources[0].dtype
-        w = weights.to(dtype)
-        out = sources[0] * w[0].unsqueeze(-1)
-        for i in range(1, len(sources)):
-            out = out + sources[i] * w[i].unsqueeze(-1)
-        return out
+        # One fused, compiled aggregation instead of ~2k per-source kernels.
+        # Stacking is cheap relative to the launch overhead it removes, and
+        # Inductor fuses the norm/softmax/weighted-sum chain into a few kernels.
+        return _attn_res_aggregate_compiled(
+            torch.stack(sources, dim=0), self.query.float(), self.key_norm_weight.float(), self.eps
+        )
 
 
 def accumulate_block(
