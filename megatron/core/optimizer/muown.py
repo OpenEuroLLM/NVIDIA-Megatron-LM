@@ -205,10 +205,16 @@ class Muown(torch.optim.Optimizer):
                 state = self.state[p]
                 if len(state) == 0:
                     state["direction_momentum"] = torch.zeros_like(tangential)
-                    state["magnitude_momentum"] = torch.zeros_like(radial)
+                    # Allocated at the *parameter* shape, not the natural [out, 1]
+                    # of a per-row magnitude. Megatron's optimizer-state handling
+                    # (checkpoint save, distributed optimizer sharding) requires
+                    # every state tensor to match the parameter shape; a [out, 1]
+                    # buffer makes every save fail with "Optimizer shape ... does
+                    # not match model shape". Only column 0 is used.
+                    state["magnitude_momentum"] = torch.zeros_like(p, dtype=torch.float32)
 
                 dir_buf = state["direction_momentum"]
-                mag_buf = state["magnitude_momentum"]
+                mag_buf = state["magnitude_momentum"][..., :1]
                 dir_buf.mul_(momentum).add_(tangential, alpha=1.0 - momentum)
                 mag_buf.mul_(momentum).add_(radial, alpha=1.0 - momentum)
 
