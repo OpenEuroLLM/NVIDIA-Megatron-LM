@@ -849,10 +849,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         state = self._depth_state
         if self.mhc_attn_mixer is not None:
             mixer = self.mhc_attn_mixer if kind == "attn" else self.mhc_mlp_mixer
-            h_pre, h_post, h_res = mixer(state.streams)
-            # Stash the coefficients: they are computed from the pre-update stream
-            # state and are reused by the matching _depth_write.
-            state.pending = (mixer, h_pre, h_post, h_res)
+            h_pre, _h_post, _h_res = mixer(state.streams)
+            # Deliberately do NOT stash the coefficients for the matching write.
+            # `streams` is unchanged between read and write (the write is what
+            # updates it), so recomputing there is numerically identical and the
+            # coefficient path is now a single fused kernel. Caching them in
+            # mutable Python state instead couples the two halves of the layer,
+            # which is one of the things CUDA graph capture cannot represent.
             return mixer.read(state.streams, h_pre)
         module = self.attnres_attn if kind == "attn" else self.attnres_mlp
         return module(state.sources())
@@ -894,9 +897,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 )
 
         if self.mhc_attn_mixer is not None:
-            mixer, _h_pre, h_post, h_res = state.pending
+            mixer = self.mhc_attn_mixer if kind == "attn" else self.mhc_mlp_mixer
+            _h_pre, h_post, h_res = mixer(state.streams)
             state.streams = mixer.write(state.streams, out, h_post, h_res, lerp=lerp)
-            state.pending = None
             return collapse_streams(state.streams)
 
         accumulate_block(state, out, lerp=lerp)

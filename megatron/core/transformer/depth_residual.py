@@ -47,7 +47,6 @@ class DepthResidualState:
         self.layers_per_block = layers_per_block
         # mHC state
         self.streams: torch.Tensor | None = None
-        self.pending = None
         # Block AttnRes state
         self.blocks: list[torch.Tensor] = []
         self.partial: torch.Tensor | None = None
@@ -121,7 +120,6 @@ class DepthResidualState:
         """
         if self.mode == "mhc":
             self.streams = payload.permute(1, 2, 0, 3).contiguous()
-            self.pending = None
             return
         tensors = list(torch.unbind(payload, dim=0))
         if has_partial:
