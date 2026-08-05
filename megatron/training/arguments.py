@@ -2616,6 +2616,14 @@ def _add_training_args(parser):
                        help='Normalize the LM head too. By default the head is left '
                             'unconstrained (qwen3-style row growth) and controlled by weight '
                             'decay instead.')
+    group.add_argument('--ngpt-scaler-lr-mult', type=float, default=1.0,
+                       help='Learning-rate multiplier for nGPT scaler parameters (LERP alphas, '
+                            's_qk, s_uv). On a normalized architecture these carry all the '
+                            'magnitude information, so they often want a larger step than the '
+                            'direction-carrying weight matrices.')
+    group.add_argument('--ngpt-scaler-wd-mult', type=float, default=0.0,
+                       help='Weight-decay multiplier for nGPT scaler parameters. 0 by default: '
+                            'decaying them toward zero fights the geometry.')
     group.add_argument('--weight-normalizer-every-n-steps', type=int, default=1,
                        help='Run the weight normalizer only every N optimizer steps.')
     group.add_argument('--optimizer-cpu-offload', action='store_true',
