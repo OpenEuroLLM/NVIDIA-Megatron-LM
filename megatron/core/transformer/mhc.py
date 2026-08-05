@@ -167,29 +167,6 @@ def _mhc_read(streams, h_pre):
 _mhc_read_compiled = None
 
 
-def _mhc_coeffs_and_read(
-    flat, streams, phi, b_pre, b_post, b_res, a_pre, a_post, a_res, n, eps, iters
-):
-    """Coefficients and read-out in one pass over the stream state.
-
-    ``_mhc_coeffs`` and :func:`_mhc_read` each traversed the full ``[s, b, n, C]``
-    state separately -- two reads of the widest tensor in the model where one
-    suffices, since the read-out only needs ``h_pre``, which the coefficient pass
-    has already produced. Fusing them lets Inductor keep the state resident.
-
-    Returns:
-        ``(h_post, h_res, layer_input)``; ``h_pre`` is consumed internally.
-    """
-    h_pre, h_post, h_res = _mhc_coeffs(
-        flat, phi, b_pre, b_post, b_res, a_pre, a_post, a_res, n, eps, iters
-    )
-    layer_input = (h_pre.to(streams.dtype).unsqueeze(-1) * streams).sum(dim=-2)
-    return h_post, h_res, layer_input
-
-
-_mhc_coeffs_read_compiled = None
-
-
 def sinkhorn_knopp(logits: torch.Tensor, num_iters: int = 20, eps: float = 1e-8) -> torch.Tensor:
     """Project a matrix onto the Birkhoff polytope, fusing the Sinkhorn sweeps.
 
@@ -365,40 +342,6 @@ class MHCMixer(nn.Module):
             2.0 * torch.sigmoid(h_post),
             sinkhorn_knopp(h_res, self.num_sinkhorn_iters),
         )
-
-    def coeffs_and_read(self, streams: torch.Tensor):
-        """Compute the write coefficients and the layer input in one pass.
-
-        Returns:
-            ``(h_post, h_res, layer_input)``.
-        """
-        global _mhc_coeffs_read_compiled
-        if _mhc_coeffs_read_compiled is None:
-            try:
-                _mhc_coeffs_read_compiled = torch.compile(_mhc_coeffs_and_read, dynamic=False)
-            except Exception:  # pragma: no cover
-                _mhc_coeffs_read_compiled = _mhc_coeffs_and_read
-        s_, b_, n_, c_ = streams.shape
-        flat = streams.reshape(s_, b_, n_ * c_)
-        args = (
-            flat,
-            streams,
-            self.phi,
-            self.b_pre,
-            self.b_post,
-            self.b_res,
-            self.alpha_pre,
-            self.alpha_post,
-            self.alpha_res,
-            n_,
-            self.eps,
-            self.num_sinkhorn_iters,
-        )
-        try:
-            return _mhc_coeffs_read_compiled(*args)
-        except Exception:  # pragma: no cover - Inductor unavailable
-            _mhc_coeffs_read_compiled = _mhc_coeffs_and_read
-            return _mhc_coeffs_and_read(*args)
 
     def read(self, streams: torch.Tensor, h_pre: torch.Tensor) -> torch.Tensor:
         """Aggregate the ``n`` streams into a single ``C``-dim layer input."""
