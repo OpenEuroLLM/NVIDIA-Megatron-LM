@@ -849,13 +849,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         state = self._depth_state
         if self.mhc_attn_mixer is not None:
             mixer = self.mhc_attn_mixer if kind == "attn" else self.mhc_mlp_mixer
-            h_pre, _h_post, _h_res = mixer(state.streams)
-            # Deliberately do NOT stash the coefficients for the matching write.
-            # `streams` is unchanged between read and write (the write is what
-            # updates it), so recomputing there is numerically identical and the
-            # coefficient path is now a single fused kernel. Caching them in
-            # mutable Python state instead couples the two halves of the layer,
-            # which is one of the things CUDA graph capture cannot represent.
+            h_pre, h_post, h_res = mixer(state.streams)
+            # Cache for the matching write. Recomputing there is bit-identical
+            # (streams is unchanged in between) but costs a second full read of
+            # the flattened [s, b, n, C] state plus its projection -- real money
+            # on an arm that is memory-traffic bound. The recompute exists only
+            # to make the layer capturable by CUDA graphs, and mHC cannot use
+            # graphs yet, so it buys nothing today. Revisit when the
+            # preallocated-buffer refactor lands.
+            state.pending = (h_post, h_res)
             return mixer.read(state.streams, h_pre)
         module = self.attnres_attn if kind == "attn" else self.attnres_mlp
         return module(state.sources())
@@ -897,7 +899,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         if self.mhc_attn_mixer is not None:
             mixer = self.mhc_attn_mixer if kind == "attn" else self.mhc_mlp_mixer
-            _h_pre, h_post, h_res = mixer(state.streams)
+            h_post, h_res = state.pending
+            state.pending = None
             state.streams = mixer.write(state.streams, out, h_post, h_res, lerp=lerp)
             # Return a zero-cost view, not collapse_streams(). The next sublayer
             # reads from state.streams and ignores this value; only the enclosing

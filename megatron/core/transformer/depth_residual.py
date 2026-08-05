@@ -70,6 +70,7 @@ class DepthResidualState:
         self.layers_per_block = layers_per_block
         # mHC state
         self.streams: torch.Tensor | None = None
+        self.pending = None
         # Block AttnRes state
         self.blocks: list[torch.Tensor] = []
         self.partial: torch.Tensor | None = None
