@@ -114,6 +114,37 @@ def _mhc_coeffs(flat, phi, b_pre, b_post, b_res, a_pre, a_post, a_res, n, eps, i
 _mhc_coeffs_compiled = None
 
 
+def _mhc_write(streams, sublayer_out, h_post, h_res):
+    """Fused mHC stream update: ``H_res @ x + H_post^T f(x)`` in one pass.
+
+    Args:
+        streams: ``[s, b, n, C]`` current stream state.
+        sublayer_out: ``[s, b, C]`` attention or MLP output.
+        h_post: ``[s, b, n]`` write coefficients.
+        h_res: ``[s, b, n, n]`` doubly stochastic stream mixer.
+
+    Returns:
+        ``[s, b, n, C]`` updated streams.
+
+    The previous formulation materialized the write-back term as a full
+    ``[s, b, n, C]`` tensor and then called ``baddbmm``. That is the wrong shape
+    of computation here: with ``n`` around 2-4 the "matmul" is a handful of
+    multiply-adds per output element, so a batched GEMM with a 4-long inner
+    dimension gets no efficiency while the intermediate doubles traffic over the
+    widest tensor mHC owns.
+
+    Written as one expression, Inductor fuses the broadcasted product straight
+    into the reduction and the write-back into the same epilogue, so nothing
+    between the inputs and the output is ever materialized. Traffic drops from
+    roughly 4x to 2x the stream state per sublayer.
+    """
+    mixed = (h_res.unsqueeze(-1) * streams.unsqueeze(-3)).sum(dim=-2)
+    return mixed + h_post.unsqueeze(-1) * sublayer_out.unsqueeze(-2)
+
+
+_mhc_write_compiled = None
+
+
 def sinkhorn_knopp(logits: torch.Tensor, num_iters: int = 20, eps: float = 1e-8) -> torch.Tensor:
     """Project a matrix onto the Birkhoff polytope, fusing the Sinkhorn sweeps.
 
@@ -321,7 +352,6 @@ class MHCMixer(nn.Module):
             The updated stream state, ``[s, b, n, C]``.
         """
         s, b, n, c = streams.shape
-        contribution = h_post.to(streams.dtype).unsqueeze(-1) * sublayer_out.unsqueeze(-2)
         if lerp is None:
             # Fuse the stream mix and the write-back into one batched GEMM:
             # baddbmm computes contribution + h_res @ streams in a single pass,
@@ -329,11 +359,22 @@ class MHCMixer(nn.Module):
             # read/write it costs. mHC is bandwidth-bound in exactly this term
             # (paper Table 2: I/O grows with n), so removing one traversal of the
             # widened residual is the cheapest available win.
-            return torch.baddbmm(
-                contribution.reshape(s * b, n, c),
-                h_res.to(streams.dtype).reshape(s * b, n, n),
-                streams.reshape(s * b, n, c),
-            ).view(s, b, n, c)
+            global _mhc_write_compiled
+            if _mhc_write_compiled is None:
+                try:
+                    _mhc_write_compiled = torch.compile(_mhc_write, dynamic=False)
+                except Exception:  # pragma: no cover
+                    _mhc_write_compiled = _mhc_write
+            try:
+                return _mhc_write_compiled(
+                    streams, sublayer_out, h_post.to(streams.dtype), h_res.to(streams.dtype)
+                )
+            except Exception:  # pragma: no cover - Inductor unavailable
+                _mhc_write_compiled = _mhc_write
+                return _mhc_write(
+                    streams, sublayer_out, h_post.to(streams.dtype), h_res.to(streams.dtype)
+                )
+        contribution = h_post.to(streams.dtype).unsqueeze(-1) * sublayer_out.unsqueeze(-2)
         mixed = torch.einsum("sbij,sbjc->sbic", h_res.to(streams.dtype), streams)
         # nGPT composition: the doubly stochastic mix is a *convex combination* of
         # the streams, so even when every input stream is unit norm the mixed
