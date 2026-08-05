@@ -641,9 +641,10 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     # No intermediate_hidden_states requested: just hidden_states
                     hidden_states = checkpointed_result
             else:
-                depth_state = self._make_depth_state(hidden_states)
+                hidden_states, depth_state = self._depth_enter(hidden_states)
                 for l_no, layer in enumerate(self.layers):
-                    layer._depth_state = depth_state
+                    if depth_state is not None:
+                        layer._depth_state = depth_state
                     # Get appropriate inner quantization context
                     if use_inner_quantization_context:
                         if self.config.fp8:
@@ -688,13 +689,8 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                         intermediate_hidden_states.append(hidden_states)
 
         # Collapse the depth-wise residual state (mHC streams / AttnRes blocks)
-        # back to a single hidden state before the final norm, and drop the
-        # per-layer references so the state is not kept alive after the forward.
-        depth_state = getattr(self.layers[0], "_depth_state", None) if len(self.layers) else None
-        if depth_state is not None:
-            hidden_states = depth_state.collapse()
-            for layer in self.layers:
-                layer._depth_state = None
+        # back to a single hidden state before the final norm.
+        hidden_states = self._depth_exit(hidden_states)
 
         # Final layer norm.
         if self.final_layernorm is not None:
@@ -716,19 +712,29 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
         return hidden_states
 
-    def _make_depth_state(self, hidden_states: Tensor):
-        """Create the depth-wise residual state for this forward pass, or None.
+    def _depth_enter(self, hidden_states: Tensor):
+        """Widen the residual stream for this forward pass, if a scheme is active.
 
         mHC and Block AttnRes both replace the single residual stream with a
         wider, depth-spanning state that every layer in this block reads from and
-        writes to. The block owns it for the duration of the forward pass.
+        writes to, but they carry it differently:
+
+        * **mHC** widens ``hidden_states`` itself to ``[s, b, n, h]``. The state
+          then travels through the layers as an ordinary argument and return
+          value, which is what allows the layers to be CUDA-graph captured --
+          see the note in :class:`~megatron.core.transformer.transformer_layer.TransformerLayer`.
+        * **Block AttnRes** accumulates a growing list of block summaries, which
+          is not expressible as a single fixed-shape tensor, so the block owns a
+          :class:`~megatron.core.transformer.depth_residual.DepthResidualState`
+          and stashes it on each layer.
 
         Args:
             hidden_states: The block's input hidden states, ``[s, b, h]``.
 
         Returns:
-            A :class:`~megatron.core.transformer.depth_residual.DepthResidualState`,
-            or None when neither scheme is enabled.
+            ``(hidden_states, depth_state)``. ``hidden_states`` is widened for
+            mHC and unchanged otherwise; ``depth_state`` is None unless Block
+            AttnRes is active.
 
         Raises:
             NotImplementedError: If pipeline parallelism is active. Both schemes
@@ -739,7 +745,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         mhc = getattr(self.config, "mhc", False)
         attn_res = getattr(self.config, "attn_res", False)
         if not mhc and not attn_res:
-            return None
+            return hidden_states, None
         if mhc and attn_res:
             raise ValueError("mhc and attn_res are mutually exclusive; enable at most one")
 
@@ -751,20 +757,46 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 "shape negotiation must be widened before PP > 1 can be enabled."
             )
 
+        if mhc:
+            from megatron.core.transformer.mhc import expand_to_streams
+
+            return expand_to_streams(hidden_states, self.config.mhc_expansion_rate), None
+
         from megatron.core.transformer.attn_res import resolve_layers_per_block
         from megatron.core.transformer.depth_residual import DepthResidualState
 
-        if mhc:
-            return DepthResidualState(
-                "mhc", hidden_states, expansion_rate=self.config.mhc_expansion_rate
-            )
-        return DepthResidualState(
-            "attn_res",
+        return hidden_states, DepthResidualState(
             hidden_states,
             layers_per_block=resolve_layers_per_block(
                 self.config.num_layers, self.config.attn_res_num_blocks
             ),
         )
+
+    def _depth_exit(self, hidden_states: Tensor) -> Tensor:
+        """Reduce the depth-wise state back to a single ``[s, b, h]`` hidden state.
+
+        Also drops the per-layer Block AttnRes references so the state is not kept
+        alive past the forward pass.
+
+        Args:
+            hidden_states: The trunk output -- ``[s, b, n, h]`` streams under mHC,
+                otherwise ``[s, b, h]``.
+
+        Returns:
+            A ``[s, b, h]`` hidden state ready for the final norm.
+        """
+        if getattr(self.config, "mhc", False) and hidden_states.dim() == 4:
+            from megatron.core.transformer.mhc import collapse_streams
+
+            return collapse_streams(hidden_states)
+
+        depth_state = getattr(self.layers[0], "_depth_state", None) if len(self.layers) else None
+        if depth_state is None:
+            return hidden_states
+        hidden_states = depth_state.collapse()
+        for layer in self.layers:
+            layer._depth_state = None
+        return hidden_states
 
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: dict = None

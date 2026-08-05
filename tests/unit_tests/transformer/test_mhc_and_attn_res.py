@@ -214,17 +214,18 @@ def _depth_weights(module: BlockAttnRes, sources: list[torch.Tensor]) -> torch.T
 
 
 class TestDepthResidualState:
-    def test_mhc_state_shapes_and_collapse(self):
+    def test_mhc_streams_travel_as_hidden_states(self):
+        """mHC needs no side state: expand/collapse bracket the layer loop."""
         h = torch.randn(S, B, C)
-        state = DepthResidualState("mhc", h, expansion_rate=N)
-        assert state.streams.shape == (S, B, N, C)
+        streams = expand_to_streams(h, N)
+        assert streams.shape == (S, B, N, C)
         # every stream starts as a copy of the embedding
-        assert torch.allclose(state.streams[:, :, 0], h)
-        assert state.collapse().shape == (S, B, C)
+        assert torch.allclose(streams[:, :, 0], h)
+        assert collapse_streams(streams).shape == (S, B, C)
 
     def test_attn_res_state_accumulates_and_seals(self):
         h = torch.randn(S, B, C)
-        state = DepthResidualState("attn_res", h, layers_per_block=2)
+        state = DepthResidualState(h, layers_per_block=2)
         assert state.blocks == [h] or torch.allclose(state.blocks[0], h)
         accumulate_block(state, torch.randn(S, B, C))
         assert len(state.sources()) == 2  # embedding + partial
@@ -232,7 +233,7 @@ class TestDepthResidualState:
         assert len(state.blocks) == 2 and state.partial is None
 
     def test_should_seal_respects_block_size(self):
-        state = DepthResidualState("attn_res", torch.randn(S, B, C), layers_per_block=3)
+        state = DepthResidualState(torch.randn(S, B, C), layers_per_block=3)
         assert [state.should_seal(i) for i in range(1, 7)] == [
             False,
             False,
@@ -242,37 +243,30 @@ class TestDepthResidualState:
             True,
         ]
 
-    @pytest.mark.parametrize("mode", ["mhc", "attn_res"])
-    def test_payload_roundtrip(self, mode):
+    def test_payload_roundtrip(self):
         """The pipeline payload must reconstruct the state exactly."""
         h = torch.randn(S, B, C)
-        state = DepthResidualState(mode, h, expansion_rate=N, layers_per_block=2)
-        if mode == "attn_res":
-            accumulate_block(state, torch.randn(S, B, C))
+        state = DepthResidualState(h, layers_per_block=2)
+        accumulate_block(state, torch.randn(S, B, C))
         payload = state.to_payload()
         before = state.collapse().clone()
 
-        restored = DepthResidualState(
-            mode, torch.zeros_like(h), expansion_rate=N, layers_per_block=2
-        )
-        restored.load_payload(payload, has_partial=(mode == "attn_res"))
+        restored = DepthResidualState(torch.zeros_like(h), layers_per_block=2)
+        restored.load_payload(payload, has_partial=True)
         assert torch.allclose(restored.collapse(), before, atol=1e-6)
 
     def test_payload_slots_matches_expansion(self):
         """AttnRes block count plays the same role as the mHC expansion rate."""
         h = torch.randn(S, B, C)
-        mhc = DepthResidualState("mhc", h, expansion_rate=N)
-        assert mhc.to_payload().shape == (N, S, B, C)
-        ar = DepthResidualState("attn_res", h, layers_per_block=2)
+        assert expand_to_streams(h, N).permute(2, 0, 1, 3).shape == (N, S, B, C)
+        ar = DepthResidualState(h, layers_per_block=2)
         accumulate_block(ar, torch.randn(S, B, C))
         assert ar.to_payload().shape[1:] == (S, B, C)
 
     def test_accumulate_with_lerp_stays_on_sphere(self):
         lerp = NGPTResidual(C, lerp_normalization="analytic")
         state = DepthResidualState(
-            "attn_res",
-            torch.nn.functional.normalize(torch.randn(S, B, C), dim=-1),
-            layers_per_block=2,
+            torch.nn.functional.normalize(torch.randn(S, B, C), dim=-1), layers_per_block=2
         )
         # The LERP variant must be used consistently for the whole block: the
         # seeding contribution is normalized so the running summary starts on the
@@ -280,7 +274,3 @@ class TestDepthResidualState:
         for _ in range(4):
             accumulate_block(state, torch.randn(S, B, C), lerp=lerp)
         assert torch.allclose(state.partial.norm(dim=-1), torch.ones(S, B), atol=1e-4)
-
-    def test_rejects_bad_mode(self):
-        with pytest.raises(ValueError, match="mode must be"):
-            DepthResidualState("bogus", torch.randn(S, B, C))
