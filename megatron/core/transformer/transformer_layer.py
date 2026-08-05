@@ -849,7 +849,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         state = self._depth_state
         if self.mhc_attn_mixer is not None:
             mixer = self.mhc_attn_mixer if kind == "attn" else self.mhc_mlp_mixer
-            h_pre, h_post, h_res = mixer(state.streams)
+            h_post, h_res, layer_input = mixer.coeffs_and_read(state.streams)
             # Cache for the matching write. Recomputing there is bit-identical
             # (streams is unchanged in between) but costs a second full read of
             # the flattened [s, b, n, C] state plus its projection -- real money
@@ -858,7 +858,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             # graphs yet, so it buys nothing today. Revisit when the
             # preallocated-buffer refactor lands.
             state.pending = (h_post, h_res)
-            return mixer.read(state.streams, h_pre)
+            return layer_input
         module = self.attnres_attn if kind == "attn" else self.attnres_mlp
         return module(state.sources())
 
