@@ -145,6 +145,28 @@ def _mhc_write(streams, sublayer_out, h_post, h_res):
 _mhc_write_compiled = None
 
 
+def _mhc_read(streams, h_pre):
+    """Fused mHC read-out: ``H_pre @ x``, i.e. the C-dim layer input.
+
+    Args:
+        streams: ``[s, b, n, C]`` current stream state.
+        h_pre: ``[s, b, n]`` read coefficients.
+
+    Returns:
+        ``[s, b, C]`` layer input.
+
+    Same reasoning as :func:`_mhc_write`: an ``n``-long contraction is a couple
+    of multiply-adds per output element, so expressing it as a fused
+    elementwise-plus-reduction lets Inductor read the stream state once and emit
+    the result directly, rather than dispatching a separate contraction kernel
+    over the widest tensor in the model.
+    """
+    return (h_pre.unsqueeze(-1) * streams).sum(dim=-2)
+
+
+_mhc_read_compiled = None
+
+
 def sinkhorn_knopp(logits: torch.Tensor, num_iters: int = 20, eps: float = 1e-8) -> torch.Tensor:
     """Project a matrix onto the Birkhoff polytope, fusing the Sinkhorn sweeps.
 
@@ -323,7 +345,17 @@ class MHCMixer(nn.Module):
 
     def read(self, streams: torch.Tensor, h_pre: torch.Tensor) -> torch.Tensor:
         """Aggregate the ``n`` streams into a single ``C``-dim layer input."""
-        return torch.einsum("sbn,sbnc->sbc", h_pre.to(streams.dtype), streams)
+        global _mhc_read_compiled
+        if _mhc_read_compiled is None:
+            try:
+                _mhc_read_compiled = torch.compile(_mhc_read, dynamic=False)
+            except Exception:  # pragma: no cover
+                _mhc_read_compiled = _mhc_read
+        try:
+            return _mhc_read_compiled(streams, h_pre.to(streams.dtype))
+        except Exception:  # pragma: no cover - Inductor unavailable
+            _mhc_read_compiled = _mhc_read
+            return _mhc_read(streams, h_pre.to(streams.dtype))
 
     def write(
         self,
