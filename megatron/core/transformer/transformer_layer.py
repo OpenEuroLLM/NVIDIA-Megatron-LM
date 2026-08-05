@@ -872,7 +872,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             rest of the layer (and the block) sees the usual contract.
         """
         from megatron.core.transformer.attn_res import accumulate_block
-        from megatron.core.transformer.mhc import collapse_streams
 
         if isinstance(output_with_bias, tuple):
             out, bias = output_with_bias[0], output_with_bias[1]
@@ -900,7 +899,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             mixer = self.mhc_attn_mixer if kind == "attn" else self.mhc_mlp_mixer
             _h_pre, h_post, h_res = mixer(state.streams)
             state.streams = mixer.write(state.streams, out, h_post, h_res, lerp=lerp)
-            return collapse_streams(state.streams)
+            # Return a zero-cost view, not collapse_streams(). The next sublayer
+            # reads from state.streams and ignores this value; only the enclosing
+            # block's final collapse (transformer_block: depth_state.collapse())
+            # is actually consumed. Collapsing here reduced a full [s, b, n, h]
+            # tensor once per sublayer -- 36 wasted reductions per forward at 18
+            # layers, over the widest tensor mHC owns. The view keeps the
+            # [s, b, h] shape/dtype contract downstream code relies on.
+            return state.streams[:, :, 0]
 
         accumulate_block(state, out, lerp=lerp)
         if kind == "mlp" and state.should_seal(self.layer_number):
