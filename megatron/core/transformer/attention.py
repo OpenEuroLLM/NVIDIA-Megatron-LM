@@ -1466,6 +1466,20 @@ class SelfAttention(Attention):
             else None
         )
 
+        # nGPT per-channel scalers on Q/K (s_qk). Built here so they sit beside
+        # the norms they compensate for.
+        self.ngpt_sq = None
+        self.ngpt_sk = None
+        if getattr(self.config, "ngpt_use_sqk", False):
+            from megatron.core.transformer.ngpt import EigenLRScaler
+
+            base = self.config.ngpt_scaler_base_scale
+            base = (self.config.hidden_size**-0.5) if base == -1.0 else base
+            q_dim = self.query_projection_size
+            k_dim = self.kv_projection_size
+            self.ngpt_sq = EigenLRScaler(q_dim, self.config.ngpt_scaler_init, base)
+            self.ngpt_sk = EigenLRScaler(k_dim, self.config.ngpt_scaler_init, base)
+
     def run_realtime_tests(self):
         """Performs a consistency check.
 
@@ -1650,6 +1664,14 @@ class SelfAttention(Attention):
 
         if self.k_layernorm is not None:
             key = apply_module(self.k_layernorm)(key)
+
+        # nGPT s_qk: once Q/K are unit vectors their dot product is a cosine in
+        # [-1, 1], so the logits carry no scale of their own. These learned
+        # per-channel scalers reintroduce it. Applied after the norm, before RoPE
+        # consumers, matching the reference implementation.
+        if self.ngpt_sq is not None:
+            query = self.ngpt_sq(query)
+            key = self.ngpt_sk(key)
 
         if self.config.test_mode:
             self.run_realtime_tests()

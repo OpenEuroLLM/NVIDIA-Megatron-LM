@@ -275,7 +275,9 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # attention variant
     ####################
-    experimental_attention_variant: Optional[Literal['gated_delta_net', 'mlstm', 'mamba', 'dsa']] = None
+    experimental_attention_variant: Optional[
+        Literal['gated_delta_net', 'mlstm', 'mamba', 'dsa']
+    ] = None
     """Type of attention variant to use. Currently support gated_delta_net, mlstm and dsa."""
 
     ####################
@@ -1223,6 +1225,24 @@ class TransformerConfig(ModelParallelConfig):
 
     ngpt_post_layer_norm_ffn: bool = True
     """L2-normalize the MLP output before the LERP residual update."""
+
+    ngpt_use_sqk: bool = False
+    """Learnable per-channel scalers on Q and K (nGPT's s_qk). Once Q/K are
+    L2-normalized their dot product is a cosine, so the attention logits lose all
+    scale; s_qk puts it back as a learned quantity. Pair with qk_l2_norm."""
+
+    ngpt_use_suv: bool = False
+    """Learnable per-channel scaler on the MLP intermediate (nGPT's s_uv). Takes
+    the place of the fixed 1/sqrt(ffn/hidden) up-scale when the fc1 weights are
+    row-normalized and can no longer carry that magnitude themselves."""
+
+    ngpt_scaler_init: float = 1.0
+    """Effective value of the nGPT scalers at initialization."""
+
+    ngpt_scaler_base_scale: float = -1.0
+    """Raw-parameter init for the scaler eigen-LR reparameterization; -1 selects
+    1/sqrt(hidden_size). The optimizer sees a parameter of this scale while the
+    effective value starts at ngpt_scaler_init, decoupling the two."""
 
     ####################
     # mHC (manifold-constrained hyper-connections)

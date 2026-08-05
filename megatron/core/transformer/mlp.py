@@ -233,6 +233,16 @@ class MLP(MegatronModule):
         else:
             self.activation_func = self.config.activation_func
 
+        self.ngpt_suv = None
+        if getattr(self.config, "ngpt_use_suv", False):
+            from megatron.core.transformer.ngpt import EigenLRScaler
+
+            base = self.config.ngpt_scaler_base_scale
+            base = (self.config.hidden_size**-0.5) if base == -1.0 else base
+            # fc1 emits 2x ffn for a gated unit (gate and up are concatenated).
+            width = self.config.ffn_hidden_size * (2 if self.config.gated_linear_unit else 1)
+            self.ngpt_suv = EigenLRScaler(width, self.config.ngpt_scaler_init, base)
+
         self.linear_fc2 = submodules.linear_fc2(
             not_none(self.config.ffn_hidden_size),
             not_none(
@@ -257,6 +267,11 @@ class MLP(MegatronModule):
         nvtx_range_push(suffix="linear_fc1")
         intermediate_parallel, bias_parallel = apply_module(self.linear_fc1)(hidden_states)
         nvtx_range_pop(suffix="linear_fc1")
+
+        # nGPT s_uv: replaces the magnitude the fc1 rows can no longer carry once
+        # they are normalized. Applied to the pre-activation intermediate.
+        if self.ngpt_suv is not None:
+            intermediate_parallel = self.ngpt_suv(intermediate_parallel)
 
         nvtx_range_push(suffix="activation")
         if self.config.use_te_activation_func:
