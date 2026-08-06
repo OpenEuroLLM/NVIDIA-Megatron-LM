@@ -76,18 +76,18 @@ if HAVE_TRITON:
     # 3090 Ti does not transfer to GH200 -- so let Triton pick it on whatever
     # device actually runs. Autotuning keys on (C, N), which are fixed for a
     # given model, so the search happens once.
+    # The bound on BLOCK_T * BLOCK_C is what keeps this list sane. The inner
+    # products materialize a [BLOCK_T, N, N, BLOCK_C] tile of fp32 accumulators,
+    # so the register footprint is N^2 * BLOCK_T * BLOCK_C * 4 bytes -- 32 KB at
+    # the cap below with n=4. Past that, occupancy collapses and the kernel gets
+    # slower rather than faster, so there is no point searching there.
     _CONFIGS = [
         triton.Config({"BLOCK_T": bt, "BLOCK_C": bc}, num_warps=w, num_stages=st)
-        for bt, bc, w, st in [
-            (1, 128, 4, 2),
-            (2, 128, 4, 2),
-            (4, 64, 4, 2),
-            (4, 128, 8, 2),
-            (8, 64, 8, 2),
-            (8, 128, 8, 3),
-            (16, 64, 8, 3),
-            (16, 32, 4, 3),
-        ]
+        for bt in (1, 2, 4, 8, 16, 32)
+        for bc in (32, 64, 128, 256)
+        for w in (4, 8, 16)
+        for st in (2, 3)
+        if bt * bc <= 512
     ]
 
     @triton.autotune(configs=_CONFIGS, key=["C", "N"])
