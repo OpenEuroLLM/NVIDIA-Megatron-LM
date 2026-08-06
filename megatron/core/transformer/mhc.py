@@ -295,6 +295,25 @@ def _mhc_mix_normalized(streams, h_res, eps):
 _LERP_RECOMPUTE = os.environ.get("MHC_LERP_RECOMPUTE", "0") != "0"
 
 
+_COMPILED: dict = {}
+
+
+def _compiled(fn):
+    """Return a compiled ``fn``, falling back to eager if Inductor is unusable.
+
+    Compiled lazily and cached per function, so a runtime without a working
+    Triton toolchain still trains, just slower.
+    """
+    cached = _COMPILED.get(fn)
+    if cached is None:
+        try:
+            cached = torch.compile(fn, dynamic=False)
+        except Exception:  # pragma: no cover - depends on the runtime
+            cached = fn
+        _COMPILED[fn] = cached
+    return cached
+
+
 def _mhc_write_lerp(streams, sublayer_out, h_post, h_res, eps, lerp):
     """The mHC write composed with an nGPT LERP, as one fusible region.
 
