@@ -145,6 +145,83 @@ def _mhc_write(streams, sublayer_out, h_post, h_res):
 _mhc_write_compiled = None
 
 
+class _MHCWrite(torch.autograd.Function):
+    """The mHC write, with the backward routed through a fused Triton kernel.
+
+    The forward is unchanged -- still the compiled expression above, still at 84%
+    of GH200's bandwidth. Only the backward differs: autograd would derive four
+    separate kernels from that expression, each re-reading the upstream gradient,
+    which is 604 MB at the training shapes and the largest tensor mHC owns.
+    :func:`~megatron.core.transformer.mhc_kernels.write_backward` computes all
+    four in one pass, cutting the backward's traffic from ~3.9 GB to ~2.1 GB.
+
+    Only used when the kernel can actually run on the inputs; see
+    :func:`~megatron.core.transformer.mhc_kernels.can_use`. When it cannot, the
+    caller stays on the plain compiled path and lets autograd do the backward,
+    because the kernel module's PyTorch fallback materializes a ``[t, n, n, C]``
+    intermediate that would be worse than what Inductor emits.
+    """
+
+    @staticmethod
+    def forward(ctx, streams, sublayer_out, h_post, h_res):
+        ctx.save_for_backward(streams, sublayer_out, h_post, h_res)
+        out = _mhc_write_dispatch(streams, sublayer_out, h_post, h_res)
+        _prewarm_backward(out, streams, sublayer_out, h_post, h_res)
+        return out
+
+    @staticmethod
+    def backward(ctx, g):
+        from megatron.core.transformer.mhc_kernels import write_backward
+
+        streams, sublayer_out, h_post, h_res = ctx.saved_tensors
+        # The kernel indexes as if contiguous; g arrives from whatever produced it.
+        return write_backward(g.contiguous(), streams, sublayer_out, h_post, h_res)
+
+
+_BACKWARD_PREWARMED = False
+
+
+def _prewarm_backward(grad_like, streams, sublayer_out, h_post, h_res):
+    """Run the backward kernel once during a forward, and discard the result.
+
+    Triton autotuning benchmarks every candidate tile on the first call for a
+    given key. Left alone, that first call is the one Megatron makes *inside*
+    ``torch.cuda.graph`` capture for the backward graph, and benchmarking there
+    issues host-side work that invalidates the capture -- an abort, not a
+    slowdown. Forwards always run eagerly before any capture (the graph runner
+    performs warmup steps first), so this puts the search somewhere safe.
+
+    Once per process, never while a capture is already running, and at the real
+    shapes so the tuned configuration is the one the actual backward will use.
+    """
+    global _BACKWARD_PREWARMED
+    if _BACKWARD_PREWARMED:
+        return
+    if grad_like.is_cuda and torch.cuda.is_current_stream_capturing():
+        return
+    _BACKWARD_PREWARMED = True
+
+    from megatron.core.transformer.mhc_kernels import write_backward
+
+    with torch.no_grad():
+        write_backward(grad_like, streams, sublayer_out, h_post, h_res)
+
+
+def _mhc_write_dispatch(streams, sublayer_out, h_post, h_res):
+    """Compiled forward write, falling back to eager if Inductor is unusable."""
+    global _mhc_write_compiled
+    if _mhc_write_compiled is None:
+        try:
+            _mhc_write_compiled = torch.compile(_mhc_write, dynamic=False)
+        except Exception:  # pragma: no cover
+            _mhc_write_compiled = _mhc_write
+    try:
+        return _mhc_write_compiled(streams, sublayer_out, h_post, h_res)
+    except Exception:  # pragma: no cover - Inductor unavailable at runtime
+        _mhc_write_compiled = _mhc_write
+        return _mhc_write(streams, sublayer_out, h_post, h_res)
+
+
 def _mhc_read(streams, h_pre):
     """Fused mHC read-out: ``H_pre @ x``, i.e. the C-dim layer input.
 
@@ -385,27 +462,14 @@ class MHCMixer(nn.Module):
         """
         s, b, n, c = streams.shape
         if lerp is None:
-            # Fuse the stream mix and the write-back into one batched GEMM:
-            # baddbmm computes contribution + h_res @ streams in a single pass,
-            # avoiding a separate full [s, b, n, C] `mixed` tensor and the extra
-            # read/write it costs. mHC is bandwidth-bound in exactly this term
-            # (paper Table 2: I/O grows with n), so removing one traversal of the
-            # widened residual is the cheapest available win.
-            global _mhc_write_compiled
-            if _mhc_write_compiled is None:
-                try:
-                    _mhc_write_compiled = torch.compile(_mhc_write, dynamic=False)
-                except Exception:  # pragma: no cover
-                    _mhc_write_compiled = _mhc_write
-            try:
-                return _mhc_write_compiled(
-                    streams, sublayer_out, h_post.to(streams.dtype), h_res.to(streams.dtype)
-                )
-            except Exception:  # pragma: no cover - Inductor unavailable
-                _mhc_write_compiled = _mhc_write
-                return _mhc_write(
-                    streams, sublayer_out, h_post.to(streams.dtype), h_res.to(streams.dtype)
-                )
+            from megatron.core.transformer.mhc_kernels import can_use
+
+            post, res = h_post.to(streams.dtype), h_res.to(streams.dtype)
+            if can_use(streams, n):
+                # Fused Triton backward: one pass over the upstream gradient
+                # instead of the four Inductor derives from the forward.
+                return _MHCWrite.apply(streams, sublayer_out, post, res)
+            return _mhc_write_dispatch(streams, sublayer_out, post, res)
         contribution = h_post.to(streams.dtype).unsqueeze(-1) * sublayer_out.unsqueeze(-2)
         mixed = torch.einsum("sbij,sbjc->sbic", h_res.to(streams.dtype), streams)
         # nGPT composition: the doubly stochastic mix is a *convex combination* of

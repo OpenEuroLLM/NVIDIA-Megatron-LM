@@ -46,6 +46,8 @@ Both fall back to the PyTorch formulation when Triton is unavailable or the
 inputs do not meet the kernels' constraints, so neither can break a run.
 """
 
+import os
+
 import torch
 
 try:
@@ -55,6 +57,9 @@ try:
     HAVE_TRITON = True
 except ImportError:  # pragma: no cover - depends on the runtime
     HAVE_TRITON = False
+
+
+_ENABLED = os.environ.get("MHC_TRITON_BACKWARD", "1") != "0"
 
 
 def _is_pow2(x: int) -> bool:
@@ -192,13 +197,24 @@ if HAVE_TRITON:
         )
 
 
-def _usable(streams: torch.Tensor, n: int) -> bool:
+def can_use(streams: torch.Tensor, n: int) -> bool:
     """Whether the Triton path can run on these inputs.
 
     ``tl.arange`` requires a power-of-two extent, so the stream count has to be
     one; mHC uses 2 or 4 in practice. Everything else falls back.
+
+    Callers should check this *before* routing through a custom autograd
+    Function: the PyTorch fallbacks below are correct but materialize a
+    ``[t, n, n, C]`` intermediate, which is four times the stream state. Leaving
+    the backward to Inductor is the better answer when the kernel cannot run.
+
+    Set ``MHC_TRITON_BACKWARD=0`` to force that path -- a kill switch for a
+    hand-written kernel, and the toggle used to A/B it.
     """
-    return HAVE_TRITON and streams.is_cuda and _is_pow2(n)
+    return _ENABLED and HAVE_TRITON and streams.is_cuda and _is_pow2(n)
+
+
+_usable = can_use  # internal alias used by the launchers below
 
 
 def grad_h_res(

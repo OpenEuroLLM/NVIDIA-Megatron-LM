@@ -30,7 +30,11 @@ from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
-S, B, H, L, N = 16, 2, 64, 4, 3
+# n must be a power of two, or MHCMixer.write takes the Inductor fallback and
+# these tests silently stop covering the hand-written backward -- which is the
+# part most likely to break capture, since Triton autotuning cannot run inside
+# one. test_uses_the_triton_backward pins that.
+S, B, H, L, N = 16, 2, 64, 4, 4
 
 
 def _config(cuda_graph_impl: str) -> TransformerConfig:
@@ -107,6 +111,20 @@ class TestMHCCudaGraphs:
         assert set(replay_grads) == set(ref_grads)
         for name, grad in ref_grads.items():
             torch.testing.assert_close(replay_grads[name], grad, rtol=0, atol=0, msg=name)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+    def test_uses_the_triton_backward(self):
+        """These tests must exercise the hand-written backward, not the fallback.
+
+        Capture is the thing most likely to break it, so a configuration that
+        quietly routes around it would make the graph test meaningless.
+        """
+        from megatron.core.transformer.mhc_kernels import can_use
+
+        assert can_use(torch.empty(1, device="cuda"), N), (
+            "the CUDA-graph tests are not covering the Triton backward; "
+            "check N is a power of two and MHC_TRITON_BACKWARD is not 0"
+        )
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
     def test_streams_are_not_stashed_on_the_layer(self):
