@@ -274,9 +274,25 @@ def _mhc_mix_normalized(streams, h_res, eps):
 # handles module parameters correctly; there is no dropout in this region, so the
 # recomputation is deterministic.
 #
-# Set MHC_LERP_RECOMPUTE=0 to keep the intermediates instead, which is the
-# faster choice if a configuration has memory to spare.
-_LERP_RECOMPUTE = os.environ.get("MHC_LERP_RECOMPUTE", "1") != "0"
+# MEASURED, AND IT FREES NOTHING -- hence off by default. With recompute on,
+# occupancy at mbs=8 was 0.647/0.621 against 0.647/0.624 without, and mbs=16
+# still OOMs. So the LERP write's intermediates are *not* what fills memory, and
+# the reasoning above is wrong somewhere: the additive path's mbs=28-32 does not
+# come from _MHCWrite's recompute alone.
+#
+# Where the memory actually goes is still unmeasured. Back-of-envelope from the
+# probe: at mbs=8 activations are ~56 GB, about 2.6x per token what the additive
+# arm uses at mbs=32 -- so something in this configuration does retain much more,
+# just not here. The other things these arms turn on are ngpt, qk_l2_norm and the
+# s_qk/s_uv scalers, none of which have been looked at.
+#
+# The next step is torch.cuda.memory._record_memory_history on a LERP sublayer,
+# not another hypothesis. Three have been tried and measured flat: fusing this
+# region (65.9 -> 65.6), trading CUDA graphs for batch (frees 0.02), and this.
+#
+# Set MHC_LERP_RECOMPUTE=1 to re-enable; the mechanism is verified correct
+# (bit-identical gradients including lerp.alpha and mixer.phi), just not useful.
+_LERP_RECOMPUTE = os.environ.get("MHC_LERP_RECOMPUTE", "0") != "0"
 
 
 def _mhc_write_lerp(streams, sublayer_out, h_post, h_res, eps, lerp):
