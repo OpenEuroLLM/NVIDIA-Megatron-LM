@@ -222,6 +222,34 @@ def _mhc_write_dispatch(streams, sublayer_out, h_post, h_res):
         return _mhc_write(streams, sublayer_out, h_post, h_res)
 
 
+def _mhc_mix_normalized(streams, h_res, eps):
+    """The stream mix, renormalized onto the unit sphere for the nGPT LERP.
+
+    Args:
+        streams: ``[s, b, n, C]`` current stream state.
+        h_res: ``[s, b, n, n]`` doubly stochastic stream mixer.
+        eps: Numerical floor for the division.
+
+    Returns:
+        ``[s, b, n, C]`` mixed streams, each row unit norm.
+
+    Two things this deliberately avoids, both costing a full ``[s, b, n, C]``
+    tensor, and together enough to OOM a 130M run at n=4 before its first
+    iteration:
+
+    * ``torch.einsum`` for an ``n``-long contraction, which dispatches a batched
+      GEMM over the widest tensor in the model to do a handful of multiply-adds
+      per output element. The additive write already had this removed; the LERP
+      branch kept it.
+    * ``F.normalize(mixed.float(), ...)``, which retains an fp32 copy of the
+      whole mixed state for backward. ``vector_norm`` reduces to ``[s, b, n, 1]``
+      without promoting its operand, so the division stays in the activation
+      dtype.
+    """
+    mixed = (h_res.unsqueeze(-1) * streams.unsqueeze(-3)).sum(dim=-2)
+    return mixed / torch.linalg.vector_norm(mixed, dim=-1, keepdim=True).clamp(min=eps)
+
+
 def _mhc_read(streams, h_pre):
     """Fused mHC read-out: ``H_pre @ x``, i.e. the C-dim layer input.
 
@@ -471,13 +499,18 @@ class MHCMixer(nn.Module):
                 return _MHCWrite.apply(streams, sublayer_out, post, res)
             return _mhc_write_dispatch(streams, sublayer_out, post, res)
         contribution = h_post.to(streams.dtype).unsqueeze(-1) * sublayer_out.unsqueeze(-2)
-        mixed = torch.einsum("sbij,sbjc->sbic", h_res.to(streams.dtype), streams)
         # nGPT composition: the doubly stochastic mix is a *convex combination* of
         # the streams, so even when every input stream is unit norm the mixed
         # result is shorter (equality only when the streams are identical).
         # Renormalize before the LERP, otherwise the LERP's closed-form correction
         # -- which assumes a unit-norm base point -- would not land on the sphere.
-        mixed = F.normalize(mixed.float(), p=2, dim=-1, eps=1e-6).to(streams.dtype)
+        res = h_res.to(streams.dtype)
+        try:
+            mixed = _compiled(_mhc_mix_normalized)(streams, res, self.eps)
+        except Exception:  # pragma: no cover - Inductor unusable at runtime
+            # torch.compile defers compilation to the first call, so a broken
+            # toolchain surfaces here rather than where the wrapper was built.
+            mixed = _mhc_mix_normalized(streams, res, self.eps)
         return lerp(contribution, mixed)
 
 
