@@ -250,6 +250,40 @@ def _mhc_mix_normalized(streams, h_res, eps):
     return mixed / torch.linalg.vector_norm(mixed, dim=-1, keepdim=True).clamp(min=eps)
 
 
+def _mhc_write_lerp(streams, sublayer_out, h_post, h_res, eps, lerp):
+    """The mHC write composed with an nGPT LERP, as one fusible region.
+
+    Args:
+        streams: ``[s, b, n, C]`` current stream state.
+        sublayer_out: ``[s, b, C]`` attention or MLP output.
+        h_post: ``[s, b, n]`` write coefficients, in the stream dtype.
+        h_res: ``[s, b, n, n]`` doubly stochastic stream mixer, in the stream dtype.
+        eps: Numerical floor for the renormalization.
+        lerp: The :class:`~megatron.core.transformer.ngpt.NGPTResidual` to apply.
+
+    Returns:
+        ``[s, b, n, C]`` updated streams, each row unit norm.
+
+    Kept as one compiled function rather than three steps so Inductor sees the
+    whole chain. Written as separate statements it materializes the write-back
+    term and the mixed state as full ``[s, b, n, C]`` tensors before the LERP
+    even starts, then walks the result several more times for the LERP's own
+    normalize and interpolation -- on the widest tensor mHC owns, at ``n`` times
+    the residual width. Dynamo inlines the residual module's forward, so the
+    whole thing collapses into a handful of kernels.
+
+    nGPT composition: the doubly stochastic mix is a *convex combination* of the
+    streams, so even when every input stream is unit norm the mixed result is
+    shorter (equality only when the streams are identical). Renormalize before
+    the LERP, otherwise its closed-form correction -- which assumes a unit-norm
+    base point -- would not land on the sphere.
+    """
+    contribution = h_post.unsqueeze(-1) * sublayer_out.unsqueeze(-2)
+    mixed = (h_res.unsqueeze(-1) * streams.unsqueeze(-3)).sum(dim=-2)
+    mixed = mixed / torch.linalg.vector_norm(mixed, dim=-1, keepdim=True).clamp(min=eps)
+    return lerp(contribution, mixed)
+
+
 def _mhc_read(streams, h_pre):
     """Fused mHC read-out: ``H_pre @ x``, i.e. the C-dim layer input.
 
@@ -498,20 +532,15 @@ class MHCMixer(nn.Module):
                 # instead of the four Inductor derives from the forward.
                 return _MHCWrite.apply(streams, sublayer_out, post, res)
             return _mhc_write_dispatch(streams, sublayer_out, post, res)
-        contribution = h_post.to(streams.dtype).unsqueeze(-1) * sublayer_out.unsqueeze(-2)
-        # nGPT composition: the doubly stochastic mix is a *convex combination* of
-        # the streams, so even when every input stream is unit norm the mixed
-        # result is shorter (equality only when the streams are identical).
-        # Renormalize before the LERP, otherwise the LERP's closed-form correction
-        # -- which assumes a unit-norm base point -- would not land on the sphere.
-        res = h_res.to(streams.dtype)
+        post, res = h_post.to(streams.dtype), h_res.to(streams.dtype)
         try:
-            mixed = _compiled(_mhc_mix_normalized)(streams, res, self.eps)
+            return _compiled(_mhc_write_lerp)(
+                streams, sublayer_out, post, res, self.eps, lerp
+            )
         except Exception:  # pragma: no cover - Inductor unusable at runtime
             # torch.compile defers compilation to the first call, so a broken
             # toolchain surfaces here rather than where the wrapper was built.
-            mixed = _mhc_mix_normalized(streams, res, self.eps)
-        return lerp(contribution, mixed)
+            return _mhc_write_lerp(streams, sublayer_out, post, res, self.eps, lerp)
 
 
 def _inv_sigmoid(p: float) -> float:
