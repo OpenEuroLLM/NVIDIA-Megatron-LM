@@ -43,6 +43,73 @@ learn the wider shape.)
 import torch
 
 
+def depth_payload_slots(config) -> int:
+    """How many ``[s, b, h]`` slices the inter-stage payload occupies.
+
+    Both depth-wise schemes widen what crosses a pipeline stage boundary, and
+    the pipeline schedules need that width up front to size their receive
+    buffers. Returns 1 when neither scheme is active, i.e. the ordinary residual.
+
+    Args:
+        config: A :class:`~megatron.core.transformer.transformer_config.TransformerConfig`.
+
+    Returns:
+        The multiplier on ``hidden_size`` for the inter-stage tensor.
+    """
+    if getattr(config, "mhc", False):
+        return config.mhc_expansion_rate
+    if getattr(config, "attn_res", False):
+        # b_0 (the embedding) plus one slice per completed block. Mid-block the
+        # in-progress partial sum takes the slot of the block it will become, so
+        # this is the maximum over every boundary, not just the last one.
+        return config.attn_res_num_blocks + 1
+    return 1
+
+
+def pack_payload(sources: list[torch.Tensor], slots: int) -> torch.Tensor:
+    """Flatten Block AttnRes sources into one ``[s, b, slots * h]`` tensor.
+
+    Padded to a fixed width so every stage boundary ships the same shape, which
+    is what lets the schedules compute one tensor shape for the whole pipeline.
+    Unused slots are zero and are never read: the receiving stage derives how
+    many are live from its own layer offset, which is static.
+
+    The payload is deliberately kept 3-D. The p2p layer exchanges shapes as a
+    3-element tensor when ``variable_seq_lengths`` is set, so a rank-4 payload
+    would be silently truncated there.
+
+    Args:
+        sources: The ``[s, b, h]`` tensors to ship, at most ``slots`` of them.
+        slots: Fixed payload width from :func:`depth_payload_slots`.
+
+    Returns:
+        ``[s, b, slots * h]``.
+    """
+    if len(sources) > slots:
+        raise ValueError(f"payload has {len(sources)} sources but only {slots} slots")
+    s, b, h = sources[0].shape
+    payload = sources[0].new_zeros((s, b, slots, h))
+    for i, src in enumerate(sources):
+        payload[:, :, i] = src
+    return payload.reshape(s, b, slots * h)
+
+
+def unpack_payload(payload: torch.Tensor, slots: int, live: int) -> list[torch.Tensor]:
+    """Recover the live ``[s, b, h]`` slices from :func:`pack_payload`.
+
+    Args:
+        payload: ``[s, b, slots * h]`` tensor received from the previous stage.
+        slots: Fixed payload width.
+        live: How many leading slices carry real data.
+
+    Returns:
+        A list of ``live`` tensors of shape ``[s, b, h]``.
+    """
+    s, b, wide = payload.shape
+    view = payload.reshape(s, b, slots, wide // slots)
+    return [view[:, :, i] for i in range(live)]
+
+
 class DepthResidualState:
     """Block Attention Residual state for one forward pass.
 

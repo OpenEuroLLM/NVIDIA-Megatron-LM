@@ -716,31 +716,31 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         """Widen the residual stream for this forward pass, if a scheme is active.
 
         mHC and Block AttnRes both replace the single residual stream with a
-        wider, depth-spanning state that every layer in this block reads from and
-        writes to, but they carry it differently:
+        wider, depth-spanning state that every layer reads from and writes to,
+        but they carry it differently within a stage:
 
-        * **mHC** widens ``hidden_states`` itself to ``[s, b, n, h]``. The state
-          then travels through the layers as an ordinary argument and return
-          value, which is what allows the layers to be CUDA-graph captured --
-          see the note in :class:`~megatron.core.transformer.transformer_layer.TransformerLayer`.
+        * **mHC** widens ``hidden_states`` itself to ``[s, b, n, h]``, so the
+          state travels through the layers as an ordinary argument and return
+          value -- which is what allows the layers to be CUDA-graph captured.
         * **Block AttnRes** accumulates a growing list of block summaries, which
-          is not expressible as a single fixed-shape tensor, so the block owns a
+          no single fixed-shape tensor expresses, so the block owns a
           :class:`~megatron.core.transformer.depth_residual.DepthResidualState`
           and stashes it on each layer.
 
+        Across a pipeline stage boundary both travel the same way: flattened to
+        ``[s, b, slots * h]`` by :func:`~megatron.core.transformer.depth_residual.pack_payload`,
+        a fixed width so the schedules can compute one tensor shape for the whole
+        pipeline. Deliberately 3-D -- the p2p layer exchanges shapes as a
+        3-element tensor under ``variable_seq_lengths``, so a rank-4 payload
+        would be silently truncated there.
+
         Args:
-            hidden_states: The block's input hidden states, ``[s, b, h]``.
+            hidden_states: ``[s, b, h]`` on the first stage, otherwise the
+                ``[s, b, slots * h]`` payload from the previous stage.
 
         Returns:
             ``(hidden_states, depth_state)``. ``hidden_states`` is widened for
-            mHC and unchanged otherwise; ``depth_state`` is None unless Block
-            AttnRes is active.
-
-        Raises:
-            NotImplementedError: If pipeline parallelism is active. Both schemes
-                widen the inter-stage payload (mHC by the expansion rate, AttnRes
-                by the block count), which requires the pipeline shape
-                negotiation to be widened as well.
+            mHC; ``depth_state`` is None unless Block AttnRes is active.
         """
         mhc = getattr(self.config, "mhc", False)
         attn_res = getattr(self.config, "attn_res", False)
@@ -749,51 +749,97 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         if mhc and attn_res:
             raise ValueError("mhc and attn_res are mutually exclusive; enable at most one")
 
-        if self.config.pipeline_model_parallel_size > 1:
-            raise NotImplementedError(
-                "mHC and Block AttnRes currently require pipeline_model_parallel_size == 1. "
-                "Both widen the residual payload that crosses a pipeline stage boundary "
-                "(by the expansion rate / block count respectively), so the pipeline "
-                "shape negotiation must be widened before PP > 1 can be enabled."
-            )
+        from megatron.core.transformer.depth_residual import depth_payload_slots, unpack_payload
+
+        slots = depth_payload_slots(self.config)
 
         if mhc:
             from megatron.core.transformer.mhc import expand_to_streams
 
-            return expand_to_streams(hidden_states, self.config.mhc_expansion_rate), None
+            if self.pre_process:
+                return expand_to_streams(hidden_states, slots), None
+            # Already widened by an earlier stage; restore the stream axis.
+            s, b, wide = hidden_states.shape
+            return hidden_states.reshape(s, b, slots, wide // slots), None
 
         from megatron.core.transformer.attn_res import resolve_layers_per_block
         from megatron.core.transformer.depth_residual import DepthResidualState
 
-        return hidden_states, DepthResidualState(
-            hidden_states,
-            layers_per_block=resolve_layers_per_block(
-                self.config.num_layers, self.config.attn_res_num_blocks
-            ),
+        layers_per_block = resolve_layers_per_block(
+            self.config.num_layers, self.config.attn_res_num_blocks
         )
+        if self.pre_process:
+            return hidden_states, DepthResidualState(
+                hidden_states, layers_per_block=layers_per_block
+            )
 
-    def _depth_exit(self, hidden_states: Tensor) -> Tensor:
-        """Reduce the depth-wise state back to a single ``[s, b, h]`` hidden state.
+        live, has_partial = self._depth_live_slots(layers_per_block)
+        sources = unpack_payload(hidden_states, slots, live)
+        state = DepthResidualState(sources[0], layers_per_block=layers_per_block)
+        # sources() appends the partial last when there is one, so pack_payload
+        # put it in the final live slot.
+        if has_partial:
+            state.blocks, state.partial = sources[:-1], sources[-1]
+        else:
+            state.blocks, state.partial = sources, None
+        return hidden_states, state
 
-        Also drops the per-layer Block AttnRes references so the state is not kept
-        alive past the forward pass.
+    def _depth_live_slots(self, layers_per_block: int) -> tuple[int, bool]:
+        """Payload slices carrying real data at this stage's input boundary.
 
-        Args:
-            hidden_states: The trunk output -- ``[s, b, n, h]`` streams under mHC,
-                otherwise ``[s, b, h]``.
+        Derived from the layer offset rather than signalled, because the offset
+        is static: layer counts per stage do not vary at run time, so both sides
+        of the boundary compute the same answer. ``b_0`` is always present, one
+        more slice per block sealed so far, and one for the in-progress partial
+        sum when the boundary falls mid-block.
 
         Returns:
-            A ``[s, b, h]`` hidden state ready for the final norm.
+            ``(live_slices, has_partial)``.
         """
-        if getattr(self.config, "mhc", False) and hidden_states.dim() == 4:
+        done = get_transformer_layer_offset(self.config, vp_stage=self.vp_stage)
+        has_partial = bool(done % layers_per_block)
+        return 1 + done // layers_per_block + int(has_partial), has_partial
+
+    def _depth_exit(self, hidden_states: Tensor) -> Tensor:
+        """Reduce or repack the depth-wise state at the end of this stage.
+
+        On the last pipeline stage the state collapses to a single ``[s, b, h]``
+        hidden state for the final norm. Otherwise it is flattened to the
+        fixed-width payload the next stage expects.
+
+        Args:
+            hidden_states: The trunk output -- ``[s, b, n, h]`` streams under
+                mHC, otherwise ``[s, b, h]``.
+
+        Returns:
+            ``[s, b, h]`` on the last stage, else ``[s, b, slots * h]``.
+        """
+        from megatron.core.transformer.depth_residual import depth_payload_slots, pack_payload
+
+        mhc = getattr(self.config, "mhc", False)
+        if mhc and hidden_states.dim() == 4:
             from megatron.core.transformer.mhc import collapse_streams
 
-            return collapse_streams(hidden_states)
+            if self.post_process:
+                return collapse_streams(hidden_states)
+            s, b, n, h = hidden_states.shape
+            # reshape returns a view, and the pipeline schedule refuses to free a
+            # view of another tensor when it deallocates a stage output.
+            return make_viewless_tensor(
+                inp=hidden_states.reshape(s, b, n * h), requires_grad=True, keep_graph=True
+            )
 
         depth_state = getattr(self.layers[0], "_depth_state", None) if len(self.layers) else None
         if depth_state is None:
             return hidden_states
-        hidden_states = depth_state.collapse()
+        if self.post_process:
+            hidden_states = depth_state.collapse()
+        else:
+            hidden_states = make_viewless_tensor(
+                inp=pack_payload(depth_state.sources(), depth_payload_slots(self.config)),
+                requires_grad=True,
+                keep_graph=True,
+            )
         for layer in self.layers:
             layer._depth_state = None
         return hidden_states

@@ -10,7 +10,12 @@ from megatron.core.transformer.attn_res import (
     accumulate_block,
     resolve_layers_per_block,
 )
-from megatron.core.transformer.depth_residual import DepthResidualState
+from megatron.core.transformer.depth_residual import (
+    DepthResidualState,
+    depth_payload_slots,
+    pack_payload,
+    unpack_payload,
+)
 from megatron.core.transformer.mhc import (
     MHCMixer,
     collapse_streams,
@@ -274,3 +279,63 @@ class TestDepthResidualState:
         for _ in range(4):
             accumulate_block(state, torch.randn(S, B, C), lerp=lerp)
         assert torch.allclose(state.partial.norm(dim=-1), torch.ones(S, B), atol=1e-4)
+
+
+class TestPipelinePayload:
+    """The fixed-width payload that crosses a pipeline stage boundary.
+
+    Deliberately 3-D: the p2p layer exchanges shapes as a 3-element tensor when
+    variable_seq_lengths is set, so a rank-4 payload would be silently truncated
+    there and the receiving stage would allocate the wrong buffer.
+    """
+
+    def test_slots_match_each_scheme(self):
+        class Cfg:
+            mhc = False
+            attn_res = False
+            mhc_expansion_rate = 4
+            attn_res_num_blocks = 8
+
+        cfg = Cfg()
+        assert depth_payload_slots(cfg) == 1  # ordinary residual
+        cfg.mhc = True
+        assert depth_payload_slots(cfg) == 4
+        cfg.mhc, cfg.attn_res = False, True
+        assert depth_payload_slots(cfg) == 9  # b_0 plus one per block
+
+    @pytest.mark.parametrize("live", [1, 2, 5])
+    def test_pack_unpack_roundtrip(self, live):
+        srcs = [torch.randn(S, B, C) for _ in range(live)]
+        payload = pack_payload(srcs, slots=5)
+        assert payload.shape == (S, B, 5 * C)
+        assert payload.dim() == 3
+        for got, want in zip(unpack_payload(payload, slots=5, live=live), srcs):
+            torch.testing.assert_close(got, want)
+
+    def test_unused_slots_are_zero(self):
+        """Padding must not leak whatever was in memory into a later stage."""
+        payload = pack_payload([torch.randn(S, B, C)], slots=4)
+        assert payload.reshape(S, B, 4, C)[:, :, 1:].abs().max() == 0
+
+    def test_rejects_overfull_payload(self):
+        with pytest.raises(ValueError, match="slots"):
+            pack_payload([torch.randn(S, B, C) for _ in range(5)], slots=4)
+
+    def test_mhc_stream_flattening_is_reversible(self):
+        """The mHC payload is the stream state itself, flattened and restored."""
+        streams = expand_to_streams(torch.randn(S, B, C), N)
+        flat = streams.reshape(S, B, N * C)
+        assert flat.dim() == 3
+        torch.testing.assert_close(flat.reshape(S, B, N, C), streams)
+
+    def test_attn_res_payload_never_exceeds_slots(self):
+        """Every boundary must fit: mid-block the partial takes an extra slice."""
+        num_blocks, layers_per_block = 4, 3
+        slots = num_blocks + 1
+        state = DepthResidualState(torch.randn(S, B, C), layers_per_block=layers_per_block)
+        for layer in range(1, num_blocks * layers_per_block + 1):
+            accumulate_block(state, torch.randn(S, B, C))
+            if state.should_seal(layer):
+                state.seal_block()
+            assert len(state.sources()) <= slots, f"overflow after layer {layer}"
+            pack_payload(state.sources(), slots)  # must not raise at any boundary
