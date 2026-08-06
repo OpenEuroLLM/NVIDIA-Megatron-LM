@@ -42,9 +42,12 @@ sublayer output -- mixing before renormalization, since a convex combination of
 unit vectors is not itself unit norm.
 """
 
+import os
+
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 
 def _sinkhorn_knopp_impl(
@@ -248,6 +251,32 @@ def _mhc_mix_normalized(streams, h_res, eps):
     """
     mixed = (h_res.unsqueeze(-1) * streams.unsqueeze(-3)).sum(dim=-2)
     return mixed / torch.linalg.vector_norm(mixed, dim=-1, keepdim=True).clamp(min=eps)
+
+
+# Recompute the LERP write in backward rather than keeping its intermediates.
+#
+# The additive write runs at micro-batch 28-32; the LERP write cannot get past 8
+# on the same model, and a probe showed why: steady-state occupancy at mbs=8 is
+# only 0.62, yet mbs=16 OOMs, so activations dominate and roughly double with
+# batch. That batch gap is the whole 65-vs-200 TFLOP/s difference -- the arms are
+# memory-bound, not compute-bound, and no amount of kernel fusion touches it
+# (fusing the region was measured at 65.9 -> 65.6, i.e. nothing).
+#
+# The additive path avoids this already: _MHCWrite saves its four inputs and
+# recomputes everything in a Triton backward. The LERP path had no equivalent, so
+# AOTAutograd saved every [s, b, n, C] intermediate the chain produces -- the
+# write-back term, the mixed state before and after renormalization, plus the
+# residual module's own internals -- across all 36 sublayers.
+#
+# Checkpointing gets the same effect without hand-deriving gradients for seven
+# lerp_normalization modes and for the residual's learnable alpha, which is a
+# parameter and needs its own gradient. use_reentrant=False is the variant that
+# handles module parameters correctly; there is no dropout in this region, so the
+# recomputation is deterministic.
+#
+# Set MHC_LERP_RECOMPUTE=0 to keep the intermediates instead, which is the
+# faster choice if a configuration has memory to spare.
+_LERP_RECOMPUTE = os.environ.get("MHC_LERP_RECOMPUTE", "1") != "0"
 
 
 def _mhc_write_lerp(streams, sublayer_out, h_post, h_res, eps, lerp):
@@ -534,9 +563,13 @@ class MHCMixer(nn.Module):
             return _mhc_write_dispatch(streams, sublayer_out, post, res)
         post, res = h_post.to(streams.dtype), h_res.to(streams.dtype)
         try:
-            return _compiled(_mhc_write_lerp)(
-                streams, sublayer_out, post, res, self.eps, lerp
-            )
+            fn = _compiled(_mhc_write_lerp)
+            if _LERP_RECOMPUTE:
+                # Trade one recomputation of this region for the intermediates it
+                # would otherwise keep alive; see the note on _LERP_RECOMPUTE.
+                return checkpoint(fn, streams, sublayer_out, post, res, self.eps, lerp,
+                                  use_reentrant=False)
+            return fn(streams, sublayer_out, post, res, self.eps, lerp)
         except Exception:  # pragma: no cover - Inductor unusable at runtime
             # torch.compile defers compilation to the first call, so a broken
             # toolchain surfaces here rather than where the wrapper was built.
