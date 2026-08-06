@@ -138,3 +138,48 @@ class TestMHCCudaGraphs:
         block(hidden_states=x, attention_mask=None)
         for layer in block.layers:
             assert layer._depth_state is None
+
+
+class TestNGPTScalersInAttention:
+    """s_qk must be sized to broadcast against q/k as attention actually holds them.
+
+    The unit tests for EigenLRScaler exercised it standalone, so nothing caught
+    that the attention module built it at query_projection_size while applying it
+    after the reshape to [s, b, heads, head_dim]. Two 6B-token runs died on that
+    after a couple of iterations.
+    """
+
+    def setup_method(self, method):
+        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+        Utils.initialize_model_parallel(1, 1)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+    def test_scaled_attention_runs(self):
+        model_parallel_cuda_manual_seed(123)
+        cfg = TransformerConfig(
+            num_layers=2,
+            hidden_size=H,
+            num_attention_heads=4,
+            kv_channels=H // 4,
+            use_cpu_initialization=True,
+            pipeline_dtype=torch.float32,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            ngpt=True,
+            ngpt_lerp_normalization="analytic",
+            qk_l2_norm=True,
+            ngpt_use_sqk=True,
+            ngpt_use_suv=True,
+        )
+        block = TransformerBlock(cfg, get_gpt_layer_with_transformer_engine_spec()).cuda()
+        attn = block.layers[0].self_attention
+        assert attn.ngpt_sq is not None, "s_qk was not built"
+        assert attn.ngpt_sq.weight.shape[-1] == attn.hidden_size_per_attention_head
+
+        x = torch.randn(S, B, H, device="cuda", requires_grad=True)
+        out = block(hidden_states=x, attention_mask=None)
+        out.square().mean().backward()
+        assert torch.isfinite(out).all() and torch.isfinite(x.grad).all()

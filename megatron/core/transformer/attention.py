@@ -1475,10 +1475,14 @@ class SelfAttention(Attention):
 
             base = self.config.ngpt_scaler_base_scale
             base = (self.config.hidden_size**-0.5) if base == -1.0 else base
-            q_dim = self.query_projection_size
-            k_dim = self.kv_projection_size
-            self.ngpt_sq = EigenLRScaler(q_dim, self.config.ngpt_scaler_init, base)
-            self.ngpt_sk = EigenLRScaler(k_dim, self.config.ngpt_scaler_init, base)
+            # Sized by the *head* dimension, not the projection size: s_qk is
+            # applied after q and k are reshaped to [s, b, heads, head_dim], so a
+            # scaler of width query_projection_size fails to broadcast against
+            # the last axis. nGPT scales each head's q/k vector, which is what
+            # this width corresponds to.
+            head_dim = self.hidden_size_per_attention_head
+            self.ngpt_sq = EigenLRScaler(head_dim, self.config.ngpt_scaler_init, base)
+            self.ngpt_sk = EigenLRScaler(head_dim, self.config.ngpt_scaler_init, base)
 
     def run_realtime_tests(self):
         """Performs a consistency check.
