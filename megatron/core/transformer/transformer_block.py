@@ -196,6 +196,40 @@ def get_num_layers_to_build(
     return num_layers_to_build
 
 
+def build_loop_schedule(config) -> Optional[List[int]]:
+    """Return the order in which ``self.layers`` is applied, or None when not looping.
+
+    A looped stack is prelude / block x iterations / coda over *unique* layers, so
+    with 3 prelude, a 3-layer block run 4 times and 3 coda the 9 built layers are
+    applied in the order::
+
+        [0, 1, 2,  3, 4, 5,  3, 4, 5,  3, 4, 5,  3, 4, 5,  6, 7, 8]
+
+    giving an effective depth of 18. The block's weights are shared across
+    iterations, which is only well-posed if the residual keeps a stable magnitude
+    with depth -- the property nGPT's LERP residual provides and a plain additive
+    residual does not.
+
+    Args:
+        config: A :class:`TransformerConfig` (or anything exposing the loop fields).
+
+    Returns:
+        The layer-index schedule, or None when ``loop_block_layers`` is 0.
+    """
+    block = getattr(config, "loop_block_layers", 0)
+    if not block:
+        return None
+    prelude = getattr(config, "loop_prelude_layers", 0)
+    coda = getattr(config, "loop_coda_layers", 0)
+    iterations = getattr(config, "loop_iterations", 1)
+
+    schedule = list(range(prelude))
+    for _ in range(iterations):
+        schedule.extend(range(prelude, prelude + block))
+    schedule.extend(range(prelude + block, prelude + block + coda))
+    return schedule
+
+
 @dataclass
 class TransformerBlockSubmodules:
     """
@@ -365,6 +399,29 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 for i, layer_spec in enumerate(self.submodules.layer_specs)
             ]
         )
+
+        # Looped depth: the middle block is applied loop_iterations times. Stored as
+        # an explicit index list rather than nested loops in forward, so the whole
+        # schedule is inspectable and testable without running a forward.
+        self._loop_schedule = build_loop_schedule(self.config)
+        if self._loop_schedule is not None:
+            # Both of these iterate self.layers once and key state per module, so a
+            # layer applied several times per step would either recompute the wrong
+            # activations or replay another position's captured graph. Fail loudly
+            # rather than silently produce wrong numbers.
+            if self.config.recompute_granularity is not None:
+                raise NotImplementedError(
+                    "Looped depth does not support activation recompute: "
+                    "_checkpointed_forward walks self.layers once and would not "
+                    "reproduce the repeated block."
+                )
+            if getattr(self.config, "cuda_graph_impl", "none") != "none":
+                raise NotImplementedError(
+                    "Looped depth does not support CUDA graphs: CudaGraphManager keys "
+                    "graphs per module and assumes one call per module per step, so a "
+                    "looped layer would replay the wrong position's graph. "
+                    "Set cuda_graph_impl: none."
+                )
 
         # @TODO: add back account_for_embedding_in_pipeline_split (see issue #293)
         # In pipeline parallelism, we want to add this LN only to the last stage of the pipeline
@@ -642,7 +699,13 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     hidden_states = checkpointed_result
             else:
                 hidden_states, depth_state = self._depth_enter(hidden_states)
-                for l_no, layer in enumerate(self.layers):
+                if self._loop_schedule is None:
+                    layer_order = list(enumerate(self.layers))
+                else:
+                    # l_no counts *positions*, not unique layers, so extract_layer_indices
+                    # keeps addressing depth rather than parameters.
+                    layer_order = [(i, self.layers[li]) for i, li in enumerate(self._loop_schedule)]
+                for l_no, layer in layer_order:
                     if depth_state is not None:
                         layer._depth_state = depth_state
                     # Get appropriate inner quantization context

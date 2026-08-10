@@ -1303,12 +1303,49 @@ class TransformerConfig(ModelParallelConfig):
     toward the normalized sublayer output instead of a plain sum, keeping block summaries on
     the unit sphere rather than growing with block size. Requires ngpt=True."""
 
+    # ---- Looped (weight-tied) depth ----
+    # A prelude/loop/coda stack: the middle block is built once and applied
+    # ``loop_iterations`` times, so effective depth exceeds parameter depth. The
+    # motivation is nGPT's LERP residual, which holds ||x|| constant with depth --
+    # a repeated block then sees inputs from the same distribution at every
+    # iteration, which is exactly what weight tying across depth requires.
+    #
+    # ``num_layers`` counts *unique* layers, so it must equal
+    # prelude + block + coda. Effective depth is prelude + block*iterations + coda.
+    loop_block_layers: int = 0
+    """Number of unique layers in the looped block. 0 disables looping entirely."""
+
+    loop_iterations: int = 1
+    """How many times the looped block is applied. 1 is equivalent to no looping."""
+
+    loop_prelude_layers: int = 0
+    """Unique layers applied once before the loop, to get off the token embedding."""
+
+    loop_coda_layers: int = 0
+    """Unique layers applied once after the loop, before the final norm and head."""
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
         details.
         """
         super().__post_init__()
+
+        if self.loop_block_layers:
+            unique = self.loop_prelude_layers + self.loop_block_layers + self.loop_coda_layers
+            if unique != self.num_layers:
+                raise ValueError(
+                    "num_layers counts unique layers when looping, so it must equal "
+                    f"loop_prelude_layers + loop_block_layers + loop_coda_layers "
+                    f"({self.loop_prelude_layers} + {self.loop_block_layers} + "
+                    f"{self.loop_coda_layers} = {unique}), got num_layers={self.num_layers}."
+                )
+            if self.loop_iterations < 1:
+                raise ValueError(f"loop_iterations must be >= 1, got {self.loop_iterations}")
+            if self.pipeline_model_parallel_size > 1:
+                # The loop would have to be split across stages, and a tied layer
+                # living on one stage cannot be applied on another.
+                raise ValueError("Looped depth requires pipeline_model_parallel_size == 1.")
 
         # When fp32 residual connections are enabled, pipeline parallel communication must
         # use fp32 to match the dtype of the residual stream between pipeline stages.
