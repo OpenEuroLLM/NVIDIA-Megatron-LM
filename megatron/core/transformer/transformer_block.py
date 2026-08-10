@@ -36,6 +36,7 @@ from megatron.core.utils import (
     WrappedTensor,
     deprecate_inference_params,
     get_pg_rank,
+    log_single_rank,
     make_viewless_tensor,
 )
 
@@ -210,6 +211,19 @@ def build_loop_schedule(config) -> Optional[List[int]]:
     with depth -- the property nGPT's LERP residual provides and a plain additive
     residual does not.
 
+    ``loop_group_size`` sets *where* the recurrence sits, at identical parameter
+    count and identical FLOPs -- only the application order changes. For a 6-layer
+    block run twice::
+
+        group 6 (default):  3 4 5 6 7 8 | 3 4 5 6 7 8    outer recurrence
+        group 3:            3 4 5 3 4 5 | 6 7 8 6 7 8
+        group 1:            3 3 | 4 4 | 5 5 | 6 6 | ...  each layer repeated
+
+    At group 1 a layer immediately consumes its own output, which is the hardest
+    case for magnitude stability; at group 6 it sees the rest of the block first.
+    So the LERP's advantage, if the invariance is what makes tying work, should be
+    largest at small group sizes.
+
     Args:
         config: A :class:`TransformerConfig` (or anything exposing the loop fields).
 
@@ -222,10 +236,13 @@ def build_loop_schedule(config) -> Optional[List[int]]:
     prelude = getattr(config, "loop_prelude_layers", 0)
     coda = getattr(config, "loop_coda_layers", 0)
     iterations = getattr(config, "loop_iterations", 1)
+    # 0 means "the whole block is one group", i.e. outer recurrence.
+    group = getattr(config, "loop_group_size", 0) or block
 
     schedule = list(range(prelude))
-    for _ in range(iterations):
-        schedule.extend(range(prelude, prelude + block))
+    for start in range(prelude, prelude + block, group):
+        for _ in range(iterations):
+            schedule.extend(range(start, start + group))
     schedule.extend(range(prelude + block, prelude + block + coda))
     return schedule
 
@@ -405,6 +422,19 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         # schedule is inspectable and testable without running a forward.
         self._loop_schedule = build_loop_schedule(self.config)
         if self._loop_schedule is not None:
+            # Logged unconditionally: a looped run that silently fell back to a plain
+            # stack is indistinguishable from a correct one in the loss curve, and the
+            # flags reaching Megatron at all depends on plumbing outside this repo.
+            # This line is the positive confirmation that the loop is active.
+            log_single_rank(
+                logger,
+                logging.INFO,
+                f"Looped depth active: {len(self.layers)} unique layers applied as "
+                f"{len(self._loop_schedule)} (prelude {self.config.loop_prelude_layers}, "
+                f"block {self.config.loop_block_layers} x {self.config.loop_iterations}, "
+                f"group {self.config.loop_group_size or self.config.loop_block_layers}, "
+                f"coda {self.config.loop_coda_layers}); schedule={self._loop_schedule}",
+            )
             # Both of these iterate self.layers once and key state per module, so a
             # layer applied several times per step would either recompute the wrong
             # activations or replay another position's captured graph. Fail loudly

@@ -81,6 +81,45 @@ class TestLoopSchedule:
         )
         assert build_loop_schedule(cfg) == list(range(6))
 
+    def test_group_size_moves_the_recurrence_without_changing_cost(self):
+        """Same parameters, same FLOPs, different order -- only the schedule changes.
+
+        Group 1 makes a layer consume its own output immediately, which is the case
+        the LERP's magnitude invariance is supposed to make well-posed; group == block
+        is outer recurrence, where a layer sees the rest of the block first.
+        """
+        common = dict(
+            num_layers=12, loop_prelude_layers=3, loop_block_layers=6, loop_iterations=2,
+            loop_coda_layers=3,
+        )
+        expected = {
+            6: [3, 4, 5, 6, 7, 8, 3, 4, 5, 6, 7, 8],
+            3: [3, 4, 5, 3, 4, 5, 6, 7, 8, 6, 7, 8],
+            2: [3, 4, 3, 4, 5, 6, 5, 6, 7, 8, 7, 8],
+            1: [3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8],
+        }
+        for group, middle in expected.items():
+            schedule = build_loop_schedule(_config(loop_group_size=group, **common))
+            assert schedule == [0, 1, 2] + middle + [9, 10, 11], group
+            # Every group size is iso-cost: same effective depth, same unique layers.
+            assert len(schedule) == 18 and len(set(schedule)) == 12
+
+    def test_group_size_zero_is_whole_block(self):
+        cfg = dict(
+            num_layers=12, loop_prelude_layers=3, loop_block_layers=6, loop_iterations=2,
+            loop_coda_layers=3,
+        )
+        assert build_loop_schedule(_config(loop_group_size=0, **cfg)) == build_loop_schedule(
+            _config(loop_group_size=6, **cfg)
+        )
+
+    def test_group_size_must_divide_the_block(self):
+        with pytest.raises(ValueError, match="must divide"):
+            _config(
+                num_layers=12, loop_prelude_layers=3, loop_block_layers=6, loop_iterations=2,
+                loop_coda_layers=3, loop_group_size=4,
+            )
+
     def test_num_layers_must_count_unique_layers(self):
         with pytest.raises(ValueError, match="unique layers"):
             _config(

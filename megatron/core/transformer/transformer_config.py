@@ -1324,6 +1324,13 @@ class TransformerConfig(ModelParallelConfig):
     loop_coda_layers: int = 0
     """Unique layers applied once after the loop, before the final norm and head."""
 
+    loop_group_size: int = 0
+    """Where the recurrence sits inside the block, at identical parameters and FLOPs.
+
+    0 (default) repeats the whole block -- outer recurrence. N>0 partitions the block
+    into consecutive groups of N and repeats each group in place, so N=1 applies each
+    layer ``loop_iterations`` times before moving on. Must divide loop_block_layers."""
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
@@ -1342,6 +1349,12 @@ class TransformerConfig(ModelParallelConfig):
                 )
             if self.loop_iterations < 1:
                 raise ValueError(f"loop_iterations must be >= 1, got {self.loop_iterations}")
+            if self.loop_group_size and self.loop_block_layers % self.loop_group_size:
+                raise ValueError(
+                    f"loop_group_size ({self.loop_group_size}) must divide "
+                    f"loop_block_layers ({self.loop_block_layers}); otherwise the block "
+                    "cannot be partitioned into equal groups."
+                )
             if self.pipeline_model_parallel_size > 1:
                 # The loop would have to be split across stages, and a tied layer
                 # living on one stage cannot be applied on another.
