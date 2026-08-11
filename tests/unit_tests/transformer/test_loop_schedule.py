@@ -10,6 +10,8 @@ layer that runs more than once per step. These tests pin the schedule exactly an
 require the incompatible paths to fail loudly.
 """
 
+import logging
+
 import pytest
 import torch
 
@@ -181,3 +183,117 @@ class TestLoopedBlock:
             )
         with pytest.raises(NotImplementedError, match="CUDA graphs"):
             TransformerBlock(_config(cuda_graph_impl="local", **loop), spec)
+
+
+class _StubHybridStack:
+    """Minimal stand-in for the inputs of ``HybridStack._validate_loop_schedule``.
+
+    The validator reads only ``config``, ``layer_type_list`` and ``layers``.
+    Building a real HybridStack would need a GPU, a process group and the
+    mLSTM/Mamba kernels, none of which the validation logic depends on.
+    """
+
+    def __init__(self, config, pattern):
+        self.config = config
+        self.layer_type_list = list(pattern)
+        self.layers = [object()] * len(pattern)
+
+
+def _looped_pattern(config, pattern):
+    """The layer-type string a looped hybrid stack actually executes."""
+    schedule = build_loop_schedule(config)
+    return ''.join(pattern[i] for i in schedule)
+
+
+class TestHybridLoopedStack:
+    """HybridStack shares build_loop_schedule but indexes heterogeneous layers.
+
+    In a hybrid stack an index selects a layer *type* as well as a layer, so the
+    schedule decides the mixer/MLP composition of the repeated region. These pin
+    what a given (prelude, block, iterations, coda) does to the pattern.
+    """
+
+    def test_looping_repeats_the_block_pattern(self):
+        """3 softmax + (6 alternating)x2 + 3 softmax, over unique layers."""
+        pattern = "*-*-*-" + "M-M-M-" + "*-*-*-"
+        config = _config(
+            num_layers=18, loop_prelude_layers=6, loop_block_layers=6,
+            loop_iterations=2, loop_coda_layers=6,
+        )
+        assert _looped_pattern(config, pattern) == "*-*-*-" + "M-M-M-M-M-M-" + "*-*-*-"
+
+    def test_only_the_linear_block_is_repeated(self):
+        """The point of looping a hybrid: softmax layers stay out of the loop.
+
+        KV cache scales with effective depth, so repeating a softmax layer costs
+        cache; a linear layer's recurrent state is sequence-independent and costs
+        essentially nothing. The softmax count must therefore not change.
+        """
+        pattern = "*-*-*-" + "M-M-M-" + "*-*-*-"
+        config = _config(
+            num_layers=18, loop_prelude_layers=6, loop_block_layers=6,
+            loop_iterations=2, loop_coda_layers=6,
+        )
+        looped = _looped_pattern(config, pattern)
+        assert looped.count("*") == pattern.count("*") == 6
+        assert looped.count("M") == 2 * pattern.count("M") == 6
+
+    def test_alternating_block_does_not_warn(self, caplog):
+        """``M-`` repeats cleanly: the block ends on '-' and restarts on 'M'."""
+        from megatron.core.models.hybrid.hybrid_block import HybridStack
+
+        config = _config(
+            num_layers=18, loop_prelude_layers=6, loop_block_layers=6,
+            loop_iterations=2, loop_coda_layers=6,
+        )
+        stub = _StubHybridStack(config, "*-*-*-" + "M-M-M-" + "*-*-*-")
+        with caplog.at_level(logging.WARNING):
+            HybridStack._validate_loop_schedule(stub)
+        assert "seam" not in caplog.text and "starts and ends" not in caplog.text
+
+    def test_block_starting_and_ending_on_same_type_warns(self, caplog):
+        """A block ``M-M`` splices 'M' onto 'M' at every seam -- usually off-by-one."""
+        from megatron.core.models.hybrid.hybrid_block import HybridStack
+
+        config = _config(
+            num_layers=11, loop_prelude_layers=4, loop_block_layers=3,
+            loop_iterations=2, loop_coda_layers=4,
+        )
+        stub = _StubHybridStack(config, "*-*-" + "M-M" + "-*-*")
+        with caplog.at_level(logging.WARNING):
+            HybridStack._validate_loop_schedule(stub)
+        assert "starts and ends" in caplog.text
+
+    def test_layer_type_count_must_match_built_layers(self):
+        from megatron.core.models.hybrid.hybrid_block import HybridStack
+
+        config = _config(
+            num_layers=18, loop_prelude_layers=6, loop_block_layers=6,
+            loop_iterations=2, loop_coda_layers=6,
+        )
+        stub = _StubHybridStack(config, "*-*-*-" + "M-M-M-" + "*-*-*-")
+        stub.layers = stub.layers[:-1]
+        with pytest.raises(ValueError, match="one layer type per built layer"):
+            HybridStack._validate_loop_schedule(stub)
+
+    def test_recompute_and_cuda_graphs_are_rejected(self):
+        """Same reason as TransformerBlock: both walk self.layers once."""
+        from megatron.core.models.hybrid.hybrid_block import HybridStack
+
+        loop = dict(
+            num_layers=18, loop_prelude_layers=6, loop_block_layers=6,
+            loop_iterations=2, loop_coda_layers=6,
+        )
+        pattern = "*-*-*-" + "M-M-M-" + "*-*-*-"
+        with pytest.raises(NotImplementedError, match="recompute"):
+            HybridStack._validate_loop_schedule(
+                _StubHybridStack(
+                    _config(recompute_granularity="full", recompute_method="uniform",
+                            recompute_num_layers=1, **loop),
+                    pattern,
+                )
+            )
+        with pytest.raises(NotImplementedError, match="CUDA graphs"):
+            HybridStack._validate_loop_schedule(
+                _StubHybridStack(_config(cuda_graph_impl="local", **loop), pattern)
+            )
