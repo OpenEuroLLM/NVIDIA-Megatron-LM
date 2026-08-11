@@ -435,23 +435,13 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 f"group {self.config.loop_group_size or self.config.loop_block_layers}, "
                 f"coda {self.config.loop_coda_layers}); schedule={self._loop_schedule}",
             )
-            # Both of these iterate self.layers once and key state per module, so a
-            # layer applied several times per step would either recompute the wrong
-            # activations or replay another position's captured graph. Fail loudly
-            # rather than silently produce wrong numbers.
-            if self.config.recompute_granularity is not None:
-                raise NotImplementedError(
-                    "Looped depth does not support activation recompute: "
-                    "_checkpointed_forward walks self.layers once and would not "
-                    "reproduce the repeated block."
-                )
-            if getattr(self.config, "cuda_graph_impl", "none") != "none":
-                raise NotImplementedError(
-                    "Looped depth does not support CUDA graphs: CudaGraphManager keys "
-                    "graphs per module and assumes one call per module per step, so a "
-                    "looped layer would replay the wrong position's graph. "
-                    "Set cuda_graph_impl: none."
-                )
+            # Recompute walks the loop schedule (see megatron/core/recompute.py), and
+            # CUDA graphs need no special handling: at PP=1 CudaGraphManager selects
+            # the first FWD_READY runner and a forward flips it to BWD_READY, so N
+            # calls to one module capture N runners and replay them in capture order.
+            # That is the same mechanism gradient accumulation already relies on --
+            # a looped layer at mbs<gbs/DP was always being called several times per
+            # step. Both paths are covered by tests; neither is guarded here.
 
         # @TODO: add back account_for_embedding_in_pipeline_split (see issue #293)
         # In pipeline parallelism, we want to add this LN only to the last stage of the pipeline

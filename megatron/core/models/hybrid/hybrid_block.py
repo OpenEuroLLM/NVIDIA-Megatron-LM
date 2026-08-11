@@ -233,12 +233,12 @@ class HybridStack(MegatronModule):
     def _validate_loop_schedule(self) -> None:
         """Reject loop configurations this stack cannot execute correctly.
 
-        The first two guards mirror TransformerBlock: both activation recompute
-        and CUDA graphs iterate ``self.layers`` once and key state per module, so
-        a layer applied several times per step would either recompute the wrong
-        activations or replay another position's captured graph.
+        Recompute and CUDA graphs both work under a loop schedule and are not
+        checked here -- recompute walks the schedule, and CudaGraphManager already
+        handles a module called several times per step, which is what gradient
+        accumulation does.
 
-        The third is specific to a hybrid stack. ``build_loop_schedule`` addresses
+        What is checked is specific to a hybrid stack. ``build_loop_schedule`` addresses
         layers by index, and in a hybrid stack the index also selects a layer
         *type*, so repeating a block splices its last layer type directly onto its
         first. A block is not required to be homogeneous -- the natural hybrid
@@ -248,20 +248,6 @@ class HybridStack(MegatronModule):
         rather than an intent. That is a warning, not an error: it is a design
         smell, and the caller may have meant it.
         """
-        if self.config.recompute_granularity is not None:
-            raise NotImplementedError(
-                "Looped depth does not support activation recompute: the "
-                "checkpointed forward walks self.layers once and would not "
-                "reproduce the repeated block."
-            )
-        if getattr(self.config, "cuda_graph_impl", "none") != "none":
-            raise NotImplementedError(
-                "Looped depth does not support CUDA graphs: CudaGraphManager keys "
-                "graphs per module and assumes one call per module per step, so a "
-                "looped layer would replay the wrong position's graph. "
-                "Set cuda_graph_impl: none."
-            )
-
         prelude = self.config.loop_prelude_layers
         block = self.config.loop_block_layers
         if len(self.layer_type_list) != len(self.layers):

@@ -168,21 +168,54 @@ class TestLoopedBlock:
                 assert param.grad is not None, f"looped layer param without grad: {name}"
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
-    def test_recompute_and_cuda_graphs_are_rejected(self):
-        """Both walk self.layers once; silently wrong numbers are worse than a crash."""
-        spec = get_gpt_layer_with_transformer_engine_spec()
-        loop = dict(
+    def test_recompute_matches_no_recompute_under_looping(self):
+        """Recompute must reproduce the looped forward, not the unlooped one.
+
+        This is the failure the old guard was there to prevent: chunking
+        range(num_layers) instead of the schedule silently applies the block once
+        rather than once per iteration, which is a different model that trains
+        perfectly happily.
+        """
+        model_parallel_cuda_manual_seed(123)
+        # One block, toggled between calls: two constructions would differ in their
+        # weights and mask a real discrepancy behind an init difference.
+        cfg = _config(
             num_layers=5, loop_prelude_layers=1, loop_block_layers=3, loop_iterations=3,
-            loop_coda_layers=1,
+            loop_coda_layers=1, ngpt=True, ngpt_lerp_normalization="analytic",
+            recompute_method="uniform", recompute_num_layers=1,
         )
-        with pytest.raises(NotImplementedError, match="recompute"):
-            TransformerBlock(
-                _config(recompute_granularity="full", recompute_method="uniform",
-                        recompute_num_layers=1, **loop),
-                spec,
-            )
-        with pytest.raises(NotImplementedError, match="CUDA graphs"):
-            TransformerBlock(_config(cuda_graph_impl="local", **loop), spec)
+        block = TransformerBlock(cfg, get_gpt_layer_with_transformer_engine_spec()).cuda()
+        block.train()
+        x = torch.randn(S, B, H, device="cuda")
+
+        cfg.recompute_granularity = None
+        plain = block(hidden_states=x.clone(), attention_mask=None)
+        cfg.recompute_granularity = "full"
+        recomputed = block(hidden_states=x.clone(), attention_mask=None)
+
+        torch.testing.assert_close(plain, recomputed, rtol=1e-3, atol=1e-3)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+    def test_recompute_walks_every_position_not_every_layer(self):
+        """The chunk driver must cover effective depth, not unique depth."""
+        spec = get_gpt_layer_with_transformer_engine_spec()
+        block = TransformerBlock(
+            _config(num_layers=5, loop_prelude_layers=1, loop_block_layers=3,
+                    loop_iterations=3, loop_coda_layers=1,
+                    recompute_granularity="full", recompute_method="uniform",
+                    recompute_num_layers=1),
+            spec,
+        ).cuda()
+        block.train()
+
+        calls = []
+        for i, layer in enumerate(block.layers):
+            layer.register_forward_hook(lambda m, a, o, i=i: calls.append(i))
+        block(hidden_states=torch.randn(S, B, H, device="cuda"), attention_mask=None)
+
+        assert calls == block._loop_schedule, (
+            f"recompute applied {calls}, schedule is {block._loop_schedule}"
+        )
 
 
 class _StubHybridStack:
@@ -276,8 +309,13 @@ class TestHybridLoopedStack:
         with pytest.raises(ValueError, match="one layer type per built layer"):
             HybridStack._validate_loop_schedule(stub)
 
-    def test_recompute_and_cuda_graphs_are_rejected(self):
-        """Same reason as TransformerBlock: both walk self.layers once."""
+    def test_recompute_and_cuda_graphs_are_not_rejected(self):
+        """Both work under a loop schedule; neither is guarded any more.
+
+        Recompute walks the schedule, and CudaGraphManager already handles a
+        module called several times per step -- gradient accumulation does the
+        same thing.
+        """
         from megatron.core.models.hybrid.hybrid_block import HybridStack
 
         loop = dict(
@@ -285,15 +323,13 @@ class TestHybridLoopedStack:
             loop_iterations=2, loop_coda_layers=6,
         )
         pattern = "*-*-*-" + "M-M-M-" + "*-*-*-"
-        with pytest.raises(NotImplementedError, match="recompute"):
-            HybridStack._validate_loop_schedule(
-                _StubHybridStack(
-                    _config(recompute_granularity="full", recompute_method="uniform",
-                            recompute_num_layers=1, **loop),
-                    pattern,
-                )
+        HybridStack._validate_loop_schedule(
+            _StubHybridStack(
+                _config(recompute_granularity="full", recompute_method="uniform",
+                        recompute_num_layers=1, **loop),
+                pattern,
             )
-        with pytest.raises(NotImplementedError, match="CUDA graphs"):
-            HybridStack._validate_loop_schedule(
-                _StubHybridStack(_config(cuda_graph_impl="local", **loop), pattern)
-            )
+        )
+        HybridStack._validate_loop_schedule(
+            _StubHybridStack(_config(cuda_graph_impl="local", **loop), pattern)
+        )
