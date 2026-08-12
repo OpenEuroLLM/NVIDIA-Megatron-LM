@@ -460,7 +460,14 @@ class GatedDeltaNet(MegatronModule):
         dt_bias_local_cp = get_parameter_local_cp(
             self.dt_bias, dim=0, cp_group=self.pg_collection.cp
         )
-        g, beta = self._compute_g_and_beta(A_log_local_cp, dt_bias_local_cp, alpha, beta)
+        g, beta = self._compute_g_and_beta(
+            A_log_local_cp,
+            dt_bias_local_cp,
+            alpha,
+            beta,
+            self.config.linear_beta_max,
+            self.config.linear_beta_activation,
+        )
         nvtx_range_pop(suffix="g_and_beta")
 
         nvtx_range_push(suffix="gated_delta_rule")
@@ -563,13 +570,40 @@ class GatedDeltaNet(MegatronModule):
         return query, key, value, gate, beta, alpha
 
     @jit_fuser
-    def _compute_g_and_beta(self, A_log_local_cp, dt_bias_local_cp, alpha, beta):
+    def _compute_g_and_beta(
+        self,
+        A_log_local_cp,
+        dt_bias_local_cp,
+        alpha,
+        beta,
+        beta_max: float = 1.0,
+        beta_activation: str = "sigmoid",
+    ):
         """
         Compute g (decay) and beta (sigmoid) for gated delta rule.
         Fuses exp, softplus, mul, neg, and sigmoid operations.
+
+        beta is ``beta_max * shape(x)`` with ``shape`` mapping to ``(0, 1)``.
+        With ``beta_max=2`` the delta-rule transition ``(I - beta k k^T)`` gains
+        eigenvalues in ``(-1, 1]`` instead of ``(0, 1]``, which is what enables
+        state tracking. Scaling here covers both the fused kernel and the
+        reference implementation, since both consume the beta returned here.
+
+        ``beta_activation="double_sigmoid"`` sums two offset sigmoids to give
+        the same range but a flat plateau at the midpoint; with ``beta_max=2``
+        that is ``sigmoid(4(x-1)) + sigmoid(4(x+1))``, plateauing at beta=1
+        (transition eigenvalue 0).
         """
         g = -A_log_local_cp.exp() * F.softplus(alpha.float() + dt_bias_local_cp)  # In fp32
-        beta = beta.sigmoid()
+        if beta_activation == "double_sigmoid":
+            # 0.5 * (s(4(x-1)) + s(4(x+1))) -- in (0, 1), plateau 0.5 at x=0.
+            beta = 0.5 * (
+                torch.sigmoid(4.0 * (beta - 1.0)) + torch.sigmoid(4.0 * (beta + 1.0))
+            )
+        else:
+            beta = beta.sigmoid()
+        if beta_max != 1.0:
+            beta = beta * beta_max
         return g, beta
 
     def _resolve_cu_seqlens(

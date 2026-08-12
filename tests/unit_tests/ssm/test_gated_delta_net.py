@@ -205,6 +205,81 @@ class TestGatedDeltaNet:
         assert g.shape == alpha.shape
         assert beta_sig.shape == beta.shape
 
+        # Default beta_max=1.0 keeps beta in [0, 1) -> delta-rule transition
+        # (I - beta k k^T) has eigenvalues in (0, 1] (standard GatedDeltaNet).
+        assert beta_sig.min() >= 0.0
+        assert beta_sig.max() <= 1.0
+
+        # beta_max=2.0 doubles beta into [0, 2), extending the transition
+        # eigenvalues to (-1, 1] so the recurrence can express reflections.
+        # This is what enables state tracking (Grazzi et al.).
+        with torch._dynamo.config.patch(disable=True):
+            _, beta_neg = gdn._compute_g_and_beta(
+                A_log_mock, dt_bias_mock, alpha, beta, beta_max=2.0
+            )
+
+        assert beta_neg.shape == beta.shape
+        assert beta_neg.min() >= 0.0
+        assert beta_neg.max() <= 2.0
+        # Exactly 2x the beta_max=1.0 result, elementwise.
+        torch.testing.assert_close(beta_neg.float(), 2.0 * beta_sig.float())
+        # With enough samples the doubled range must actually exceed 1.0,
+        # i.e. some transition eigenvalues really do go negative.
+        assert beta_neg.max() > 1.0
+
+        # double_sigmoid: same (0, beta_max) range, but a flat plateau at the
+        # midpoint. At beta_max=2 this is sigmoid(4(x-1)) + sigmoid(4(x+1)),
+        # so beta plateaus at 1.0 -> transition eigenvalue plateaus at 0.
+        with torch._dynamo.config.patch(disable=True):
+            _, beta_ds = gdn._compute_g_and_beta(
+                A_log_mock,
+                dt_bias_mock,
+                alpha,
+                beta,
+                beta_max=2.0,
+                beta_activation="double_sigmoid",
+            )
+
+        assert beta_ds.shape == beta.shape
+        assert beta_ds.min() >= 0.0
+        assert beta_ds.max() <= 2.0
+
+        # The plateau: at pre-activation 0 the output is exactly beta_max/2,
+        # and it is far flatter there than the plain sigmoid.
+        zero = torch.zeros_like(beta)
+        with torch._dynamo.config.patch(disable=True):
+            _, at_zero = gdn._compute_g_and_beta(
+                A_log_mock,
+                dt_bias_mock,
+                alpha,
+                zero,
+                beta_max=2.0,
+                beta_activation="double_sigmoid",
+            )
+        torch.testing.assert_close(
+            at_zero.float(), torch.ones_like(at_zero, dtype=torch.float32), rtol=1e-3, atol=1e-3
+        )
+
+        eps = 0.05
+        pert = torch.full_like(beta, eps)
+        with torch._dynamo.config.patch(disable=True):
+            _, ds_eps = gdn._compute_g_and_beta(
+                A_log_mock,
+                dt_bias_mock,
+                alpha,
+                pert,
+                beta_max=2.0,
+                beta_activation="double_sigmoid",
+            )
+            _, sig_eps = gdn._compute_g_and_beta(
+                A_log_mock, dt_bias_mock, alpha, pert, beta_max=2.0
+            )
+        # Slope near 0 is ~0.141 for double_sigmoid vs ~0.5 for 2*sigmoid,
+        # so the same perturbation moves beta far less: that is the stable regime.
+        ds_move = (ds_eps.float() - 1.0).abs().mean()
+        sig_move = (sig_eps.float() - 1.0).abs().mean()
+        assert ds_move < sig_move
+
     def test_gpu_forward_thd_correctness(self):
         if self.sp_size > 1:
             pytest.skip("Sequence parallel is not supported for this test case.")
