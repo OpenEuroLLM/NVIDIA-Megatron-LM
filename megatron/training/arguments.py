@@ -2924,6 +2924,15 @@ def _add_data_args(parser):
                        help='Probability of producing a short sequence.')
     group.add_argument('--num-workers', type=int, default=2,
                        help="Dataloader number of workers.")
+    # OELLM PATCH: expose the torch DataLoader prefetch depth (batches queued
+    # per worker). Upstream never sets it, so it defaults to 2. Default None
+    # here preserves that exactly; see megatron/training/datasets/data_samplers.py.
+    group.add_argument('--dataloader-prefetch-factor', type=int, default=None,
+                       help='Number of batches each dataloader worker keeps '
+                       'prefetched. Deepens the buffer that absorbs parallel-'
+                       'filesystem read-latency spikes without adding more '
+                       'concurrent readers. Requires --num-workers > 0. '
+                       'Unset = torch default (2).')
     group.add_argument('--reset-position-ids', action='store_true',
                        help='Reset posistion ids after end-of-document token.')
     group.add_argument('--reset-attention-mask', action='store_true',
