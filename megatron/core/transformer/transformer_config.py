@@ -685,7 +685,7 @@ class TransformerConfig(ModelParallelConfig):
     the MNNVL case."""
 
     moe_per_layer_logging: bool = False
-    """Enable per-layer logging for MoE, currently supports auxiliary loss and z loss."""
+    """Enable per-layer MoE loss, router-score, and expert-utilization logging."""
 
     moe_expert_capacity_factor: Optional[float] = None
     """moe_expert_capacity_factor (float): The capacity factor for each expert, None means no token

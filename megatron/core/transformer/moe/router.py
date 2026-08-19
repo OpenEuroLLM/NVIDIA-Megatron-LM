@@ -12,6 +12,7 @@ from megatron.core.transformer.moe.moe_utils import (
     ProcessGroupCollection,
     apply_random_logits,
     apply_router_token_dropping,
+    compute_router_score_distribution,
     compute_routing_scores_for_aux_loss,
     get_tokens_per_expert_and_token_count,
     router_gating_linear,
@@ -585,6 +586,10 @@ class TopKRouter(Router):
                 router_replay=self.router_replay,
             )
 
+        # Keep the selected map separate from the final dispatch map. Capacity dropping can
+        # remove assignments, and logging both populations makes that loss visible.
+        selected_routing_map = routing_map
+
         # Apply token dropping to probs and routing_map.
         if self.config.moe_expert_capacity_factor is not None:
             probs, routing_map = apply_router_token_dropping(
@@ -630,45 +635,49 @@ class TopKRouter(Router):
         # Optionally apply expert bias
         self._apply_expert_bias(routing_map, padding_mask=padding_mask)
 
-        # Track per-expert token counts for utilization logging.
-        # Exclude padding tokens so this metric is consistent with the soft-distribution
-        # router stats below (both denominators are "valid tokens").
-        num_layers = self.config.num_layers
-        if self.config.mtp_num_layers is not None:
-            num_layers += self.config.mtp_num_layers
-        if padding_mask is not None:
-            tokens_per_expert = routing_map[~padding_mask].sum(dim=0).float()
-        else:
-            tokens_per_expert = routing_map.sum(dim=0).float()
-        save_to_expert_utilization_tracker(
-            tokens_per_expert,
-            self.layer_number,
-            num_layers,
-            reduce_group=self.tp_cp_group,
-        )
-
-        # Track router soft-distribution statistics (confidence, entropy, logit bias).
-        with torch.no_grad():
-            soft = torch.softmax(logits.float(), dim=-1)  # [T, E]
-            max_probs = soft.max(dim=-1).values           # [T]
-            token_entropy = -(soft * soft.clamp(min=1e-12).log()).sum(dim=-1)  # [T]
+        # Record metrics once for a real training forward. The grad-mode guard excludes eval
+        # and the no-grad pass of reentrant activation checkpointing.
+        if self.training and torch.is_grad_enabled():
+            num_layers = self.config.num_layers
+            if self.config.mtp_num_layers is not None:
+                num_layers += self.config.mtp_num_layers
             if padding_mask is not None:
                 valid = ~padding_mask
-                save_to_router_stats_tracker(
-                    max_probs[valid].sum(),
-                    token_entropy[valid].sum(),
-                    logits.float()[valid].sum(dim=0),
-                    valid.float().sum(),
-                    self.layer_number,
-                    num_layers,
-                    reduce_group=self.tp_cp_group,
-                )
+                selected_tokens_per_expert = selected_routing_map[valid].sum(dim=0).float()
+                dispatched_tokens_per_expert = routing_map[valid].sum(dim=0).float()
             else:
+                valid = None
+                selected_tokens_per_expert = selected_routing_map.sum(dim=0).float()
+                dispatched_tokens_per_expert = routing_map.sum(dim=0).float()
+            save_to_expert_utilization_tracker(
+                selected_tokens_per_expert,
+                dispatched_tokens_per_expert,
+                self.layer_number,
+                num_layers,
+                reduce_group=self.tp_cp_group,
+            )
+
+            # Track a normalized distribution derived from the configured score function.
+            # For sigmoid routing, expert_bias is included because it changes expert selection.
+            with torch.no_grad():
+                score_distribution = compute_router_score_distribution(
+                    logits, self.score_function, self.expert_bias
+                )
+                max_scores = score_distribution.max(dim=-1).values
+                score_entropy = -(
+                    score_distribution * score_distribution.clamp(min=1e-12).log()
+                ).sum(dim=-1)
+                if valid is not None:
+                    max_scores = max_scores[valid]
+                    score_entropy = score_entropy[valid]
+                    valid_logits = logits.float()[valid]
+                else:
+                    valid_logits = logits.float()
                 save_to_router_stats_tracker(
-                    max_probs.sum(),
-                    token_entropy.sum(),
-                    logits.float().sum(dim=0),
-                    torch.tensor(float(logits.shape[0]), device=logits.device),
+                    max_scores.sum(),
+                    score_entropy.sum(),
+                    valid_logits.sum(dim=0),
+                    torch.tensor(float(valid_logits.shape[0]), device=logits.device),
                     self.layer_number,
                     num_layers,
                     reduce_group=self.tp_cp_group,
