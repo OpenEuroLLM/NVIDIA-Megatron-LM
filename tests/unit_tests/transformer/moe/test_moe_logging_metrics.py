@@ -7,6 +7,7 @@ import torch
 from megatron.core.transformer.moe.moe_utils import (
     clear_expert_utilization_tracker,
     compute_expert_load_metrics,
+    compute_normalized_entropy,
     compute_router_score_distribution,
     get_expert_utilization_tracker,
     save_to_expert_utilization_tracker,
@@ -60,6 +61,13 @@ def test_router_score_distribution_matches_configured_score_function():
     torch.testing.assert_close(biased.sum(dim=-1), torch.ones(1))
     assert unbiased.argmax(dim=-1).item() == 0
     assert biased.argmax(dim=-1).item() == 2
+
+
+def test_normalized_entropy_spans_zero_to_one():
+    distributions = torch.tensor([[0.25, 0.25, 0.25, 0.25], [1.0, 0.0, 0.0, 0.0]])
+    torch.testing.assert_close(
+        compute_normalized_entropy(distributions), torch.tensor([1.0, 0.0]), atol=1e-6, rtol=0
+    )
 
 
 def test_utilization_tracker_keeps_selected_and_dispatched_counts():

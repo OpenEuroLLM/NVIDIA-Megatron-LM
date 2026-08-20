@@ -12,6 +12,7 @@ from megatron.core.transformer.moe.moe_utils import (
     ProcessGroupCollection,
     apply_random_logits,
     apply_router_token_dropping,
+    compute_normalized_entropy,
     compute_router_score_distribution,
     compute_routing_scores_for_aux_loss,
     get_tokens_per_expert_and_token_count,
@@ -664,9 +665,7 @@ class TopKRouter(Router):
                     logits, self.score_function, self.expert_bias
                 )
                 max_scores = score_distribution.max(dim=-1).values
-                score_entropy = -(
-                    score_distribution * score_distribution.clamp(min=1e-12).log()
-                ).sum(dim=-1)
+                score_entropy = compute_normalized_entropy(score_distribution)
                 if valid is not None:
                     max_scores = max_scores[valid]
                     score_entropy = score_entropy[valid]

@@ -820,6 +820,17 @@ def compute_router_score_distribution(
     raise ValueError(f"Invalid score_function: {score_function}")
 
 
+def compute_normalized_entropy(distribution: torch.Tensor) -> torch.Tensor:
+    """Compute entropy over the last dimension, normalized to the range [0, 1]."""
+    num_categories = distribution.shape[-1]
+    entropy = -(
+        distribution * distribution.clamp(min=1e-12).log()
+    ).sum(dim=-1)
+    if num_categories > 1:
+        return entropy / math.log(num_categories)
+    return torch.ones_like(entropy)
+
+
 def compute_expert_load_metrics(
     tokens_per_expert: torch.Tensor, near_dead_uniform_fraction: float = 0.1
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -839,11 +850,7 @@ def compute_expert_load_metrics(
     near_dead_threshold = near_dead_uniform_fraction / num_experts
     near_dead_count = (fractions < near_dead_threshold).sum().float() * has_tokens
     max_fraction = fractions.max() * has_tokens
-    entropy = -(fractions * fractions.clamp(min=1e-12).log()).sum() * has_tokens
-    if num_experts > 1:
-        entropy = entropy / math.log(num_experts)
-    else:
-        entropy = counts.new_ones(()) * has_tokens
+    entropy = compute_normalized_entropy(fractions) * has_tokens
     mean = counts.mean()
     max_vio = ((counts.max() - mean) / mean.clamp_min(1e-20)) * has_tokens
     coefficient_of_variation = (counts.std(unbiased=False) / mean.clamp_min(1e-20)) * has_tokens
@@ -1156,7 +1163,6 @@ def track_moe_metrics(
         persistent_near_dead_slots = (near_dead_streaks >= 100).sum().item()
 
         dead_count_list = []
-        max_frac_list = []
         expert_entropy_list = []
         selected_max_vio_list = []
         dropped_frac_list = []
@@ -1174,42 +1180,38 @@ def track_moe_metrics(
             selected_max_vio = compute_expert_load_metrics(selected)[4].item()
             if dispatched_total > 0:
                 fractions = dispatched / dispatched_total
-                max_frac = fractions.max().item()
                 dead_count = int((dispatched == 0).sum().item())
-                p = fractions.clamp(min=1e-12)
-                entropy = (-(p * p.log()).sum()).item()
+                entropy = compute_normalized_entropy(fractions).item()
             else:
-                max_frac = 0.0
                 dead_count = dispatched.numel()
                 entropy = 0.0
             dropped_frac = 1.0 - (dispatched_total / selected_total)
 
             dead_count_list.append(dead_count)
-            max_frac_list.append(max_frac)
             expert_entropy_list.append(entropy)
             selected_max_vio_list.append(selected_max_vio)
             dropped_frac_list.append(dropped_frac)
 
             if per_layer_logging:
                 if writer is not None:
-                    writer.add_scalar(f'moe/expert_max_frac_layer_{i}', max_frac, iteration)
-                    writer.add_scalar(f'moe/expert_entropy_layer_{i}', entropy, iteration)
+                    writer.add_scalar(
+                        f'moe/dispatched_expert_load_entropy_layer_{i}', entropy, iteration
+                    )
                 if _have_wandb:
-                    wandb_layer_log[f'router-layers/expert_max_frac_layer_{i}'] = max_frac
-                    wandb_layer_log[f'router-layers/expert_entropy_layer_{i}'] = entropy
+                    wandb_layer_log[
+                        f'router-layers/dispatched_expert_load_entropy_layer_{i}'
+                    ] = entropy
 
         if dead_count_list:
             total_dead = sum(dead_count_list)
-            mean_max_frac = sum(max_frac_list) / len(max_frac_list)
-            agg_max_frac = max(max_frac_list)
             mean_expert_entropy = sum(expert_entropy_list) / len(expert_entropy_list)
-            agg_max_expert_entropy = max(expert_entropy_list)
+            min_expert_entropy = min(expert_entropy_list)
+            max_expert_entropy = max(expert_entropy_list)
             aggregate_log = {
                 'expert_dead_count': total_dead,
-                'expert_max_frac_mean': mean_max_frac,
-                'expert_max_frac_max': agg_max_frac,
-                'expert_entropy_mean': mean_expert_entropy,
-                'expert_entropy_max': agg_max_expert_entropy,
+                'dispatched_expert_load_entropy_mean': mean_expert_entropy,
+                'dispatched_expert_load_entropy_min': min_expert_entropy,
+                'dispatched_expert_load_entropy_max': max_expert_entropy,
                 'selected_zero_load_expert_layer_slots': selected_zero_slots,
                 'selected_near_dead_expert_layer_slots': selected_near_dead_slots,
                 'persistent_selected_near_dead_expert_layer_slots_100': (
@@ -1286,14 +1288,14 @@ def track_moe_metrics(
                         f'moe/router_mean_max_prob_layer_{i}', mean_max_score_i, iteration
                     )
                     writer.add_scalar(
-                        f'moe/router_mean_token_entropy_layer_{i}', mean_score_entropy_i, iteration
+                        f'moe/router_mean_score_entropy_layer_{i}', mean_score_entropy_i, iteration
                     )
                     writer.add_scalar(
                         f'moe/expert_logit_spread_layer_{i}', logit_spread_i, iteration
                     )
                 if _have_wandb_rs:
                     wandb_rs_log[f'router-layers/router_mean_max_prob_layer_{i}'] = mean_max_score_i
-                    wandb_rs_log[f'router-layers/router_mean_token_entropy_layer_{i}'] = (
+                    wandb_rs_log[f'router-layers/router_mean_score_entropy_layer_{i}'] = (
                         mean_score_entropy_i
                     )
                     wandb_rs_log[f'router-layers/expert_logit_spread_layer_{i}'] = logit_spread_i
@@ -1313,13 +1315,13 @@ def track_moe_metrics(
                 writer.add_scalar('moe/expert_logit_spread_max', agg_max_logit_spread, iteration)
                 writer.add_scalar('moe/expert_logit_spread_mean', agg_mean_logit_spread, iteration)
                 writer.add_scalar(
-                    'moe/router_mean_token_entropy_mean', agg_mean_router_score_entropy, iteration
-                )
-                writer.add_scalar(
-                    'moe/router_mean_token_entropy_max', agg_max_router_score_entropy, iteration
+                    'moe/router_mean_score_entropy_mean', agg_mean_router_score_entropy, iteration
                 )
                 writer.add_scalar(
                     'moe/router_mean_score_entropy_min', agg_min_router_score_entropy, iteration
+                )
+                writer.add_scalar(
+                    'moe/router_mean_score_entropy_max', agg_max_router_score_entropy, iteration
                 )
             if wandb_writer:
                 wandb_writer.log(
@@ -1327,14 +1329,14 @@ def track_moe_metrics(
                         **wandb_rs_log,
                         'router-aggregates/expert_logit_spread_max': agg_max_logit_spread,
                         'router-aggregates/expert_logit_spread_mean': agg_mean_logit_spread,
-                        'router-aggregates/router_mean_token_entropy_mean': (
+                        'router-aggregates/router_mean_score_entropy_mean': (
                             agg_mean_router_score_entropy
-                        ),
-                        'router-aggregates/router_mean_token_entropy_max': (
-                            agg_max_router_score_entropy
                         ),
                         'router-aggregates/router_mean_score_entropy_min': (
                             agg_min_router_score_entropy
+                        ),
+                        'router-aggregates/router_mean_score_entropy_max': (
+                            agg_max_router_score_entropy
                         ),
                     },
                     iteration,
@@ -1474,7 +1476,8 @@ def save_to_router_stats_tracker(
 
     Args:
         sum_max_score: Sum of per-token maxima from the configured score distribution.
-        sum_score_entropy: Sum of per-token entropy from the configured score distribution.
+        sum_score_entropy: Sum of normalized per-token entropy from the configured score
+            distribution.
         sum_logits: Sum of logits across valid tokens, shape [num_experts].
         token_count: Number of valid (non-padding) tokens, scalar tensor.
         layer_number: 1-indexed layer number.
