@@ -766,9 +766,10 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
         else:
             iter_finalize_fn()
         
-        # before wandb_finalize_fn tries to add it to the artifact (avoids "Path is not a file").
-        if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
-            torch.distributed.barrier()
+    # Ensure the checkpoint tracker is visible before the last rank may add it to W&B.
+    # This must be collective: a rank-0-only barrier desynchronizes the following barrier.
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
 
 
     # Additional callback for one_logger (last rank)

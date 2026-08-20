@@ -800,9 +800,7 @@ def compute_routing_scores_for_aux_loss(
 
 
 def compute_router_score_distribution(
-    logits: torch.Tensor,
-    score_function: str,
-    expert_bias: Optional[torch.Tensor] = None,
+    logits: torch.Tensor, score_function: str, expert_bias: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
     """Return a normalized full-expert distribution for router diagnostics.
 
@@ -848,17 +846,21 @@ def compute_expert_load_metrics(
         entropy = counts.new_ones(()) * has_tokens
     mean = counts.mean()
     max_vio = ((counts.max() - mean) / mean.clamp_min(1e-20)) * has_tokens
-    coefficient_of_variation = (
-        counts.std(unbiased=False) / mean.clamp_min(1e-20)
-    ) * has_tokens
-    return (
-        dead_count,
-        near_dead_count,
-        max_fraction,
-        entropy,
-        max_vio,
-        coefficient_of_variation,
-    )
+    coefficient_of_variation = (counts.std(unbiased=False) / mean.clamp_min(1e-20)) * has_tokens
+    return (dead_count, near_dead_count, max_fraction, entropy, max_vio, coefficient_of_variation)
+
+
+def update_expert_near_dead_streaks(
+    streaks: torch.Tensor, near_dead_mask: torch.Tensor
+) -> torch.Tensor:
+    """Update consecutive near-dead optimizer-step counts in place."""
+    if streaks.shape != near_dead_mask.shape:
+        raise ValueError(
+            f"streak and near-dead mask shapes must match, got {streaks.shape} and "
+            f"{near_dead_mask.shape}"
+        )
+    streaks.copy_(torch.where(near_dead_mask, streaks + 1, torch.zeros_like(streaks)))
+    return streaks
 
 
 def apply_router_token_dropping(
@@ -1119,10 +1121,6 @@ def track_moe_metrics(
     if 'selected_values' in util_tracker:
         selected_values = util_tracker['selected_values']
         dispatched_values = util_tracker['dispatched_values']
-        microbatch_sums = util_tracker['microbatch_sums']
-        microbatch_maxima = util_tracker['microbatch_maxima']
-        microbatch_entropy_min = util_tracker['microbatch_entropy_min']
-        microbatch_count = util_tracker['microbatch_count']
 
         # Collect across pipeline parallel stages.
         if pg_collection is None:
@@ -1141,47 +1139,29 @@ def track_moe_metrics(
                 torch.distributed.all_reduce(values, group=reduce_group)
             torch.distributed.all_reduce(values, group=dp_group, op=torch.distributed.ReduceOp.AVG)
 
-        # Local-microbatch metrics are computed before count aggregation. Reduce their sums and
-        # observation counts with SUM, worst cases with MAX, and entropy minima with MIN.
-        for values in (microbatch_sums, microbatch_count):
-            torch.distributed.all_reduce(values, group=pp_group)
-            if reduce_group is not None:
-                torch.distributed.all_reduce(values, group=reduce_group)
-            torch.distributed.all_reduce(values, group=dp_group)
-        torch.distributed.all_reduce(
-            microbatch_maxima, group=pp_group, op=torch.distributed.ReduceOp.MAX
-        )
-        torch.distributed.all_reduce(
-            microbatch_entropy_min, group=pp_group, op=torch.distributed.ReduceOp.MIN
-        )
-        if reduce_group is not None:
-            torch.distributed.all_reduce(
-                microbatch_maxima, group=reduce_group, op=torch.distributed.ReduceOp.MAX
-            )
-            torch.distributed.all_reduce(
-                microbatch_entropy_min, group=reduce_group, op=torch.distributed.ReduceOp.MIN
-            )
-        torch.distributed.all_reduce(
-            microbatch_maxima, group=dp_group, op=torch.distributed.ReduceOp.MAX
-        )
-        torch.distributed.all_reduce(
-            microbatch_entropy_min, group=dp_group, op=torch.distributed.ReduceOp.MIN
-        )
+        active_layers = selected_values.sum(dim=-1) > 0
+        selected_means = selected_values.mean(dim=-1, keepdim=True)
+        selected_zero_mask = (selected_values == 0) & active_layers.unsqueeze(-1)
+        selected_near_dead_mask = (
+            selected_values < 0.1 * selected_means
+        ) & active_layers.unsqueeze(-1)
+        near_dead_streaks = util_tracker.get('selected_near_dead_streaks')
+        if near_dead_streaks is None or near_dead_streaks.shape != selected_values.shape:
+            near_dead_streaks = torch.zeros_like(selected_values, dtype=torch.int32)
+            util_tracker['selected_near_dead_streaks'] = near_dead_streaks
+        update_expert_near_dead_streaks(near_dead_streaks, selected_near_dead_mask)
 
-        dead_slots, near_dead_slots = [], []
-        selected_max_frac_list, selected_normalized_entropy_list = [], []
-        selected_max_vio_list, selected_cv_list = [], []
-        max_frac_list, normalized_entropy_list, dropped_frac_list = [], [], []
-        max_vio_list, cv_list = [], []
-        micro_means, micro_maxima, micro_entropy_minima = [], [], []
+        selected_zero_slots = selected_zero_mask.sum().item()
+        selected_near_dead_slots = selected_near_dead_mask.sum().item()
+        persistent_near_dead_slots = (near_dead_streaks >= 100).sum().item()
+
+        dead_count_list = []
+        max_frac_list = []
+        expert_entropy_list = []
+        selected_max_vio_list = []
+        dropped_frac_list = []
         wandb_layer_log: dict = {}
         _have_wandb = per_layer_logging and (wandb_writer is not None)
-        _wandb = None
-        if _have_wandb:
-            try:
-                import wandb as _wandb  # type: ignore[import-not-found]
-            except ImportError:
-                _have_wandb = False
 
         for i in range(dispatched_values.shape[0]):
             selected = selected_values[i]
@@ -1191,298 +1171,53 @@ def track_moe_metrics(
             if selected_total == 0:
                 continue
 
-            (
-                _,
-                _,
-                selected_max_frac,
-                selected_normalized_entropy,
-                selected_max_vio,
-                selected_cv,
-            ) = compute_expert_load_metrics(selected)
-            (
-                dead,
-                near_dead,
-                max_frac,
-                normalized_entropy,
-                max_vio,
-                coefficient_of_variation,
-            ) = compute_expert_load_metrics(dispatched)
-            if dispatched_total == 0:
-                dead = dispatched.new_tensor(float(dispatched.numel()))
-                near_dead = dispatched.new_tensor(float(dispatched.numel()))
+            selected_max_vio = compute_expert_load_metrics(selected)[4].item()
+            if dispatched_total > 0:
+                fractions = dispatched / dispatched_total
+                max_frac = fractions.max().item()
+                dead_count = int((dispatched == 0).sum().item())
+                p = fractions.clamp(min=1e-12)
+                entropy = (-(p * p.log()).sum()).item()
+            else:
+                max_frac = 0.0
+                dead_count = dispatched.numel()
+                entropy = 0.0
             dropped_frac = 1.0 - (dispatched_total / selected_total)
-            dead_slots.append(dead.item())
-            near_dead_slots.append(near_dead.item())
-            selected_max_frac_list.append(selected_max_frac.item())
-            selected_normalized_entropy_list.append(selected_normalized_entropy.item())
-            selected_max_vio_list.append(selected_max_vio.item())
-            selected_cv_list.append(selected_cv.item())
-            max_frac_list.append(max_frac.item())
-            normalized_entropy_list.append(normalized_entropy.item())
-            max_vio_list.append(max_vio.item())
-            cv_list.append(coefficient_of_variation.item())
-            dropped_frac_list.append(dropped_frac)
 
-            layer_micro_mean = None
-            if microbatch_count[i].item() > 0:
-                layer_micro_mean = microbatch_sums[i] / microbatch_count[i]
-                micro_means.append(layer_micro_mean.cpu())
-                micro_maxima.append(microbatch_maxima[i].cpu())
-                micro_entropy_minima.append(microbatch_entropy_min[i].item())
+            dead_count_list.append(dead_count)
+            max_frac_list.append(max_frac)
+            expert_entropy_list.append(entropy)
+            selected_max_vio_list.append(selected_max_vio)
+            dropped_frac_list.append(dropped_frac)
 
             if per_layer_logging:
                 if writer is not None:
-                    writer.add_histogram(
-                        f'moe/selected_tokens_per_expert_layer_{i}', selected.cpu(), iteration
-                    )
-                    writer.add_histogram(
-                        f'moe/dispatched_tokens_per_expert_layer_{i}', dispatched.cpu(), iteration
-                    )
-                    writer.add_scalar(
-                        f'moe/selected_expert_max_frac_layer_{i}', selected_max_frac, iteration
-                    )
-                    writer.add_scalar(
-                        f'moe/selected_expert_normalized_entropy_layer_{i}',
-                        selected_normalized_entropy,
-                        iteration,
-                    )
-                    writer.add_scalar(
-                        f'moe/selected_expert_max_vio_layer_{i}', selected_max_vio, iteration
-                    )
-                    writer.add_scalar(
-                        f'moe/selected_expert_cv_layer_{i}',
-                        selected_cv,
-                        iteration,
-                    )
-                    writer.add_scalar(
-                        f'moe/dispatched_expert_max_frac_layer_{i}', max_frac, iteration
-                    )
-                    writer.add_scalar(
-                        f'moe/dispatched_expert_normalized_entropy_layer_{i}',
-                        normalized_entropy,
-                        iteration,
-                    )
-                    writer.add_scalar(
-                        f'moe/dispatched_expert_max_vio_layer_{i}', max_vio, iteration
-                    )
-                    writer.add_scalar(
-                        f'moe/dispatched_expert_cv_layer_{i}',
-                        coefficient_of_variation,
-                        iteration,
-                    )
-                    writer.add_scalar(
-                        f'moe/dropped_assignment_frac_layer_{i}', dropped_frac, iteration
-                    )
-                    if layer_micro_mean is not None:
-                        writer.add_scalar(
-                            f'moe/local_microbatch_zero_load_count_mean_layer_{i}',
-                            layer_micro_mean[0],
-                            iteration,
-                        )
-                        writer.add_scalar(
-                            f'moe/local_microbatch_zero_load_count_max_layer_{i}',
-                            microbatch_maxima[i, 0],
-                            iteration,
-                        )
-                        writer.add_scalar(
-                            f'moe/local_microbatch_dead_expert_count_mean_layer_{i}',
-                            layer_micro_mean[1],
-                            iteration,
-                        )
-                        writer.add_scalar(
-                            f'moe/local_microbatch_dead_expert_count_max_layer_{i}',
-                            microbatch_maxima[i, 1],
-                            iteration,
-                        )
-                        writer.add_scalar(
-                            f'moe/local_microbatch_max_frac_mean_layer_{i}',
-                            layer_micro_mean[2],
-                            iteration,
-                        )
-                        writer.add_scalar(
-                            f'moe/local_microbatch_max_frac_max_layer_{i}',
-                            microbatch_maxima[i, 2],
-                            iteration,
-                        )
-                        writer.add_scalar(
-                            f'moe/local_microbatch_normalized_entropy_mean_layer_{i}',
-                            layer_micro_mean[3],
-                            iteration,
-                        )
-                        writer.add_scalar(
-                            f'moe/local_microbatch_normalized_entropy_min_layer_{i}',
-                            microbatch_entropy_min[i],
-                            iteration,
-                        )
-                        writer.add_scalar(
-                            f'moe/local_microbatch_max_vio_mean_layer_{i}',
-                            layer_micro_mean[4],
-                            iteration,
-                        )
-                        writer.add_scalar(
-                            f'moe/local_microbatch_max_vio_max_layer_{i}',
-                            microbatch_maxima[i, 4],
-                            iteration,
-                        )
-                        writer.add_scalar(
-                            f'moe/local_microbatch_cv_mean_layer_{i}',
-                            layer_micro_mean[5],
-                            iteration,
-                        )
-                        writer.add_scalar(
-                            f'moe/local_microbatch_cv_max_layer_{i}',
-                            microbatch_maxima[i, 5],
-                            iteration,
-                        )
+                    writer.add_scalar(f'moe/expert_max_frac_layer_{i}', max_frac, iteration)
+                    writer.add_scalar(f'moe/expert_entropy_layer_{i}', entropy, iteration)
                 if _have_wandb:
-                    wandb_layer_log[f'router-layers/selected_tokens_per_expert_layer_{i}'] = (
-                        _wandb.Histogram(selected.cpu().numpy())
-                    )
-                    wandb_layer_log[f'router-layers/dispatched_tokens_per_expert_layer_{i}'] = (
-                        _wandb.Histogram(dispatched.cpu().numpy())
-                    )
-                    wandb_layer_log[f'router-layers/selected_expert_max_frac_layer_{i}'] = (
-                        selected_max_frac
-                    )
-                    wandb_layer_log[
-                        f'router-layers/selected_expert_normalized_entropy_layer_{i}'
-                    ] = selected_normalized_entropy
-                    wandb_layer_log[
-                        f'router-layers/selected_expert_max_vio_layer_{i}'
-                    ] = selected_max_vio
-                    wandb_layer_log[
-                        f'router-layers/selected_expert_cv_layer_{i}'
-                    ] = selected_cv
-                    wandb_layer_log[
-                        f'router-layers/dispatched_expert_max_frac_layer_{i}'
-                    ] = max_frac
-                    wandb_layer_log[
-                        f'router-layers/dispatched_expert_normalized_entropy_layer_{i}'
-                    ] = normalized_entropy
-                    wandb_layer_log[
-                        f'router-layers/dispatched_expert_max_vio_layer_{i}'
-                    ] = max_vio
-                    wandb_layer_log[
-                        f'router-layers/dispatched_expert_cv_layer_{i}'
-                    ] = coefficient_of_variation
-                    wandb_layer_log[
-                        f'router-layers/dropped_assignment_frac_layer_{i}'
-                    ] = dropped_frac
-                    if layer_micro_mean is not None:
-                        wandb_layer_log[
-                            f'router-layers/local_microbatch_zero_load_count_mean_layer_{i}'
-                        ] = layer_micro_mean[0]
-                        wandb_layer_log[
-                            f'router-layers/local_microbatch_zero_load_count_max_layer_{i}'
-                        ] = microbatch_maxima[i, 0]
-                        wandb_layer_log[
-                            f'router-layers/local_microbatch_dead_expert_count_mean_layer_{i}'
-                        ] = layer_micro_mean[1]
-                        wandb_layer_log[
-                            f'router-layers/local_microbatch_dead_expert_count_max_layer_{i}'
-                        ] = microbatch_maxima[i, 1]
-                        wandb_layer_log[
-                            f'router-layers/local_microbatch_max_frac_mean_layer_{i}'
-                        ] = layer_micro_mean[2]
-                        wandb_layer_log[
-                            f'router-layers/local_microbatch_max_frac_max_layer_{i}'
-                        ] = microbatch_maxima[i, 2]
-                        wandb_layer_log[
-                            f'router-layers/local_microbatch_normalized_entropy_mean_layer_{i}'
-                        ] = layer_micro_mean[3]
-                        wandb_layer_log[
-                            f'router-layers/local_microbatch_normalized_entropy_min_layer_{i}'
-                        ] = microbatch_entropy_min[i]
-                        wandb_layer_log[
-                            f'router-layers/local_microbatch_max_vio_mean_layer_{i}'
-                        ] = layer_micro_mean[4]
-                        wandb_layer_log[
-                            f'router-layers/local_microbatch_max_vio_max_layer_{i}'
-                        ] = microbatch_maxima[i, 4]
-                        wandb_layer_log[
-                            f'router-layers/local_microbatch_cv_mean_layer_{i}'
-                        ] = layer_micro_mean[5]
-                        wandb_layer_log[
-                            f'router-layers/local_microbatch_cv_max_layer_{i}'
-                        ] = microbatch_maxima[i, 5]
+                    wandb_layer_log[f'router-layers/expert_max_frac_layer_{i}'] = max_frac
+                    wandb_layer_log[f'router-layers/expert_entropy_layer_{i}'] = entropy
 
-        if dead_slots:
-            total_dead_slots = sum(dead_slots)
-            total_near_dead_slots = sum(near_dead_slots)
+        if dead_count_list:
+            total_dead = sum(dead_count_list)
             mean_max_frac = sum(max_frac_list) / len(max_frac_list)
             agg_max_frac = max(max_frac_list)
-            mean_normalized_entropy = sum(normalized_entropy_list) / len(normalized_entropy_list)
-            min_normalized_entropy = min(normalized_entropy_list)
-            mean_dropped_frac = sum(dropped_frac_list) / len(dropped_frac_list)
-            max_dropped_frac = max(dropped_frac_list)
+            mean_expert_entropy = sum(expert_entropy_list) / len(expert_entropy_list)
+            agg_max_expert_entropy = max(expert_entropy_list)
             aggregate_log = {
-                'expert_layer_zero_load_slots': total_dead_slots,
-                'expert_layer_dead_expert_slots': total_near_dead_slots,
-                'selected_expert_max_frac_mean': (
-                    sum(selected_max_frac_list) / len(selected_max_frac_list)
-                ),
-                'selected_expert_max_frac_max': max(selected_max_frac_list),
-                'selected_expert_normalized_entropy_mean': (
-                    sum(selected_normalized_entropy_list)
-                    / len(selected_normalized_entropy_list)
-                ),
-                'selected_expert_normalized_entropy_min': min(
-                    selected_normalized_entropy_list
-                ),
-                'selected_expert_max_vio_mean': (
-                    sum(selected_max_vio_list) / len(selected_max_vio_list)
+                'expert_dead_count': total_dead,
+                'expert_max_frac_mean': mean_max_frac,
+                'expert_max_frac_max': agg_max_frac,
+                'expert_entropy_mean': mean_expert_entropy,
+                'expert_entropy_max': agg_max_expert_entropy,
+                'selected_zero_load_expert_layer_slots': selected_zero_slots,
+                'selected_near_dead_expert_layer_slots': selected_near_dead_slots,
+                'persistent_selected_near_dead_expert_layer_slots_100': (
+                    persistent_near_dead_slots
                 ),
                 'selected_expert_max_vio_max': max(selected_max_vio_list),
-                'selected_expert_cv_mean': (
-                    sum(selected_cv_list) / len(selected_cv_list)
-                ),
-                'selected_expert_cv_max': max(selected_cv_list),
-                'dispatched_expert_max_frac_mean': mean_max_frac,
-                'dispatched_expert_max_frac_max': agg_max_frac,
-                'dispatched_expert_normalized_entropy_mean': mean_normalized_entropy,
-                'dispatched_expert_normalized_entropy_min': min_normalized_entropy,
-                'dispatched_expert_max_vio_mean': sum(max_vio_list) / len(max_vio_list),
-                'dispatched_expert_max_vio_max': max(max_vio_list),
-                'dispatched_expert_cv_mean': (
-                    sum(cv_list) / len(cv_list)
-                ),
-                'dispatched_expert_cv_max': max(cv_list),
-                'dropped_assignment_frac_mean': mean_dropped_frac,
-                'dropped_assignment_frac_max': max_dropped_frac,
+                'dropped_assignment_frac_max': max(dropped_frac_list),
             }
-            if micro_means:
-                stacked_means = torch.stack(micro_means)
-                stacked_maxima = torch.stack(micro_maxima)
-                aggregate_log.update(
-                    {
-                        'local_microbatch_zero_load_count_mean': (
-                            stacked_means[:, 0].mean().item()
-                        ),
-                        'local_microbatch_zero_load_count_max': (
-                            stacked_maxima[:, 0].max().item()
-                        ),
-                        'local_microbatch_dead_expert_count_mean': (
-                            stacked_means[:, 1].mean().item()
-                        ),
-                        'local_microbatch_dead_expert_count_max': (
-                            stacked_maxima[:, 1].max().item()
-                        ),
-                        'local_microbatch_max_frac_mean': stacked_means[:, 2].mean().item(),
-                        'local_microbatch_max_frac_max': stacked_maxima[:, 2].max().item(),
-                        'local_microbatch_normalized_entropy_mean': (
-                            stacked_means[:, 3].mean().item()
-                        ),
-                        'local_microbatch_normalized_entropy_min': min(micro_entropy_minima),
-                        'local_microbatch_max_vio_mean': stacked_means[:, 4].mean().item(),
-                        'local_microbatch_max_vio_max': stacked_maxima[:, 4].max().item(),
-                        'local_microbatch_cv_mean': (
-                            stacked_means[:, 5].mean().item()
-                        ),
-                        'local_microbatch_cv_max': (
-                            stacked_maxima[:, 5].max().item()
-                        ),
-                    }
-                )
             if writer is not None:
                 for name, value in aggregate_log.items():
                     writer.add_scalar(f'moe/{name}', value, iteration)
@@ -1503,8 +1238,8 @@ def track_moe_metrics(
     if 'sum_max_score' in rs_tracker:
         sum_max_score = rs_tracker['sum_max_score']  # [num_layers]
         sum_score_entropy = rs_tracker['sum_score_entropy']
-        sum_logits = rs_tracker['sum_logits']            # [num_layers, num_experts]
-        token_count = rs_tracker['token_count']          # [num_layers]
+        sum_logits = rs_tracker['sum_logits']  # [num_layers, num_experts]
+        token_count = rs_tracker['token_count']  # [num_layers]
 
         # PP reduction
         if pg_collection is None:
@@ -1548,21 +1283,17 @@ def track_moe_metrics(
             if per_layer_logging:
                 if writer is not None:
                     writer.add_scalar(
-                        f'moe/router_mean_max_score_layer_{i}', mean_max_score_i, iteration
+                        f'moe/router_mean_max_prob_layer_{i}', mean_max_score_i, iteration
                     )
                     writer.add_scalar(
-                        f'moe/router_mean_score_entropy_layer_{i}',
-                        mean_score_entropy_i,
-                        iteration,
+                        f'moe/router_mean_token_entropy_layer_{i}', mean_score_entropy_i, iteration
                     )
                     writer.add_scalar(
                         f'moe/expert_logit_spread_layer_{i}', logit_spread_i, iteration
                     )
                 if _have_wandb_rs:
-                    wandb_rs_log[
-                        f'router-layers/router_mean_max_score_layer_{i}'
-                    ] = mean_max_score_i
-                    wandb_rs_log[f'router-layers/router_mean_score_entropy_layer_{i}'] = (
+                    wandb_rs_log[f'router-layers/router_mean_max_prob_layer_{i}'] = mean_max_score_i
+                    wandb_rs_log[f'router-layers/router_mean_token_entropy_layer_{i}'] = (
                         mean_score_entropy_i
                     )
                     wandb_rs_log[f'router-layers/expert_logit_spread_layer_{i}'] = logit_spread_i
@@ -1574,25 +1305,21 @@ def track_moe_metrics(
                 router_score_entropy_list
             )
             agg_max_router_score_entropy = max(router_score_entropy_list)
+            agg_min_router_score_entropy = min(router_score_entropy_list)
             if total_loss_dict is not None:
                 # Surface the worst-layer bias in the train log line.
                 total_loss_dict['expert_logit_spread_max'] = torch.tensor(agg_max_logit_spread)
             if writer is not None:
+                writer.add_scalar('moe/expert_logit_spread_max', agg_max_logit_spread, iteration)
+                writer.add_scalar('moe/expert_logit_spread_mean', agg_mean_logit_spread, iteration)
                 writer.add_scalar(
-                    'moe/expert_logit_spread_max', agg_max_logit_spread, iteration
+                    'moe/router_mean_token_entropy_mean', agg_mean_router_score_entropy, iteration
                 )
                 writer.add_scalar(
-                    'moe/expert_logit_spread_mean', agg_mean_logit_spread, iteration
+                    'moe/router_mean_token_entropy_max', agg_max_router_score_entropy, iteration
                 )
                 writer.add_scalar(
-                    'moe/router_mean_score_entropy_mean',
-                    agg_mean_router_score_entropy,
-                    iteration,
-                )
-                writer.add_scalar(
-                    'moe/router_mean_score_entropy_max',
-                    agg_max_router_score_entropy,
-                    iteration,
+                    'moe/router_mean_score_entropy_min', agg_min_router_score_entropy, iteration
                 )
             if wandb_writer:
                 wandb_writer.log(
@@ -1600,11 +1327,14 @@ def track_moe_metrics(
                         **wandb_rs_log,
                         'router-aggregates/expert_logit_spread_max': agg_max_logit_spread,
                         'router-aggregates/expert_logit_spread_mean': agg_mean_logit_spread,
-                        'router-aggregates/router_mean_score_entropy_mean': (
+                        'router-aggregates/router_mean_token_entropy_mean': (
                             agg_mean_router_score_entropy
                         ),
-                        'router-aggregates/router_mean_score_entropy_max': (
+                        'router-aggregates/router_mean_token_entropy_max': (
                             agg_max_router_score_entropy
+                        ),
+                        'router-aggregates/router_mean_score_entropy_min': (
+                            agg_min_router_score_entropy
                         ),
                     },
                     iteration,
@@ -1683,10 +1413,10 @@ def save_to_expert_utilization_tracker(
     num_layers: int,
     reduce_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> None:
-    """Accumulate aggregate and local-microbatch expert utilization statistics.
+    """Accumulate selected and dispatched expert counts for global-step logging.
 
     Called every forward pass from the router. The actual distributed reduction and
-    logging happen at logging intervals inside track_moe_metrics().
+    logging happen once per optimizer step inside track_moe_metrics().
 
     Args:
         selected_tokens_per_expert: Local pre-capacity token counts, shape [num_experts].
@@ -1705,52 +1435,21 @@ def save_to_expert_utilization_tracker(
             num_layers, num_experts, device=device, dtype=torch.float32
         )
         tracker['dispatched_values'] = torch.zeros_like(tracker['selected_values'])
-        tracker['microbatch_sums'] = torch.zeros(
-            num_layers, 6, device=device, dtype=torch.float32
-        )
-        tracker['microbatch_maxima'] = torch.zeros_like(tracker['microbatch_sums'])
-        tracker['microbatch_entropy_min'] = torch.full(
-            (num_layers,), float('inf'), device=device, dtype=torch.float32
-        )
-        tracker['microbatch_count'] = torch.zeros(
-            num_layers, device=device, dtype=torch.float32
+        tracker['selected_near_dead_streaks'] = torch.zeros(
+            num_layers, num_experts, device=device, dtype=torch.int32
         )
         tracker['reduce_group'] = reduce_group
     idx = layer_number - 1
     tracker['selected_values'][idx] += selected_tokens_per_expert.detach().float()
     tracker['dispatched_values'][idx] += dispatched_tokens_per_expert.detach().float()
 
-    metrics = torch.stack(compute_expert_load_metrics(dispatched_tokens_per_expert.detach()))
-    selected_has_tokens = (selected_tokens_per_expert.sum() > 0).float()
-    all_dispatch_dropped = selected_has_tokens * (
-        dispatched_tokens_per_expert.sum() == 0
-    ).float()
-    metrics[0] += all_dispatch_dropped * dispatched_tokens_per_expert.numel()
-    metrics[1] += all_dispatch_dropped * dispatched_tokens_per_expert.numel()
-    tracker['microbatch_sums'][idx] += metrics
-    tracker['microbatch_maxima'][idx] = torch.maximum(
-        tracker['microbatch_maxima'][idx], metrics
-    )
-    has_tokens = selected_tokens_per_expert.sum() > 0
-    entropy_candidate = torch.where(
-        has_tokens, metrics[3], metrics.new_tensor(float('inf'))
-    )
-    tracker['microbatch_entropy_min'][idx] = torch.minimum(
-        tracker['microbatch_entropy_min'][idx], entropy_candidate
-    )
-    tracker['microbatch_count'][idx] += has_tokens.float()
-
 
 def clear_expert_utilization_tracker() -> None:
-    """Zero out the expert utilization tracker without deallocating the buffer."""
+    """Clear per-step counts while preserving cross-step near-dead streaks."""
     tracker = get_expert_utilization_tracker()
     if 'selected_values' in tracker:
         tracker['selected_values'].zero_()
         tracker['dispatched_values'].zero_()
-        tracker['microbatch_sums'].zero_()
-        tracker['microbatch_maxima'].zero_()
-        tracker['microbatch_entropy_min'].fill_(float('inf'))
-        tracker['microbatch_count'].zero_()
 
 
 def get_router_stats_tracker() -> dict:
@@ -1771,7 +1470,7 @@ def save_to_router_stats_tracker(
     """Accumulate per-layer router statistics for logging.
 
     Called every forward pass from the router alongside save_to_expert_utilization_tracker.
-    Distributed reduction and logging happen at logging intervals inside track_moe_metrics().
+    Distributed reduction and logging happen once per optimizer step inside track_moe_metrics().
 
     Args:
         sum_max_score: Sum of per-token maxima from the configured score distribution.
@@ -1789,9 +1488,7 @@ def save_to_router_stats_tracker(
         num_experts = sum_logits.shape[0]
         device = sum_logits.device
         tracker['sum_max_score'] = torch.zeros(num_layers, device=device, dtype=torch.float32)
-        tracker['sum_score_entropy'] = torch.zeros(
-            num_layers, device=device, dtype=torch.float32
-        )
+        tracker['sum_score_entropy'] = torch.zeros(num_layers, device=device, dtype=torch.float32)
         tracker['sum_logits'] = torch.zeros(
             num_layers, num_experts, device=device, dtype=torch.float32
         )
@@ -1897,7 +1594,11 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         inp_shape = inp.shape
         inp = inp.view(-1, inp_shape[-1])
 
-        if te_general_gemm is not None and router_dtype != torch.float64 and router_dtype != torch.float32:
+        if (
+            te_general_gemm is not None
+            and router_dtype != torch.float64
+            and router_dtype != torch.float32
+        ):
             output = te_general_gemm(weight, inp, router_dtype, layout="TN", bias=bias)
             output = output[0]
         elif bias is None:
