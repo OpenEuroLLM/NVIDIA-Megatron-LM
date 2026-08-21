@@ -41,6 +41,23 @@ class OptimizerConfig:
     weight_decay: float = 0.01
     """Weight decay coefficient for L2 regularization."""
 
+    scaler_wd_mult: float = 0.0
+    """Multiplier applied to `weight_decay` for "scalers": 1-D, non-bias parameters, i.e. the
+    learnable gains of every norm layer (RMSNorm/LayerNorm weights, including the qk-layernorm
+    gains and the TE-fused `*.layer_norm_weight` tensors).
+
+    Defaults to 0.0, which is the historical Megatron behaviour: every 1-D parameter is excluded
+    from weight decay entirely. That leaves those gains with NO restoring force, so they can grow
+    without bound over a long run. This matters most for the qk-layernorm gains, since attention
+    logits scale with gamma_q * gamma_k and nothing in the loss opposes their growth (the output
+    z-loss only sees the LM head), and for the final layernorm gain, which multiplies the LM head
+    input directly.
+
+    Set to 1.0 to decay scalers at the same rate as every other weight (this is what OLMo 2/3 do
+    -- they exempt only the input embedding). Fractional values give them a weaker decay than the
+    2-D weights. Biases are always excluded regardless of this setting.
+    """
+
     ##############
     # Precision
     ##############

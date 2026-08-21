@@ -1911,6 +1911,16 @@ def _add_regularization_args(parser):
                        help='Dropout probability for hidden state transformer.')
     group.add_argument('--weight-decay', type=float, default=0.01,
                        help='Weight decay coefficient for L2 regularization.')
+    group.add_argument('--scaler-wd-mult', type=float, default=0.0,
+                       help='Multiplier on --weight-decay for "scalers": 1-D non-bias params, '
+                       'i.e. every learnable norm gain (RMSNorm/LayerNorm weights, the '
+                       'qk-layernorm gains, and the TE-fused *.layer_norm_weight tensors). '
+                       'Default 0.0 reproduces the historical behaviour of excluding all 1-D '
+                       'params from weight decay, which leaves those gains with no restoring '
+                       'force: attention logits scale with gamma_q * gamma_k and the output '
+                       'z-loss does not see them. Use 1.0 to decay scalers like every other '
+                       'weight (as OLMo 2/3 do), or a fraction for weaker decay. Biases are '
+                       'always excluded.')
     group.add_argument('--start-weight-decay', type=float,
                        help='Initial weight decay coefficient for L2 regularization.')
     group.add_argument('--end-weight-decay', type=float,

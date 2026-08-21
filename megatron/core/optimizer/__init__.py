@@ -137,11 +137,17 @@ def _get_param_groups(
             # TODO: Make sure there is a way to support old no_weight_decay_func functionality
             # and default_skip_embedding_weight_decay:
             #     or (default_skip_embedding_weight_decay and "embedding" in name)
-            no_wd = name.endswith(".bias") or len(param.shape) == 1
-            if not no_wd:
-                wd_mult = 1.0
-            else:
+            # Biases are never decayed. "Scalers" -- 1-D non-bias params, i.e. every norm gain --
+            # are decayed at `scaler_wd_mult` x the scheduled weight decay; that multiplier
+            # defaults to 0.0, which reproduces the historical "no wd on any 1-D param" behaviour.
+            # See OptimizerConfig.scaler_wd_mult for why this is worth being able to change.
+            is_bias = name.endswith(".bias")
+            if is_bias:
                 wd_mult = 0.0
+            elif len(param.shape) == 1:
+                wd_mult = float(config_for_param.scaler_wd_mult)
+            else:
+                wd_mult = 1.0
 
             # Create config_tuple that is hash-able. Remove timers object before
             # creating config_tuple.
