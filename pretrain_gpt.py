@@ -183,6 +183,11 @@ def _log_cu_seqlens(packed_seq_params, vp_stage):
         f"rank={torch.distributed.get_rank()} "
         f"pp={parallel_state.get_pipeline_model_parallel_rank()} "
         f"tp={parallel_state.get_tensor_model_parallel_rank()} "
+        # dp is what makes the log checkable at DP>1: different data-parallel replicas
+        # read different documents, so cu_seqlens must only be compared WITHIN a replica.
+        # Without this the checker lumps every rank together and reports a false failure
+        # on any production-shaped run (measured, job 1498402).
+        f"dp={parallel_state.get_data_parallel_rank()} "
         f"vp={vp_stage} "
         f"max_seqlen={packed_seq_params.max_seqlen_q} "
         f"cu_seqlens={packed_seq_params.cu_seqlens_q.tolist()}",
