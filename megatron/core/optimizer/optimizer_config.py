@@ -165,6 +165,37 @@ class OptimizerConfig:
     apply_wd_to_qk_layernorm: bool = False
     """If true, apply weight decay to qk layernorm as a special case."""
 
+    qk_layernorm_wd_mult: float = 0.0
+    """Multiplier applied to `weight_decay` for the qk-layernorm gains: 1-D non-bias parameters
+    whose name contains `q_layernorm.` or `k_layernorm.` (which also covers the MLA
+    `linear_q_layernorm.` / `linear_kv_layernorm.` variants).
+
+    These are the gains most in need of a restoring force: attention logits scale with
+    gamma_q * gamma_k, and nothing in the loss opposes their growth -- the output z-loss only
+    sees the LM head. Kept separate from `residual_norm_wd_mult` because the two failure modes
+    are different, so they are worth tuning independently.
+
+    Defaults to 0.0, the historical Megatron behaviour of exempting every 1-D parameter from
+    weight decay. Setting this to 1.0 and leaving `residual_norm_wd_mult` at 0.0 reproduces
+    `apply_wd_to_qk_layernorm` for the norm GAINS. The one difference is a qk-layernorm bias, if
+    the norm has one: `apply_wd_to_qk_layernorm` decays it (its predicate drops anything
+    qk-layernorm out of the skip set, biases included), whereas these multipliers always exempt
+    biases. RMSNorm has no bias, so this only bites with a biased LayerNorm qk-norm."""
+
+    residual_norm_wd_mult: float = 0.0
+    """Multiplier applied to `weight_decay` for the remaining norm gains: every 1-D non-bias
+    parameter that is NOT a qk-layernorm gain. In practice these are the residual-stream norms --
+    `input_layernorm`, `pre_mlp_layernorm`, the final layernorm, and the TE-fused
+    `*.layer_norm_weight` tensors folded into the qkv/fc1 linears.
+
+    The final layernorm gain is the one that matters most here, since it multiplies the LM head
+    input directly. Defaults to 0.0, i.e. no decay, matching historical Megatron. Set to 1.0 to
+    decay them like every other weight (this is what OLMo 2/3 do -- they exempt only the input
+    embedding), or to a fraction for weaker decay.
+
+    Biases are always excluded from weight decay regardless of either multiplier. Together these
+    two settings generalise `apply_wd_to_qk_layernorm`, so they are mutually exclusive with it."""
+
     ##############
     # Precision
     ##############

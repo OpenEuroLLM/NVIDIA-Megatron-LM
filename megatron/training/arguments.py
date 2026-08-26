@@ -1350,6 +1350,18 @@ def validate_args(args, defaults={}):
             raise ValueError(f"Invalid no_weight_decay_cond_type: {args.no_weight_decay_cond_type}")
         args.no_weight_decay_cond_type = None
 
+    # --qk-layernorm-wd-mult / --residual-norm-wd-mult are the continuous
+    # generalisation of --apply-wd-to-qk-layernorm, so the two would otherwise
+    # install overlapping wd_mult overrides on the same parameters.
+    assert not (
+        (args.qk_layernorm_wd_mult != 0.0 or args.residual_norm_wd_mult != 0.0)
+        and args.apply_wd_to_qk_layernorm
+    ), \
+        '--qk-layernorm-wd-mult/--residual-norm-wd-mult and --apply-wd-to-qk-layernorm ' \
+        'are mutually exclusive; --qk-layernorm-wd-mult 1.0 with ' \
+        '--residual-norm-wd-mult 0.0 reproduces --apply-wd-to-qk-layernorm for the norm ' \
+        'gains (it differs only on a qk-layernorm bias, which these multipliers exempt).'
+
     if args.weight_decay_incr_style == 'constant':
         assert args.start_weight_decay is None
         assert args.end_weight_decay is None
@@ -2502,6 +2514,23 @@ def _add_regularization_args(parser):
                        help='Weight decay coefficient for L2 regularization.')
     group.add_argument('--apply-wd-to-qk-layernorm', action='store_true',
                        help='Apply weight decay to qk layernorm as a special case.')
+    group.add_argument('--qk-layernorm-wd-mult', type=float, default=0.0,
+                       help='Multiplier on --weight-decay for the qk-layernorm gains (1-D '
+                       'non-bias params whose name contains q_layernorm. or k_layernorm.). '
+                       'These need a restoring force the most: attention logits scale with '
+                       'gamma_q * gamma_k and nothing in the loss opposes their growth. '
+                       'Default 0.0 = historical Megatron behaviour (no decay on 1-D params). '
+                       'Use 1.0 to decay them like every other weight.')
+    group.add_argument('--residual-norm-wd-mult', type=float, default=0.0,
+                       help='Multiplier on --weight-decay for the remaining norm gains: every '
+                       '1-D non-bias param that is NOT a qk-layernorm gain, i.e. the '
+                       'residual-stream norms (input_layernorm, pre_mlp_layernorm, the final '
+                       'layernorm, and the TE-fused *.layer_norm_weight tensors). The final '
+                       'layernorm gain matters most, since it multiplies the LM head input '
+                       'directly. Default 0.0 = no decay. Use 1.0 to decay like every other '
+                       'weight (as OLMo 2/3 do), or a fraction for weaker decay. Biases are '
+                       'always excluded. Together with --qk-layernorm-wd-mult this generalises '
+                       '--apply-wd-to-qk-layernorm, so they are mutually exclusive with it.')
     group.add_argument('--clip-grad', type=float, default=1.0,
                        help='Gradient clipping based on global L2 norm.')
     group.add_argument('--adam-beta1', type=float, default=0.9,
