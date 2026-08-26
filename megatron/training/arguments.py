@@ -1259,19 +1259,30 @@ def validate_args(args, defaults={}):
         #   none                           -> no rope at all; cu_seqlens still masks
         #                                    documents in the kernel. Nothing to do.
         #
-        # NB yarn silently lands in the middle case: arguments.py force-disables
-        # apply_rope_fusion whenever position_embedding_type != 'rope' (see the "Legacy RoPE
-        # arguments" block above), so it is not something the user has to turn off.
+        # yarn cannot satisfy this and is therefore unsupported: the "Legacy RoPE arguments"
+        # block above force-disables apply_rope_fusion whenever position_embedding_type is not
+        # exactly 'rope' (arguments.py:1005), so it always lands in the unfused case and the
+        # user has no way to turn it back on. Say so, rather than asking for a flag that has
+        # already been overridden.
         if args.position_embedding_type in ('rope', 'yarn') and not args.apply_rope_fusion:
-            warn_rank_0(
+            if args.position_embedding_type == 'yarn':
+                remedy = (
+                    'yarn cannot be used with --packed-doc-attention: apply_rope_fusion is '
+                    'force-disabled for every position_embedding_type other than rope, so '
+                    'the fused thd path is unreachable. Use position_embedding_type=rope '
+                    'with --apply-rope-fusion, or none.'
+                )
+            else:
+                remedy = 'Set --apply-rope-fusion, or position_embedding_type=none.'
+            raise AssertionError(
                 f'--packed-doc-attention with position_embedding_type='
-                f'{args.position_embedding_type} and apply_rope_fusion off uses the UNFUSED '
-                f'thd rope path, which reads cu_seqlens back to the host once per attention '
-                f'call (rope_utils._apply_rotary_pos_emb_thd) instead of once per microbatch. '
-                f'Correct, but it gives back the stream-drain saving of the host-side '
-                f'cu_seqlens derivation. Prefer position_embedding_type=rope with '
-                f'--apply-rope-fusion.',
-                args.rank,
+                f'{args.position_embedding_type} and apply_rope_fusion off runs the UNFUSED '
+                f'thd rope path, which reads cu_seqlens back to the host once per ATTENTION '
+                f'CALL (rope_utils._apply_rotary_pos_emb_thd) instead of once per microbatch '
+                f'-- one stream drain per layer, ~60x more at 32B, which is exactly the cost '
+                f'the host-side derivation exists to remove. Numerically correct but slower '
+                f'than the dense mask it replaces, hence an error rather than a warning. '
+                f'{remedy}'
             )
         assert args.spec is None or args.spec[0] != 'local', \
             '--packed-doc-attention requires the transformer_engine spec, not --spec local.'
@@ -1296,61 +1307,27 @@ def validate_args(args, defaults={}):
                 'create_attention_mask_in_dataloader, which TE would discard anyway.',
                 args.rank,
             )
-        if args.pipeline_model_parallel_size > 1 and not args.packed_doc_attention_scatter:
-            # LOCAL MODE: every stage derives cu_seqlens itself, so every stage builds the
-            # dataset (pretrain_gpt.is_dataset_built_on_rank) and there is one data iterator
-            # PER MODEL CHUNK. The cost that matters is not reader count, it is the ADDRESS
-            # SPACE those builds map -- see the OOM note below.
-            chunks = args.virtual_pipeline_model_parallel_size or 1
-            warn_rank_0(
-                f'packed_doc_attention in LOCAL mode builds the dataset on every pipeline '
-                f'stage, once per model chunk: {chunks} chunk-dataloader(s) per rank at '
-                f'PP={args.pipeline_model_parallel_size}. '
-                f'--packed-doc-attention-scatter reads on the endpoint stages only.',
-                args.rank,
-            )
-            if chunks > 2:
-                # MEASURED, 512 nodes, PP=4/VPP=4, job 1497412: rank 0 died in the dataset
-                # build with
-                #     numpy/core/memmap.py:268 OSError [Errno 12] Cannot allocate memory
-                # and the job then HUNG, because the surviving ranks waited on a dead rank 0.
-                # It is mapped BYTES, not mapping count: ~2.7k mappings per chunk is far
-                # under vm.max_map_count (65530), but the data cache was 704 GB over 18,685
-                # files, so one build maps ~103 GB and four of them ~412 GB against ~472 GB
-                # of CPU RAM. VPP=2 (~206 GB) survived the same blend; VPP=4 did not.
-                # Warned rather than asserted because the bound is the CACHE SIZE, which is
-                # not knowable here -- a small blend at VPP=4 is fine.
-                warn_rank_0(
-                    f'packed_doc_attention LOCAL mode with {chunks} model chunks maps the '
-                    f'dataset indices {chunks} TIMES PER RANK. At 512 nodes with a 704 GB '
-                    f'index cache this ran out of address space in the dataset build '
-                    f'(OSError [Errno 12] from numpy memmap) and the job hung rather than '
-                    f'exiting. If that happens, use --packed-doc-attention-scatter; it does '
-                    f'not scale with the chunk count.',
-                    args.rank,
-                )
-        if args.packed_doc_attention_scatter:
-            # SCATTER'S COST SCALES WITH THE MICROBATCH COUNT, AND ONLY WITH THAT. It
-            # prefetches a whole iteration up front, which is work that cannot hide behind
-            # compute, so M is the whole story:
-            #   M=1024 (2 nodes, DP=1)   +14.7% to +34.1% vs local   jobs 1497045/46
-            #   M=16   (512 nodes, DP=128) no measurable cost, -2.8% vs an unmasked
-            #                              control, inside a +-3.2% noise floor  job 1498007
-            # So the small-scale "local wins" result does NOT transfer to production, where
-            # large DP makes M small. It also does not scale with the model-chunk count,
-            # which is what makes it the only mode that runs at PP=4/VPP=4.
-            warn_rank_0(
-                'packed_doc_attention_scatter prefetches a whole iteration of micro-batches '
-                'on the stages that read data. Both its memory and its time cost scale with '
-                'the microbatch count, which is large when data-parallel size is small: '
-                'measured +15-34% at DP=1, and no measurable cost at DP=128.',
-                args.rank,
-            )
-    elif args.packed_doc_attention_scatter:
-        raise AssertionError(
-            '--packed-doc-attention-scatter only means anything with --packed-doc-attention.'
+        # THE COST SCALES WITH THE MICROBATCH COUNT, AND ONLY WITH THAT. A whole iteration
+        # is prefetched up front, which is work that cannot hide behind compute, so M is the
+        # whole story:
+        #   M=1024 (2 nodes, DP=1)     +14.7% to +34.1% vs the deleted per-stage mode 1497045/46
+        #   M=16   (512 nodes, DP=128) no measurable cost, -2.8% vs an unmasked control,
+        #                              inside a +-3.2% noise floor                 job 1498007
+        # So the small-scale "local wins" result did NOT transfer to production, where large
+        # DP makes M small -- and local did not run at all at PP=4/VPP=4. Warned only where
+        # it is actually large, so production runs stay quiet.
+        microbatches = args.global_batch_size // (
+            args.micro_batch_size * args.data_parallel_size
         )
-
+        if microbatches >= 128:
+            warn_rank_0(
+                f'--packed-doc-attention prefetches a whole iteration of micro-batches on '
+                f'the stages that read data, and both its memory and its time cost scale '
+                f'with that count -- {microbatches} here, which is large because '
+                f'data-parallel size is only {args.data_parallel_size}. Measured +15-34% at '
+                f'M=1024, and no measurable cost at M=16.',
+                args.rank,
+            )
     # Print arguments.
     _print_args("arguments", args)
 
@@ -3089,16 +3066,6 @@ def _add_data_args(parser):
                        '--reset-position-ids redundant. Folds the micro-batch into one packed '
                        'sequence, so it currently requires CP=1. '
                        'OELLM patch, see pretrain_gpt.py.')
-    group.add_argument('--packed-doc-attention-scatter', action='store_true',
-                       help='With --packed-doc-attention, derive cu_seqlens for the whole '
-                       'iteration on the reading stage and broadcast it over the '
-                       'model-parallel group in ONE collective before the pipeline schedule '
-                       'runs, instead of having every stage read the dataloader and derive '
-                       'it locally. Trades ~PP x the dataloader readers for a prefetch stash '
-                       'of one iteration of micro-batches. NB the collective must happen '
-                       'before the schedule: doing it per-microbatch inside get_batch '
-                       'deadlocks against the p2p activation chain. '
-                       'OELLM patch, see megatron/training/packed_doc_attention.py.')
     group.add_argument('--packed-doc-attention-log-cu-seqlens', type=int, default=0,
                        help='With --packed-doc-attention, print this rank\'s cu_seqlens for '
                        'the first N calls to get_batch. cu_seqlens is a few dozen bytes, so '

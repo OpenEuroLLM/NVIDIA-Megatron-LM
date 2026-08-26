@@ -39,7 +39,7 @@ except ImportError:
 
 stimer = StragglerDetector()
 
-# OELLM PATCH: let training.train_step drive the scatter-mode prefetch without importing
+# OELLM PATCH: let training.train_step drive the cu_seqlens prefetch without importing
 # this module (see megatron/training/packed_doc_attention.py).
 pda.register_prefetch_hook(lambda *a: _prefetch_cu_seqlens_for_iteration(*a))
 
@@ -93,67 +93,6 @@ def _build_packed_seq_params(tokens: torch.Tensor, eod_id: int) -> PackedSeqPara
     )
 
 
-def _shared_packed_seq_params(packed_length: int):
-    """Share TP rank 0's host-derived thd PackedSeqParams across the TP group.
-
-    Every transformer layer on every rank needs cu_seqlens, but not every rank has the
-    tokens: `get_batch_on_this_tp_rank` broadcasts tokens on the first stage, sets them
-    to None on the last (utils.py:600-609), and for middle stages broadcasts nothing. So
-    TP rank 0 derives it -- on the HOST, before the tokens are uploaded -- and hands it to
-    the rest of its tensor-parallel group.
-
-    Takes no tokens: the derivation happens in get_batch_on_this_tp_rank now, because that
-    is the last place the tokens exist on the CPU. Deriving here would mean deriving from
-    the uploaded copy, which is what used to cost a readback.
-
-    Safe as a collective because all TP ranks of a given (stage, chunk) run this at the
-    same point for the same microbatch -- the assumption get_batch_on_this_tp_rank already
-    makes for its own broadcasts. Note the group is deliberately the TENSOR-parallel group,
-    never the pipeline one.
-
-    ================== DO NOT WIDEN THIS TO THE PIPELINE GROUP ==================
-    Sending cu_seqlens across pipeline stages from here DEADLOCKS. Measured, not
-    theorised (job 1494386, hung at the first training step, cancelled):
-
-        rank 0 (first stage) enters forward_step -> get_batch -> broadcast, and blocks
-               waiting for every rank in the group;
-        rank N (last stage) is in recv_forward, blocked on rank N-1 <- ... <- rank 0;
-        rank 0 cannot produce those activations because it is stuck in the broadcast.
-
-    A circular wait between the collective and the p2p activation chain. This is NOT
-    about microbatch ordering -- the interleaved schedule's tables (get_schedule_table,
-    schedules.py:1045) are rank-independent, so the k-th forward is the same
-    (chunk, microbatch) everywhere and the CONTENT would have been correct. The problem is
-    purely that a blocking collective cannot sit inside a pipeline whose stages are waiting
-    on each other's activations. Every pipeline stage deriving cu_seqlens locally is
-    therefore not one of two options; it is the only one that works.
-    =============================================================================
-
-    NO DEVICE READBACK HAPPENS HERE ANY MORE. The derivation moved to the host, into
-    get_batch_on_this_tp_rank, where the tokens still live on the CPU: max_seqlen and the
-    entry count are then Python ints by construction. The share is a GLOO broadcast of a
-    small host buffer, so the header arrives host-side and the only device traffic is one
-    async H2D copy of the exact-size cu_seqlens.
-
-    The old version derived on the GPU and paid two stream drains per microbatch per rank
-    -- `int(...max())` for TE's kernel-launch int, and `.tolist()` to learn the slice
-    length. Both sat at the top of forward_step, so they destroyed CPU run-ahead M times
-    per iteration.
-
-    The buffer is fixed-size so every rank agrees on the shape before it knows the document
-    count -- a pack of `packed_length` tokens holds at most that many documents, hence at
-    most packed_length + 1 cu_seqlens entries. Layout: [n_entries, max_seqlen, cu_seqlens...].
-    """
-    cu_seqlens, max_seqlen = pda.share_cu_seqlens_over_tp(packed_length)
-    return PackedSeqParams(
-        qkv_format='thd',
-        cu_seqlens_q=cu_seqlens,
-        cu_seqlens_kv=cu_seqlens,
-        max_seqlen_q=max_seqlen,
-        max_seqlen_kv=max_seqlen,
-    )
-
-
 _PDA_LOGGED_CALLS = 0
 
 
@@ -162,7 +101,8 @@ def _log_cu_seqlens(packed_seq_params, vp_stage):
 
     cu_seqlens is a handful of int32s -- a few dozen bytes -- so logging it outright is
     cheaper than any runtime cross-check, and unlike a collective it cannot deadlock
-    against the pipeline's p2p chain (see _shared_packed_seq_params for that failure).
+    against the pipeline's p2p chain (packed_doc_attention.prefetch_iteration explains
+    that failure).
 
     DEBUG ONLY, and the default of 0 matters: the `.tolist()` below is a device->host
     readback, i.e. exactly the per-microbatch stream drain the host-side derivation exists
@@ -197,7 +137,7 @@ def _log_cu_seqlens(packed_seq_params, vp_stage):
 
 
 def _prefetch_cu_seqlens_for_iteration(data_iterator, vp_stage, num_microbatches, derive=True):
-    """OELLM PATCH: scatter-mode hook, called from train_step before the schedule runs.
+    """OELLM PATCH: cu_seqlens prefetch hook, called from train_step before the schedule.
 
     Registered with megatron.training.packed_doc_attention so training.py does not have to
     import this module. See that module for why the collective cannot live in get_batch.
@@ -223,43 +163,29 @@ def _prefetch_cu_seqlens_for_iteration(data_iterator, vp_stage, num_microbatches
 def get_batch(data_iterator, vp_stage=None):
     """Generate a batch."""
     args = get_args()
-    is_endpoint = is_first_or_last_pipeline_stage(vp_stage)
-    scatter = args.packed_doc_attention and args.packed_doc_attention_scatter
+    # Endpoint stages only -- the upstream rule, unmodified. --packed-doc-attention used to
+    # widen this so every stage could derive cu_seqlens from its own read; that mode is gone
+    # (it mapped the dataset indices once per model chunk and ran out of address space at
+    # PP=4/VPP=4). cu_seqlens now always arrives via the per-iteration broadcast that
+    # training.maybe_prefetch_cu_seqlens issues BEFORE the schedule -- it cannot be done
+    # here, because a collective inside forward_step deadlocks against the p2p activation
+    # chain (job 1494386, see megatron/training/packed_doc_attention.py).
+    reads_data = is_first_or_last_pipeline_stage(vp_stage)
 
-    # Which ranks pull from the dataloader:
-    #   plain           endpoints only (upstream)
-    #   packed local    EVERY stage -- each derives cu_seqlens itself, because a collective
-    #                   here would deadlock against the p2p chain (_shared_packed_seq_params)
-    #   packed scatter  endpoints only -- cu_seqlens was broadcast for the whole iteration
-    #                   before the schedule started (training/packed_doc_attention.py)
-    reads_data = is_endpoint or (args.packed_doc_attention and not scatter)
+    if not args.packed_doc_attention:
+        if not reads_data:
+            return None, None, None, None, None, None
+        batch = get_batch_on_this_cp_rank(get_batch_on_this_tp_rank(data_iterator))
+        return (*batch.values(), None)
 
-    # TODO: this is pretty hacky, find a better way
-    if not reads_data and not args.packed_doc_attention:
-        return None, None, None, None, None, None
-
-    if scatter:
-        batch, cu_seqlens, max_seqlen = pda.pop(vp_stage, reads_data=reads_data)
-        packed_seq_params = PackedSeqParams(
-            qkv_format='thd',
-            cu_seqlens_q=cu_seqlens,
-            cu_seqlens_kv=cu_seqlens,
-            max_seqlen_q=max_seqlen,
-            max_seqlen_kv=max_seqlen,
-        )
-    else:
-        # get batches based on the TP rank you are on
-        batch = get_batch_on_this_tp_rank(data_iterator)
-
-        # slice batch along sequence dimension for context parallelism
-        batch = get_batch_on_this_cp_rank(batch)
-
-        if not args.packed_doc_attention:
-            return (*batch.values(), None)
-
-        packed_seq_params = _shared_packed_seq_params(
-            args.seq_length * args.micro_batch_size
-        )
+    batch, cu_seqlens, max_seqlen = pda.pop(vp_stage, reads_data=reads_data)
+    packed_seq_params = PackedSeqParams(
+        qkv_format='thd',
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_kv=cu_seqlens,
+        max_seqlen_q=max_seqlen,
+        max_seqlen_kv=max_seqlen,
+    )
 
     if args.packed_doc_attention_log_cu_seqlens:
         _log_cu_seqlens(packed_seq_params, vp_stage)
@@ -402,23 +328,8 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
 
 
 def is_dataset_built_on_rank(vp_stage=None):
-    args = get_args()
-    if args.packed_doc_attention and not args.packed_doc_attention_scatter:
-        # OELLM PATCH: every pipeline stage needs cu_seqlens for its own transformer layers.
-        # In this mode each stage derives it from its own copy of the batch, which is why
-        # every stage builds the dataset.
-        #
-        # Stages agree because the sampler is deterministic in (data_parallel_rank,
-        # consumed_samples) -- both equal across the pipeline stages of one DP replica --
-        # and because each model chunk owns its own data iterator (training.py:708-724),
-        # consumed in microbatch order. The barriers in blended_megatron_dataset_builder are
-        # symmetric in is_built_on_rank (the short-cut path at :422 issues the same count as
-        # the build path), so widening this is safe.
-        #
-        # Sending cu_seqlens across stages instead is not an option: a blocking collective
-        # inside forward_step deadlocks against the p2p activation chain. Measured in job
-        # 1494386. See _shared_packed_seq_params for the mechanism.
-        return parallel_state.get_tensor_model_parallel_rank() == 0
+    # cu_seqlens always comes from the endpoint stages via packed_doc_attention's per-iteration broadcast, so the
+    # upstream rule stands unmodified.
     return is_first_or_last_pipeline_stage(vp_stage) and parallel_state.get_tensor_model_parallel_rank() == 0
 
 

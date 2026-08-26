@@ -1317,22 +1317,22 @@ def dummy_train_step(data_iterator):
 
 
 def maybe_prefetch_cu_seqlens(args, data_iterator, num_microbatches):
-    """OELLM PATCH: scatter-mode cu_seqlens prefetch, run BEFORE a pipeline schedule.
+    """OELLM PATCH: cu_seqlens prefetch for --packed-doc-attention, BEFORE a schedule runs.
 
-    --packed-doc-attention-scatter derives cu_seqlens for the whole iteration on the
-    reading stage and broadcasts it in one collective. It has to happen here rather than in
-    get_batch: a collective inside forward_step deadlocks against the p2p activation chain
-    (measured, job 1494386). See megatron/training/packed_doc_attention.py.
+    Derives cu_seqlens for the whole iteration on the reading stage and broadcasts it in one
+    collective. It has to happen here rather than in get_batch: a collective inside
+    forward_step deadlocks against the p2p activation chain (measured, job 1494386). See
+    megatron/training/packed_doc_attention.py.
 
     Every call site that drives forward_backward_func must call this first, otherwise
     get_batch pops an empty stash -- which is why evaluate() calls it too.
     """
-    if not getattr(args, 'packed_doc_attention_scatter', False):
+    if not getattr(args, 'packed_doc_attention', False):
         return
     hook = packed_doc_attention.prefetch_hook()
     assert hook is not None, (
-        'packed_doc_attention_scatter needs the training script to register a prefetch '
-        'hook (pretrain_gpt.py does this at import).'
+        'packed_doc_attention needs the training script to register a prefetch hook '
+        '(pretrain_gpt.py does this at import).'
     )
     packed_doc_attention.reset()
     is_chunked = isinstance(data_iterator, list)

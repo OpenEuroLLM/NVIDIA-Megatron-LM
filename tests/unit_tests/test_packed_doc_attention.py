@@ -22,7 +22,7 @@ import pretrain_gpt
 from megatron.core.datasets.gpt_dataset import _get_ltor_masks_and_position_ids
 from megatron.training import packed_doc_attention as pda
 from megatron.training.training import get_pipeline_tensor_shapes
-from pretrain_gpt import _build_packed_seq_params, _shared_packed_seq_params
+from pretrain_gpt import _build_packed_seq_params
 
 EOD = 0
 
@@ -42,15 +42,41 @@ TOKEN_PATTERNS = [
 
 
 def _stub_lone_tp_rank(monkeypatch):
-    """Present as a tensor-parallel group of one: no gloo group, so no collective is issued.
-
-    The world size has to be stubbed too, not just the rank -- share_cu_seqlens_over_tp
-    asserts that a TP group wider than 1 has a gloo sibling, precisely so a missing group
-    cannot let non-zero ranks fall through with a stale buffer.
-    """
-    monkeypatch.setattr(pda.parallel_state, "get_tensor_model_parallel_group_gloo", lambda: None)
+    """Present as a model-parallel group of one, so no collective is issued."""
     monkeypatch.setattr(pda.parallel_state, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(pda.parallel_state, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(pda.parallel_state, "get_model_parallel_group", lambda: None)
+    monkeypatch.setattr(pda.parallel_state, "get_model_parallel_src_rank", lambda: 0)
+    monkeypatch.setattr(pda.torch.distributed, "get_rank", lambda: 0)
+
+
+def _prefetch_one_rank(rows_per_microbatch, packed_length, monkeypatch, vp_stage=None):
+    """Drive prefetch_iteration as a single rank that reads its own data.
+
+    Stands in for the real call in training.maybe_prefetch_cu_seqlens: fetch_batch normally
+    routes through get_batch_on_this_tp_rank, which derives cu_seqlens on the host and
+    leaves it in the batch under CU_SEQLENS_KEY. That is reproduced here so the test
+    exercises the real encode/broadcast/decode arithmetic and not a stub of it.
+    """
+    _stub_lone_tp_rank(monkeypatch)
+    batches = iter(rows_per_microbatch)
+
+    def fetch_batch(_iterator):
+        rows = next(batches)
+        cpu_tokens = torch.tensor(rows, dtype=torch.long)
+        return {
+            "tokens": cpu_tokens.cuda(),
+            pda.CU_SEQLENS_KEY: pda.derive_cu_seqlens_cpu(cpu_tokens, EOD),
+        }
+
+    pda.prefetch_iteration(
+        data_iterator=None,
+        vp_stage=vp_stage,
+        num_microbatches=len(rows_per_microbatch),
+        packed_length=packed_length,
+        fetch_batch=fetch_batch,
+        reads_data=True,
+    )
 
 
 def _mask_from_cu_seqlens(cu_seqlens, total):
@@ -266,7 +292,7 @@ def test_pipeline_tensor_shapes_fold(packed, seq_length, micro_batch_size, expec
     assert folded_seq * folded_mbs == seq_length * micro_batch_size
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU for the shared buffer")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU for the broadcast buffer")
 @pytest.mark.parametrize(
     "rows",
     [
@@ -275,64 +301,69 @@ def test_pipeline_tensor_shapes_fold(packed, seq_length, micro_batch_size, expec
         pytest.param([[1, 2, 3, 4, 5, 6, 7, 8]], id="single_document"),
     ],
 )
-def test_shared_packed_seq_params_roundtrip(rows, monkeypatch):
-    """The fixed-size TP buffer must reproduce exactly what rank 0 computed.
+def test_broadcast_buffer_roundtrip(rows, monkeypatch):
+    """The fixed-size broadcast buffer must reproduce exactly what the source computed.
 
-    Encoding is [n_entries, max_seqlen, cu_seqlens...] padded to a fixed length so every
-    rank agrees on the shape before it knows the document count; the slice arithmetic on
-    the way out is the part that can silently drop or pad an entry.
+    Encoding is [n_entries, max_seqlen, cu_seqlens...] padded to a fixed width so every rank
+    agrees on the shape before it knows the document count; the slice arithmetic on the way
+    out is the part that can silently drop or pad an entry.
     """
-    # Pretend to be a lone tensor-parallel rank: no gloo group, so no collective is issued.
-    _stub_lone_tp_rank(monkeypatch)
-
     cpu_tokens = torch.tensor(rows, dtype=torch.long)
-    tokens = cpu_tokens.cuda()
-    packed_length = tokens.numel()
+    packed_length = cpu_tokens.numel()
+    direct = _build_packed_seq_params(cpu_tokens.cuda(), EOD)
 
-    direct = _build_packed_seq_params(tokens, EOD)
-    # Stand in for get_batch_on_this_tp_rank, which derives on the host before the H2D copy.
-    pda.stash_cpu_cu_seqlens(*pda.derive_cu_seqlens_cpu(cpu_tokens, EOD))
-    shared = _shared_packed_seq_params(packed_length)
+    pda.reset()
+    _prefetch_one_rank([rows], packed_length, monkeypatch)
+    batch, cu_seqlens, max_seqlen = pda.pop(None, reads_data=True)
 
-    assert shared.qkv_format == "thd"
-    assert shared.max_seqlen_q == direct.max_seqlen_q
-    assert shared.max_seqlen_kv == direct.max_seqlen_kv
-    assert shared.cu_seqlens_q.dtype == torch.int32
-    torch.testing.assert_close(shared.cu_seqlens_q.cpu(), direct.cu_seqlens_q.cpu())
+    assert pda.CU_SEQLENS_KEY not in batch, "the entry must be popped, never left in the batch"
+    assert max_seqlen == direct.max_seqlen_q
+    assert cu_seqlens.dtype == torch.int32
+    torch.testing.assert_close(cu_seqlens.cpu(), direct.cu_seqlens_q.cpu())
     # No trailing padding leaked into the slice, and it still spans the whole pack.
-    assert shared.cu_seqlens_q[-1].item() == packed_length
-    assert shared.cu_seqlens_q.numel() == direct.cu_seqlens_q.numel()
+    assert cu_seqlens[-1].item() == packed_length
+    assert cu_seqlens.numel() == direct.cu_seqlens_q.numel()
+    pda.reset()
 
 
-def test_cpu_header_handoff_is_pop_not_peek():
-    """The hand-off slot must clear on read, and reset() must not leave one behind.
+def test_cu_seqlens_travels_in_the_batch_and_is_popped():
+    """The header rides with its own microbatch, and never survives into the model.
 
-    This is the property the module-global hand-off rests on: a value can be consumed at
-    most once, so a stash that nobody consumed (training.dummy_train_step does exactly
-    that) is overwritten before the next take rather than being read for the wrong
-    microbatch. Lose it and the failure is silently wrong document boundaries.
+    It used to be handed over through a module global, which was correct only while every
+    read happened to be immediately preceded by a write in the same call chain -- an
+    invariant nothing enforced, and one that prefetching a microbatch ahead would have
+    broken silently. Carrying it in the batch removes the ordering question entirely; these
+    assertions are what keep it removed.
     """
-    pda.reset()
-    assert pda.take_cpu_cu_seqlens() is None, "starts empty"
-
     cu = numpy.array([0, 4, 8], dtype=numpy.int32)
-    pda.stash_cpu_cu_seqlens(cu, 4)
-    first = pda.take_cpu_cu_seqlens()
-    assert first is not None and first[1] == 4
-    assert pda.take_cpu_cu_seqlens() is None, "second read must not repeat the value"
+    batch = {"tokens": torch.ones(1, 8, dtype=torch.long), pda.CU_SEQLENS_KEY: (cu, 4)}
 
-    # An unconsumed stash is replaced, not queued -- the dummy_train_step case.
-    pda.stash_cpu_cu_seqlens(numpy.array([0, 8], dtype=numpy.int32), 8)
-    pda.stash_cpu_cu_seqlens(cu, 4)
-    taken = pda.take_cpu_cu_seqlens()
-    assert taken[1] == 4, "take must see the most recent stash"
+    header = pda.pop_cu_seqlens(batch)
+    assert header is not None and header[1] == 4
+    assert pda.CU_SEQLENS_KEY not in batch, "popped, so it cannot reach the reshape or model"
+    assert "tokens" in batch, "popping must not disturb the real batch entries"
 
-    pda.stash_cpu_cu_seqlens(cu, 4)
-    pda.reset()
-    assert pda.take_cpu_cu_seqlens() is None, "reset must drop an unconsumed hand-off"
+    # Reading twice is not a stale repeat, it is simply absent -- and absent is what a rank
+    # that did not read the dataloader legitimately sees.
+    assert pda.pop_cu_seqlens(batch) is None
+    assert pda.pop_cu_seqlens({}) is None
+    assert pda.pop_cu_seqlens(None) is None, "middle stages can be handed no batch at all"
 
 
-def test_scatter_shares_cu_seqlens_across_chunks():
+def test_cu_seqlens_key_is_absent_when_packing_is_off():
+    """Nothing may be added to the batch unless packing asked for it.
+
+    Two positional unpackings depend on this -- pretrain_gpt's non-packed
+    `return (*batch.values(), None)` and pretrain_mamba's `return batch.values()` -- and an
+    unexpected extra value would shift every field silently.
+    """
+    plain = {"tokens": None, "labels": None, "loss_mask": None}
+    before = list(plain)
+    assert pda.pop_cu_seqlens(plain) is None
+    assert list(plain) == before, "pop must not mutate a batch that never carried the key"
+
+
+def test_shares_cu_seqlens_across_chunks():
     """Chunks 1..VPP-1 must get chunk 0's cu_seqlens, and must not share its list object.
 
     Scatter was broken at VPP>1: prefetch_iteration only fills the broadcast buffer inside
@@ -367,7 +398,7 @@ def test_scatter_shares_cu_seqlens_across_chunks():
     pda.reset()
 
 
-def test_scatter_refuses_to_share_from_a_chunk_that_never_derived():
+def test_refuses_to_share_from_a_chunk_that_never_derived():
     """The failure has to surface here, not inside a TE kernel assert much later."""
     pda.reset()
     with pytest.raises(AssertionError, match="was not prefetched"):
@@ -378,22 +409,26 @@ def test_scatter_refuses_to_share_from_a_chunk_that_never_derived():
 def test_consecutive_microbatches_do_not_alias(monkeypatch):
     """Each microbatch must own its cu_seqlens, because TE reads it again in backward.
 
-    Under 1F1B the backward for microbatch m runs several microbatches after its forward.
-    If the device tensor were a view into a recycled buffer, microbatch m+1 would overwrite
-    the boundaries m is still going to use -- and nothing would raise, because the dtype and
-    (usually) the shape match. Attention would simply be masked against the wrong document
-    layout in the backward pass.
+    Under 1F1B the backward for microbatch m runs several microbatches after its forward. If
+    microbatch m+1's boundaries landed in the same storage as m's, m's backward would be
+    masked against the wrong document layout -- and nothing would raise, because the dtype
+    and (usually) the shape match. The prefetch buffer is [num_microbatches, width], so each
+    microbatch owns a distinct row; this pins that down rather than trusting the indexing.
     """
-    _stub_lone_tp_rank(monkeypatch)
-    packed_length = 8
+    pda.reset()
+    _prefetch_one_rank(
+        [[[1, 2, EOD, 4, 5, 6, 7, 8]], [[EOD, 2, EOD, 4, EOD, 6, 7, 8]]],
+        packed_length=8,
+        monkeypatch=monkeypatch,
+    )
 
-    pda.stash_cpu_cu_seqlens(*pda.derive_cu_seqlens_cpu(torch.tensor([[1, 2, EOD, 4, 5, 6, 7, 8]]), EOD))
-    first, _ = pda.share_cu_seqlens_over_tp(packed_length)
+    _, first, _ = pda.pop(None, reads_data=False)
     kept = first.clone()
+    _, second, _ = pda.pop(None, reads_data=False)
 
-    pda.stash_cpu_cu_seqlens(*pda.derive_cu_seqlens_cpu(torch.tensor([[EOD, 2, EOD, 4, EOD, 6, 7, 8]]), EOD))
-    second, _ = pda.share_cu_seqlens_over_tp(packed_length)
-
-    assert first.data_ptr() != second.data_ptr()
+    assert first.data_ptr() != second.data_ptr(), "microbatches must not share storage"
+    # The second is genuinely different data, so an overwrite would be visible.
+    assert first.numel() != second.numel() or not torch.equal(first, second)
     torch.cuda.synchronize()
-    torch.testing.assert_close(first, kept)
+    torch.testing.assert_close(first, kept, msg="microbatch 0 was overwritten by microbatch 1")
+    pda.reset()

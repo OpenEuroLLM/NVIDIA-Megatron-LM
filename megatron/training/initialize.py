@@ -379,15 +379,6 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 get_embedding_ranks=get_embedding_ranks,
                 get_position_embedding_ranks=get_position_embedding_ranks,
                 create_gloo_process_groups=args.enable_gloo_process_groups,
-                # OELLM PATCH: LOCAL-mode --packed-doc-attention shares its cu_seqlens header
-                # across the TP group host-side, so it needs a gloo sibling of that group.
-                # SCATTER does not: it broadcasts over the MODEL-parallel group, which
-                # already spans TP, so requesting it there would build one extra process
-                # group per TP group -- 512 of them at production scale -- for nothing.
-                create_tensor_parallel_gloo_group=(
-                    getattr(args, 'packed_doc_attention', False)
-                    and not getattr(args, 'packed_doc_attention_scatter', False)
-                ),
                 high_priority_stream_groups=args.high_priority_stream_groups,
                 sharp_enabled_group=args.sharp_enabled_group,
             )
