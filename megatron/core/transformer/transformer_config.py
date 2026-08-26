@@ -687,6 +687,18 @@ class TransformerConfig(ModelParallelConfig):
     moe_per_layer_logging: bool = False
     """Enable per-layer MoE loss, router-score, and expert-utilization logging."""
 
+    moe_expert_viability_metrics: bool = False
+    """Enable opt-in per-layer routed-expert viability diagnostics.
+
+    Requires ``moe_per_layer_logging`` because the diagnostics are emitted per MoE layer.
+    """
+
+    moe_masked_layer_validation: bool = False
+    """Enable an opt-in paired validation probe that masks one routed MoE layer."""
+
+    moe_masked_layer_eval_iters: int = 8
+    """Dedicated validation batches used by each masked-layer probe."""
+
     moe_expert_capacity_factor: Optional[float] = None
     """moe_expert_capacity_factor (float): The capacity factor for each expert, None means no token
     will be dropped. The default is None."""
@@ -912,6 +924,12 @@ class TransformerConfig(ModelParallelConfig):
         details.
         """
         super().__post_init__()
+        if self.moe_expert_viability_metrics and not self.moe_per_layer_logging:
+            raise ValueError("moe_expert_viability_metrics requires moe_per_layer_logging.")
+        if self.moe_masked_layer_validation and not self.moe_expert_viability_metrics:
+            raise ValueError("moe_masked_layer_validation requires moe_expert_viability_metrics.")
+        if self.moe_masked_layer_eval_iters <= 0:
+            raise ValueError("moe_masked_layer_eval_iters must be positive.")
         if self.fp16 and self.bf16:
             raise ValueError(
                 f"Only one of self.fp16: {self.fp16} and self.bf16 {self.bf16} should be True."

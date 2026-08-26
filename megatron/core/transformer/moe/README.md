@@ -570,6 +570,9 @@ For MoE models, certain configurations may prevent CUDA Graph capture of MoE lay
 | Argument | Description | Default |
 |----------|-------------|---------|
 | --moe-per-layer-logging | Per-layer logging | False |
+| --moe-expert-viability-metrics | Routed-expert output viability diagnostics (requires per-layer logging) | False |
+| --moe-masked-layer-validation | Paired validation probe that masks one routed MoE layer | False |
+| --moe-masked-layer-eval-iters | Dedicated batches per masked-layer probe | 8 |
 | --moe-router-force-load-balancing | Force load balancing (experimental) | False |
 
 ## Examples

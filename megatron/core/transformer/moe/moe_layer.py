@@ -16,6 +16,8 @@ from megatron.core.transformer.moe.moe_utils import (
     MoECudaGraphTensorStore,
     get_default_pg_collection,
     maybe_skip_or_early_return_by_cudagraph,
+    save_routed_expert_output_stats,
+    should_mask_routed_moe_layer,
 )
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.moe.token_dispatcher import (
@@ -387,6 +389,8 @@ class MoELayer(BaseMoELayer):
 
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):
+            viability_input = hidden_states
+            routed_output = None
             try:
                 if "route" in self.fwd_execution_map:
                     shared_expert_output = self.shared_experts_compute(hidden_states)
@@ -415,6 +419,12 @@ class MoELayer(BaseMoELayer):
                 ), f"mlp_bias is not supported for {type(self.token_dispatcher)}"
                 output = self.combine(output)
 
+                # `output` is the routed path only at this point: shared experts are added in
+                # postprocess below.  This is consequently also the precise masking boundary.
+                routed_output = output
+                if should_mask_routed_moe_layer(self.layer_number):
+                    output = torch.zeros_like(output)
+
                 if intermediate_tensors is not None:
                     return output, mlp_bias
 
@@ -423,6 +433,17 @@ class MoELayer(BaseMoELayer):
                     output, shared_expert_output = intermediate_tensors
 
                 output = self.postprocess(output, shared_expert_output)
+
+                # Partial CUDA-graph execution can enter postprocess with an externally supplied
+                # intermediate, in which case this invocation did not observe the routed output.
+                if self.config.moe_expert_viability_metrics and routed_output is not None:
+                    save_routed_expert_output_stats(
+                        routed_output,
+                        viability_input,
+                        output,
+                        self.layer_number,
+                        self.config.num_layers,
+                    )
 
                 if intermediate_tensors is not None:
                     return output

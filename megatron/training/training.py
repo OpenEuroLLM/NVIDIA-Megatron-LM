@@ -1990,6 +1990,7 @@ def training_log(
             moe_layer_freq=args.moe_layer_freq,
             mtp_num_layers=args.mtp_num_layers,
             pg_collection=pg_collection,
+            expert_viability_metrics=args.moe_expert_viability_metrics,
         )
 
     # Log MTP metrics.

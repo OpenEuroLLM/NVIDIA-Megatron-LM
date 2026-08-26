@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import functools
+from contextlib import contextmanager
 import math
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
@@ -43,6 +44,106 @@ except ImportError:
 _MOE_LAYER_WISE_LOGGING_TRACKER: dict = {}
 _MOE_EXPERT_UTILIZATION_TRACKER: dict = {}
 _MOE_ROUTER_STATS_TRACKER: dict = {}
+_MOE_EXPERT_VIABILITY_TRACKER: dict = {}
+
+# A deliberately internal threshold: it is a diagnostic definition, not a training knob.
+EXPERT_COLLAPSE_RMS_FRACTION = 0.10
+_MASKED_ROUTED_MOE_LAYER: Optional[int] = None
+
+
+@contextmanager
+def mask_routed_moe_layer(layer_number: int):
+    """Temporarily zero only the routed path of one physical MoE layer.
+
+    The router still executes and shared experts remain intact.  The context is process-local,
+    which makes it safe for the paired validation caller to enter on every rank.
+    """
+    global _MASKED_ROUTED_MOE_LAYER
+    previous = _MASKED_ROUTED_MOE_LAYER
+    _MASKED_ROUTED_MOE_LAYER = layer_number
+    try:
+        yield
+    finally:
+        _MASKED_ROUTED_MOE_LAYER = previous
+
+
+def should_mask_routed_moe_layer(layer_number: Optional[int]) -> bool:
+    """Whether the supplied MoE layer is selected by the temporary mask context."""
+    return layer_number is not None and layer_number == _MASKED_ROUTED_MOE_LAYER
+
+
+def _combined_rms(tensors: List[Optional[torch.Tensor]]) -> torch.Tensor:
+    """RMS over several tensors, weighted by element count."""
+    valid = [tensor.detach().float() for tensor in tensors if tensor is not None]
+    if not valid:
+        return torch.tensor(float('nan'))
+    square_sum = sum(tensor.square().sum() for tensor in valid)
+    count = sum(tensor.numel() for tensor in valid)
+    return torch.sqrt(square_sum / count)
+
+
+def local_expert_rms(experts: torch.nn.Module, num_local_experts: int, gradients: bool = False):
+    """Return combined RMS values for local routed experts.
+
+    Supports both SequentialMLP (one module per expert) and grouped expert tensors whose
+    leading dimension is the local expert dimension. Parameters that cannot be attributed to
+    an individual expert are intentionally excluded.
+    """
+    local = getattr(experts, 'local_experts', None)
+    if local is not None:
+        return torch.stack([
+            _combined_rms([p.grad if gradients else p for p in expert.parameters()])
+            for expert in local
+        ])
+    per_expert = [[] for _ in range(num_local_experts)]
+    for parameter in experts.parameters():
+        tensor = parameter.grad if gradients else parameter
+        if tensor is not None and tensor.ndim > 0 and tensor.shape[0] == num_local_experts:
+            for index in range(num_local_experts):
+                per_expert[index].append(tensor[index])
+    if not any(per_expert):
+        return None
+    return torch.stack([_combined_rms(tensors) for tensors in per_expert])
+
+
+def save_routed_expert_output_stats(
+    routed_output: torch.Tensor, input_tensor: torch.Tensor, layer_output: torch.Tensor,
+    layer_number: Optional[int], num_layers: int,
+) -> None:
+    """Accumulate squared-sum/count routed-path statistics without retaining activations."""
+    if layer_number is None:
+        return
+    tracker = _MOE_EXPERT_VIABILITY_TRACKER
+    if 'routed_sq_sum' not in tracker:
+        device = routed_output.device
+        tracker['routed_sq_sum'] = torch.zeros(num_layers, device=device, dtype=torch.float32)
+        tracker['input_sq_sum'] = torch.zeros_like(tracker['routed_sq_sum'])
+        tracker['output_sq_sum'] = torch.zeros_like(tracker['routed_sq_sum'])
+        tracker['routed_count'] = torch.zeros_like(tracker['routed_sq_sum'])
+        tracker['input_count'] = torch.zeros_like(tracker['routed_sq_sum'])
+        tracker['output_count'] = torch.zeros_like(tracker['routed_sq_sum'])
+    index = layer_number - 1
+    tracker['routed_sq_sum'][index] += routed_output.detach().float().square().sum()
+    tracker['input_sq_sum'][index] += input_tensor.detach().float().square().sum()
+    tracker['output_sq_sum'][index] += layer_output.detach().float().square().sum()
+    tracker['routed_count'][index] += routed_output.numel()
+    tracker['input_count'][index] += input_tensor.numel()
+    tracker['output_count'][index] += layer_output.numel()
+
+
+def get_expert_viability_tracker() -> dict:
+    """Return the opt-in routed-expert viability tracker."""
+    return _MOE_EXPERT_VIABILITY_TRACKER
+
+
+def clear_expert_viability_tracker() -> None:
+    """Clear sufficient statistics after their logging event."""
+    for key in (
+        'routed_sq_sum', 'input_sq_sum', 'output_sq_sum', 'routed_count', 'input_count',
+        'output_count',
+    ):
+        if key in _MOE_EXPERT_VIABILITY_TRACKER:
+            _MOE_EXPERT_VIABILITY_TRACKER[key].zero_()
 
 
 def switch_load_balancing_loss_func(
@@ -1040,6 +1141,7 @@ def track_moe_metrics(
     moe_layer_freq: Optional[Union[int, List[int]]] = None,
     mtp_num_layers: Optional[int] = None,
     pg_collection: Optional[ProcessGroupCollection] = None,
+    expert_viability_metrics: bool = False,
 ) -> None:
     """Track the MoE metrics for logging.
 
@@ -1061,6 +1163,7 @@ def track_moe_metrics(
                                         Defaults to None.
         pg_collection (ProcessGroupCollection, optional): The process group collection.
                                                           Defaults to None.
+        expert_viability_metrics: Whether to emit routed-expert viability diagnostics.
     """
     # Aux loss logging
     tracker = get_moe_layer_wise_logging_tracker()
@@ -1342,7 +1445,68 @@ def track_moe_metrics(
                     iteration,
                 )
 
+    # Routed expert output health. All values are squared-sum/count sufficient statistics,
+    # so no activations survive the forward pass.
+    viability_tracker = get_expert_viability_tracker()
+    if expert_viability_metrics and 'routed_sq_sum' in viability_tracker:
+        if pg_collection is None:
+            pp_group = parallel_state.get_pipeline_model_parallel_group()
+            dp_group = parallel_state.get_data_parallel_group(
+                with_context_parallel=False, partial_data_parallel=False
+            )
+        else:
+            pp_group, dp_group = pg_collection.pp, pg_collection.dp
+        # The routed output is sharded by TP/CP in common MoE configurations.
+        # Sum both numerator and denominator over that ownership group before PP/DP.
+        tp_cp_group = (
+            parallel_state.get_tensor_and_context_parallel_group()
+            if pg_collection is None
+            else pg_collection.tp_cp
+        )
+        values = [
+            viability_tracker[key]
+            for key in ('routed_sq_sum', 'input_sq_sum', 'output_sq_sum', 'routed_count',
+                        'input_count', 'output_count')
+        ]
+        for value in values:
+            torch.distributed.all_reduce(value, group=tp_cp_group)
+            torch.distributed.all_reduce(value, group=pp_group)
+            torch.distributed.all_reduce(value, group=dp_group, op=torch.distributed.ReduceOp.AVG)
+
+        layer_log = {}
+        routed_to_input, routed_to_output = [], []
+        for i in range(viability_tracker['routed_sq_sum'].numel()):
+            routed_count = viability_tracker['routed_count'][i]
+            if routed_count.item() == 0:
+                continue
+            routed_rms = torch.sqrt(viability_tracker['routed_sq_sum'][i] / routed_count).item()
+            input_rms = torch.sqrt(
+                viability_tracker['input_sq_sum'][i] / viability_tracker['input_count'][i]
+            ).item()
+            output_rms = torch.sqrt(
+                viability_tracker['output_sq_sum'][i] / viability_tracker['output_count'][i]
+            ).item()
+            input_ratio = routed_rms / max(input_rms, 1.0e-12)
+            output_ratio = routed_rms / max(output_rms, 1.0e-12)
+            metrics = {
+                f'moe/routed_expert_output_rms_layer_{i}': routed_rms,
+                f'moe/routed_expert_output_to_input_rms_layer_{i}': input_ratio,
+                f'moe/routed_expert_output_to_layer_output_rms_layer_{i}': output_ratio,
+            }
+            layer_log.update(metrics)
+            routed_to_input.append(input_ratio)
+            routed_to_output.append(output_ratio)
+        if routed_to_input:
+            layer_log['moe/routed_expert_output_to_input_rms_min'] = min(routed_to_input)
+            layer_log['moe/routed_expert_output_to_layer_output_rms_min'] = min(routed_to_output)
+        if writer is not None:
+            for name, value in layer_log.items():
+                writer.add_scalar(name, value, iteration)
+        if wandb_writer and layer_log:
+            wandb_writer.log(layer_log, iteration)
+
     clear_aux_losses_tracker()
+    clear_expert_viability_tracker()
 
 
 def get_updated_expert_bias(
