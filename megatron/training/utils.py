@@ -516,6 +516,21 @@ def get_batch_on_this_tp_rank(data_iterator):
 
         assert data_iterator is not None
         data = next(data_iterator)
+
+        # OELLM PATCH: derive cu_seqlens HERE, while the tokens are still on the host.
+        # Doing it after the .cuda() below costs two device->host readbacks per microbatch
+        # (max_seqlen for TE's kernel-launch int, and the entry count to size the slice),
+        # each of which drains the stream at the top of forward_step and kills CPU
+        # run-ahead. From host tokens both are Python ints for free.
+        # pretrain_gpt._shared_packed_seq_params picks this up and shares it across the TP
+        # group over gloo; only TP rank 0 gets here, which is why it has to be shared.
+        if args.packed_doc_attention:
+            from megatron.training import packed_doc_attention as _pda
+
+            _pda.stash_cpu_cu_seqlens(
+                *_pda.derive_cu_seqlens_cpu(data["tokens"], _pda.get_eod_token_id())
+            )
+
         batch = {
             'tokens': data["tokens"].cuda(non_blocking=True),
             'labels': data["labels"].cuda(non_blocking=True),

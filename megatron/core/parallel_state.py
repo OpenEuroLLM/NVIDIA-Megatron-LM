@@ -26,6 +26,9 @@ logger = logging.getLogger(__name__)
 
 # Intra-layer model parallel group that the current rank belongs to.
 _TENSOR_MODEL_PARALLEL_GROUP = None
+# OELLM PATCH: host-side (gloo) sibling of the above, created only when
+# create_tensor_parallel_gloo_group is set. See --packed-doc-attention.
+_TENSOR_MODEL_PARALLEL_GROUP_GLOO = None
 # Inter-layer model parallel group that the current rank belongs to.
 _PIPELINE_MODEL_PARALLEL_GROUP = None
 # Model parallel group (both intra- and pipeline) that the current rank belongs to.
@@ -528,6 +531,7 @@ def initialize_model_parallel(
     get_embedding_ranks: Optional[Callable[[List[int], Optional[int]], List[int]]] = None,
     get_position_embedding_ranks: Optional[Callable[[List[int], Optional[int]], List[int]]] = None,
     create_gloo_process_groups: bool = True,
+    create_tensor_parallel_gloo_group: bool = False,
     high_priority_stream_groups: Optional[List[str]] = None,
     sharp_enabled_group: Optional[str] = None,
 ) -> None:
@@ -949,6 +953,7 @@ def initialize_model_parallel(
     assert (
         _TENSOR_MODEL_PARALLEL_GROUP is None
     ), 'tensor model parallel group is already initialized'
+    global _TENSOR_MODEL_PARALLEL_GROUP_GLOO
     for ranks in decoder_rank_generator.get_ranks('tp'):
         group = create_group(
             ranks,
@@ -956,9 +961,25 @@ def initialize_model_parallel(
             pg_options=get_nccl_options("tp", nccl_comm_cfgs),
             group_desc="TENSOR_MODEL_PARALLEL_GROUP",
         )
+        # OELLM PATCH: optional host-side sibling of the TP group. --packed-doc-attention
+        # shares a few dozen bytes of cu_seqlens header across the TP group every
+        # microbatch; over NCCL that header would land on the device and have to be read
+        # back, which is the per-microbatch stream drain the CPU derivation exists to
+        # remove. Off by default -- creating one gloo group per TP group costs startup time
+        # at scale and nothing else needs it.
+        if create_tensor_parallel_gloo_group:
+            group_gloo = create_group(
+                ranks,
+                timeout=timeout,
+                backend="gloo",
+                group_desc="TENSOR_MODEL_PARALLEL_GROUP_GLOO",
+            )
+        else:
+            group_gloo = None
         if rank in ranks:
             _TENSOR_MODEL_PARALLEL_GROUP = group
             _TENSOR_MODEL_PARALLEL_GLOBAL_RANKS = ranks
+            _TENSOR_MODEL_PARALLEL_GROUP_GLOO = group_gloo
 
     # Build the pipeline model-parallel groups and embedding groups
     # (first and last rank in each pipeline model-parallel group).
@@ -1326,6 +1347,22 @@ def get_tensor_model_parallel_group(check_initialized=True):
             _TENSOR_MODEL_PARALLEL_GROUP is not None
         ), "tensor model parallel group is not initialized"
     return _TENSOR_MODEL_PARALLEL_GROUP
+
+
+def get_tensor_model_parallel_group_gloo(check_initialized=False):
+    """OELLM PATCH: host-side sibling of the tensor-model-parallel group, or None.
+
+    Returns None unless initialize_model_parallel was called with
+    create_tensor_parallel_gloo_group=True, so callers must handle absence. Used by
+    --packed-doc-attention to share the cu_seqlens header across the TP group without
+    routing it through the device (which would force a per-microbatch readback).
+    """
+    if check_initialized:
+        assert _TENSOR_MODEL_PARALLEL_GROUP_GLOO is not None, (
+            "tensor model parallel gloo group is not initialized -- pass "
+            "create_tensor_parallel_gloo_group=True to initialize_model_parallel()"
+        )
+    return _TENSOR_MODEL_PARALLEL_GROUP_GLOO
 
 
 def get_pipeline_model_parallel_group(check_initialized=True):
@@ -1959,6 +1996,9 @@ def destroy_model_parallel():
 
     global _TENSOR_MODEL_PARALLEL_GROUP
     _TENSOR_MODEL_PARALLEL_GROUP = None
+
+    global _TENSOR_MODEL_PARALLEL_GROUP_GLOO
+    _TENSOR_MODEL_PARALLEL_GROUP_GLOO = None
 
     global _PIPELINE_MODEL_PARALLEL_GROUP
     _PIPELINE_MODEL_PARALLEL_GROUP = None
