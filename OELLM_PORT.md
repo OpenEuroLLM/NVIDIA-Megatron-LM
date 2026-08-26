@@ -24,8 +24,8 @@ eight months newer.
 | 2 | Skip wandb artifact for non-persistent checkpoints | `6be53e28f` | **ported** — `b503bd8d3` |
 | 10 | `--save-extra-steps` | `7c44f6d5e` | **ported** — `8dc8d7f80`, re-expressed as a `CheckpointConfig` field |
 | 5 | `--dataloader-prefetch-factor` | `fc7b3b204` | **ported** — `8b2e30175` |
-| 9 | Tokens/s/GPU logging (+ wandb memory stats) | `cfae32698` | todo |
-| 6 | `--scaler-wd-mult` | `e7c9d4dd2` | todo — re-implement on the new API |
+| 9 | Tokens/s/GPU logging (+ wandb memory stats) | `cfae32698` | **ported** — `38898bff0` |
+| 6 | norm-gain weight decay | `e7c9d4dd2` | **ported** — `2157fea9d`, rewritten and **split into two knobs** |
 | 7 | `--final-logit-softcapping` + `--output-z-loss-coeff` | `67dff69fd`, `19238a240` | todo |
 | — | `.github/` CI workflows | `d5652c26a`, `f858f45ab`, `055f7defc` | **dropped** — OELLM repo CI, not training |
 
@@ -77,8 +77,21 @@ eight `config/experiments/oellm_32b_dense/packed_doc_attention_*.yaml`, plus
 `scripts/korbi/compare_doc_attention_arms.py` and
 `scripts/tests/test_packed_doc_attention.sh`.
 
-Surviving OELLM arguments: `--scaler-wd-mult`, `--final-logit-softcapping`,
-`--output-z-loss-coeff`, `--save-extra-steps`, `--dataloader-prefetch-factor`.
+`scaler_wd_mult: X` is **replaced by two settings** (feature #6 was deliberately
+changed during the port, not just moved): `qk_layernorm_wd_mult` for the
+q/k-layernorm gains and `residual_norm_wd_mult` for the remaining
+residual-stream norm gains. Setting both to the old `scaler_wd_mult` value
+reproduces the old behaviour exactly. Affected:
+`config/backend/megatron/base_defaults.yaml` and
+`config/experiments/oellm_32b_dense/stability_check_nodes512_lr3e-4.yaml`.
+
+The tensorboard/wandb metric key `throughput` is now logged as `TFLOPS`, and
+`Tokens per second per GPU` is added alongside it (feature #9) — matching what
+every OELLM run has recorded so far, so existing dashboards keep working.
+
+Surviving OELLM arguments: `--qk-layernorm-wd-mult`, `--residual-norm-wd-mult`,
+`--final-logit-softcapping`, `--output-z-loss-coeff`, `--save-extra-steps`,
+`--dataloader-prefetch-factor`.
 
 ## Open gates
 
