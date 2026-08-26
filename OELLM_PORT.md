@@ -93,13 +93,69 @@ Surviving OELLM arguments: `--qk-layernorm-wd-mult`, `--residual-norm-wd-mult`,
 `--final-logit-softcapping`, `--output-z-loss-coeff`, `--save-extra-steps`,
 `--dataloader-prefetch-factor`.
 
+## Container gate: RESOLVED — 26.04 is out, 26.06 and 26.08 work
+
+Tested 2026-08-26 on JUPITER from `~/work/Projects/oellm-autoexp-debug`.
+
+| container | torch | TE | nvrx | ships mcore | mcore 0.19 imports? |
+|---|---|---|---|---|---|
+| `nemo_26.04.sif` | 2.11.0a0 | 2.14.0 | **0.6.0.dev33** | 0.17.0rc0 | **NO** |
+| `nemo_26.06.sif` | 2.12.0a0 | 2.16.0 | 0.6.0 | 0.18.2 | yes |
+| `nemo_26.08.00.sif` | 2.13.0a0 | 2.17.1 | 0.6.0 | **0.19.0** | yes |
+
+**`nemo_26.04.sif` cannot run megatron-core 0.19 at all**, and this has nothing
+to do with the port — plain `import megatron.core` fails. TE and torch are fine
+(2.14 and 2.11 clear 0.19's `torch>=2.6.0` and its TE 2.6/2.7 guards). The
+blocker is nvidia-resiliency-ext:
+
+```
+megatron/core/__init__.py -> ... -> dist_checkpointing/strategies/torch.py:64
+    HAVE_NVRX = has_nvrx_async_support()
+  -> dist_checkpointing/strategies/nvrx.py:45
+    AssertionError: Minimum required nvidia-resiliency-ext package version is 0.6.0.
+```
+
+`strategies/nvrx.py` is new in 0.19 and does not exist in the 0.16 fork.
+`has_nvrx_async_support()` runs unconditionally at import and *asserts* instead
+of returning False, so an older nvrx makes the whole package unimportable
+whether or not nvrx checkpointing is used. 26.04 ships `0.6.0.dev33+15a8515`,
+and PEP 440 orders `0.6.0.dev33 < 0.6.0`.
+
+**The assert is legitimate, not cosmetic — do not patch it out.** Of the nine
+API symbols the check requires, 26.04's nvrx has eight; it is missing
+`filesystem_async._results_queue`, which nvrx 0.6.0 final does have (verified on
+both 26.06 and 26.08). Bypassing the assert would therefore yield
+`HAVE_NVRX = False` anyway and silently disable nvrx async checkpointing, which
+the FT/async-save setup depends on.
+
+So adopting 0.19 requires a container move. `nemo_26.08.00.sif` is the natural
+target: it ships megatron-core 0.19.0 itself, i.e. it is the pairing NVIDIA
+validated 0.19 against. Note the previous 26.06 evaluation measured -1.5%
+throughput and +22% checkpoint time against 26.04, so the container change has
+its own cost that needs re-measuring for 26.08.
+
+### What has been verified in-container
+
+With `PYTHONPATH` pointing at this branch (confirmed resolving to it, not the
+container's own megatron-core), on **both 26.06 and 26.08**:
+
+- `import megatron.core` -> 0.19.1
+- the ported arguments parse: `--qk-layernorm-wd-mult`,
+  `--residual-norm-wd-mult`, `--dataloader-prefetch-factor`, `--save-extra-steps`
+- `wd_mult` resolves identically to the local run for every parameter class,
+  including the unchanged upstream defaults
+- 83 unit tests pass (`test_argument_utils.py` — which covers the extended
+  `CheckpointConfig` — `optimizer/test_param_group_identifier_keys.py`,
+  `test_optimizer_param_scheduler.py`)
+
+All of this is CPU-only. No GPU test, no training step, and no loss-parity check
+against the old fork has been run yet.
+
 ## Open gates
 
-Neither has been checked yet; both can block adoption independently of the port.
-
-- **Container / TE.** Production runs `nemo_26.04.sif`. The old fork pinned
-  `transformer-engine>=2.9.0a0,<2.10`; 0.19 drops the pin, requires
-  `torch>=2.6.0`, and guards paths on TE 2.6/2.7.
 - **Checkpoint resume.** The 32B flagship has live `torch_dist` checkpoints
   written by the 0.16-based fork. 0.19 must be able to resume them, or the
   switch can only happen at a run boundary.
+- **Throughput on 26.08.** Unmeasured. 26.06 cost -1.5% vs 26.04.
+- **Loss parity.** Feature #7 (softcap + LM-head z-loss) is not ported yet, and
+  nothing so far has been validated by running a training step.
