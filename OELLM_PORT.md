@@ -21,9 +21,9 @@ eight months newer.
 | 4 | `_is_usable()` guard in `ft_integration` | `c2a2adb78` | **dropped** — fixed upstream |
 | 1 | Energy monitor null-NVML guard | `7231359bc` | **dropped** — fixed upstream |
 | 8 | `--packed-doc-attention` | `aa7d6d5f3`, `3192738e1`, `d3f3d5890` | **dropped** — superseded upstream |
-| 2 | Skip wandb artifact for non-persistent checkpoints | `6be53e28f` | todo |
-| 10 | `--save-extra-steps` | `7c44f6d5e` | todo |
-| 5 | `--dataloader-prefetch-factor` | `fc7b3b204` | todo |
+| 2 | Skip wandb artifact for non-persistent checkpoints | `6be53e28f` | **ported** — `b503bd8d3` |
+| 10 | `--save-extra-steps` | `7c44f6d5e` | **ported** — `8dc8d7f80`, re-expressed as a `CheckpointConfig` field |
+| 5 | `--dataloader-prefetch-factor` | `fc7b3b204` | **ported** — `8b2e30175` |
 | 9 | Tokens/s/GPU logging (+ wandb memory stats) | `cfae32698` | todo |
 | 6 | `--scaler-wd-mult` | `e7c9d4dd2` | todo — re-implement on the new API |
 | 7 | `--final-logit-softcapping` + `--output-z-loss-coeff` | `67dff69fd`, `19238a240` | todo |
@@ -60,8 +60,11 @@ Two behavioural differences to validate rather than assume:
   keeps per-sample `cu_seqlens` padded to `seq_length + 1`. Same masking
   semantics, different attention shape — throughput numbers in
   `packed_doc_attention_speed_n512.yaml` do not transfer.
-- Upstream ties inter-document masking to `use_per_sequence_balancing` in the
-  sampler, which overlaps with feature #5 (`--dataloader-prefetch-factor`).
+- Upstream passes `use_per_sequence_balancing=args.dataloader_inter_document_masking`
+  (`pretrain_gpt.py:172`). That is a context-parallel batch-slicing option
+  consumed by `get_batch_on_this_cp_rank` (`core/utils.py:2617`, zigzag CP
+  balancing), NOT a dataloader or sampler setting — it does not interact with
+  feature #5.
 
 ## Config migration (oellm-autoexp)
 
