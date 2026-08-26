@@ -91,6 +91,7 @@ from megatron.core.rerun_state_machine import (
     RerunDataIterator,
     RerunMode,
 )
+from megatron.training import packed_doc_attention
 from megatron.training.initialize import initialize_megatron
 from megatron.training.initialize import write_args_to_tensorboard
 from megatron.training.initialize import set_jit_fusion_options
@@ -100,6 +101,7 @@ from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_utils import track_moe_metrics
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
+from megatron.core.models.common.language_module.language_module import OutputZLossLoggingHelper
 from megatron.core.parallel_state import (
     destroy_global_memory_buffer,
     destroy_model_parallel,
@@ -1314,6 +1316,55 @@ def dummy_train_step(data_iterator):
             batch = get_batch_on_this_cp_rank(batch)
 
 
+def maybe_prefetch_cu_seqlens(args, data_iterator, num_microbatches):
+    """OELLM PATCH: cu_seqlens prefetch for --packed-doc-attention, BEFORE a schedule runs.
+
+    Derives cu_seqlens for the whole iteration on the reading stage and broadcasts it in one
+    collective. It has to happen here rather than in get_batch: a collective inside
+    forward_step deadlocks against the p2p activation chain (measured, job 1494386). See
+    megatron/training/packed_doc_attention.py.
+
+    Every call site that drives forward_backward_func must call this first, otherwise
+    get_batch pops an empty stash -- which is why evaluate() calls it too.
+    """
+    if not getattr(args, 'packed_doc_attention', False):
+        return
+    hook = packed_doc_attention.prefetch_hook()
+    assert hook is not None, (
+        'packed_doc_attention needs the training script to register a prefetch hook '
+        '(pretrain_gpt.py does this at import).'
+    )
+    packed_doc_attention.reset()
+    is_chunked = isinstance(data_iterator, list)
+    iterators = data_iterator if is_chunked else [data_iterator]
+    # ONLY CHUNK 0 DERIVES. cu_seqlens depends on the microbatch, not the chunk -- every
+    # virtual stage sees microbatch m on the same tokens -- so one derivation serves them
+    # all, and chunk 0 is the only one that can do it: the model-parallel source rank is
+    # pipeline rank 0, which is the FIRST STAGE for chunk 0 and for no other chunk, so it
+    # only reads data there. Letting the others derive is what produced an empty cu_seqlens
+    # and killed 1865 ranks in a TE assert at 512 nodes (job 1497767).
+    for vp_stage, chunk_iterator in enumerate(iterators):
+        hook(chunk_iterator, vp_stage if is_chunked else None, num_microbatches, vp_stage == 0)
+    for vp_stage in range(1, len(iterators)):
+        packed_doc_attention.share_cu_seqlens_from(vp_stage, 0)
+
+
+def get_pipeline_tensor_shapes(args):
+    """OELLM PATCH: (seq_length, micro_batch_size) as the pipeline p2p buffers must see them.
+
+    --packed-doc-attention folds the micro-batch into one packed sequence ([b, s] -> [1, b*s])
+    so TE's thd kernels get the batch dimension of 1 they require (mcore reaches [t, h, d] via
+    query.squeeze(1) in transformer/attention.py). The pipeline p2p buffers are sized from
+    these two numbers alone -- schedules.py:999 for the interleaved schedule and
+    get_tensor_shapes() at :1945 for 1F1B -- so they have to be folded the same way. Otherwise
+    the element count still matches and nothing errors, but the receiving stage reinterprets a
+    [t, 1, h] activation as [s, b, h]: silently wrong, token t landing at (t // b, t % b).
+    """
+    if args.packed_doc_attention:
+        return args.seq_length * args.micro_batch_size, 1
+    return args.seq_length, args.micro_batch_size
+
+
 def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func):
     """Single training step."""
     args = get_args()
@@ -1345,14 +1396,17 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                 if isinstance(optim_instance, DistributedOptimizer):
                     optim_instance._copy_main_params_to_param_buffer()
 
+        maybe_prefetch_cu_seqlens(args, data_iterator, get_num_microbatches())
+
         # Forward pass.
+        pipeline_seq_length, pipeline_micro_batch_size = get_pipeline_tensor_shapes(args)
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step_func,
             data_iterator=data_iterator,
             model=model,
             num_microbatches=get_num_microbatches(),
-            seq_length=args.seq_length,
-            micro_batch_size=args.micro_batch_size,
+            seq_length=pipeline_seq_length,
+            micro_batch_size=pipeline_micro_batch_size,
             decoder_seq_length=args.decoder_seq_length,
             forward_only=False,
             adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
@@ -1661,6 +1715,11 @@ def training_log(
         mtp_loss_scale = 1 / get_num_microbatches()
         MTPLossLoggingHelper.track_mtp_metrics(
             mtp_loss_scale, iteration, writer, wandb_writer, total_loss_dict
+        )
+    if args.output_z_loss_coeff is not None:
+        output_z_loss_scale = 1 / get_num_microbatches()
+        OutputZLossLoggingHelper.track_metrics(
+            output_z_loss_scale, iteration, writer, wandb_writer, total_loss_dict
         )
     if iteration % args.log_interval == 0:
         if args.record_memory_history and (is_last_rank() or torch.distributed.get_backend() == 'fake'):
@@ -2656,13 +2715,15 @@ def evaluate(
             # Don't care about timing during evaluation
             config.timers = None
             ft_integration.on_eval_step_start()
+            maybe_prefetch_cu_seqlens(args, data_iterator, eval_num_microbatches)
+            eval_pipeline_seq_length, eval_pipeline_mbs = get_pipeline_tensor_shapes(args)
             loss_dicts = forward_backward_func(
                 forward_step_func=forward_step_func,
                 data_iterator=data_iterator,
                 model=model,
                 num_microbatches=eval_num_microbatches,
-                seq_length=args.seq_length,
-                micro_batch_size=args.micro_batch_size,
+                seq_length=eval_pipeline_seq_length,
+                micro_batch_size=eval_pipeline_mbs,
                 decoder_seq_length=args.decoder_seq_length,
                 forward_only=True,
             )
@@ -2729,13 +2790,14 @@ def evaluate(
         if non_loss_data_func is not None:
             collected_non_loss_data = non_loss_data_func(model)
         elif process_non_loss_data_func is not None and is_last_rank():
+            nonloss_pipeline_seq_length, nonloss_pipeline_mbs = get_pipeline_tensor_shapes(args)
             collected_non_loss_data = forward_backward_func(
                 forward_step_func=forward_step_func,
                 data_iterator=data_iterator,
                 model=model,
                 num_microbatches=get_num_microbatches(),
-                seq_length=args.seq_length,
-                micro_batch_size=args.micro_batch_size,
+                seq_length=nonloss_pipeline_seq_length,
+                micro_batch_size=nonloss_pipeline_mbs,
                 decoder_seq_length=args.decoder_seq_length,
                 forward_only=True,
                 collect_non_loss_data=True,

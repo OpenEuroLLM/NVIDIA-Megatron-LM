@@ -1225,6 +1225,109 @@ def validate_args(args, defaults={}):
             args.recompute_granularity != 'full'
         ), 'recompute_granularity must not be full when CUDA Graphs are enabled.'
 
+    # OELLM PATCH: packed (thd) document attention. See pretrain_gpt.py.
+    if args.packed_doc_attention:
+        assert not args.use_legacy_models, \
+            '--packed-doc-attention requires megatron-core models, not --use-legacy-models.'
+        assert args.context_parallel_size == 1, (
+            '--packed-doc-attention does not support context parallelism: thd + CP additionally '
+            'needs cu_seqlens_q_padded/cu_seqlens_kv_padded and the CP load-balanced token '
+            'reordering.'
+        )
+        assert args.position_embedding_type in ('rope', 'yarn', 'none'), (
+            f'--packed-doc-attention expects rotary or absent position embeddings, got '
+            f'{args.position_embedding_type}. RoPE restarts per document via cu_seqlens; '
+            'learned_absolute would instead need --reset-position-ids, which is a separate path.'
+        )
+        assert args.attention_backend not in (AttnBackend.local, AttnBackend.unfused), (
+            f'--packed-doc-attention needs a TE varlen backend (flash, fused or auto), got '
+            f'{args.attention_backend}.'
+        )
+        # === ROPE VARIANTS ===================================================
+        # All three combinations are CORRECT; they differ in how much they cost.
+        #
+        #   rope/yarn + apply_rope_fusion  -> fused_apply_rotary_pos_emb_thd, cu_seqlens
+        #                                    goes straight to TE. The intended path.
+        #   rope/yarn, fusion off          -> _apply_rotary_pos_emb_thd, which per CALL does
+        #                                    `((cu_seqlens[1:] - cu_seqlens[:-1]) // cp).tolist()`
+        #                                    (rope_utils.py:204) and, on its offset-mapping
+        #                                    branch, `cu_seqlens[i].item()` PER DOCUMENT.
+        #                                    Those are device readbacks in upstream code,
+        #                                    once per attention layer per microbatch --
+        #                                    strictly worse than the single per-microbatch
+        #                                    readback the host derivation just removed.
+        #   none                           -> no rope at all; cu_seqlens still masks
+        #                                    documents in the kernel. Nothing to do.
+        #
+        # yarn cannot satisfy this and is therefore unsupported: the "Legacy RoPE arguments"
+        # block above force-disables apply_rope_fusion whenever position_embedding_type is not
+        # exactly 'rope' (arguments.py:1005), so it always lands in the unfused case and the
+        # user has no way to turn it back on. Say so, rather than asking for a flag that has
+        # already been overridden.
+        if args.position_embedding_type in ('rope', 'yarn') and not args.apply_rope_fusion:
+            if args.position_embedding_type == 'yarn':
+                remedy = (
+                    'yarn cannot be used with --packed-doc-attention: apply_rope_fusion is '
+                    'force-disabled for every position_embedding_type other than rope, so '
+                    'the fused thd path is unreachable. Use position_embedding_type=rope '
+                    'with --apply-rope-fusion, or none.'
+                )
+            else:
+                remedy = 'Set --apply-rope-fusion, or position_embedding_type=none.'
+            raise AssertionError(
+                f'--packed-doc-attention with position_embedding_type='
+                f'{args.position_embedding_type} and apply_rope_fusion off runs the UNFUSED '
+                f'thd rope path, which reads cu_seqlens back to the host once per ATTENTION '
+                f'CALL (rope_utils._apply_rotary_pos_emb_thd) instead of once per microbatch '
+                f'-- one stream drain per layer, ~60x more at 32B, which is exactly the cost '
+                f'the host-side derivation exists to remove. Numerically correct but slower '
+                f'than the dense mask it replaces, hence an error rather than a warning. '
+                f'{remedy}'
+            )
+        assert args.spec is None or args.spec[0] != 'local', \
+            '--packed-doc-attention requires the transformer_engine spec, not --spec local.'
+        assert args.cuda_graph_impl == 'none', (
+            '--packed-doc-attention builds a cu_seqlens tensor whose length changes with the '
+            'document count of every microbatch, which would force CUDA graph recapture each '
+            'step. Set --cuda-graph-impl none.'
+        )
+        if args.sequence_parallel:
+            packed_length = args.seq_length * args.micro_batch_size
+            assert packed_length % args.tensor_model_parallel_size == 0, (
+                f'--packed-doc-attention folds the micro-batch into a single {packed_length}-'
+                f'token sequence, which sequence parallelism must be able to split across '
+                f'{args.tensor_model_parallel_size} tensor-parallel ranks.'
+            )
+        if args.create_attention_mask_in_dataloader:
+            # TE only reads `attention_mask` for padding/arbitrary mask types, so the dense
+            # [b, 1, s, s] mask never reaches the kernel anyway -- it is pure dataloader cost.
+            args.create_attention_mask_in_dataloader = False
+            warn_rank_0(
+                'packed_doc_attention masks documents via cu_seqlens; disabling '
+                'create_attention_mask_in_dataloader, which TE would discard anyway.',
+                args.rank,
+            )
+        # THE COST SCALES WITH THE MICROBATCH COUNT, AND ONLY WITH THAT. A whole iteration
+        # is prefetched up front, which is work that cannot hide behind compute, so M is the
+        # whole story:
+        #   M=1024 (2 nodes, DP=1)     +14.7% to +34.1% vs the deleted per-stage mode 1497045/46
+        #   M=16   (512 nodes, DP=128) no measurable cost, -2.8% vs an unmasked control,
+        #                              inside a +-3.2% noise floor                 job 1498007
+        # So the small-scale "local wins" result did NOT transfer to production, where large
+        # DP makes M small -- and local did not run at all at PP=4/VPP=4. Warned only where
+        # it is actually large, so production runs stay quiet.
+        microbatches = args.global_batch_size // (
+            args.micro_batch_size * args.data_parallel_size
+        )
+        if microbatches >= 128:
+            warn_rank_0(
+                f'--packed-doc-attention prefetches a whole iteration of micro-batches on '
+                f'the stages that read data, and both its memory and its time cost scale '
+                f'with that count -- {microbatches} here, which is large because '
+                f'data-parallel size is only {args.data_parallel_size}. Measured +15-34% at '
+                f'M=1024, and no measurable cost at M=16.',
+                args.rank,
+            )
     # Print arguments.
     _print_args("arguments", args)
 
@@ -1911,6 +2014,16 @@ def _add_regularization_args(parser):
                        help='Dropout probability for hidden state transformer.')
     group.add_argument('--weight-decay', type=float, default=0.01,
                        help='Weight decay coefficient for L2 regularization.')
+    group.add_argument('--scaler-wd-mult', type=float, default=0.0,
+                       help='Multiplier on --weight-decay for "scalers": 1-D non-bias params, '
+                       'i.e. every learnable norm gain (RMSNorm/LayerNorm weights, the '
+                       'qk-layernorm gains, and the TE-fused *.layer_norm_weight tensors). '
+                       'Default 0.0 reproduces the historical behaviour of excluding all 1-D '
+                       'params from weight decay, which leaves those gains with no restoring '
+                       'force: attention logits scale with gamma_q * gamma_k and the output '
+                       'z-loss does not see them. Use 1.0 to decay scalers like every other '
+                       'weight (as OLMo 2/3 do), or a fraction for weaker decay. Biases are '
+                       'always excluded.')
     group.add_argument('--start-weight-decay', type=float,
                        help='Initial weight decay coefficient for L2 regularization.')
     group.add_argument('--end-weight-decay', type=float,
@@ -2222,6 +2335,13 @@ def _add_training_args(parser):
     group.add_argument('--cross-entropy-fusion-impl', type=str, default='native',
                        choices=['native', 'te'],
                        help='Implementation of cross entropy loss calculation.')
+    group.add_argument('--final-logit-softcapping', type=float, default=None,
+                       help='If set, soft-cap the final output-layer (LM head) logits with '
+                       'c * tanh(logits / c) where c is this value (e.g. 30.0 as in Gemma 2).')
+    group.add_argument('--output-z-loss-coeff', type=float, default=None,
+                       help='Scaling coefficient for the output (LM head) z-loss, an auxiliary '
+                       'loss coeff * mean(logsumexp(logits) ** 2) that keeps the softmax '
+                       'log-normalizer near zero for stability. A starting value of 1e-4 is recommended.')
     group.add_argument('--use-flash-attn', action='store_true',
                        help='use FlashAttention implementation of attention. '
                        'https://arxiv.org/abs/2205.14135')
@@ -2917,6 +3037,15 @@ def _add_data_args(parser):
                        help='Probability of producing a short sequence.')
     group.add_argument('--num-workers', type=int, default=2,
                        help="Dataloader number of workers.")
+    # OELLM PATCH: expose the torch DataLoader prefetch depth (batches queued
+    # per worker). Upstream never sets it, so it defaults to 2. Default None
+    # here preserves that exactly; see megatron/training/datasets/data_samplers.py.
+    group.add_argument('--dataloader-prefetch-factor', type=int, default=None,
+                       help='Number of batches each dataloader worker keeps '
+                       'prefetched. Deepens the buffer that absorbs parallel-'
+                       'filesystem read-latency spikes without adding more '
+                       'concurrent readers. Requires --num-workers > 0. '
+                       'Unset = torch default (2).')
     group.add_argument('--reset-position-ids', action='store_true',
                        help='Reset posistion ids after end-of-document token.')
     group.add_argument('--reset-attention-mask', action='store_true',
@@ -2927,6 +3056,25 @@ def _add_data_args(parser):
     group.add_argument('--no-create-attention-mask-in-dataloader', action='store_false',
                        help='If set, do not create attention_masks in dataloader.',
                        dest='create_attention_mask_in_dataloader')
+    group.add_argument('--packed-doc-attention', action='store_true',
+                       help='Disable cross-document attention by handing Transformer Engine '
+                       'cu_seqlens (thd/varlen attention) instead of a dense mask. Note that '
+                       '--reset-attention-mask does NOT achieve this: the GPT layer specs pin '
+                       'attn_mask_type to causal and TE only reads attention_mask for padding '
+                       'and arbitrary mask types, so the dataloader mask is silently discarded. '
+                       'This also restarts RoPE at every document boundary, making '
+                       '--reset-position-ids redundant. Folds the micro-batch into one packed '
+                       'sequence, so it currently requires CP=1. '
+                       'OELLM patch, see pretrain_gpt.py.')
+    group.add_argument('--packed-doc-attention-log-cu-seqlens', type=int, default=0,
+                       help='With --packed-doc-attention, print this rank\'s cu_seqlens for '
+                       'the first N calls to get_batch. cu_seqlens is a few dozen bytes, so '
+                       'logging it is far cheaper than any runtime cross-check -- and unlike '
+                       'a collective it cannot deadlock against the pipeline p2p chain. Every '
+                       'rank sharing a tensor-parallel index must print identical values for '
+                       'a given call index; verify with '
+                       'scripts/korbi/check_cu_seqlens_agreement.py. '
+                       'OELLM patch, see pretrain_gpt.py.')
     group.add_argument('--num-dataset-builder-threads', type=int, default=1,
                        help='Number of parallel threads per rank for dataset builder')
     group.add_argument('--object-storage-cache-path', type=str, default=None,

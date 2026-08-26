@@ -557,7 +557,9 @@ class GPTModel(LanguageModule):
                 loss_mask, num_tokens = roll_tensor(
                     loss_mask, shifts=-1, dims=-1, cp_group=self.cp_group
                 )
-                mtp_loss = self.compute_language_model_loss(mtp_labels, mtp_logits)
+                mtp_loss = self.compute_language_model_loss(
+                    mtp_labels, mtp_logits, record_z_loss=False
+                )
                 mtp_loss = loss_mask * mtp_loss
                 if self.training:
                     # TODO(shifangx): remove the use of parallel_state here
@@ -604,6 +606,13 @@ class GPTModel(LanguageModule):
         logits, _ = self.output_layer(
             hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
         )
+
+        # Final-logit soft-capping (Gemma 2 style): logits <- c * tanh(logits / c).
+        # Elementwise, so it is applied directly on the local tensor-parallel logit shard and
+        # affects both the returned logits and the loss.
+        if self.config.final_logit_softcapping is not None:
+            c = self.config.final_logit_softcapping
+            logits = c * torch.tanh(logits / c)
 
         # Restore sequence parallel execution to the output layer if necessary.
         if sequence_parallel_override:

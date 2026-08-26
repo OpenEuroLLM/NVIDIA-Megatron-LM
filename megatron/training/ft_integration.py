@@ -164,10 +164,40 @@ def on_eval_step_end() -> None:
         _curr_eval_iter_idx += 1
 
 
+def _is_usable(rmon_cli) -> bool:
+    """True if the rank monitor client exists AND its socket is still open.
+
+    `is not None` alone is NOT sufficient on the post-training path. training.py
+    ends `train()` with:
+
+        if args.enable_ft_package and ft_integration.get_rank_monitor_client() is not None:
+            ft_integration.get_rank_monitor_client().shutdown_workload_monitoring()
+
+    which closes the socket and sets `is_initialized = False`, but does NOT clear
+    _GLOBAL_RANK_MONITOR_CLIENT -- only ft_integration.shutdown() does that, and
+    that is gated behind `if should_exit:`. So when training ends by exhausting
+    train_iters/train_samples (should_exit is False), `train()` RETURNS instead of
+    calling sys.exit(), and pretrain() then calls on_checkpointing_start() on a
+    shut-down client. The old `is not None` guard passed and
+    RankMonitorClient._ensure_is_ready() raised
+
+        RankMonitorClientError: RankMonitorClient is not initialized
+
+    on every rank -> exit code 1 -> ft_launcher reads that as a worker failure and
+    restarts the whole worker group, which reloads the checkpoint, finds the
+    iteration budget already spent, exits the loop immediately and crashes in the
+    same place. That is a self-sustaining restart loop which burns max_restarts
+    (observed on JUPITER job 1355470: 10/10 -> 9/10 -> 8/10 with no training in
+    between). Runs that exit via a signal, --exit-duration-in-mins or
+    --exit-interval set should_exit and are unaffected.
+    """
+    return rmon_cli is not None and getattr(rmon_cli, "is_initialized", True)
+
+
 def on_checkpointing_start() -> None:
     """Should be called before each checkpoint-saving-related operation."""
     rmon_cli = get_rank_monitor_client()
-    if rmon_cli is not None:
+    if _is_usable(rmon_cli):
         rmon_cli.start_section("checkpointing")
 
 
@@ -178,7 +208,7 @@ def on_checkpointing_end(is_async_finalization: bool) -> None:
         is_async_finalization (bool): true if called after an async checkpointing finalization
     """
     rmon_cli = get_rank_monitor_client()
-    if rmon_cli is not None:
+    if _is_usable(rmon_cli):
         rmon_cli.end_section("checkpointing")
     # async checkpointing finalization is called before each training iter, it can be no-op.
     # let's try to update the timeouts only on the `save_checkpoint`
@@ -241,7 +271,17 @@ def _update_timeouts(selected_sections, calc_out_of_section):
 
 def _maybe_update_timeouts(is_closing_ft=False):
     rmon_cli = get_rank_monitor_client()
-    if rmon_cli is None:
+    # Same shut-down-but-not-None case as _is_usable() documents. This one is
+    # reached from shutdown(), i.e. pretrain()'s final ft_integration.shutdown():
+    # _update_timeouts() calls rmon_cli.calculate_and_set_section_timeouts(),
+    # which raises RankMonitorClientError on a closed socket. Guarding only the
+    # checkpointing hooks would just move the same crash a few lines later,
+    # whenever --calc-ft-timeouts is set.
+    # Consequence: on the natural-completion path the refined FT timeouts are not
+    # persisted, because the client was closed before we got here. They are still
+    # persisted on every should_exit path (signal / --exit-duration-in-mins /
+    # --exit-interval), which is where a long chained run actually picks them up.
+    if not _is_usable(rmon_cli):
         return
     if not _is_calculating_timeouts:
         return
