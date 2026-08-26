@@ -92,18 +92,83 @@ def local_expert_rms(experts: torch.nn.Module, num_local_experts: int, gradients
     local = getattr(experts, 'local_experts', None)
     if local is not None:
         return torch.stack([
-            _combined_rms([p.grad if gradients else p for p in expert.parameters()])
+            _combined_rms(
+                [getattr(p, 'main_grad', p.grad) if gradients else p for p in expert.parameters()]
+            )
             for expert in local
         ])
     per_expert = [[] for _ in range(num_local_experts)]
     for parameter in experts.parameters():
-        tensor = parameter.grad if gradients else parameter
+        tensor = getattr(parameter, 'main_grad', parameter.grad) if gradients else parameter
         if tensor is not None and tensor.ndim > 0 and tensor.shape[0] == num_local_experts:
             for index in range(num_local_experts):
                 per_expert[index].append(tensor[index])
     if not any(per_expert):
         return None
     return torch.stack([_combined_rms(tensors) for tensors in per_expert])
+
+
+def expert_rms_statistics(
+    experts: torch.nn.Module, num_local_experts: int, gradients: bool = False
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    """Return per-local-expert squared sums and element counts for a combined RMS."""
+    local = getattr(experts, 'local_experts', None)
+    if local is not None:
+        stats = []
+        for expert in local:
+            tensors = [getattr(p, 'main_grad', p.grad) if gradients else p for p in expert.parameters()]
+            tensors = [t.detach().float() for t in tensors if t is not None]
+            stats.append((sum(t.square().sum() for t in tensors), sum(t.numel() for t in tensors)))
+        return torch.stack([s[0] for s in stats]), torch.tensor(
+            [s[1] for s in stats], device=stats[0][0].device, dtype=torch.float32
+        )
+    sums, counts = [], []
+    for index in range(num_local_experts):
+        tensors = []
+        for parameter in experts.parameters():
+            tensor = getattr(parameter, 'main_grad', parameter.grad) if gradients else parameter
+            if tensor is not None and tensor.ndim > 0 and tensor.shape[0] == num_local_experts:
+                tensors.append(tensor[index].detach().float())
+        if not tensors:
+            return None
+        sums.append(sum(t.square().sum() for t in tensors))
+        counts.append(sum(t.numel() for t in tensors))
+    return torch.stack(sums), torch.tensor(counts, device=sums[0].device, dtype=torch.float32)
+
+
+def capture_expert_viability_parameter_stats(model_chunks) -> None:
+    """Capture parameter and finalized-gradient sufficient statistics at a log event.
+
+    This intentionally runs from the training loop immediately before ``optimizer.step``;
+    it therefore adds no work to ordinary non-logging iterations.
+    """
+    tracker = get_expert_viability_tracker()
+    for chunk in model_chunks:
+        for module in chunk.modules():
+            if not hasattr(module, 'local_expert_indices') or not hasattr(module, 'experts'):
+                continue
+            if not getattr(module.config, 'moe_expert_viability_metrics', False):
+                continue
+            weight = expert_rms_statistics(module.experts, module.num_local_experts)
+            grad = expert_rms_statistics(module.experts, module.num_local_experts, gradients=True)
+            if weight is None:
+                continue
+            if 'weight_sq_sum' not in tracker:
+                device = weight[0].device
+                shape = (module.config.num_layers, module.config.num_moe_experts)
+                for name in (
+                    'weight_sq_sum', 'weight_count', 'grad_sq_sum', 'grad_count', 'initial_rms'
+                ):
+                    tracker[name] = torch.zeros(shape, device=device, dtype=torch.float32)
+            layer = module.layer_number - 1
+            indices = torch.tensor(module.local_expert_indices, device=weight[0].device)
+            tracker['weight_sq_sum'][layer, indices] = weight[0]
+            tracker['weight_count'][layer, indices] = weight[1]
+            if hasattr(module, '_initial_expert_rms'):
+                tracker['initial_rms'][layer, indices] = module._initial_expert_rms.float()
+            if grad is not None:
+                tracker['grad_sq_sum'][layer, indices] = grad[0]
+                tracker['grad_count'][layer, indices] = grad[1]
 
 
 def save_routed_expert_output_stats(
@@ -140,7 +205,7 @@ def clear_expert_viability_tracker() -> None:
     """Clear sufficient statistics after their logging event."""
     for key in (
         'routed_sq_sum', 'input_sq_sum', 'output_sq_sum', 'routed_count', 'input_count',
-        'output_count',
+        'output_count', 'weight_sq_sum', 'weight_count', 'grad_sq_sum', 'grad_count',
     ):
         if key in _MOE_EXPERT_VIABILITY_TRACKER:
             _MOE_EXPERT_VIABILITY_TRACKER[key].zero_()
@@ -1504,6 +1569,55 @@ def track_moe_metrics(
                 writer.add_scalar(name, value, iteration)
         if wandb_writer and layer_log:
             wandb_writer.log(layer_log, iteration)
+
+    if expert_viability_metrics and 'weight_sq_sum' in viability_tracker:
+        if pg_collection is None:
+            groups = (
+                parallel_state.get_tensor_and_context_parallel_group(),
+                parallel_state.get_pipeline_model_parallel_group(),
+                parallel_state.get_expert_model_parallel_group(),
+            )
+        else:
+            groups = (pg_collection.tp_cp, pg_collection.pp, pg_collection.ep)
+        for name in ('weight_sq_sum', 'weight_count', 'grad_sq_sum', 'grad_count', 'initial_rms'):
+            value = viability_tracker[name]
+            for group in groups:
+                torch.distributed.all_reduce(value, group=group)
+        weight_rms = torch.sqrt(
+            viability_tracker['weight_sq_sum'] / viability_tracker['weight_count'].clamp_min(1)
+        )
+        grad_rms = torch.sqrt(
+            viability_tracker['grad_sq_sum'] / viability_tracker['grad_count'].clamp_min(1)
+        )
+        initial_rms = viability_tracker['initial_rms']
+        param_log = {}
+        collapsed_fractions, relative_medians = [], []
+        for i in range(weight_rms.shape[0]):
+            active = viability_tracker['weight_count'][i] > 0
+            if not active.any():
+                continue
+            weights, grads, initial = weight_rms[i, active], grad_rms[i, active], initial_rms[i, active]
+            relative = weights / initial.clamp_min(1.0e-12)
+            collapsed = (relative < EXPERT_COLLAPSE_RMS_FRACTION).float().mean().item()
+            values = {
+                f'moe/expert_weight_rms_median_layer_{i}': weights.median().item(),
+                f'moe/expert_weight_rms_p10_layer_{i}': torch.quantile(weights, 0.1).item(),
+                f'moe/expert_weight_rms_min_layer_{i}': weights.min().item(),
+                f'moe/expert_weight_rms_relative_to_init_median_layer_{i}': relative.median().item(),
+                f'moe/expert_weight_collapsed_frac_layer_{i}': collapsed,
+                f'moe/expert_grad_rms_median_layer_{i}': grads.median().item(),
+            }
+            param_log.update(values)
+            collapsed_fractions.append(collapsed)
+            relative_medians.append(relative.median().item())
+        if collapsed_fractions:
+            param_log['moe/expert_weight_collapsed_frac_max'] = max(collapsed_fractions)
+            param_log['moe/expert_weight_rms_relative_to_init_median_min'] = min(relative_medians)
+        if writer is not None:
+            for name, value in param_log.items():
+                writer.add_scalar(name, value, iteration)
+        if wandb_writer and param_log:
+            wandb_writer.log(param_log, iteration)
 
     clear_aux_losses_tracker()
     clear_expert_viability_tracker()

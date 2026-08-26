@@ -15,6 +15,7 @@ from megatron.core.transformer.moe.moe_utils import (
     MoECudaGraphPartialCaptureSignal,
     MoECudaGraphTensorStore,
     get_default_pg_collection,
+    expert_rms_statistics,
     maybe_skip_or_early_return_by_cudagraph,
     save_routed_expert_output_stats,
     should_mask_routed_moe_layer,
@@ -228,6 +229,11 @@ class MoELayer(BaseMoELayer):
             self.config,
             pg_collection=pg_collection,
         )
+        if config.moe_expert_viability_metrics:
+            initial_stats = expert_rms_statistics(self.experts, self.num_local_experts)
+            if initial_stats is not None:
+                initial_rms = torch.sqrt(initial_stats[0] / initial_stats[1])
+                self.register_buffer('_initial_expert_rms', initial_rms, persistent=True)
 
         # Initialize shared experts
         if self.use_shared_expert:
