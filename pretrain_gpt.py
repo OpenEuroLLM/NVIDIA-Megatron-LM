@@ -28,8 +28,8 @@ from megatron.core import mpu
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
-from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.models.gpt import GPTModel
+from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_context_parallel_group,
@@ -50,14 +50,9 @@ from megatron.core.utils import (
     get_te_version,
     get_torch_version,
 )
-from megatron.training import (
-    get_args,
-    get_timers,
-    inprocess_restart,
-    pretrain,
-    print_rank_0,
-    set_startup_timestamps,
-)
+from megatron.training import get_args, get_timers, inprocess_restart
+from megatron.training import packed_doc_attention as pda
+from megatron.training import pretrain, print_rank_0, set_startup_timestamps
 from megatron.training.argument_utils import gpt_config_from_args, pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
@@ -94,31 +89,50 @@ BATCH_KEYS = [
 ]
 
 
-def get_batch(data_iterator, vp_stage: Optional[int] = None):
-    """Generate a batch."""
+def _reads_dataloader(args, vp_stage: Optional[int] = None) -> bool:
+    """Does this rank's pipeline stage pull microbatches from the dataloader?
 
-    args = get_args()
+    The endpoint stages need tokens (first) and labels (last); an MTP stage needs both.
+    Every OTHER stage needs cu_seqlens and nothing else, and gets it from the scatter --
+    see megatron/training/packed_doc_attention.py for why it must not read instead.
+    """
     config = core_transformer_config_from_args(args)
+    return is_first_or_last_pipeline_stage(vp_stage) or mtp_on_this_rank_func(
+        layout=config.pipeline_model_parallel_layout,
+        mtp_num_layers=config.mtp_num_layers,
+        ignore_virtual=False,
+        vp_stage=vp_stage,
+    )
 
+
+def _read_microbatch(
+    args, data_iterator, vp_stage: Optional[int] = None, metadata_only: bool = False
+) -> dict:
+    """Pull ONE microbatch and take it all the way to this rank's own tensors.
+
+    dataloader -> TP broadcast -> pack-flatten -> context-parallel split. Shared by the
+    upstream path and by the packed-doc-attention prefetch so the two cannot drift; the
+    only caller-visible difference is that this returns the batch DICT rather than the
+    BATCH_KEYS list.
+
+    ``metadata_only`` stops before the context-parallel split, for a stage that wanted
+    nothing but cu_seqlens. It is not an optimisation: the split has nothing to split, and
+    the per-document path would dereference the tokens that are not there --
+    ``batch["labels"].size(1)`` on None (core/utils.py:2444). Upstream returns early at the
+    same point for the same reason.
+    """
+    config = core_transformer_config_from_args(args)
     cp_size = args.context_parallel_size
     tp_rank = mpu.get_tensor_model_parallel_rank()
     is_sft = args.sft
     has_cu_seqlens = is_sft or args.dataloader_inter_document_masking
-    create_attention_mask_in_dataloader = args.create_attention_mask_in_dataloader
+    is_hybrid_cp = args.hybrid_context_parallel
     mtp_on_this_rank = mtp_on_this_rank_func(
         layout=config.pipeline_model_parallel_layout,
         mtp_num_layers=config.mtp_num_layers,
         ignore_virtual=False,
         vp_stage=vp_stage,
     )
-    is_hybrid_cp = args.hybrid_context_parallel
-
-    if (
-        not is_first_or_last_pipeline_stage(vp_stage)
-        and not mtp_on_this_rank
-        and not has_cu_seqlens
-    ):
-        return [None for _ in BATCH_KEYS]
 
     batch = {}
     if tp_rank == 0:
@@ -136,7 +150,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         broadcast_group=mpu.get_tensor_model_parallel_group(),
         has_cu_seqlens=has_cu_seqlens,
         is_hybrid_cp=is_hybrid_cp,
-        create_attention_mask_in_dataloader=create_attention_mask_in_dataloader,
+        create_attention_mask_in_dataloader=args.create_attention_mask_in_dataloader,
         cp_size=cp_size,
         tp_rank=tp_rank,
         micro_batch_size=args.micro_batch_size,
@@ -149,28 +163,61 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
 
     batch = flatten_batch_for_packed_sequences(batch)
 
-    if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank:
-        assert has_cu_seqlens
-        return (
-            None,
-            batch['cu_seqlens'],
-            batch['cu_seqlens_padded'],
-            None,
-            None,
-            None,
-            None,
-            batch['max_seqlen'],
-            None,
-            None,
-        )
+    if metadata_only:
+        return batch
 
-    batch = get_batch_on_this_cp_rank(
+    # OELLM PATCH: context parallelism with thd needs document lengths divisible by
+    # 2 * cp_size and a non-None cu_seqlens_padded, neither of which GPTDataset produces.
+    # This snaps the boundaries so both hold; a no-op at CP=1 and for SFT (whose dataset
+    # already emits a genuine padded layout). See packed_doc_attention.py.
+    per_sequence_balancing = args.dataloader_inter_document_masking and not is_sft
+    if per_sequence_balancing and cp_size > 1:
+        batch = pda.apply_cp_document_padding(batch, cp_size)
+        # With divisible documents the PER-DOCUMENT zigzag is available, and it is the
+        # layout TE's context-parallel thd kernels actually index with. Upstream falls back
+        # to the per-SEQUENCE zigzag precisely because it does not pad (see the
+        # use_per_sequence_balancing docstring in core/utils.py), which hands TE a token
+        # order its thd path does not expect.
+        per_sequence_balancing = False
+
+    return get_batch_on_this_cp_rank(
         batch,
         is_hybrid_cp=is_hybrid_cp,
         cp_group=get_context_parallel_group(),
         hybrid_cp_group_func=get_hybrid_data_context_parallel_groups,
-        use_per_sequence_balancing=args.dataloader_inter_document_masking and not is_sft,
+        use_per_sequence_balancing=per_sequence_balancing,
     )
+
+
+def get_batch(data_iterator, vp_stage: Optional[int] = None):
+    """Generate a batch."""
+
+    args = get_args()
+
+    # OELLM PATCH: with inter-document masking on, cu_seqlens reaches every pipeline stage
+    # through one broadcast issued before the schedule, not through a dataloader read on
+    # each stage. See megatron/training/packed_doc_attention.py.
+    if pda.is_scattered(args):
+        return _get_batch_scattered(args, vp_stage)
+
+    is_sft = args.sft
+    has_cu_seqlens = is_sft or args.dataloader_inter_document_masking
+    reads_dataloader = _reads_dataloader(args, vp_stage)
+
+    if not reads_dataloader and not has_cu_seqlens:
+        return [None for _ in BATCH_KEYS]
+
+    if not reads_dataloader:
+        # SFT at PP>1: middle stages read the dataloader only for cu_seqlens. Unchanged
+        # upstream behaviour -- the scatter above covers pretraining, where the dataset is
+        # 15 T tokens and building its index on every stage is what runs a node out of RAM.
+        batch = _read_microbatch(args, data_iterator, vp_stage, metadata_only=True)
+        return [
+            batch[key] if key in ('cu_seqlens', 'cu_seqlens_padded', 'max_seqlen') else None
+            for key in BATCH_KEYS
+        ]
+
+    batch = _read_microbatch(args, data_iterator, vp_stage)
 
     # Return values in BATCH_KEYS order so callers can unpack into the fixed
     # names regardless of any provenance fields wrappers like BlendedDataset
@@ -179,6 +226,100 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     # get_batch_on_this_tp_rank. BATCH_KEYS is already alphabetical, matching
     # the historical sorted(batch.keys()) order.
     return [batch[key] for key in BATCH_KEYS]
+
+
+# ---------------------------------------------------------------------------
+# OELLM PATCH: packed document attention (scatter mode)
+# ---------------------------------------------------------------------------
+
+
+def _get_batch_scattered(args, vp_stage: Optional[int] = None):
+    """Serve one microbatch out of the per-iteration prefetch instead of the iterator.
+
+    Every rank -- reading stage or not -- takes cu_seqlens from the SAME broadcast, so the
+    document boundaries the attention kernel sees are bit-identical across TP and PP by
+    construction rather than by two derivations happening to agree.
+    """
+    reads_dataloader = _reads_dataloader(args, vp_stage)
+    batch, metadata = pda.pop(vp_stage, reads_data=reads_dataloader)
+
+    if args.packed_doc_attention_log_cu_seqlens:
+        _log_cu_seqlens(metadata, vp_stage)
+
+    if batch is None:
+        # Middle stages consume activations, not tokens. cu_seqlens is the only thing they
+        # need, and it is the only thing they get.
+        batch = {key: None for key in BATCH_KEYS}
+
+    # Overwrite rather than keep a reading rank's own copy: identical values, but taking the
+    # broadcast one everywhere removes the possibility of a stage disagreeing at all.
+    batch['cu_seqlens'] = metadata.cu_seqlens
+    batch['cu_seqlens_padded'] = metadata.cu_seqlens_padded
+    batch['max_seqlen'] = metadata.max_seqlen
+    return [batch[key] for key in BATCH_KEYS]
+
+
+def _prefetch_cu_seqlens_for_iteration(data_iterator, vp_stage, num_microbatches, derive=True):
+    """Prefetch hook, called from train_step and evaluate BEFORE the schedule runs.
+
+    Registered with megatron.training.packed_doc_attention at import so training.py can
+    drive it without importing this script. See that module for why the collective cannot
+    live in get_batch.
+    """
+    args = get_args()
+
+    pda.prefetch_iteration(
+        data_iterator=data_iterator,
+        vp_stage=vp_stage,
+        num_microbatches=num_microbatches,
+        fetch_batch=lambda iterator: _read_microbatch(args, iterator, vp_stage),
+        reads_data=_reads_dataloader(args, vp_stage),
+        derive=derive,
+    )
+
+
+pda.register_prefetch_hook(_prefetch_cu_seqlens_for_iteration)
+
+_PDA_LOGGED_CALLS = 0
+
+
+def _log_cu_seqlens(metadata, vp_stage):
+    """Print this rank's cu_seqlens so stage agreement can be checked from the logs.
+
+    cu_seqlens is a handful of int32s -- a few dozen bytes -- so logging it outright is
+    cheaper than any runtime cross-check, and unlike a collective it cannot deadlock against
+    the pipeline's p2p chain (packed_doc_attention.prefetch_iteration explains that failure).
+
+    DEBUG ONLY, and the default of 0 matters: the ``.tolist()`` below is a device->host
+    readback, i.e. exactly the per-microbatch stream drain the scatter exists to remove.
+    Turning this on re-introduces it.
+
+    Ranks are comparable by call index: the interleaved schedule's tables are
+    rank-independent, so the k-th call to get_batch is the same (chunk, microbatch) on every
+    rank -- only the wall-clock timing differs. So all ranks sharing a data-parallel index
+    must print identical cu_seqlens for a given call. Check with
+    scripts/korbi/check_cu_seqlens_agreement.py.
+    """
+    global _PDA_LOGGED_CALLS
+    if _PDA_LOGGED_CALLS >= get_args().packed_doc_attention_log_cu_seqlens:
+        return
+    print(
+        f"[PDA] call={_PDA_LOGGED_CALLS} "
+        f"rank={torch.distributed.get_rank()} "
+        f"pp={mpu.get_pipeline_model_parallel_rank()} "
+        f"tp={mpu.get_tensor_model_parallel_rank()} "
+        # dp is what makes the log checkable at DP>1: different data-parallel replicas read
+        # different documents, so cu_seqlens must only be compared WITHIN a replica. Without
+        # this the checker lumps every rank together and reports a false failure on any
+        # production-shaped run (measured, job 1498402).
+        f"dp={mpu.get_data_parallel_rank()} "
+        f"cp={mpu.get_context_parallel_rank()} "
+        f"vp={vp_stage} "
+        f"max_seqlen={int(metadata.max_seqlen.reshape(-1)[0])} "
+        f"cu_seqlens={metadata.cu_seqlens.reshape(-1).tolist()}",
+        flush=True,
+    )
+    _PDA_LOGGED_CALLS += 1
 
 
 # define spiky loss as a loss that's 10x the max loss observed
@@ -451,6 +592,19 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
 
     config = core_gpt_dataset_config_from_args(args)
 
+    # OELLM PATCH: is_packed_sequence is what makes is_dataset_built_on_rank() build the
+    # dataset on EVERY pipeline stage rather than just the endpoints, and it stays SFT-only.
+    #
+    # Upstream's get_batch widens the read to middle stages whenever cu_seqlens is in play
+    # (`is_sft or args.dataloader_inter_document_masking`), which does not agree with this
+    # flag: with masking on and PP>1 a middle stage is asked to read a dataset it never
+    # built, `TypeError: 'NoneType' object is not an iterator` (jobs 1511085 / 1511146,
+    # ranks 20/24 at PP=4). Widening the flag to match would fix that crash and reintroduce
+    # a worse one -- one index map per model chunk, ~412 GB against ~472 GB of node RAM at
+    # PP=4/VPP=4 (job 1497412).
+    #
+    # Neither, therefore. Middle stages do not read at all; cu_seqlens reaches them through
+    # the per-iteration broadcast in megatron/training/packed_doc_attention.py.
     is_packed_sequence = False
     if args.sft:
         dataset_type = SFTDataset

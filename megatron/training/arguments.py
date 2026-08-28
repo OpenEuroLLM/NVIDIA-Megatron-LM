@@ -385,6 +385,124 @@ def tuple_type(x):
     assert isinstance(x, str)
     return tuple(int(i) for i in x.strip('()').split(','))
 
+def _validate_packed_doc_attention(args):
+    """OELLM PATCH: everything --dataloader-inter-document-masking silently needs.
+
+    Masking documents by handing Transformer Engine cu_seqlens instead of a dense mask puts
+    the model on TE's thd/varlen path, and that path has requirements the flag itself does
+    not state. Each one below is a configuration that would otherwise fail deep inside a
+    kernel, or -- worse -- run and be slower or wrong. See
+    megatron/training/packed_doc_attention.py.
+
+    NB --reset-attention-mask is NOT an alternative to this flag and never was: the GPT layer
+    specs pin attn_mask_type to `causal` (models/gpt/gpt_layer_specs.py) and TE only reads
+    `attention_mask` for `padding`/`arbitrary` mask types, so the dense [b, 1, s, s] mask the
+    dataloader builds is discarded. Every OELLM run before this flag trained with full
+    cross-document attention.
+    """
+    packed_length = args.seq_length * args.micro_batch_size
+
+    # The 0.16 fork also asserted `not args.use_legacy_models` here. 0.19 removed the legacy
+    # model path outright -- there is no such argument any more -- so the check is not merely
+    # redundant, it raises AttributeError on a real Namespace.
+    assert args.position_embedding_type in ('rope', 'yarn', 'none'), (
+        f'--dataloader-inter-document-masking expects rotary or absent position embeddings, '
+        f'got {args.position_embedding_type}. RoPE restarts per document via cu_seqlens; '
+        'learned_absolute would instead need --reset-position-ids, which is a separate path.'
+    )
+    assert args.attention_backend not in (AttnBackend.local, AttnBackend.unfused), (
+        f'--dataloader-inter-document-masking needs a TE varlen backend (flash, fused or '
+        f'auto), got {args.attention_backend}.'
+    )
+    assert args.spec is None or args.spec[0] != 'local', (
+        '--dataloader-inter-document-masking requires the transformer_engine spec, not '
+        '--spec local.'
+    )
+    assert args.cuda_graph_impl == 'none', (
+        '--dataloader-inter-document-masking builds a cu_seqlens tensor whose length changes '
+        'with the document count of every microbatch, which would force CUDA graph recapture '
+        'each step. Set --cuda-graph-impl none.'
+    )
+
+    # === ROPE VARIANTS =======================================================
+    # All three combinations are CORRECT; they differ in how much they cost.
+    #
+    #   rope/yarn + apply_rope_fusion  -> fused_apply_rotary_pos_emb_thd, cu_seqlens goes
+    #                                    straight to TE. The intended path.
+    #   rope/yarn, fusion off          -> _apply_rotary_pos_emb_thd, which per CALL does
+    #                                    `((cu_seqlens[1:] - cu_seqlens[:-1]) // cp).tolist()`
+    #                                    (rope_utils.py) and, on its offset-mapping branch,
+    #                                    `cu_seqlens[i].item()` PER DOCUMENT. Those are device
+    #                                    readbacks in upstream code, once per attention layer
+    #                                    per microbatch -- strictly worse than the single
+    #                                    per-iteration sync the scatter costs.
+    #   none                           -> no rope at all; cu_seqlens still masks documents in
+    #                                    the kernel. Nothing to do.
+    #
+    # yarn cannot satisfy this and is therefore unsupported: the "Legacy RoPE arguments" block
+    # force-disables apply_rope_fusion whenever position_embedding_type is not exactly 'rope',
+    # so it always lands in the unfused case and the user has no way to turn it back on. Say
+    # so, rather than asking for a flag that has already been overridden.
+    if args.position_embedding_type in ('rope', 'yarn') and not args.apply_rope_fusion:
+        if args.position_embedding_type == 'yarn':
+            remedy = (
+                'yarn cannot be used with --dataloader-inter-document-masking: '
+                'apply_rope_fusion is force-disabled for every position_embedding_type other '
+                'than rope, so the fused thd path is unreachable. Use '
+                'position_embedding_type=rope with --apply-rope-fusion, or none.'
+            )
+        else:
+            remedy = 'Set --apply-rope-fusion, or position_embedding_type=none.'
+        raise AssertionError(
+            f'--dataloader-inter-document-masking with position_embedding_type='
+            f'{args.position_embedding_type} and apply_rope_fusion off runs the UNFUSED thd '
+            f'rope path, which reads cu_seqlens back to the host once per ATTENTION CALL '
+            f'(rope_utils._apply_rotary_pos_emb_thd) instead of once per iteration -- one '
+            f'stream drain per layer, ~60x more at 32B. Numerically correct but slower than '
+            f'the dense mask it replaces, hence an error rather than a warning. {remedy}'
+        )
+
+    if args.sequence_parallel:
+        assert packed_length % args.tensor_model_parallel_size == 0, (
+            f'--dataloader-inter-document-masking folds the micro-batch into a single '
+            f'{packed_length}-token sequence, which sequence parallelism must be able to '
+            f'split across {args.tensor_model_parallel_size} tensor-parallel ranks.'
+        )
+
+    if args.context_parallel_size > 1 and not args.sft:
+        # TE's context-parallel thd path asserts "cu_seqlens_padded is required for THD
+        # format!" and partitions each document with thd_get_partitioned_indices, which needs
+        # every document length divisible by 2 * cp_size. GPTDataset produces neither, so
+        # packed_doc_attention.apply_cp_document_padding snaps the boundaries -- see its
+        # docstring for what that costs. The packed length itself must already be divisible,
+        # because the first and last boundaries are pinned.
+        assert packed_length % (2 * args.context_parallel_size) == 0, (
+            f'--dataloader-inter-document-masking at context_parallel_size='
+            f'{args.context_parallel_size} folds the micro-batch into a single '
+            f'{packed_length}-token sequence, which the context-parallel zigzag splits into '
+            f'{2 * args.context_parallel_size} chunks. seq_length * micro_batch_size must be '
+            f'divisible by 2 * context_parallel_size.'
+        )
+        warn_rank_0(
+            f'--dataloader-inter-document-masking with context_parallel_size='
+            f'{args.context_parallel_size}: document boundaries are snapped to multiples of '
+            f'{2 * args.context_parallel_size} tokens so TE\'s thd context-parallel kernels '
+            f'can partition them. Up to {2 * args.context_parallel_size - 1} tokens per '
+            f'boundary therefore still attend into the neighbouring document. '
+            f'See megatron/training/packed_doc_attention.py:snap_cu_seqlens_to_multiple.',
+            args.rank,
+        )
+
+    # create_attention_mask_in_dataloader is already forced off far earlier in validate_args
+    # (it has to be: the TP broadcast protocol is keyed off it). Asserted rather than set, so
+    # that if that block ever moves this fails loudly instead of silently broadcasting a mask
+    # TE would discard.
+    assert not args.create_attention_mask_in_dataloader, (
+        '--dataloader-inter-document-masking masks documents via cu_seqlens and must not also '
+        'build a dense mask in the dataloader.'
+    )
+
+
 def validate_args(args, defaults={}):
 
     # Prep for checkpoint conversion.
@@ -1584,6 +1702,12 @@ def validate_args(args, defaults={}):
         args.position_embedding_type = 'rope'
     if args.position_embedding_type != 'rope':
         args.apply_rope_fusion = False
+
+    # OELLM PATCH: packed (thd) document attention. Deliberately placed AFTER the legacy RoPE
+    # block above, because that block force-disables apply_rope_fusion and the check below
+    # depends on its final value. See megatron/training/packed_doc_attention.py.
+    if args.dataloader_inter_document_masking:
+        _validate_packed_doc_attention(args)
 
     # Would just need to add 'NoPE' as a position_embedding_type to support this, but for now
     # don't allow it to keep things simple
@@ -3194,7 +3318,21 @@ def _add_data_args(parser):
     group.add_argument('--dataloader-inter-document-masking', action='store_true',
                        help='Return cu_seqlens marking document boundaries '
                        'within each sample so that attention is restricted '
-                       'to individual documents.')
+                       'to individual documents. Note that --reset-attention-mask does NOT '
+                       'achieve this: the GPT layer specs pin attn_mask_type to causal and TE '
+                       'only reads attention_mask for padding and arbitrary mask types, so the '
+                       'dataloader mask is silently discarded. This also restarts RoPE at every '
+                       'document boundary, making --reset-position-ids redundant.')
+    group.add_argument('--packed-doc-attention-log-cu-seqlens', type=int, default=0,
+                       help='With --dataloader-inter-document-masking, print this rank\'s '
+                       'cu_seqlens for the first N calls to get_batch. cu_seqlens is a few '
+                       'dozen bytes, so logging it is far cheaper than any runtime cross-check '
+                       '-- and unlike a collective it cannot deadlock against the pipeline p2p '
+                       'chain. Every rank sharing a data-parallel index must print identical '
+                       'values for a given call index; verify with '
+                       'scripts/korbi/check_cu_seqlens_agreement.py. DEBUG ONLY: the readback '
+                       'it needs is the per-microbatch stream drain the scatter exists to '
+                       'remove. OELLM patch, see megatron/training/packed_doc_attention.py.')
     group.add_argument('--eod-mask-loss', action='store_true',
                        help='Mask loss for the end of document tokens.')
     group.add_argument('--no-create-attention-mask-in-dataloader', action='store_false',

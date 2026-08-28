@@ -57,6 +57,7 @@ from megatron.core.fp8_utils import correct_amax_history_if_needed
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper, get_shared_capture_stream
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.inference.unified_memory import create_unified_mempool
+from megatron.core.models.common.language_module.language_module import OutputZLossLoggingHelper
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     is_linear_attention_variant,
 )
@@ -135,6 +136,7 @@ from megatron.core.utils import (
     get_pg_size,
     unwrap_model,
 )
+from megatron.training import packed_doc_attention
 from megatron.training.checkpointing import (
     checkpoint_exists,
     get_loaded_iteration,
@@ -150,7 +152,7 @@ from megatron.training.initialize import (
     set_jit_fusion_options,
     write_args_to_tensorboard,
 )
-from megatron.training.utils import is_gtp_remat_active, is_hybrid_model
+from megatron.training.utils import is_gtp_remat_active, is_hybrid_model, warn_rank_0
 
 # Local.
 from . import ft_integration, one_logger_utils
@@ -358,9 +360,31 @@ def consume_seqlen_stats_in_iteration() -> Tuple[Optional[float], Optional[float
     Sync cost: exactly ONE all-reduce of a 2-element ``float64`` tensor and ONE
     host sync (``tolist()``). Skipped entirely when the flag is ``False``.
 
-    All ranks within one DP group accumulated identical values (``cu_seqlens`` is
-    replicated across TP/CP/PP); the world all-reduce therefore overcounts by a
-    factor of ``TP * CP * PP``, which we divide out.
+    OELLM PATCH -- THE DEDUP FACTOR, DERIVED RATHER THAN GUESSED.
+
+    ``update_seqlen_stats_from_cu_seqlens`` runs inside ``forward_step``, i.e. once per
+    (model chunk, micro-batch) on EVERY rank, and each call adds the whole micro-batch's
+    ``cu_seqlens`` -- so per rank per iteration the accumulator holds ``vpp * M`` micro-batch
+    contributions where the truth for that rank's data-parallel replica is ``M``.
+
+    Which axes replicate the value, and why:
+      TP   every tensor-parallel rank receives the same cu_seqlens over the TP broadcast.
+      PP   every pipeline stage receives it over the packed-doc-attention scatter (before
+           that, by reading the dataloader itself -- either way, replicated).
+      CP   the context-parallel split leaves cu_seqlens UNTOUCHED (it is in METADATA_KEYS,
+           core/utils.py), so each CP rank reports the FULL pack, not its shard.
+      VPP  not a rank axis at all -- it multiplies the CALL COUNT per rank instead. It lands
+           in the same product for a different reason, which is exactly why it was missed.
+      DP   the one axis that must NOT be divided out: different replicas hold different
+           documents and their sum IS the global batch.
+
+    So the world all-reduce yields ``TP * CP * PP * VPP * global_truth``.
+
+    The VPP term was absent upstream. MEASURED, jobs 1516064 / 1516065 (16 nodes, TP4 x PP4,
+    VPP=2): the packed arm reported 717.5 TFLOP/s/GPU against the unpacked control's 366.7 --
+    a factor 1.96 -- while tokens/s/GPU, computed from the closed form rather than from here,
+    agreed to 0.3%. At production's VPP=4 it would have reported ~4x. Metrics only; nothing
+    about training depends on it. But it is the number a throughput comparison gets read off.
     """
     global _seqlen_stats_in_iteration, _seqlen_stats_active
     if not _seqlen_stats_active:
@@ -373,7 +397,11 @@ def consume_seqlen_stats_in_iteration() -> Tuple[Optional[float], Optional[float
         tp_size = max(mpu.get_tensor_model_parallel_world_size(), 1)
         cp_size = max(mpu.get_context_parallel_world_size(), 1)
         pp_size = max(mpu.get_pipeline_model_parallel_world_size(), 1)
-        dedup = tp_size * cp_size * pp_size
+        # OELLM PATCH: VPP too -- see the docstring for why it belongs in this product even
+        # though it is not a rank axis. `or 1` because the accessor returns None, not 1, when
+        # virtual pipelining is off.
+        vpp_size = max(mpu.get_virtual_pipeline_model_parallel_world_size() or 1, 1)
+        dedup = tp_size * cp_size * pp_size * vpp_size
     else:
         # No model-parallel state -> treat as a single rank, no reduction.
         # This is the standalone unit-test path; production always initializes mpu.
@@ -385,6 +413,65 @@ def consume_seqlen_stats_in_iteration() -> Tuple[Optional[float], Optional[float
     t.zero_()
     _seqlen_stats_active = False
     return total_real_tokens / dedup, seqlen_squared_sum / dedup
+
+
+_SEQLEN_STATS_MISMATCH_WARNED = False
+
+
+def check_seqlen_stats_token_count(total_real_tokens, batch_size, args):
+    """OELLM PATCH: cross-check the packed token count against the closed form, once.
+
+    ``total_real_tokens`` is an INDEPENDENT count of the same quantity ``batch_size *
+    seq_length`` already gives: GPTDataset's inter-document masking folds any shortfall into
+    the last document, so ``cu_seqlens[-1]`` is exactly ``seq_length`` for every sample, at
+    every CP size, and boundary snapping preserves the total. The two must therefore agree
+    EXACTLY, and if they do not, the dedup factor is wrong.
+
+    This exists because the VPP overcount shipped silently: the only symptom was a TFLOP/s
+    number that looked plausible in isolation, and it took an A/B against an unpacked control
+    to notice. This check would have fired at iteration 1 of a single run.
+
+    A WARNING, not an assert -- it is a metrics defect, and killing a 512-node job over a
+    reporting error would be the worse failure. Fires once per process.
+
+    Skipped for SFT, whose dataset legitimately pads: there ``sum(L_i)`` counts real tokens
+    only and is SUPPOSED to come in under ``batch_size * seq_length``.
+    """
+    global _SEQLEN_STATS_MISMATCH_WARNED
+    if total_real_tokens is None or _SEQLEN_STATS_MISMATCH_WARNED:
+        return
+    if getattr(args, 'sft', False):
+        return
+    expected = batch_size * args.seq_length
+    # Exact equality in spirit; a relative tolerance only to absorb float64 accumulation of
+    # ~10^9-magnitude integers, which cannot reach 1e-9 relative by rounding alone.
+    if abs(total_real_tokens - expected) > 1e-9 * expected:
+        _SEQLEN_STATS_MISMATCH_WARNED = True
+        warn_rank_0(
+            f'packed-sequence FLOPs accounting is inconsistent: cu_seqlens summed to '
+            f'{total_real_tokens:.0f} real tokens for a global batch that contains '
+            f'{expected} (= global_batch_size {batch_size} x seq_length {args.seq_length}). '
+            f'Ratio {total_real_tokens / expected:.3f}. The reported TFLOP/s is wrong by that '
+            f'factor; tokens/s/GPU is unaffected. Most likely the dedup factor in '
+            f'consume_seqlen_stats_in_iteration() is missing a parallelism axis -- it must be '
+            f'TP x CP x PP x VPP.',
+            getattr(args, 'rank', None),
+        )
+
+
+def reset_seqlen_stats():
+    """OELLM PATCH: drop any accumulated packed-sequence stats without consuming them.
+
+    ``evaluate()`` drives the same ``forward_step``, so it accumulates into the same buffer --
+    but only the TRAINING loop calls ``consume_seqlen_stats_in_iteration``. Without this, the
+    validation microbatches land in the next training iteration's FLOPs number, and that
+    iteration alone reports inflated throughput. Rare (eval_interval is large) and metrics-only,
+    which is exactly why it would never have been tracked down from a log.
+    """
+    global _seqlen_stats_active
+    if _seqlen_stats_in_iteration is not None:
+        _seqlen_stats_in_iteration.zero_()
+    _seqlen_stats_active = False
 
 
 def num_floating_point_operations(
@@ -2333,6 +2420,76 @@ def dummy_train_step(data_iterator):
             )
 
 
+def maybe_prefetch_cu_seqlens(args, data_iterator, num_microbatches):
+    """OELLM PATCH: publish cu_seqlens to every pipeline stage BEFORE a schedule runs.
+
+    The stages that read the dataloader publish what it handed them, and one broadcast over
+    the model-parallel group serves the rest for the whole iteration. It has to happen here
+    rather than in get_batch: a collective inside forward_step deadlocks against the p2p
+    activation chain (measured, job 1494386). See megatron/training/packed_doc_attention.py.
+
+    Every call site that drives forward_backward_func must call this first, otherwise
+    get_batch pops an empty stash -- which is why evaluate() calls it too.
+    """
+    if not packed_doc_attention.is_scattered(args):
+        return
+    hook = packed_doc_attention.prefetch_hook()
+    assert hook is not None, (
+        'packed_doc_attention needs the training script to register a prefetch hook '
+        '(pretrain_gpt.py does this at import).'
+    )
+    packed_doc_attention.reset()
+    is_chunked = isinstance(data_iterator, list)
+    iterators = data_iterator if is_chunked else [data_iterator]
+    # ONLY CHUNK 0 PUBLISHES. cu_seqlens depends on the microbatch, not the chunk -- every
+    # virtual stage sees microbatch m on the same tokens -- so one publication serves them
+    # all, and chunk 0 is the only one that can do it: the model-parallel source rank is
+    # pipeline rank 0, which is the FIRST STAGE for chunk 0 and for no other chunk, so it
+    # only reads data there. Letting the others publish is what produced an empty cu_seqlens
+    # and killed 1865 ranks in a TE assert at 512 nodes (job 1497767).
+    for vp_stage, chunk_iterator in enumerate(iterators):
+        hook(chunk_iterator, vp_stage if is_chunked else None, num_microbatches, vp_stage == 0)
+    for vp_stage in range(1, len(iterators)):
+        packed_doc_attention.share_metadata_from(vp_stage, 0)
+
+
+def get_pipeline_tensor_shapes(args, micro_batch_size=None):
+    """OELLM PATCH: (seq_length, micro_batch_size) as the pipeline p2p buffers must see them.
+
+    Packed (thd) attention folds the micro-batch into ONE packed sequence -- [b, s] becomes
+    [1, b*s] in core.utils.flatten_batch_for_packed_sequences -- so that TE's thd kernels get
+    the batch dimension of 1 they require; mcore reaches the [t, h, d] they want via
+    query.squeeze(1) (transformer/attention.py:1469). The pipeline p2p buffers are sized from
+    these two numbers alone (schedules.py:1157 for the interleaved schedule, get_tensor_shapes
+    at :2116 for 1F1B), so they have to be folded the same way.
+
+    UPSTREAM DOES NOT DO THIS, and it is why inter-document masking dies at PP>1. The element
+    count still matches, so nothing errors at the p2p boundary -- but a middle stage receives
+    a [b*s, 1, h] activation into an [s, b, h] buffer, its query comes out 4-D, and
+    query.squeeze(1) is then a no-op because dim 1 is b, not 1. The 4-D tensor reaches the
+    thd rope kernel and it dies:
+
+        transformer_engine/pytorch/attention/rope.py:142 in forward
+        RuntimeError: expected 3D tensor
+
+    measured on rank 31 (pipeline stage 1 of 4) at 16 nodes, job 1511160. At micro_batch_size
+    1 the fold is the identity, which is why PP>1 with mbs=1 does not show it.
+
+    Applies to SFT too, not just --dataloader-inter-document-masking: the fold happens
+    whenever cu_seqlens is present, so both need the same p2p shape.
+
+    The cp and sequence-parallel divisions are NOT applied here -- the schedule already does
+    both to whatever it is given (schedules.py:1159-1161, :2111-2114).
+    """
+    micro_batch_size = args.micro_batch_size if micro_batch_size is None else micro_batch_size
+    has_cu_seqlens = getattr(args, 'sft', False) or getattr(
+        args, 'dataloader_inter_document_masking', False
+    )
+    if has_cu_seqlens:
+        return args.seq_length * micro_batch_size, 1
+    return args.seq_length, micro_batch_size
+
+
 def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None, pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None, p2p_communicator: Optional[P2PCommunicator] = None):
     """Single training step.
 
@@ -2404,13 +2561,17 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             enable_tokens_per_expert_logging(model, args.save)
         if save_dgrads_in_this_iteration:
             enable_dgrad_logging(model, args.save)
+        # OELLM PATCH: cu_seqlens for the whole iteration, published before the schedule
+        # starts. Must precede forward_backward_func -- a collective inside it deadlocks.
+        maybe_prefetch_cu_seqlens(args, data_iterator, get_num_microbatches())
+        pipeline_seq_length, pipeline_micro_batch_size = get_pipeline_tensor_shapes(args)
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step_func,
             data_iterator=data_iterator,
             model=model,
             num_microbatches=get_num_microbatches(),
-            seq_length=args.seq_length,
-            micro_batch_size=args.micro_batch_size,
+            seq_length=pipeline_seq_length,
+            micro_batch_size=pipeline_micro_batch_size,
             decoder_seq_length=args.decoder_seq_length,
             forward_only=False,
             adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
@@ -2799,6 +2960,14 @@ def training_log(
             mtp_num_layers=args.mtp_num_layers,
             pg_collection=pg_collection,
             total_loss_dict=total_loss_dict,
+        )
+
+    # Log the output (LM head) z-loss. It is kept out of the reported cross-entropy loss on
+    # purpose (it is a pure gradient regularizer), so it needs its own metric here.
+    if args.output_z_loss_coeff is not None:
+        output_z_loss_scale = 1 / get_num_microbatches()
+        OutputZLossLoggingHelper.track_metrics(
+            output_z_loss_scale, iteration, writer, wandb_writer, total_loss_dict
         )
 
     # Log MTP metrics.
@@ -3992,6 +4161,9 @@ def train(
         total_real_tokens_in_batch, seqlen_squared_sum_in_batch = (
             consume_seqlen_stats_in_iteration()
         )
+        # OELLM PATCH: an independent count of the same tokens, so a wrong dedup factor
+        # surfaces at iteration 1 instead of needing an A/B against an unpacked control.
+        check_seqlen_stats_token_count(total_real_tokens_in_batch, batch_size, args)
         num_floating_point_operations_in_batch = num_floating_point_operations(
             args,
             batch_size,
@@ -4275,13 +4447,19 @@ def evaluate(
             # Don't care about timing during evaluation
             config.timers = None
             ft_integration.on_eval_step_start()
+            # OELLM PATCH: same prefetch as train_step -- without it get_batch pops an empty
+            # stash on the first validation microbatch.
+            maybe_prefetch_cu_seqlens(args, data_iterator, eval_num_microbatches)
+            eval_pipeline_seq_length, eval_pipeline_mbs = get_pipeline_tensor_shapes(
+                args, eval_micro_batch_size
+            )
             loss_dicts = forward_backward_func(
                 forward_step_func=forward_step_func,
                 data_iterator=data_iterator,
                 model=model,
                 num_microbatches=eval_num_microbatches,
-                seq_length=args.seq_length,
-                micro_batch_size=eval_micro_batch_size,
+                seq_length=eval_pipeline_seq_length,
+                micro_batch_size=eval_pipeline_mbs,
                 decoder_seq_length=args.decoder_seq_length,
                 forward_only=True,
                 adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
@@ -4337,17 +4515,31 @@ def evaluate(
                     print_rank_0('Exiting during evaluation, timelimit reached')
                     return None, None, True
 
+            # OELLM PATCH: validation drives the same forward_step, so it accumulates into
+            # the packed-sequence stats -- but only the training loop consumes them. Drop
+            # them here, or the next training iteration reports its FLOPs with the
+            # validation microbatches folded in. Per eval STEP rather than once at the end,
+            # so a mid-loop `return` leaves at most one step's worth behind; the only such
+            # return is the timelimit exit, which stops training anyway.
+            reset_seqlen_stats()
+
         collected_non_loss_data = None
         if non_loss_data_func is not None:
             collected_non_loss_data = non_loss_data_func(model)
         elif process_non_loss_data_func is not None and is_last_rank():
+            # OELLM PATCH: this drives the schedule too, so it needs its own prefetch and the
+            # same folded p2p shapes.
+            maybe_prefetch_cu_seqlens(args, data_iterator, eval_num_microbatches)
+            nld_seq_length, nld_micro_batch_size = get_pipeline_tensor_shapes(
+                args, eval_micro_batch_size
+            )
             collected_non_loss_data = forward_backward_func(
                 forward_step_func=forward_step_func,
                 data_iterator=data_iterator,
                 model=model,
                 num_microbatches=eval_num_microbatches,
-                seq_length=args.seq_length,
-                micro_batch_size=eval_micro_batch_size,
+                seq_length=nld_seq_length,
+                micro_batch_size=nld_micro_batch_size,
                 decoder_seq_length=args.decoder_seq_length,
                 forward_only=True,
                 collect_non_loss_data=True,
