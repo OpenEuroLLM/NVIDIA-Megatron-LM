@@ -2498,6 +2498,30 @@ def _get_batch_on_this_cp_rank_per_sequence_balancing(
             if key in METADATA_KEYS or val is None:
                 continue
             seq_dim = 2 if key == 'attention_mask' else 1
+            # OELLM PATCH: skip anything with no sequence dimension to split.
+            #
+            # The METADATA_KEYS list above is a fixed allow-list, so it cannot know about
+            # provenance fields the DATASET WRAPPERS add. BlendedDataset returns
+            # `{"dataset_id": ..., **sample}` (blended_dataset.py:109), which default_collate
+            # turns into a 1-D [micro_batch_size] tensor. It reaches here because get_batch
+            # normalises the BATCH_KEYS entries but does not strip unknown ones, and then
+            # `val.shape[seq_dim]` raises:
+            #     IndexError: tuple index out of range
+            # Measured on rank 16, job 1516834 (TP4 x CP2 x PP4, 32 nodes) -- zero iterations.
+            #
+            # This hits ANY context-parallel run on a BLENDED dataset, with or without
+            # inter-document masking; the masking path escapes it only because it routes to
+            # per-DOCUMENT balancing, which touches the four sequence tensors by name.
+            # Upstream is aware of the key at the RETURN -- get_batch's own comment cites
+            # "provenance fields wrappers like BlendedDataset add (e.g. dataset_id)" -- but the
+            # CP split runs before that return.
+            #
+            # Skipping on RANK rather than by name is deliberate: it fixes the whole class,
+            # not just dataset_id, and it cannot skip a real sequence tensor -- tokens,
+            # labels, loss_mask and position_ids are 2-D here (or [1, b*s] once packed) and
+            # attention_mask is 4-D, so none of them can have `dim() <= seq_dim`.
+            if not torch.is_tensor(val) or val.dim() <= seq_dim:
+                continue
             val = val.view(
                 *val.shape[0:seq_dim],
                 2 * cp_size,
