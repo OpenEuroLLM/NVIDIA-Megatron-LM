@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import functools
 import logging
 from collections import OrderedDict
 from typing import Any, Callable, Dict, Literal, Optional
@@ -706,7 +707,12 @@ class GPTModel(LanguageModule):
                     output_weight=output_weight,
                     runtime_gather_output=runtime_gather_output,
                     is_training=self.training,
-                    compute_language_model_loss=self.compute_language_model_loss,
+                    # MTP is an auxiliary head. It shares compute_language_model_loss, but its
+                    # z-loss must not land in the tracker as the LM head's -- only the main
+                    # head's is logged. MTP calls this positionally, so bind the flag here.
+                    compute_language_model_loss=functools.partial(
+                        self.compute_language_model_loss, record_z_loss=False
+                    ),
                     config=self.config,
                     cp_group=self.pg_collection.cp,
                     tp_group=self.tp_group,
@@ -765,6 +771,14 @@ class GPTModel(LanguageModule):
 
         # Apply MuP output scaling to logits
         logits = self._scale_logits(logits)
+
+        # Final-logit soft-capping (Gemma 2 style): logits <- c * tanh(logits / c).
+        # Elementwise, so it is applied directly on the local tensor-parallel logit shard and
+        # affects both the returned logits and the loss. Applied AFTER MuP scaling, so the cap
+        # bounds the logits that actually reach the loss rather than a pre-scaled version.
+        if self.config.final_logit_softcapping is not None:
+            c = self.config.final_logit_softcapping
+            logits = c * torch.tanh(logits / c)
 
         # Restore sequence parallel execution to the output layer if necessary.
         if sequence_parallel_override:
