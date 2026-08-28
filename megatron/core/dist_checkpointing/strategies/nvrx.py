@@ -84,4 +84,27 @@ def is_nvrx_min_version(version: str = NVRX_MIN_VERSION) -> bool:
 
     nvrx_version = str(nvrx.__version__) if HAVE_NVRX else "0.0.0"
 
-    return PkgVersion(nvrx_version) >= PkgVersion(version)
+    installed, required = PkgVersion(nvrx_version), PkgVersion(version)
+    if installed >= required:
+        return True
+
+    # OELLM PATCH: accept a dev/pre-release build of EXACTLY the required release.
+    #
+    # PEP 440 orders 0.6.0.dev33 < 0.6.0, so the stock comparison rejects the
+    # nvidia-resiliency-ext shipped in nemo_26.04 (0.6.0.dev33+15a8515). Because this
+    # assert runs unconditionally while `megatron.core` is still importing
+    # (strategies/torch.py -> has_nvrx_async_support), that rejection makes the whole
+    # package unimportable -- `import megatron.core` fails outright, whether or not nvrx
+    # checkpointing is ever used.
+    #
+    # This is a VERSION-STRING gate, not an API gate. Every symbol Megatron actually uses
+    # is checked separately, immediately below the assert in has_nvrx_async_support(), and
+    # all nine are present in 0.6.0.dev33 (verified in-container on JUPITER 2026-08-26:
+    # AsyncCallsQueue, AsyncRequest, CachedMetadataFileSystemReader, FileSystemWriterAsync,
+    # get_write_results_queue, CheckpointMetadataCache, save_state_dict_async_finalize,
+    # save_state_dict_async_plan, _results_queue). So the symbol check remains the real
+    # gate: if a dev build were genuinely incomplete, it would still return False here.
+    #
+    # Deliberately narrow -- only the SAME release tuple is accepted, so 0.5.0 (which has
+    # no spare-node support) is still rejected.
+    return installed.release == required.release
