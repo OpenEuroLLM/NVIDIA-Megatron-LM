@@ -144,6 +144,7 @@ from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_utils import (
     capture_expert_viability_parameter_stats,
     clear_aux_losses_tracker,
+    run_masked_layer_validation,
     track_moe_metrics,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
@@ -3274,6 +3275,16 @@ def evaluate_and_print_results(
         # Timelimit hit during evaluation
         if timelimit:
             return
+        if args.moe_masked_layer_validation:
+            run_masked_layer_validation(
+                forward_step_func,
+                iterator,
+                model,
+                config,
+                iteration,
+                writer=writer,
+                wandb_writer=wandb_writer,
+            )
         string = f' validation{suffix} loss at {prefix} | '
         for key in total_loss_dict:
             string += '{} value: {:.6E} | '.format(key, total_loss_dict[key].item())

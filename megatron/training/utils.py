@@ -469,6 +469,18 @@ def append_to_progress_log(string, barrier=True):
             )
 
 
+def _resolve_per_split_blend_arg(split_arg):
+    """Resolve a per-split blend argument from inline tokens or a blend file path."""
+    if split_arg is None or split_arg == "":
+        return None
+    if isinstance(split_arg, str):
+        if os.path.isfile(split_arg):
+            with open_file(split_arg, 'r') as f:
+                return f.read().split()
+        return split_arg.split()
+    return split_arg
+
+
 def get_blend_and_blend_per_split(args):
     """Get blend and blend_per_split from passed-in arguments."""
     use_data_path = args.data_path is not None or args.data_args_path is not None
@@ -494,16 +506,10 @@ def get_blend_and_blend_per_split(args):
         if args.per_split_data_args_path is not None:
             with open_file(args.per_split_data_args_path, 'r') as f:
                 per_split_data_args = json.load(f)
-                # Each element in blend_per_split should be a list of files (and optional
-                # weights), so split string if needed.
-                for split in ["train", "valid", "test"]:
-                    if isinstance(per_split_data_args[split], str):
-                        per_split_data_args[split] = per_split_data_args[split].split()
-
                 blend_per_split = [
-                    get_blend_from_list(per_split_data_args["train"]),
-                    get_blend_from_list(per_split_data_args["valid"]),
-                    get_blend_from_list(per_split_data_args["test"]),
+                    get_blend_from_list(_resolve_per_split_blend_arg(per_split_data_args["train"])),
+                    get_blend_from_list(_resolve_per_split_blend_arg(per_split_data_args["valid"])),
+                    get_blend_from_list(_resolve_per_split_blend_arg(per_split_data_args["test"])),
                 ]
         else:
             blend_per_split = [

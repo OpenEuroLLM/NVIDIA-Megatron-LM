@@ -72,6 +72,198 @@ def should_mask_routed_moe_layer(layer_number: Optional[int]) -> bool:
     return layer_number is not None and layer_number == _MASKED_ROUTED_MOE_LAYER
 
 
+class _CachingDataIterator:
+    """Wrap a data iterator and replay the microbatches it has already yielded."""
+
+    def __init__(self, data_iterator):
+        self._source = data_iterator
+        self._cache: list = []
+        self._replay = False
+        self._pos = 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._replay:
+            if self._pos >= len(self._cache):
+                raise StopIteration
+            item = self._cache[self._pos]
+            self._pos += 1
+            return item
+        item = next(self._source)
+        self._cache.append(item)
+        return item
+
+    def rewind(self) -> None:
+        self._replay = True
+        self._pos = 0
+
+
+def collect_moe_layer_numbers(model_chunks) -> List[int]:
+    """Return sorted 1-indexed physical layer numbers for local MoE layers."""
+    from megatron.core.transformer.moe.moe_layer import MoELayer
+
+    layer_numbers = []
+    for chunk in model_chunks:
+        for module in chunk.modules():
+            if isinstance(module, MoELayer) and module.layer_number is not None:
+                layer_numbers.append(module.layer_number)
+    return sorted(set(layer_numbers))
+
+
+def _evaluate_lm_loss(
+    forward_step_func,
+    data_iterator,
+    model,
+    config,
+    eval_iters: int,
+) -> float:
+    """Return token-weighted validation LM loss over ``eval_iters`` global batches."""
+    import megatron.core.parallel_state as mpu
+    from megatron.core.enums import CudaGraphScope
+    from megatron.core.pipeline_parallel import get_forward_backward_func
+    from megatron.core.transformer.cuda_graphs import FullCudaGraphWrapper
+    from megatron.core.rerun_state_machine import RerunMode, get_rerun_state_machine
+    from megatron.training import get_args, get_timers
+
+    args = get_args()
+    timers = get_timers()
+    eval_batch_size = args.global_batch_size
+    eval_num_microbatches = eval_batch_size // (args.micro_batch_size * args.data_parallel_size)
+    forward_backward_func = get_forward_backward_func()
+    if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
+        forward_backward_func = FullCudaGraphWrapper(
+            forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps
+        )
+
+    rerun_state_machine = get_rerun_state_machine()
+    rerun_mode = rerun_state_machine.get_mode()
+    rerun_state_machine.set_mode(RerunMode.DISABLED)
+
+    total_loss_dict: dict[str, torch.Tensor] = {}
+    with torch.no_grad():
+        for _ in range(eval_iters):
+            config.timers = None
+            loss_dicts = forward_backward_func(
+                forward_step_func=forward_step_func,
+                data_iterator=data_iterator,
+                model=model,
+                num_microbatches=eval_num_microbatches,
+                seq_length=args.seq_length,
+                micro_batch_size=args.micro_batch_size,
+                decoder_seq_length=args.decoder_seq_length,
+                forward_only=True,
+            )
+            config.timers = timers
+
+            if mpu.is_pipeline_last_stage(ignore_virtual=True):
+                for key in loss_dicts[0].keys():
+                    if key not in total_loss_dict:
+                        total_loss_dict[key] = torch.tensor([0.0, 0.0], dtype=torch.float).cuda()
+                    val = [x[key].view(-1) for x in loss_dicts]
+                    if val[0].numel() == 2:
+                        val = torch.vstack(val).sum(dim=0)
+                        torch.distributed.all_reduce(
+                            val,
+                            group=mpu.get_data_parallel_group(with_context_parallel=True),
+                        )
+                        total_loss_dict[key] += val
+                    elif val[0].numel() == 1:
+                        val = torch.cat(val).sum()
+                        total_loss_dict[key][0] += val
+                        total_loss_dict[key][1] += len(loss_dicts)
+                    else:
+                        raise ValueError(f"Invalid value shape: {val[0].shape} for key {key}")
+
+    rerun_state_machine.set_mode(rerun_mode)
+
+    if 'lm loss' not in total_loss_dict:
+        return float('nan')
+    numerator, denominator = total_loss_dict['lm loss']
+    return (numerator / denominator).item()
+
+
+def run_masked_layer_validation(
+    forward_step_func,
+    data_iterator,
+    model,
+    config,
+    iteration: int,
+    writer=None,
+    wandb_writer=None,
+) -> None:
+    """Run paired validation with one routed MoE layer masked at a time."""
+    from megatron.training import get_args, print_rank_0
+
+    args = get_args()
+    if not args.moe_masked_layer_validation:
+        return
+
+    eval_iters = args.moe_masked_layer_eval_iters
+    caching_iterator = _CachingDataIterator(data_iterator)
+
+    for model_module in model:
+        model_module.eval()
+
+    baseline_nll = _evaluate_lm_loss(
+        forward_step_func, caching_iterator, model, config, eval_iters
+    )
+    baseline_ppl = math.exp(min(20.0, baseline_nll))
+
+    layer_numbers = collect_moe_layer_numbers(model)
+    nll_deltas: List[float] = []
+    layer_log: dict[str, float] = {}
+    wandb_layer_log: dict[str, float] = {}
+
+    for layer_number in layer_numbers:
+        caching_iterator.rewind()
+        with mask_routed_moe_layer(layer_number):
+            masked_nll = _evaluate_lm_loss(
+                forward_step_func, caching_iterator, model, config, eval_iters
+            )
+        nll_delta = masked_nll - baseline_nll
+        ppl_delta = math.exp(min(20.0, masked_nll)) - baseline_ppl
+        nll_deltas.append(nll_delta)
+
+        layer_idx = layer_number - 1
+        layer_log[f'moe/masked_layer_nll_delta_layer_{layer_idx}'] = nll_delta
+        layer_log[f'moe/masked_layer_ppl_delta_layer_{layer_idx}'] = ppl_delta
+        wandb_layer_log[f'viability-layers/masked_layer_nll_delta_layer_{layer_idx}'] = nll_delta
+        wandb_layer_log[f'viability-layers/masked_layer_ppl_delta_layer_{layer_idx}'] = ppl_delta
+
+    aggregate_log = {}
+    wandb_aggregate_log = {}
+    if nll_deltas:
+        for stat_name, value in _aggregate_layer_values(nll_deltas).items():
+            aggregate_log[f'moe/masked_layer_nll_delta_{stat_name}'] = value
+            wandb_aggregate_log[f'viability-aggregates/masked_layer_nll_delta_{stat_name}'] = value
+
+    for model_module in model:
+        model_module.train()
+
+    if writer is not None:
+        for name, value in {**layer_log, **aggregate_log}.items():
+            if isinstance(value, torch.Tensor):
+                continue
+            writer.add_scalar(name, value, iteration)
+    if wandb_writer and (wandb_layer_log or wandb_aggregate_log):
+        wandb_writer.log({**wandb_layer_log, **wandb_aggregate_log}, iteration)
+
+    if layer_numbers:
+        agg = _aggregate_layer_values(nll_deltas)
+        print_rank_0(
+            ' masked-layer validation at iteration {} | baseline nll {:.6E} | '
+            'nll delta mean {:.6E} min {:.6E} max {:.6E}'.format(
+                iteration,
+                baseline_nll,
+                agg.get('mean', float('nan')),
+                agg.get('min', float('nan')),
+                agg.get('max', float('nan')),
+            )
+        )
+
+
 def _combined_rms(tensors: List[Optional[torch.Tensor]]) -> torch.Tensor:
     """RMS over several tensors, weighted by element count."""
     valid = [tensor.detach().float() for tensor in tensors if tensor is not None]
@@ -82,58 +274,109 @@ def _combined_rms(tensors: List[Optional[torch.Tensor]]) -> torch.Tensor:
     return torch.sqrt(square_sum / count)
 
 
-def local_expert_rms(experts: torch.nn.Module, num_local_experts: int, gradients: bool = False):
-    """Return combined RMS values for local routed experts.
+def _aggregate_layer_values(values: List[float]) -> dict[str, float]:
+    """Return mean/min/max aggregates over per-layer scalar metrics."""
+    if not values:
+        return {}
+    return {
+        'mean': sum(values) / len(values),
+        'min': min(values),
+        'max': max(values),
+    }
 
-    Supports both SequentialMLP (one module per expert) and grouped expert tensors whose
-    leading dimension is the local expert dimension. Parameters that cannot be attributed to
-    an individual expert are intentionally excluded.
-    """
+
+def _parameter_or_gradient(parameter: torch.nn.Parameter, gradients: bool) -> Optional[torch.Tensor]:
+    if gradients:
+        return getattr(parameter, 'main_grad', parameter.grad)
+    return parameter
+
+
+def _grouped_mlp_expert_tensor_groups(
+    experts: torch.nn.Module, num_local_experts: int, gradients: bool = False
+) -> Optional[List[List[torch.Tensor]]]:
+    """Extract per-local-expert tensors from legacy GroupedMLP ``weight1``/``weight2``."""
+    weight1 = getattr(experts, 'weight1', None)
+    weight2 = getattr(experts, 'weight2', None)
+    config = getattr(experts, 'config', None)
+    hidden_size = getattr(config, 'hidden_size', None)
+    if weight1 is None or weight2 is None or hidden_size is None:
+        return None
+
+    w1 = _parameter_or_gradient(weight1, gradients)
+    w2 = _parameter_or_gradient(weight2, gradients)
+    if w1 is None or w2 is None:
+        return None
+
+    try:
+        w1 = w1.view(num_local_experts, hidden_size, -1)
+        w2 = w2.view(num_local_experts, -1, hidden_size)
+    except RuntimeError:
+        return None
+
+    return [
+        [w1[index].reshape(-1), w2[index].reshape(-1)]
+        for index in range(num_local_experts)
+    ]
+
+
+def _iter_local_expert_tensor_groups(
+    experts: torch.nn.Module, num_local_experts: int, gradients: bool = False
+) -> Optional[List[List[torch.Tensor]]]:
+    """Return tensors grouped by local expert index across supported expert modules."""
     local = getattr(experts, 'local_experts', None)
     if local is not None:
-        return torch.stack([
-            _combined_rms(
-                [getattr(p, 'main_grad', p.grad) if gradients else p for p in expert.parameters()]
-            )
-            for expert in local
-        ])
+        groups = []
+        for expert in local:
+            tensors = [
+                tensor
+                for tensor in (_parameter_or_gradient(p, gradients) for p in expert.parameters())
+                if tensor is not None
+            ]
+            groups.append(tensors)
+        return groups
+
+    grouped = _grouped_mlp_expert_tensor_groups(experts, num_local_experts, gradients)
+    if grouped is not None:
+        return grouped
+
     per_expert = [[] for _ in range(num_local_experts)]
     for parameter in experts.parameters():
-        tensor = getattr(parameter, 'main_grad', parameter.grad) if gradients else parameter
+        tensor = _parameter_or_gradient(parameter, gradients)
         if tensor is not None and tensor.ndim > 0 and tensor.shape[0] == num_local_experts:
             for index in range(num_local_experts):
                 per_expert[index].append(tensor[index])
     if not any(per_expert):
         return None
-    return torch.stack([_combined_rms(tensors) for tensors in per_expert])
+    return per_expert
+
+
+def local_expert_rms(experts: torch.nn.Module, num_local_experts: int, gradients: bool = False):
+    """Return combined RMS values for local routed experts.
+
+    Supports SequentialMLP, legacy GroupedMLP (``weight1``/``weight2``), and grouped expert
+    tensors whose leading dimension is the local expert dimension. Parameters that cannot be
+    attributed to an individual expert are intentionally excluded.
+    """
+    groups = _iter_local_expert_tensor_groups(experts, num_local_experts, gradients)
+    if groups is None:
+        return None
+    return torch.stack([_combined_rms(tensors) for tensors in groups])
 
 
 def expert_rms_statistics(
     experts: torch.nn.Module, num_local_experts: int, gradients: bool = False
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
     """Return per-local-expert squared sums and element counts for a combined RMS."""
-    local = getattr(experts, 'local_experts', None)
-    if local is not None:
-        stats = []
-        for expert in local:
-            tensors = [getattr(p, 'main_grad', p.grad) if gradients else p for p in expert.parameters()]
-            tensors = [t.detach().float() for t in tensors if t is not None]
-            stats.append((sum(t.square().sum() for t in tensors), sum(t.numel() for t in tensors)))
-        return torch.stack([s[0] for s in stats]), torch.tensor(
-            [s[1] for s in stats], device=stats[0][0].device, dtype=torch.float32
-        )
-    sums, counts = [], []
-    for index in range(num_local_experts):
-        tensors = []
-        for parameter in experts.parameters():
-            tensor = getattr(parameter, 'main_grad', parameter.grad) if gradients else parameter
-            if tensor is not None and tensor.ndim > 0 and tensor.shape[0] == num_local_experts:
-                tensors.append(tensor[index].detach().float())
-        if not tensors:
-            return None
-        sums.append(sum(t.square().sum() for t in tensors))
-        counts.append(sum(t.numel() for t in tensors))
-    return torch.stack(sums), torch.tensor(counts, device=sums[0].device, dtype=torch.float32)
+    groups = _iter_local_expert_tensor_groups(experts, num_local_experts, gradients)
+    if groups is None:
+        return None
+    stats = []
+    for tensors in groups:
+        tensors = [tensor.detach().float() for tensor in tensors]
+        stats.append((sum(tensor.square().sum() for tensor in tensors), sum(tensor.numel() for tensor in tensors)))
+    return torch.stack([s[0] for s in stats]), torch.tensor(
+        [s[1] for s in stats], device=stats[0][0].device, dtype=torch.float32
+    )
 
 
 def capture_expert_viability_parameter_stats(model_chunks) -> None:
@@ -174,8 +417,14 @@ def capture_expert_viability_parameter_stats(model_chunks) -> None:
 def save_routed_expert_output_stats(
     routed_output: torch.Tensor, input_tensor: torch.Tensor, layer_output: torch.Tensor,
     layer_number: Optional[int], num_layers: int,
+    include_layer_output: bool = True,
 ) -> None:
-    """Accumulate squared-sum/count routed-path statistics without retaining activations."""
+    """Accumulate squared-sum/count routed-path statistics without retaining activations.
+
+    ``include_layer_output`` should be False when the MoE block has no shared expert:
+    in that case postprocess only reshapes the routed tensor, so routed/layer-output RMS
+    ratios would be identically one and carry no diagnostic value.
+    """
     if layer_number is None:
         return
     tracker = _MOE_EXPERT_VIABILITY_TRACKER
@@ -190,10 +439,11 @@ def save_routed_expert_output_stats(
     index = layer_number - 1
     tracker['routed_sq_sum'][index] += routed_output.detach().float().square().sum()
     tracker['input_sq_sum'][index] += input_tensor.detach().float().square().sum()
-    tracker['output_sq_sum'][index] += layer_output.detach().float().square().sum()
     tracker['routed_count'][index] += routed_output.numel()
     tracker['input_count'][index] += input_tensor.numel()
-    tracker['output_count'][index] += layer_output.numel()
+    if include_layer_output:
+        tracker['output_sq_sum'][index] += layer_output.detach().float().square().sum()
+        tracker['output_count'][index] += layer_output.numel()
 
 
 def get_expert_viability_tracker() -> dict:
@@ -1539,7 +1789,9 @@ def track_moe_metrics(
             torch.distributed.all_reduce(value, group=dp_group, op=torch.distributed.ReduceOp.AVG)
 
         layer_log = {}
-        routed_to_input, routed_to_output = [], []
+        wandb_layer_log: dict = {}
+        routed_rms_list, routed_to_input, routed_to_output = [], [], []
+        _have_wandb_viability = wandb_writer is not None
         for i in range(viability_tracker['routed_sq_sum'].numel()):
             routed_count = viability_tracker['routed_count'][i]
             if routed_count.item() == 0:
@@ -1548,27 +1800,63 @@ def track_moe_metrics(
             input_rms = torch.sqrt(
                 viability_tracker['input_sq_sum'][i] / viability_tracker['input_count'][i]
             ).item()
-            output_rms = torch.sqrt(
-                viability_tracker['output_sq_sum'][i] / viability_tracker['output_count'][i]
-            ).item()
             input_ratio = routed_rms / max(input_rms, 1.0e-12)
-            output_ratio = routed_rms / max(output_rms, 1.0e-12)
-            metrics = {
-                f'moe/routed_expert_output_rms_layer_{i}': routed_rms,
-                f'moe/routed_expert_output_to_input_rms_layer_{i}': input_ratio,
-                f'moe/routed_expert_output_to_layer_output_rms_layer_{i}': output_ratio,
-            }
-            layer_log.update(metrics)
+            output_ratio = None
+            if viability_tracker['output_count'][i].item() > 0:
+                output_rms = torch.sqrt(
+                    viability_tracker['output_sq_sum'][i] / viability_tracker['output_count'][i]
+                ).item()
+                output_ratio = routed_rms / max(output_rms, 1.0e-12)
+            if writer is not None:
+                writer.add_scalar(f'moe/routed_expert_output_rms_layer_{i}', routed_rms, iteration)
+                writer.add_scalar(
+                    f'moe/routed_expert_output_to_input_rms_layer_{i}', input_ratio, iteration
+                )
+                if output_ratio is not None:
+                    writer.add_scalar(
+                        f'moe/routed_expert_output_to_layer_output_rms_layer_{i}',
+                        output_ratio,
+                        iteration,
+                    )
+            if _have_wandb_viability:
+                wandb_layer_log[f'viability-layers/routed_expert_output_rms_layer_{i}'] = routed_rms
+                wandb_layer_log[
+                    f'viability-layers/routed_expert_output_to_input_rms_layer_{i}'
+                ] = input_ratio
+                if output_ratio is not None:
+                    wandb_layer_log[
+                        f'viability-layers/routed_expert_output_to_layer_output_rms_layer_{i}'
+                    ] = output_ratio
+            routed_rms_list.append(routed_rms)
             routed_to_input.append(input_ratio)
-            routed_to_output.append(output_ratio)
-        if routed_to_input:
-            layer_log['moe/routed_expert_output_to_input_rms_min'] = min(routed_to_input)
-            layer_log['moe/routed_expert_output_to_layer_output_rms_min'] = min(routed_to_output)
+            if output_ratio is not None:
+                routed_to_output.append(output_ratio)
+
+        routed_aggregate_specs = [
+            ('routed_expert_output_rms', routed_rms_list),
+            ('routed_expert_output_to_input_rms', routed_to_input),
+        ]
+        if routed_to_output:
+            routed_aggregate_specs.append(
+                ('routed_expert_output_to_layer_output_rms', routed_to_output)
+            )
+        wandb_aggregate_log: dict = {}
+        for metric_name, values in routed_aggregate_specs:
+            aggregates = _aggregate_layer_values(values)
+            for stat_name, value in aggregates.items():
+                layer_log[f'moe/{metric_name}_{stat_name}'] = value
+                wandb_aggregate_log[f'viability-aggregates/{metric_name}_{stat_name}'] = value
+
+        if routed_to_input and total_loss_dict is not None:
+            total_loss_dict['routed_expert_output_to_input_rms_min'] = torch.tensor(
+                layer_log['moe/routed_expert_output_to_input_rms_min']
+            )
+
         if writer is not None:
             for name, value in layer_log.items():
                 writer.add_scalar(name, value, iteration)
-        if wandb_writer and layer_log:
-            wandb_writer.log(layer_log, iteration)
+        if wandb_writer and (wandb_layer_log or wandb_aggregate_log):
+            wandb_writer.log({**wandb_layer_log, **wandb_aggregate_log}, iteration)
 
     if expert_viability_metrics and 'weight_sq_sum' in viability_tracker:
         if pg_collection is None:
@@ -1591,7 +1879,9 @@ def track_moe_metrics(
         )
         initial_rms = viability_tracker['initial_rms']
         param_log = {}
-        collapsed_fractions, relative_medians = [], []
+        wandb_param_layer_log: dict = {}
+        weight_medians, grad_medians, collapsed_fractions, relative_medians = [], [], [], []
+        _have_wandb_param = wandb_writer is not None
         for i in range(weight_rms.shape[0]):
             active = viability_tracker['weight_count'][i] > 0
             if not active.any():
@@ -1599,25 +1889,75 @@ def track_moe_metrics(
             weights, grads, initial = weight_rms[i, active], grad_rms[i, active], initial_rms[i, active]
             relative = weights / initial.clamp_min(1.0e-12)
             collapsed = (relative < EXPERT_COLLAPSE_RMS_FRACTION).float().mean().item()
-            values = {
-                f'moe/expert_weight_rms_median_layer_{i}': weights.median().item(),
-                f'moe/expert_weight_rms_p10_layer_{i}': torch.quantile(weights, 0.1).item(),
-                f'moe/expert_weight_rms_min_layer_{i}': weights.min().item(),
-                f'moe/expert_weight_rms_relative_to_init_median_layer_{i}': relative.median().item(),
-                f'moe/expert_weight_collapsed_frac_layer_{i}': collapsed,
-                f'moe/expert_grad_rms_median_layer_{i}': grads.median().item(),
-            }
-            param_log.update(values)
+            weight_median = weights.median().item()
+            grad_median = grads.median().item()
+            relative_median = relative.median().item()
+            if writer is not None:
+                writer.add_scalar(f'moe/expert_weight_rms_median_layer_{i}', weight_median, iteration)
+                writer.add_scalar(
+                    f'moe/expert_weight_rms_p10_layer_{i}',
+                    torch.quantile(weights, 0.1).item(),
+                    iteration,
+                )
+                writer.add_scalar(
+                    f'moe/expert_weight_rms_min_layer_{i}', weights.min().item(), iteration
+                )
+                writer.add_scalar(
+                    f'moe/expert_weight_rms_relative_to_init_median_layer_{i}',
+                    relative_median,
+                    iteration,
+                )
+                writer.add_scalar(
+                    f'moe/expert_weight_collapsed_frac_layer_{i}', collapsed, iteration
+                )
+                writer.add_scalar(f'moe/expert_grad_rms_median_layer_{i}', grad_median, iteration)
+            if _have_wandb_param:
+                wandb_param_layer_log[f'viability-layers/expert_weight_rms_median_layer_{i}'] = (
+                    weight_median
+                )
+                wandb_param_layer_log[f'viability-layers/expert_weight_rms_p10_layer_{i}'] = (
+                    torch.quantile(weights, 0.1).item()
+                )
+                wandb_param_layer_log[f'viability-layers/expert_weight_rms_min_layer_{i}'] = (
+                    weights.min().item()
+                )
+                wandb_param_layer_log[
+                    f'viability-layers/expert_weight_rms_relative_to_init_median_layer_{i}'
+                ] = relative_median
+                wandb_param_layer_log[f'viability-layers/expert_weight_collapsed_frac_layer_{i}'] = (
+                    collapsed
+                )
+                wandb_param_layer_log[f'viability-layers/expert_grad_rms_median_layer_{i}'] = (
+                    grad_median
+                )
+            weight_medians.append(weight_median)
+            grad_medians.append(grad_median)
             collapsed_fractions.append(collapsed)
-            relative_medians.append(relative.median().item())
-        if collapsed_fractions:
-            param_log['moe/expert_weight_collapsed_frac_max'] = max(collapsed_fractions)
-            param_log['moe/expert_weight_rms_relative_to_init_median_min'] = min(relative_medians)
+            relative_medians.append(relative_median)
+
+        param_aggregate_specs = (
+            ('expert_weight_rms_median', weight_medians),
+            ('expert_grad_rms_median', grad_medians),
+            ('expert_weight_collapsed_frac', collapsed_fractions),
+            ('expert_weight_rms_relative_to_init_median', relative_medians),
+        )
+        wandb_param_aggregate_log: dict = {}
+        for metric_name, values in param_aggregate_specs:
+            aggregates = _aggregate_layer_values(values)
+            for stat_name, value in aggregates.items():
+                param_log[f'moe/{metric_name}_{stat_name}'] = value
+                wandb_param_aggregate_log[f'viability-aggregates/{metric_name}_{stat_name}'] = value
+
+        if collapsed_fractions and total_loss_dict is not None:
+            total_loss_dict['expert_weight_collapsed_frac_max'] = torch.tensor(
+                param_log['moe/expert_weight_collapsed_frac_max']
+            )
+
         if writer is not None:
             for name, value in param_log.items():
                 writer.add_scalar(name, value, iteration)
-        if wandb_writer and param_log:
-            wandb_writer.log(param_log, iteration)
+        if wandb_writer and (wandb_param_layer_log or wandb_param_aggregate_log):
+            wandb_writer.log({**wandb_param_layer_log, **wandb_param_aggregate_log}, iteration)
 
     clear_aux_losses_tracker()
     clear_expert_viability_tracker()

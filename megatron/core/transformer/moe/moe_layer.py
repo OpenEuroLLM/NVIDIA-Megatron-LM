@@ -449,6 +449,7 @@ class MoELayer(BaseMoELayer):
                         output,
                         self.layer_number,
                         self.config.num_layers,
+                        include_layer_output=self.use_shared_expert,
                     )
 
                 if intermediate_tensors is not None:

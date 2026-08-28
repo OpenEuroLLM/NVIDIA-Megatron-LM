@@ -309,7 +309,9 @@ def validate_args(args, defaults={}):
         raise ValueError('--moe-expert-viability-metrics requires --moe-per-layer-logging')
     if args.moe_masked_layer_validation and not args.moe_expert_viability_metrics:
         raise ValueError('--moe-masked-layer-validation requires --moe-expert-viability-metrics')
-    if args.moe_masked_layer_validation and not args.do_valid:
+    if args.moe_masked_layer_validation and not (
+        getattr(args, 'do_valid', False) or (args.eval_interval and args.eval_iters > 0)
+    ):
         raise ValueError('--moe-masked-layer-validation requires validation (--do-valid)')
     if args.moe_masked_layer_eval_iters <= 0:
         raise ValueError('--moe-masked-layer-eval-iters must be positive')
@@ -2719,14 +2721,6 @@ def _add_moe_args(parser):
                        help='Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer; "seq_aux_loss" corresponds to the load balancing loss used in DeepSeekV2, which computes the loss for each individual sample; "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "none" implies no load balancing. The default is "aux_loss".')
     group.add_argument('--moe-aux-loss-coeff', type=float, nargs='+', default=0.0,
                        help='Scaling coefficient for the aux loss: a starting value of 1e-2 is recommended.')
-    group.add_argument('--moe-per-layer-logging', action='store_true',
-                       help='Enable per-layer MoE routing/load-health logging.')
-    group.add_argument('--moe-expert-viability-metrics', action='store_true',
-                       help='Log routed-expert viability diagnostics; requires --moe-per-layer-logging.')
-    group.add_argument('--moe-masked-layer-validation', action='store_true',
-                       help='Run a rotating paired validation probe that masks one routed MoE layer.')
-    group.add_argument('--moe-masked-layer-eval-iters', type=int, default=8,
-                       help='Dedicated batches for each masked-layer validation probe (default: 8).')
     # Token dispatcher arguments
     # MoE communication overlap arguments
 
