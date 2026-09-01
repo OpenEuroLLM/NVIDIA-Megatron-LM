@@ -166,6 +166,7 @@ from .activation_logging import (
 )
 from .async_utils import maybe_finalize_async_save
 from .dgrad_logging import disable_dgrad_logging, enable_dgrad_logging, save_dgrads
+from .diagnostics import get_diagnostics, setup_diagnostics
 from .global_vars import (
     destroy_global_vars,
     get_args,
@@ -1328,6 +1329,11 @@ def pretrain(
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
     model_cfg = get_model_config(model[0])
+
+    # Per-layer diagnostics: builds the parameter->slot maps and installs the
+    # activation hooks. Constructing it is free when --diagnostics-interval is 0,
+    # and setup() returns immediately in that case.
+    setup_diagnostics(args).setup(model, optimizer)
 
     # Build a separate inference model for RL if requested.
     inference_model = None
@@ -2501,6 +2507,12 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     args = get_args()
     timers = get_timers()
 
+    # Arms the activation hooks for this iteration (and clears their buffers).
+    # Must happen before the forward pass; a no-op unless --diagnostics-interval.
+    diagnostics = get_diagnostics()
+    if diagnostics is not None and iteration is not None:
+        diagnostics.begin_step(iteration)
+
     rerun_state_machine = get_rerun_state_machine()
     save_params_in_this_iteration = (args.save_params_interval is not None and
                                      (iteration + 1) % args.save_params_interval == 0)
@@ -2629,6 +2641,13 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         unwrapped_model = unwrap_model(model[0])
         unwrapped_model.cancel_gradients_last_layer(args.curr_iteration)
 
+    # Per-layer diagnostics. Deliberately BEFORE optimizer.step(): the clip
+    # scales the gradients in place, and the quantity worth recording is the
+    # gradient the optimizer was handed, not the one it kept.
+    if diagnostics is not None and iteration is not None:
+        diagnostics.finish_activation_pass()
+        diagnostics.collect(iteration)
+
     # Update parameters.
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
@@ -2665,6 +2684,10 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     # grad_norm and num_zeros_in_grad will be None on ranks without trainable params,
     # so we must gather across mp ranks
     grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm, group=mp_group)
+    # Every step, not just diagnostic ones: a clipping STREAK is only visible if
+    # every step is counted. Reads the already-reduced scalar, adds no collective.
+    if diagnostics is not None:
+        diagnostics.observe_clip(grad_norm)
     if args.log_num_zeros_in_grad:
         num_zeros_in_grad = reduce_max_stat_across_model_parallel_group(
             num_zeros_in_grad, group=mp_group
@@ -2838,6 +2861,14 @@ def training_log(
     )
     if learning_rate is None and args.freeze_all_layers:
         learning_rate = 0.0
+    # Per-layer diagnostics. Called on EVERY rank so the clip accumulators reset
+    # in lockstep; the writers only exist on the last rank, so everywhere else
+    # emit() collects its numbers and drops them. The data itself was produced by
+    # collectives in train_step, so every rank already holds it.
+    diagnostics = get_diagnostics()
+    if diagnostics is not None and (iteration % args.tensorboard_log_interval == 0):
+        diagnostics.emit(iteration, writer, wandb_writer)
+
     # Tensorboard values.
     if writer and (iteration % args.tensorboard_log_interval == 0):
         if wandb_writer:
