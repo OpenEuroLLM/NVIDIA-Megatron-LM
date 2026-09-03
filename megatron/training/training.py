@@ -2115,6 +2115,62 @@ def get_megatron_ddp_config(args: argparse.Namespace) -> DistributedDataParallel
         return DistributedDataParallelConfig(**kwargs)
 
 
+def reapply_adam_hyperparams_after_load(optimizer):
+    """Diagnostics branch (oellm/v0.19-jitsev1-diag): make Adam betas/eps follow the
+    arguments after a resume, and print what is in effect.
+
+    ``DistributedOptimizer.load_state_dict`` / ``torch.optim.Optimizer.load_state_dict``
+    replace every param_group entry with the checkpoint's, including ``betas`` and
+    ``eps``. Megatron re-applies only ``lr`` and ``weight_decay`` afterwards (through
+    ``OptimizerParamScheduler.step`` every iteration), so a resume with
+    ``--adam-beta1`` / ``--adam-beta2`` / ``--adam-eps`` different from the
+    checkpoint's would silently keep the checkpoint's values (Adam/FusedAdam read
+    ``group['betas']`` and ``group['eps']`` at every step). This re-applies the
+    argument values to every param group and prints, on rank 0, every group's
+    lr / weight_decay / betas / eps, so the job log proves which values are used.
+    """
+    args = get_args()
+    if optimizer is None or getattr(optimizer, 'is_stub_optimizer', False):
+        return
+    param_groups = optimizer.param_groups
+    if not param_groups:
+        print_rank_0('> adam hyperparameters after checkpoint load: no param groups on this rank')
+        return
+
+    def _num(v):
+        return float(v) if isinstance(v, torch.Tensor) else v
+
+    changed = []
+    if args.optimizer == 'adam':
+        wanted_betas = (args.adam_beta1, args.adam_beta2)
+        for idx, group in enumerate(param_groups):
+            if 'betas' in group and tuple(group['betas']) != wanted_betas:
+                changed.append(f"group {idx}: betas {tuple(group['betas'])} -> {wanted_betas}")
+                group['betas'] = wanted_betas
+            if 'eps' in group and group['eps'] != args.adam_eps:
+                changed.append(f"group {idx}: eps {group['eps']} -> {args.adam_eps}")
+                group['eps'] = args.adam_eps
+    for idx, group in enumerate(param_groups):
+        print_rank_0(
+            f"> adam hyperparameters after checkpoint load: param_group {idx}: "
+            f"n_params={len(group.get('params', []))} lr={_num(group.get('lr'))} "
+            f"max_lr={group.get('max_lr')} min_lr={group.get('min_lr')} "
+            f"weight_decay={_num(group.get('weight_decay'))} wd_mult={group.get('wd_mult')} "
+            f"betas={group.get('betas')} eps={group.get('eps')}"
+        )
+    if changed:
+        print_rank_0(
+            '> adam hyperparameters re-applied from the arguments, checkpoint values '
+            'overridden: ' + '; '.join(changed)
+        )
+    else:
+        print_rank_0(
+            '> adam hyperparameters: checkpoint values equal the arguments '
+            f"(betas=({args.adam_beta1}, {args.adam_beta2}), eps={args.adam_eps}); "
+            'nothing re-applied'
+        )
+
+
 def setup_model_and_optimizer(
     model_type,
     model_provider_func=None,
@@ -2322,6 +2378,9 @@ def setup_model_and_optimizer(
                 'load_checkpoint_time': timers('load-checkpoint').active_time(),
             }
         )
+        # Diagnostics branch: betas/eps come back from the checkpoint's param_groups;
+        # re-apply the arguments and log every group's hyperparameters (see the helper).
+        reapply_adam_hyperparams_after_load(optimizer)
     else:
         args.iteration = 0
         args.num_floating_point_operations_so_far = 0
