@@ -2728,6 +2728,17 @@ def _add_regularization_args(parser):
                        'weight (as OLMo 2/3 do), or a fraction for weaker decay. Biases are '
                        'always excluded. Together with --qk-layernorm-wd-mult this generalises '
                        '--apply-wd-to-qk-layernorm, so they are mutually exclusive with it.')
+    group.add_argument('--embedding-wd-mult', type=float, default=1.0,
+                       help='Multiplier on --weight-decay for the word-embedding matrix (2-D param '
+                       'whose name contains word_embeddings). Default 1.0 = decay like every other '
+                       'weight. 0.0 excludes the embeddings from weight decay as OLMo 2/3 and '
+                       'Levanter/Marin do (decay erodes the rows of rare tokens). The untied '
+                       'output layer is not affected.')
+    group.add_argument('--allow-new-param-groups-on-load', action='store_true',
+                       help='When the loaded optimizer checkpoint has no param_group matching a '
+                       'current group (a multiplier enabled mid-run creates a new group), load '
+                       'the new group from the structurally equivalent saved group and keep the '
+                       'current overrides instead of raising.')
     group.add_argument('--clip-grad', type=float, default=1.0,
                        help='Gradient clipping based on global L2 norm.')
     group.add_argument('--adam-beta1', type=float, default=0.9,

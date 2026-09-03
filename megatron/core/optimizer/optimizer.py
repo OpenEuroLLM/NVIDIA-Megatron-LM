@@ -118,6 +118,40 @@ def _multi_tensor_copy_this_to_that(
 # on every param_group at construction time. They aren't part of ``ParamGroupOverride``
 # (users don't override them directly; they're implied by ``decoupled_lr`` config and
 # expert-parallel sharding), so we list them explicitly.
+_STRUCTURAL_GROUP_KEYS = ("lr_mult", "is_expert_parallel", "is_decoupled_lr")
+
+
+def _structural_identifier(group: dict) -> tuple:
+    """The identifier restricted to the structural keys (see
+    ``OptimizerConfig.allow_new_param_groups_on_load``)."""
+    return tuple(group.get(k, group.get(f"pre_{k}")) for k in _STRUCTURAL_GROUP_KEYS)
+
+
+def fallback_saved_param_group(current_group: dict, saved_groups) -> Optional[dict]:
+    """Saved param_group to load a NEW current group from: same structural keys, and among those
+    the one sharing the most identifier fields with the current group. Returns None if no saved
+    group is structurally equivalent. The caller keeps the current group's override fields."""
+    cands = [g for g in saved_groups if _structural_identifier(g) == _structural_identifier(current_group)]
+    if not cands:
+        return None
+
+    def score(g):
+        return sum(1 for k in param_group_identifier_keys if g.get(k, g.get(f"pre_{k}")) == current_group.get(k, current_group.get(f"pre_{k}")))
+
+    return max(cands, key=score)
+
+
+def merge_new_param_group(current_group: dict, saved_group: dict) -> dict:
+    """Saved group's state fields with the current group's override fields (wd_mult, max_lr, ...)."""
+    merged = dict(saved_group)
+    for k in param_group_identifier_keys:
+        if k in current_group:
+            merged[k] = current_group[k]
+        elif f"pre_{k}" in current_group:
+            merged[f"pre_{k}"] = current_group[f"pre_{k}"]
+    return merged
+
+
 def _param_group_override_keys() -> tuple[str, ...]:
     """Return every field declared on ``ParamGroupOverride``.
 
@@ -592,7 +626,7 @@ class MegatronOptimizer(ABC):
 
     @staticmethod
     def _filter_and_reorder_param_groups(
-        current_groups: List[Dict], state_dict_groups: List[Dict]
+        current_groups: List[Dict], state_dict_groups: List[Dict], allow_new_groups: bool = False
     ) -> List[Dict]:
         """Pair each current param_group with its saved counterpart by identifier tuple.
 
@@ -634,7 +668,19 @@ class MegatronOptimizer(ABC):
         loaded_groups_map = {_identifier_for(group): group for group in state_dict_groups}
 
         final_groups = []
-        for key, params in zip(needed_groups, params_in_state_dict_order):
+        for idx, (key, params) in enumerate(zip(needed_groups, params_in_state_dict_order)):
+            if key not in loaded_groups_map and allow_new_groups:
+                saved = fallback_saved_param_group(current_groups[idx], state_dict_groups)
+                if saved is not None:
+                    logger.warning(
+                        "param_group %s not in the checkpoint; loading it from the structurally "
+                        "equivalent saved group %s and keeping the current overrides "
+                        "(allow_new_param_groups_on_load)", key, _identifier_for(saved)
+                    )
+                    group = merge_new_param_group(current_groups[idx], saved)
+                    group['params'] = params
+                    final_groups.append(group)
+                    continue
             if key not in loaded_groups_map:
                 available_keys = '\n'.join(str(k) for k in loaded_groups_map.keys())
                 raise ValueError(
@@ -1200,7 +1246,8 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
 
         # Filter and reorder param groups to match current optimizer
         state_dict[optimizer_key]['param_groups'] = self._filter_and_reorder_param_groups(
-            self.optimizer.param_groups, state_dict[optimizer_key]['param_groups']
+            self.optimizer.param_groups, state_dict[optimizer_key]['param_groups'],
+            allow_new_groups=getattr(self.config, 'allow_new_param_groups_on_load', False),
         )
         self.optimizer.load_state_dict(state_dict[optimizer_key])
 
@@ -1348,7 +1395,8 @@ class FP32Optimizer(MegatronOptimizer):
 
         # Filter and reorder param groups to match current optimizer
         state_dict['param_groups'] = self._filter_and_reorder_param_groups(
-            self.optimizer.param_groups, state_dict['param_groups']
+            self.optimizer.param_groups, state_dict['param_groups'],
+            allow_new_groups=getattr(self.config, 'allow_new_param_groups_on_load', False),
         )
         self.optimizer.load_state_dict(state_dict)
 

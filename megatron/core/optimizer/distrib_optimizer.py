@@ -67,6 +67,8 @@ from .optimizer import (
     MixedPrecisionOptimizer,
     _zero_grad_group_helper,
     copy_optimizer_param_metadata,
+    fallback_saved_param_group,
+    merge_new_param_group,
     param_group_identifier_keys,
 )
 from .optimizer_config import OptimizerConfig
@@ -966,9 +968,28 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         state_dict_param_groups = []
         for inner_param_group in inner_state_dict["param_groups"]:
             needed_groups = make_needed_groups(inner_param_group)
-            state_dict_param_groups.append(
-                {**param_groups_map[needed_groups], "params": inner_param_group['params']}
-            )
+            if needed_groups not in param_groups_map:
+                saved = None
+                if getattr(self.config, 'allow_new_param_groups_on_load', False):
+                    saved = fallback_saved_param_group(
+                        inner_param_group, state_dict["optimizer"]["param_groups"]
+                    )
+                if saved is None:
+                    raise KeyError(
+                        f"param_group {needed_groups} not found in the checkpoint "
+                        f"(identifier keys {param_group_identifier_keys}; available: "
+                        f"{list(param_groups_map.keys())}). A group added mid-run (e.g. "
+                        f"embedding_wd_mult) needs --allow-new-param-groups-on-load."
+                    )
+                logger.warning(
+                    "param_group %s not in the checkpoint; loading it from the structurally "
+                    "equivalent saved group %s and keeping the current overrides "
+                    "(allow_new_param_groups_on_load)", needed_groups, make_needed_groups(saved)
+                )
+                merged = merge_new_param_group(inner_param_group, saved)
+            else:
+                merged = param_groups_map[needed_groups]
+            state_dict_param_groups.append({**merged, "params": inner_param_group['params']})
 
         # Allocate or retrieve optimizer state (i.e., tensors).
         if len(self.optimizer.state) == 0:
