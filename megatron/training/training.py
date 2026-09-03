@@ -167,6 +167,7 @@ from .activation_logging import (
 from .async_utils import maybe_finalize_async_save
 from .dgrad_logging import disable_dgrad_logging, enable_dgrad_logging, save_dgrads
 from .diagnostics import get_diagnostics, setup_diagnostics
+from .te_debug import attach_te_debug, init_te_debug, te_debug_step
 from .global_vars import (
     destroy_global_vars,
     get_args,
@@ -1194,6 +1195,10 @@ def pretrain(
     args = get_args()
     timers = get_timers()
 
+    # Opt-in TE tensor inspection (--te-debug-config). Must precede model
+    # construction: TE reads the inspect state when its modules are built.
+    init_te_debug(args)
+
     if args.fine_grained_activation_offloading:
         from megatron.core.pipeline_parallel.utils import set_ideal_affinity_for_current_gpu
         set_ideal_affinity_for_current_gpu()
@@ -1334,6 +1339,9 @@ def pretrain(
     # activation hooks. Constructing it is free when --diagnostics-interval is 0,
     # and setup() returns immediately in that case.
     setup_diagnostics(args).setup(model, optimizer)
+    # TE inspect: name the modules (global layer numbers) and align its step
+    # counter with the resumed iteration. No-op without --te-debug-config.
+    attach_te_debug(model, getattr(args, "iteration", 0) or 0)
 
     # Build a separate inference model for RL if requested.
     inference_model = None
@@ -4090,6 +4098,8 @@ def train(
                 pg_collection=pg_collection,
                 p2p_communicator=p2p_communicator,
             )
+            # TE inspect: reduce and flush the per-step feature buffers.
+            te_debug_step()
             ft_integration.on_training_step_end()
             if _maybe_raise_workload_exception is not None and iteration != start_iteration:
                 _maybe_raise_workload_exception()

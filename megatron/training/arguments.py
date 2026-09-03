@@ -2686,6 +2686,14 @@ def _add_diagnostics_args(parser):
                             'scale of the GEMM input, weight and output gradient of the '
                             'four TE GEMMs of every layer. Empty under recipes without '
                             'per-tensor state (blockwise, mxfp8) and for bf16 layers.')
+    group.add_argument('--te-debug-config', type=str, default=None,
+                       help='nvdlfw_inspect feature YAML applied to every Transformer '
+                            'Engine module (LogTensorStats, LogFp8TensorStats, ...). '
+                            'Writes PER-RANK statistics files, so use it only on small '
+                            'probes (<= 16 nodes). See megatron/training/te_debug.py.')
+    group.add_argument('--te-debug-log-dir', type=str, default=None,
+                       help='Directory for the nvdlfw_inspect logs; defaults to '
+                            '<tensorboard-dir>/te_debug.')
 
     return parser
 
