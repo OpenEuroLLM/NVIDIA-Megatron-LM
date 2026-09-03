@@ -2675,6 +2675,17 @@ def _add_diagnostics_args(parser):
                             'mean/min/max of the pre-clip total norm -- the clip '
                             'denominator -- over the logging interval. Free, and '
                             'independent of --diagnostics-interval.')
+    group.add_argument('--diag-weight-stats', action='store_true',
+                       help='Log min/max/mean/rms of every linear_qkv / linear_proj / '
+                            'linear_fc1 / linear_fc2 weight matrix per layer, plus the '
+                            'embedding and output layer. One pass over the local weight '
+                            'shards and three small all-reduces over the model-parallel '
+                            'group on a diagnostic iteration.')
+    group.add_argument('--diag-fp8-meta', action='store_true',
+                       help='Log the FP8 delayed-scaling window-max amax and current '
+                            'scale of the GEMM input, weight and output gradient of the '
+                            'four TE GEMMs of every layer. Empty under recipes without '
+                            'per-tensor state (blockwise, mxfp8) and for bf16 layers.')
 
     return parser
 

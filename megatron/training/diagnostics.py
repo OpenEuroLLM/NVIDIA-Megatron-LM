@@ -67,9 +67,29 @@ N_GAIN_STATS = 4  # mean, std, min, max
 # Extra (non per-layer) grad-norm buckets, appended after the per-layer slots.
 GRAD_EXTRAS = ("embedding", "output_layer", "final_norm", "other")
 
-# Activation slots per layer: the input (qkv) norm and the pre-MLP norm.
-ACT_SLOTS_PER_LAYER = 2
+# Activation slots per layer: the inputs of the input (qkv) norm and of the
+# pre-MLP norm (= the residual stream at layer entry / after attention), plus the
+# two GEMM inputs that NO norm bounds: the attention output entering linear_proj
+# and the SwiGLU output entering linear_fc2. Those two are where activation
+# growth shows up first (they grew from iteration 4,000 on the 32B flagship while
+# every norm-bounded input stayed flat).
+ACT_SLOT_NAMES = ("input_norm", "pre_mlp_norm", "attn_out", "mlp_act")
+ACT_SLOTS_PER_LAYER = len(ACT_SLOT_NAMES)
 N_ACT_STATS = 3  # rms denominator, mean, non-finite count
+N_ACT_HI = 2  # abs max, max (reduced with MAX); min is reduced separately with MIN
+
+# Weight families, per layer, plus the two big non-layer matrices. Stats are
+# min / max / mean / rms of the FULL (TP-gathered) matrix.
+WEIGHT_FAMILIES = ("linear_qkv", "linear_proj", "linear_fc1", "linear_fc2")
+WEIGHT_EXTRAS = ("embedding", "output_layer")
+N_WEIGHT_SUMS = 3  # sum, sum of squares, count
+
+# FP8 delayed-scaling metadata of the four TE GEMM modules of every layer:
+# window-max amax and current scale of the GEMM input, the weight and the
+# output gradient. Empty (all zero) under recipes that keep no per-tensor state
+# (blockwise, mxfp8) and for layers running in bf16.
+FP8_MODULES = ("linear_qkv", "linear_proj", "linear_fc1", "linear_fc2")
+FP8_STATS = ("amax_in", "amax_w", "amax_g", "scale_in", "scale_w", "scale_g")
 
 
 def _classify_gain(name: str) -> str | None:
@@ -122,6 +142,8 @@ class TrainingDiagnostics:
         self.want_grads = self.enabled and getattr(args, "diag_layer_grad_norms", False)
         self.want_nonfinite = self.enabled and getattr(args, "diag_nonfinite", False)
         self.want_acts = self.enabled and getattr(args, "diag_activations", False)
+        self.want_weights = self.enabled and getattr(args, "diag_weight_stats", False)
+        self.want_fp8 = self.enabled and getattr(args, "diag_fp8_meta", False)
         # Clip tracking is independent of `interval`: a STREAK can only be counted
         # by looking at every step. It is also free — it reads a scalar training
         # has already computed and does no collective of its own.
@@ -141,7 +163,18 @@ class TrainingDiagnostics:
         self._gain_buf: torch.Tensor | None = None
         self._grad_buf: torch.Tensor | None = None
         self._act_buf: torch.Tensor | None = None
+        self._act_hi: torch.Tensor | None = None  # [slots, N_ACT_HI]: abs max, max
+        self._act_lo: torch.Tensor | None = None  # [slots]: min
         self._nonfinite_buf: torch.Tensor | None = None
+        self._w_sum: torch.Tensor | None = None  # [slots, N_WEIGHT_SUMS]
+        self._w_min: torch.Tensor | None = None  # [slots]
+        self._w_max: torch.Tensor | None = None  # [slots]
+        self._fp8_amax: torch.Tensor | None = None  # [slots, 3]: input, weight, grad
+        self._fp8_scale: torch.Tensor | None = None  # [slots, 3]
+        # (param, weight_slot) for every 2-D+ weight this rank holds a shard of
+        self._weight_params: List[Tuple[torch.nn.Parameter, int]] = []
+        # (te_module, fp8_slot) for the four GEMM modules of every layer this rank owns
+        self._fp8_modules: List[Tuple[torch.nn.Module, int]] = []
 
         # --- static maps, built once in setup() -------------------------------
         # (param, gain_slot) for every norm gain this rank owns
@@ -158,6 +191,8 @@ class TrainingDiagnostics:
         self._have_grads = False
         self._have_acts = False
         self._have_nonfinite = False
+        self._have_weights = False
+        self._have_fp8 = False
 
         # Set in setup(), once mpu and the optimizer exist. See _build_grad_map.
         self._grad_replica_factor = 1.0
@@ -179,7 +214,16 @@ class TrainingDiagnostics:
         self._grad_buf = torch.zeros(n_grad_slots, dtype=torch.float32, device=dev)
         self._act_buf = torch.zeros(n_act_slots, N_ACT_STATS, dtype=torch.float32, device=dev)
         self._act_seen = torch.zeros(n_act_slots, dtype=torch.float32, device=dev)
+        self._act_hi = torch.full((n_act_slots, N_ACT_HI), float("-inf"), dtype=torch.float32, device=dev)
+        self._act_lo = torch.full((n_act_slots,), float("inf"), dtype=torch.float32, device=dev)
         self._nonfinite_buf = torch.zeros(2, dtype=torch.float32, device=dev)
+        n_weight_slots = len(WEIGHT_FAMILIES) * self.num_layers + len(WEIGHT_EXTRAS)
+        self._w_sum = torch.zeros(n_weight_slots, N_WEIGHT_SUMS, dtype=torch.float32, device=dev)
+        self._w_min = torch.full((n_weight_slots,), float("inf"), dtype=torch.float32, device=dev)
+        self._w_max = torch.full((n_weight_slots,), float("-inf"), dtype=torch.float32, device=dev)
+        n_fp8_slots = len(FP8_MODULES) * self.num_layers
+        self._fp8_amax = torch.zeros(n_fp8_slots, 3, dtype=torch.float32, device=dev)
+        self._fp8_scale = torch.zeros(n_fp8_slots, 3, dtype=torch.float32, device=dev)
 
         global_layer = self._build_global_layer_map(model)
 
@@ -195,11 +239,19 @@ class TrainingDiagnostics:
                     if family is not None:
                         self._gain_params.append((param, self._gain_slot(family, layer)))
 
+                if self.want_weights and param.dim() >= 2:
+                    wslot = self._weight_slot(name, layer)
+                    if wslot is not None:
+                        self._weight_params.append((param, wslot))
+
         if self.want_grads:
             self._build_grad_map(model, optimizer, slot_of)
 
         if self.want_acts:
             self._install_activation_hooks(model)
+
+        if self.want_fp8:
+            self._build_fp8_map(model)
 
     def _build_grad_map(self, model, optimizer, slot_of: Dict[int, int]):
         """Decide which piece of which gradient this rank is allowed to count.
@@ -305,6 +357,41 @@ class TrainingDiagnostics:
             return min(layer, self.num_layers - 1)
         return self.num_layers + GRAD_EXTRAS.index(_classify_grad_bucket(name))
 
+    def _weight_slot(self, name: str, layer: int | None) -> int | None:
+        """Slot of a 2-D weight, or None for matrices we do not track (e.g. MoE)."""
+        if layer is not None:
+            for fi, family in enumerate(WEIGHT_FAMILIES):
+                if name.endswith(f"{family}.weight"):
+                    return fi * self.num_layers + min(layer, self.num_layers - 1)
+            return None
+        base = len(WEIGHT_FAMILIES) * self.num_layers
+        if "word_embeddings" in name:
+            return base + WEIGHT_EXTRAS.index("embedding")
+        if "output_layer" in name:
+            return base + WEIGHT_EXTRAS.index("output_layer")
+        return None
+
+    def _build_fp8_map(self, model):
+        """(module, slot) for the four TE GEMM modules of every layer on this rank."""
+        from megatron.core.transformer.transformer_layer import TransformerLayer
+
+        for chunk in model:
+            for module in chunk.modules():
+                if not isinstance(module, TransformerLayer):
+                    continue
+                li = min(max(int(module.layer_number) - 1, 0), self.num_layers - 1)
+                for mi, (parent, child) in enumerate(
+                    (
+                        ("self_attention", "linear_qkv"),
+                        ("self_attention", "linear_proj"),
+                        ("mlp", "linear_fc1"),
+                        ("mlp", "linear_fc2"),
+                    )
+                ):
+                    m = getattr(getattr(module, parent, None), child, None)
+                    if m is not None and hasattr(m, "fp8_meta"):
+                        self._fp8_modules.append((m, mi * self.num_layers + li))
+
     def _install_activation_hooks(self, model):
         """Hook the modules that normalise the residual stream.
 
@@ -338,6 +425,11 @@ class TrainingDiagnostics:
                 self._act_buf[slot, 0] = xf.pow(2).mean()
                 self._act_buf[slot, 1] = xf.mean()
                 self._act_buf[slot, 2] = (~finite).sum().float()
+                # Extremes: exact under MAX/MIN reduction across the ranks that
+                # share the layer (different microbatches / sequence slices).
+                self._act_hi[slot, 0] = xf.abs().max()
+                self._act_hi[slot, 1] = xf.max()
+                self._act_lo[slot] = xf.min()
 
             return hook
 
@@ -375,6 +467,15 @@ class TrainingDiagnostics:
                     if target is not None:
                         slot = ACT_SLOTS_PER_LAYER * li + off
                         self._hooks.append(target.register_forward_pre_hook(make_hook(slot)))
+                # The two norm-free GEMM inputs: attention output -> linear_proj,
+                # SwiGLU output -> linear_fc2. Plain pre-hooks on the GEMM modules.
+                for off, (parent, child) in enumerate(
+                    (("self_attention", "linear_proj"), ("mlp", "linear_fc2")), start=2
+                ):
+                    target = getattr(getattr(module, parent, None), child, None)
+                    if target is not None and isinstance(target, torch.nn.Module):
+                        slot = ACT_SLOTS_PER_LAYER * li + off
+                        self._hooks.append(target.register_forward_pre_hook(make_hook(slot)))
 
         for chunk in model:
             mod = chunk
@@ -400,6 +501,8 @@ class TrainingDiagnostics:
         if self._is_diag_iter and self.want_acts and self._act_seen is not None:
             self._act_seen.zero_()
             self._act_buf.zero_()
+            self._act_hi.fill_(float("-inf"))
+            self._act_lo.fill_(float("inf"))
 
     def observe_clip(self, grad_norm):
         """Runs EVERY step. Records whether the clip fired and how long a run of
@@ -441,6 +544,68 @@ class TrainingDiagnostics:
             self._collect_grad_norms()
         if self.want_nonfinite:
             self._collect_nonfinite()
+        if self.want_weights:
+            self._collect_weights()
+        if self.want_fp8:
+            self._collect_fp8_meta()
+
+    def _collect_weights(self):
+        """min / max / sum / sum-of-squares / count of every tracked weight matrix.
+
+        Weight matrices are SHARDED across TP, PARTITIONED across PP and
+        REPLICATED across DP/CP (the bf16 model copy is complete on every DP rank
+        even under the distributed optimizer). Reducing over the model-parallel
+        group -- all TP x PP ranks of ONE data-parallel replica -- therefore sees
+        every element exactly once: SUM for the sums, MIN/MAX for the extremes.
+        """
+        self._w_sum.zero_()
+        self._w_min.fill_(float("inf"))
+        self._w_max.fill_(float("-inf"))
+        for param, slot in self._weight_params:
+            v = param.detach().float()
+            self._w_sum[slot, 0] += v.sum()
+            self._w_sum[slot, 1] += v.pow(2).sum()
+            self._w_sum[slot, 2] += float(v.numel())
+            self._w_min[slot] = torch.minimum(self._w_min[slot], v.min())
+            self._w_max[slot] = torch.maximum(self._w_max[slot], v.max())
+        group = mpu.get_model_parallel_group()
+        torch.distributed.all_reduce(self._w_sum, op=torch.distributed.ReduceOp.SUM, group=group)
+        torch.distributed.all_reduce(self._w_min, op=torch.distributed.ReduceOp.MIN, group=group)
+        torch.distributed.all_reduce(self._w_max, op=torch.distributed.ReduceOp.MAX, group=group)
+        self._have_weights = True
+
+    def _collect_fp8_meta(self):
+        """Window-max amax and current scale of every FP8 GEMM operand, per layer.
+
+        Only the delayed-scaling recipe keeps this state (`fp8_meta["scaling_fwd"]`
+        / `["scaling_bwd"]`); under blockwise/mxfp8 every slot stays zero and the
+        emitter skips it. `amax_history.amax(0)` is the window maximum -- the
+        quantity `--fp8-amax-compute-algo max` derives the scale from -- so it is
+        well defined whatever TE's roll order is. TE already reduces amax across
+        its amax group each iteration; MAX (amax) / MIN (scale) over the world is
+        idempotent on that and makes the result layout-independent.
+        """
+        self._fp8_amax.zero_()
+        self._fp8_scale.fill_(float("inf"))
+        for module, slot in self._fp8_modules:
+            meta = getattr(module, "fp8_meta", None)
+            if not meta or "scaling_fwd" not in meta:
+                continue
+            fwd = meta["scaling_fwd"]
+            hist, scale = fwd.amax_history, fwd.scale
+            if hist.ndim == 2 and hist.shape[1] >= 2 and scale.numel() >= 2:
+                wmax = hist.amax(dim=0)
+                self._fp8_amax[slot, 0] = wmax[0]  # GEMM input
+                self._fp8_amax[slot, 1] = wmax[1]  # weight
+                self._fp8_scale[slot, 0] = scale[0]
+                self._fp8_scale[slot, 1] = scale[1]
+            bwd = meta.get("scaling_bwd")
+            if bwd is not None and bwd.amax_history.ndim == 2 and bwd.amax_history.shape[1] >= 1:
+                self._fp8_amax[slot, 2] = bwd.amax_history.amax(dim=0)[0]  # output gradient
+                self._fp8_scale[slot, 2] = bwd.scale[0]
+        torch.distributed.all_reduce(self._fp8_amax, op=torch.distributed.ReduceOp.MAX)
+        torch.distributed.all_reduce(self._fp8_scale, op=torch.distributed.ReduceOp.MIN)
+        self._have_fp8 = True
 
     def _collect_gains(self):
         self._gain_buf.zero_()
@@ -532,6 +697,8 @@ class TrainingDiagnostics:
             or self._have_grads
             or self._have_acts
             or self._have_nonfinite
+            or self._have_weights
+            or self._have_fp8
             or (self.want_clip and self._clip_steps > 0)
         ):
             return {}
@@ -609,21 +776,80 @@ class TrainingDiagnostics:
 
         if self._have_acts:
             a = self._act_buf.cpu()
+            hi = self._act_hi.cpu()
+            lo = self._act_lo.cpu()
+
+            def act_logs(prefix: str, slot: int):
+                row = a[slot]
+                if float(row.abs().sum()) == 0.0:
+                    return
+                # col 0 holds the MEAN SQUARE; the RMSNorm denominator is its root.
+                logs[f"{prefix}/rms_denom"] = float(row[0].clamp_min(0).sqrt())
+                logs[f"{prefix}/mean"] = float(row[1])
+                if torch.isfinite(hi[slot, 0]):
+                    logs[f"{prefix}/absmax"] = float(hi[slot, 0])
+                    logs[f"{prefix}/max"] = float(hi[slot, 1])
+                    logs[f"{prefix}/min"] = float(lo[slot])
+
             for li in range(self.num_layers):
-                for off, tag in ((0, "input_norm"), (1, "pre_mlp_norm")):
-                    row = a[ACT_SLOTS_PER_LAYER * li + off]
-                    if float(row.abs().sum()) == 0.0:
-                        continue
-                    p = f"diag/act/{tag}/layer_{li:02d}"
-                    # col 0 holds the MEAN SQUARE; the RMSNorm denominator is its root.
-                    logs[f"{p}/rms_denom"] = float(row[0].clamp_min(0).sqrt())
-                    logs[f"{p}/mean"] = float(row[1])
-            final = a[ACT_SLOTS_PER_LAYER * self.num_layers]
-            if float(final.abs().sum()) != 0.0:
-                logs["diag/act/final_norm/rms_denom"] = float(final[0].clamp_min(0).sqrt())
-                logs["diag/act/final_norm/mean"] = float(final[1])
+                for off, tag in enumerate(ACT_SLOT_NAMES):
+                    act_logs(f"diag/act/{tag}/layer_{li:02d}", ACT_SLOTS_PER_LAYER * li + off)
+            act_logs("diag/act/final_norm", ACT_SLOTS_PER_LAYER * self.num_layers)
+            # Alarm-able summaries: the largest activation anywhere, and where.
+            for off, tag in enumerate(ACT_SLOT_NAMES):
+                col = hi[off : ACT_SLOTS_PER_LAYER * self.num_layers : ACT_SLOTS_PER_LAYER, 0]
+                if torch.isfinite(col).any():
+                    finite = torch.where(torch.isfinite(col), col, torch.full_like(col, float("-inf")))
+                    logs[f"diag/act/{tag}/absmax_over_layers"] = float(finite.max())
+                    logs[f"diag/act/{tag}/argmax_layer"] = float(finite.argmax())
             logs["diag/act/nonfinite"] = float(a[:, 2].sum())
             self._have_acts = False
+
+        if self._have_weights:
+            s = self._w_sum.cpu()
+            wmin = self._w_min.cpu()
+            wmax = self._w_max.cpu()
+
+            def weight_logs(prefix: str, slot: int):
+                n = float(s[slot, 2])
+                if n <= 0.0:
+                    return
+                logs[f"{prefix}/min"] = float(wmin[slot])
+                logs[f"{prefix}/max"] = float(wmax[slot])
+                logs[f"{prefix}/mean"] = float(s[slot, 0] / n)
+                logs[f"{prefix}/rms"] = float((s[slot, 1] / n).clamp_min(0).sqrt())
+
+            for fi, family in enumerate(WEIGHT_FAMILIES):
+                absmax_per_layer = []
+                for li in range(self.num_layers):
+                    slot = fi * self.num_layers + li
+                    weight_logs(f"diag/weight/{family}/layer_{li:02d}", slot)
+                    if float(s[slot, 2]) > 0.0:
+                        absmax_per_layer.append((max(abs(float(wmin[slot])), abs(float(wmax[slot]))), li))
+                if absmax_per_layer:
+                    top = max(absmax_per_layer)
+                    logs[f"diag/weight/{family}/absmax_over_layers"] = top[0]
+                    logs[f"diag/weight/{family}/argmax_layer"] = float(top[1])
+            base = len(WEIGHT_FAMILIES) * self.num_layers
+            for ei, extra in enumerate(WEIGHT_EXTRAS):
+                weight_logs(f"diag/weight/{extra}", base + ei)
+            self._have_weights = False
+
+        if self._have_fp8:
+            am = self._fp8_amax.cpu()
+            sc = self._fp8_scale.cpu()
+            for mi, module in enumerate(FP8_MODULES):
+                for li in range(self.num_layers):
+                    slot = mi * self.num_layers + li
+                    if float(am[slot].abs().sum()) == 0.0:
+                        continue  # bf16 layer, or a recipe without per-tensor state
+                    p = f"diag/fp8/{module}/layer_{li:02d}"
+                    for k, stat in enumerate(FP8_STATS[:3]):
+                        logs[f"{p}/{stat}"] = float(am[slot, k])
+                    for k, stat in enumerate(FP8_STATS[3:]):
+                        if torch.isfinite(sc[slot, k]):
+                            logs[f"{p}/{stat}"] = float(sc[slot, k])
+            self._have_fp8 = False
 
         if self._have_nonfinite:
             logs["diag/nonfinite/weight"] = float(self._nonfinite_buf[0].item())
@@ -664,6 +890,8 @@ class TrainingDiagnostics:
         """
         if not (self._is_diag_iter and self.want_acts):
             return
+        torch.distributed.all_reduce(self._act_hi, op=torch.distributed.ReduceOp.MAX)
+        torch.distributed.all_reduce(self._act_lo, op=torch.distributed.ReduceOp.MIN)
         torch.distributed.all_reduce(self._act_buf, op=torch.distributed.ReduceOp.SUM)
         contributors = max(
             1, torch.distributed.get_world_size() // mpu.get_pipeline_model_parallel_world_size()
