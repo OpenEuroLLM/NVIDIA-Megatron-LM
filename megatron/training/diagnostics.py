@@ -592,7 +592,13 @@ class TrainingDiagnostics:
             if not meta or "scaling_fwd" not in meta:
                 continue
             fwd = meta["scaling_fwd"]
-            hist, scale = fwd.amax_history, fwd.scale
+            # Only DelayedScalingRecipeState carries amax_history/scale; the
+            # blockwise / mxfp8 recipe states exist but have neither
+            # (job 1630631: AttributeError on Float8BlockScalingRecipeState).
+            hist = getattr(fwd, "amax_history", None)
+            scale = getattr(fwd, "scale", None)
+            if hist is None or scale is None:
+                continue
             if hist.ndim == 2 and hist.shape[1] >= 2 and scale.numel() >= 2:
                 wmax = hist.amax(dim=0)
                 self._fp8_amax[slot, 0] = wmax[0]  # GEMM input
@@ -600,9 +606,11 @@ class TrainingDiagnostics:
                 self._fp8_scale[slot, 0] = scale[0]
                 self._fp8_scale[slot, 1] = scale[1]
             bwd = meta.get("scaling_bwd")
-            if bwd is not None and bwd.amax_history.ndim == 2 and bwd.amax_history.shape[1] >= 1:
-                self._fp8_amax[slot, 2] = bwd.amax_history.amax(dim=0)[0]  # output gradient
-                self._fp8_scale[slot, 2] = bwd.scale[0]
+            bhist = getattr(bwd, "amax_history", None) if bwd is not None else None
+            bscale = getattr(bwd, "scale", None) if bwd is not None else None
+            if bhist is not None and bscale is not None and bhist.ndim == 2 and bhist.shape[1] >= 1:
+                self._fp8_amax[slot, 2] = bhist.amax(dim=0)[0]  # output gradient
+                self._fp8_scale[slot, 2] = bscale[0]
         torch.distributed.all_reduce(self._fp8_amax, op=torch.distributed.ReduceOp.MAX)
         torch.distributed.all_reduce(self._fp8_scale, op=torch.distributed.ReduceOp.MIN)
         self._have_fp8 = True
