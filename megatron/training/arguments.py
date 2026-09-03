@@ -2694,6 +2694,12 @@ def _add_diagnostics_args(parser):
     group.add_argument('--te-debug-log-dir', type=str, default=None,
                        help='Directory for the nvdlfw_inspect logs; defaults to '
                             '<tensorboard-dir>/te_debug.')
+    group.add_argument('--diag-consumed-train-samples', type=int, default=None,
+                       help='Diagnostics only: after the checkpoint load, position the '
+                            'training dataloader at this consumed-sample count instead of '
+                            'the checkpoint\'s own, so a probe can run the weights of '
+                            'iteration X on the batches of iteration Y '
+                            '(Y * global batch size). Never use for real training.')
 
     return parser
 
