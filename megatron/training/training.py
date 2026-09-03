@@ -4780,6 +4780,16 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
 
     args = get_args()
 
+    # Diagnostics-only override (--diag-consumed-train-samples): run the loaded
+    # weights on the batches of a different position of the data stream.
+    if getattr(args, "diag_consumed_train_samples", None) is not None:
+        print_rank_0(
+            f"> DIAGNOSTICS: positioning the train dataloader at consumed_train_samples="
+            f"{args.diag_consumed_train_samples} instead of the checkpoint's "
+            f"{args.consumed_train_samples}"
+        )
+        args.consumed_train_samples = int(args.diag_consumed_train_samples)
+
     (train_dataloader, valid_dataloaders, test_dataloader) = (None, None, None)
 
     print_rank_0('> building train, validation, and test datasets ...')
