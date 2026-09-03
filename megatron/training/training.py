@@ -2172,19 +2172,23 @@ def reapply_adam_hyperparams_after_load(optimizer):
 
 
 def diag_swap_from_checkpoint(model, optimizer, args, dp_cp_group=None):
-    """Checkpoint surgery for probes (--diag-swap-checkpoint DIR --diag-swap-keys PAT[,PAT...]).
+    """Checkpoint surgery for probes (--diag-swap-checkpoint DIR --diag-swap-keys SEL[,SEL...]).
 
-    After the normal checkpoint load, reload every model tensor whose CHECKPOINT key matches one of
-    the regexes from DIR (a torch_dist iter_XXXXXXX directory, or a root holding
-    latest_checkpointed_iteration.txt). The checkpoint key carries the GLOBAL layer number
-    (decoder.layers.56....) while the sharded-state-dict dictionary key is stage-local, so the
-    match is on ShardedTensor.key. Every swapped tensor is logged with its norm before, after and
-    of the difference (a self-swap gives 0), and the optimizer's master params are refreshed so an
-    lr-0 optimizer step cannot write the old values back. Every rank takes part in every
-    collective load, also with an empty selection.
+    After the normal checkpoint load, reload selected model tensors from DIR (a torch_dist
+    iter_XXXXXXX directory, or a root holding latest_checkpointed_iteration.txt). A selector is a
+    regex on the CHECKPOINT key, optionally followed by @LO-HI restricting the global layer index.
+    The transformer layers share layer-agnostic checkpoint keys (decoder.layers.mlp.linear_fc1.weight)
+    with the layer index as the first sharding axis (ShardedTensor.global_offset[0]), so
+    "^decoder[.]layers[.]@56-63" selects layers 56-63 and "^output_layer[.]weight" the output layer.
+    Selectors without a range match tensors without a layer axis too; selectors with a range only
+    tensors with one. The selections of all model chunks go into ONE collective load with the
+    coverage validation off (a partial layer range is a partial coverage by design). Every swapped
+    tensor is logged with its norm before, after and of the difference (a self swap gives 0), and
+    the optimizer's master params are refreshed so an lr-0 step cannot write the old values back.
     """
     import re
     from megatron.core import dist_checkpointing
+    from megatron.core.dist_checkpointing.mapping import ShardedTensor
     from megatron.training.checkpointing import _build_sharded_state_dict_metadata
 
     ckpt_dir = args.diag_swap_checkpoint
@@ -2193,42 +2197,70 @@ def diag_swap_from_checkpoint(model, optimizer, args, dp_cp_group=None):
         with open(tracker) as fh:
             ckpt_dir = os.path.join(ckpt_dir, f"iter_{int(fh.read().strip()):07d}")
     assert os.path.isfile(os.path.join(ckpt_dir, ".metadata")), f"no torch_dist checkpoint at {ckpt_dir}"
-    pats = [re.compile(p) for p in args.diag_swap_keys.split(",") if p]
+    selectors = []
+    for sel in args.diag_swap_keys.split(","):
+        if not sel:
+            continue
+        if "@" in sel:
+            pat, rng = sel.rsplit("@", 1)
+            lo, hi = (int(x) for x in rng.split("-"))
+            selectors.append((re.compile(pat), (lo, hi)))
+        else:
+            selectors.append((re.compile(sel), None))
     if dp_cp_group is None:
         dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
     metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=dp_cp_group)
     report = mpu.get_tensor_model_parallel_rank() == 0 and mpu.get_data_parallel_rank() == 0
     stage = mpu.get_pipeline_model_parallel_rank()
-    n_local = 0
-    for ci, chunk in enumerate(unwrap_model(model)):
+    local_layer_re = re.compile(r"(?:^|\.)layers\.(\d+)\.")
+    chunks = unwrap_model(model)
+    nested, subs, befores = {}, [], []
+    for ci, chunk in enumerate(chunks):
         ssd = chunk.sharded_state_dict(metadata=metadata)
+        # global layer index of every local layer: from any ShardedTensor of that layer whose
+        # first sharding axis is the layer axis
+        layer_of_local = {}
+        for k, v in ssd.items():
+            m = local_layer_re.search(k)
+            if m and isinstance(v, ShardedTensor) and getattr(v, "prepend_axis_num", 0) >= 1:
+                layer_of_local.setdefault(int(m.group(1)), int(v.global_offset[0]))
         sub = {}
         for k, v in ssd.items():
             key = getattr(v, "key", None)
             if key is None or "_extra_state" in key or not torch.is_tensor(getattr(v, "data", None)):
                 continue
-            if any(p.search(key) for p in pats):
-                sub[k] = v
-        before = {k: v.data.detach().float().clone() for k, v in sub.items()}
-        loaded = dist_checkpointing.load(sub, ckpt_dir)  # collective: called on every rank, every chunk
-        if sub:
-            chunk.load_state_dict(loaded, strict=False)
-        for k, v in sub.items():
-            new = v.data.detach().float()
-            old = before[k]
+            m = local_layer_re.search(k)
+            layer = layer_of_local.get(int(m.group(1))) if m else None
+            for pat, rng in selectors:
+                if not pat.search(key):
+                    continue
+                if rng is None or (layer is not None and rng[0] <= layer <= rng[1]):
+                    sub[k] = v
+                    break
+        nested[f"model{ci}"] = sub
+        subs.append(sub)
+        befores.append({k: v.data.detach().float().clone() for k, v in sub.items()})
+    loaded = dist_checkpointing.load(nested, ckpt_dir, validate_access_integrity=False)
+    n_local = 0
+    for ci, chunk in enumerate(chunks):
+        if subs[ci]:
+            chunk.load_state_dict(loaded[f"model{ci}"], strict=False)
+        for k, v in subs[ci].items():
+            new, old = v.data.detach().float(), befores[ci][k]
             n_local += 1
             if report:
+                extra = f" layer {int(v.global_offset[0])}" if isinstance(v, ShardedTensor) and getattr(v, "prepend_axis_num", 0) >= 1 else ""
                 print(
-                    f"> diag swap [pp{stage} chunk{ci}] {v.key}: |before| {old.norm().item():.6g} "
+                    f"> diag swap [pp{stage} chunk{ci}] {v.key}{extra} ({k}): |before| {old.norm().item():.6g} "
                     f"|after| {new.norm().item():.6g} |after-before| {(new - old).norm().item():.6g}",
                     flush=True,
                 )
-        del before
+    del befores
     count = torch.tensor([n_local], dtype=torch.long, device=torch.cuda.current_device())
     torch.distributed.all_reduce(count)
     if torch.distributed.get_rank() == 0:
         print(f"> diag swap: {count.item()} tensor shards reloaded from {ckpt_dir} "
-              f"(patterns: {args.diag_swap_keys})", flush=True)
+              f"(selectors: {args.diag_swap_keys})", flush=True)
     assert count.item() > 0, "diag swap matched no tensor; check --diag-swap-keys"
     if optimizer is not None:
         optimizer.reload_model_params()
