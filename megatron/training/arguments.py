@@ -2705,6 +2705,15 @@ def _add_diagnostics_args(parser):
                             'every microbatch to <dir>/it<iteration>_dp<rank>_cp<rank>.npz '
                             '(TP rank 0 of the last pipeline stage). For checkpoint probes '
                             'on a fixed batch.')
+    group.add_argument('--diag-swap-checkpoint', type=str, default=None,
+                       help='Diagnostics only: after the checkpoint load, reload the model '
+                            'tensors selected by --diag-swap-keys from this torch_dist '
+                            'checkpoint (checkpoint surgery for probes).')
+    group.add_argument('--diag-swap-keys', type=str, default=None,
+                       help='Comma-separated regexes matched against the checkpoint keys '
+                            '(global layer numbering, e.g. ^output_layer[.]weight or '
+                            '^decoder[.]layers[.]5[6-9][.]) selecting the tensors to reload '
+                            'from --diag-swap-checkpoint.')
     group.add_argument('--diag-consumed-train-samples', type=int, default=None,
                        help='Diagnostics only: after the checkpoint load, position the '
                             'training dataloader at this consumed-sample count instead of '
