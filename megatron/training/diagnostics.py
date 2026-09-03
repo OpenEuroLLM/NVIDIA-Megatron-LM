@@ -144,6 +144,11 @@ class TrainingDiagnostics:
         self.want_acts = self.enabled and getattr(args, "diag_activations", False)
         self.want_weights = self.enabled and getattr(args, "diag_weight_stats", False)
         self.want_fp8 = self.enabled and getattr(args, "diag_fp8_meta", False)
+        # Output-layer logits (forward hook on the output layer; last stage only) and the
+        # per-token loss dump the checkpoint probes use on a fixed batch.
+        self.want_logits = self.enabled and getattr(args, "diag_logit_stats", False)
+        self.token_dump_dir = getattr(args, "diag_token_loss_dir", None)
+        self.want_token_dump = self.enabled and bool(self.token_dump_dir)
         # Clip tracking is independent of `interval`: a STREAK can only be counted
         # by looking at every step. It is also free — it reads a scalar training
         # has already computed and does no collective of its own.
@@ -171,6 +176,16 @@ class TrainingDiagnostics:
         self._w_max: torch.Tensor | None = None  # [slots]
         self._fp8_amax: torch.Tensor | None = None  # [slots, 3]: input, weight, grad
         self._fp8_scale: torch.Tensor | None = None  # [slots, 3]
+        # logits: [7] = sum, sum of squares, element count, sum of per-token max logit,
+        # sum of log Z, sum of (log Z)^2, token count. TP-reduced inside the hook,
+        # world-reduced in finish_activation_pass; extremes reduced with MAX / MIN.
+        self._logit_sum: torch.Tensor | None = None
+        self._logit_hi: torch.Tensor | None = None
+        self._logit_lo: torch.Tensor | None = None
+        self._tok_logz: torch.Tensor | None = None  # [b, s] of the microbatch in flight
+        self._tok_max: torch.Tensor | None = None
+        self._tok_records: List[Dict[str, "object"]] = []
+        self._have_logits = False
         # (param, weight_slot) for every 2-D+ weight this rank holds a shard of
         self._weight_params: List[Tuple[torch.nn.Parameter, int]] = []
         # (te_module, fp8_slot) for the four GEMM modules of every layer this rank owns
@@ -252,6 +267,8 @@ class TrainingDiagnostics:
 
         if self.want_fp8:
             self._build_fp8_map(model)
+        if self.want_logits or self.want_token_dump:
+            self._install_logit_hook(model)
 
     def _build_grad_map(self, model, optimizer, slot_of: Dict[int, int]):
         """Decide which piece of which gradient this rank is allowed to count.
@@ -495,6 +512,100 @@ class TrainingDiagnostics:
                 break
 
     # ------------------------------------------------------------- per-step
+    def _install_logit_hook(self, model):
+        """Forward hook on the output layer of the post-process chunk. Its output is the
+        vocab-parallel logits [s, b, V/TP]. Sums are all-reduced over TP inside the hook
+        (every TP rank runs the same forward), extremes with MAX / MIN, and the per-token
+        log Z and max logit of the microbatch are kept for `record_token_losses`. The
+        buffers exist on EVERY rank so the world reduce in finish_activation_pass matches.
+        """
+        dev = torch.cuda.current_device()
+        self._logit_sum = torch.zeros(7, dtype=torch.float64, device=dev)
+        self._logit_hi = torch.full((1,), float("-inf"), dtype=torch.float32, device=dev)
+        self._logit_lo = torch.full((1,), float("inf"), dtype=torch.float32, device=dev)
+        target = None
+        for chunk in model:
+            for name, module in chunk.named_modules():
+                if name.endswith("output_layer"):
+                    target = module
+                    break
+            if target is not None:
+                break
+        if target is None:
+            return
+        tp_group = mpu.get_tensor_model_parallel_group()
+        from megatron.core.tensor_parallel.cross_entropy import vocab_parallel_logsumexp
+
+        def hook(module, inputs, output):
+            if not self._is_diag_iter:
+                return
+            logits = output[0] if isinstance(output, (tuple, list)) else output
+            if not torch.is_tensor(logits) or logits.dim() != 3:
+                return
+            with torch.no_grad():
+                x = logits.detach()
+                tok_max = x.amax(dim=-1).float()  # [s, b] over the local vocab shard
+                torch.distributed.all_reduce(tok_max, op=torch.distributed.ReduceOp.MAX, group=tp_group)
+                logz = vocab_parallel_logsumexp(x, tp_group).float()  # [s, b], full vocab
+                self._tok_max = tok_max.transpose(0, 1).contiguous()
+                self._tok_logz = logz.transpose(0, 1).contiguous()
+                if not self.want_logits:
+                    return
+                s = torch.zeros(7, dtype=torch.float64, device=x.device)
+                for c in x.split(256, dim=0):  # bounded fp32 temporaries
+                    cf = c.float()
+                    s[0] += cf.sum(dtype=torch.float64)
+                    s[1] += cf.square().sum(dtype=torch.float64)
+                s[2] += float(x.numel())
+                torch.distributed.all_reduce(s, op=torch.distributed.ReduceOp.SUM, group=tp_group)
+                # already identical on every TP rank (TP-reduced per token): add once
+                s[3] = tok_max.sum(dtype=torch.float64)
+                s[4] = logz.sum(dtype=torch.float64)
+                s[5] = logz.square().sum(dtype=torch.float64)
+                s[6] = float(tok_max.numel())
+                self._logit_sum += s
+                hi = x.amax().float().view(1)
+                lo = x.amin().float().view(1)
+                torch.distributed.all_reduce(hi, op=torch.distributed.ReduceOp.MAX, group=tp_group)
+                torch.distributed.all_reduce(lo, op=torch.distributed.ReduceOp.MIN, group=tp_group)
+                self._logit_hi = torch.maximum(self._logit_hi, hi)
+                self._logit_lo = torch.minimum(self._logit_lo, lo)
+
+        self._hooks.append(target.register_forward_hook(hook))
+
+    def record_token_losses(self, labels, losses, loss_mask):
+        """Called from the loss function on the last pipeline stage with the per-token CE
+        losses [b, s] of one microbatch. Kept on TP rank 0 (all TP ranks hold the same
+        loss) together with the log Z / max logit the output-layer hook captured for the
+        same microbatch; written by `collect` at the end of the iteration."""
+        if not (self.want_token_dump and self._is_diag_iter):
+            return
+        if mpu.get_tensor_model_parallel_rank() != 0:
+            return
+        rec = {
+            "labels": labels.detach().to(torch.int32).cpu().numpy(),
+            "loss": losses.detach().float().cpu().numpy(),
+            "mask": loss_mask.detach().to(torch.uint8).cpu().numpy(),
+        }
+        if self._tok_logz is not None and tuple(self._tok_logz.shape) == tuple(rec["loss"].shape):
+            rec["logz"] = self._tok_logz.cpu().numpy()
+            rec["maxlogit"] = self._tok_max.cpu().numpy()
+        self._tok_records.append(rec)
+
+    def _write_token_dump(self, iteration: int):
+        import os
+        import numpy as np
+
+        os.makedirs(self.token_dump_dir, exist_ok=True)
+        keys = [k for k in self._tok_records[0] if all(k in r for r in self._tok_records)]
+        arrays = {k: np.concatenate([r[k] for r in self._tok_records], axis=0) for k in keys}
+        name = (
+            f"it{iteration:07d}_dp{mpu.get_data_parallel_rank():04d}"
+            f"_cp{mpu.get_context_parallel_rank():02d}.npz"
+        )
+        np.savez(os.path.join(self.token_dump_dir, name), iteration=np.int64(iteration), **arrays)
+        self._tok_records = []
+
     def begin_step(self, iteration: int):
         """Arm or disarm the activation hooks for this iteration."""
         self._is_diag_iter = self.enabled and (iteration % self.interval == 0)
@@ -503,6 +614,13 @@ class TrainingDiagnostics:
             self._act_buf.zero_()
             self._act_hi.fill_(float("-inf"))
             self._act_lo.fill_(float("inf"))
+        if self._is_diag_iter and self._logit_sum is not None:
+            self._logit_sum.zero_()
+            self._logit_hi.fill_(float("-inf"))
+            self._logit_lo.fill_(float("inf"))
+        self._tok_records = []
+        self._tok_logz = None
+        self._tok_max = None
 
     def observe_clip(self, grad_norm):
         """Runs EVERY step. Records whether the clip fired and how long a run of
@@ -546,6 +664,8 @@ class TrainingDiagnostics:
             self._collect_nonfinite()
         if self.want_weights:
             self._collect_weights()
+        if self.want_token_dump and self._tok_records:
+            self._write_token_dump(iteration)
         if self.want_fp8:
             self._collect_fp8_meta()
 
@@ -707,6 +827,7 @@ class TrainingDiagnostics:
             or self._have_nonfinite
             or self._have_weights
             or self._have_fp8
+            or self._have_logits
             or (self.want_clip and self._clip_steps > 0)
         ):
             return {}
@@ -863,6 +984,23 @@ class TrainingDiagnostics:
             logs["diag/nonfinite/weight"] = float(self._nonfinite_buf[0].item())
             logs["diag/nonfinite/grad"] = float(self._nonfinite_buf[1].item())
             self._have_nonfinite = False
+        if self._have_logits:
+            s = self._logit_sum.tolist()
+            n = max(s[2], 1.0)
+            nt = max(s[6], 1.0)
+            mean = s[0] / n
+            logs["diag/logits/mean"] = mean
+            logs["diag/logits/std"] = max(s[1] / n - mean * mean, 0.0) ** 0.5
+            logs["diag/logits/min"] = float(self._logit_lo.item())
+            logs["diag/logits/max"] = float(self._logit_hi.item())
+            logs["diag/logits/token_max_mean"] = s[3] / nt
+            lz = s[4] / nt
+            logs["diag/logits/logz_mean"] = lz
+            logs["diag/logits/logz_std"] = max(s[5] / nt - lz * lz, 0.0) ** 0.5
+            self._logit_sum.zero_()
+            self._logit_hi.fill_(float("-inf"))
+            self._logit_lo.fill_(float("inf"))
+            self._have_logits = False
 
         if not logs:
             return {}
@@ -896,6 +1034,13 @@ class TrainingDiagnostics:
         while the non-finite count is SUMMED — a count is a total, not an
         average, and halving it would hide a fault on one rank.
         """
+        if self._is_diag_iter and self.want_logits and self._logit_sum is not None:
+            torch.distributed.all_reduce(self._logit_sum, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(self._logit_hi, op=torch.distributed.ReduceOp.MAX)
+            torch.distributed.all_reduce(self._logit_lo, op=torch.distributed.ReduceOp.MIN)
+            # every TP rank of the output stage added the same TP-reduced sums
+            self._logit_sum /= float(mpu.get_tensor_model_parallel_world_size())
+            self._have_logits = True
         if not (self._is_diag_iter and self.want_acts):
             return
         torch.distributed.all_reduce(self._act_hi, op=torch.distributed.ReduceOp.MAX)

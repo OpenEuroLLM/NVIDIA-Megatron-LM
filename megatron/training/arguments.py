@@ -2694,6 +2694,17 @@ def _add_diagnostics_args(parser):
     group.add_argument('--te-debug-log-dir', type=str, default=None,
                        help='Directory for the nvdlfw_inspect logs; defaults to '
                             '<tensorboard-dir>/te_debug.')
+    group.add_argument('--diag-logit-stats', action='store_true',
+                       help='Log mean/std/min/max of the output-layer logits, the mean '
+                            'per-token max logit and the mean/std of the per-token '
+                            'log-partition log Z on diagnostic iterations (forward hook '
+                            'on the output layer).')
+    group.add_argument('--diag-token-loss-dir', type=str, default=None,
+                       help='Diagnostics only: on every diagnostic iteration write the '
+                            'per-token CE loss, label, loss mask, log Z and max logit of '
+                            'every microbatch to <dir>/it<iteration>_dp<rank>_cp<rank>.npz '
+                            '(TP rank 0 of the last pipeline stage). For checkpoint probes '
+                            'on a fixed batch.')
     group.add_argument('--diag-consumed-train-samples', type=int, default=None,
                        help='Diagnostics only: after the checkpoint load, position the '
                             'training dataloader at this consumed-sample count instead of '

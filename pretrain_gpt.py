@@ -51,6 +51,7 @@ from megatron.core.utils import (
     get_torch_version,
 )
 from megatron.training import get_args, get_timers, inprocess_restart
+from megatron.training.diagnostics import get_diagnostics
 from megatron.training import packed_doc_attention as pda
 from megatron.training import pretrain, print_rank_0, set_startup_timestamps
 from megatron.training.argument_utils import gpt_config_from_args, pretrain_cfg_container_from_args
@@ -348,7 +349,10 @@ def _build_cached_logits_loss_func(
 
 
 def loss_func(
-    loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optional[GPTModel] = None
+    loss_mask: torch.Tensor,
+    output_tensor: torch.Tensor,
+    model: Optional[GPTModel] = None,
+    labels: Optional[torch.Tensor] = None,
 ):
     """Loss function.
 
@@ -379,6 +383,11 @@ def loss_func(
     elif has_nvidia_modelopt and getattr(args, 'modelopt_enabled', False):  # [ModelOpt]
         loss, num_tokens, report = loss_func_modelopt(loss_mask, output_tensor, model=model)
     else:
+        if labels is not None:
+            diagnostics = get_diagnostics()
+            if diagnostics is not None:
+                # per-token CE losses [b, s] of this microbatch (--diag-token-loss-dir)
+                diagnostics.record_token_losses(labels, output_tensor, loss_mask)
         losses = output_tensor.view(-1).float()
         loss_mask = loss_mask.view(-1).float()
         loss = torch.sum(losses * loss_mask)
@@ -476,6 +485,8 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
 
     timers('batch-generator').stop()
 
+    # labels reach the loss function only for the per-token loss dump
+    token_labels = labels if getattr(args, "diag_token_loss_dir", None) else None
     with stimer:
         if return_schedule_plan:
             assert (
@@ -484,7 +495,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
             schedule_plan = model.build_schedule_plan(
                 tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask
             )
-            return schedule_plan, partial(loss_func, loss_mask, model=model)
+            return schedule_plan, partial(loss_func, loss_mask, model=model, labels=token_labels)
         else:
             output_tensor = model(
                 tokens,
@@ -496,7 +507,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
             )
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
-    return output_tensor, partial(loss_func, loss_mask, model=model)
+    return output_tensor, partial(loss_func, loss_mask, model=model, labels=token_labels)
 
 
 def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
