@@ -67,6 +67,7 @@ from .optimizer import (
     MixedPrecisionOptimizer,
     _zero_grad_group_helper,
     copy_optimizer_param_metadata,
+    match_saved_param_group,
     param_group_identifier_keys,
 )
 from .optimizer_config import OptimizerConfig
@@ -967,7 +968,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         for inner_param_group in inner_state_dict["param_groups"]:
             needed_groups = make_needed_groups(inner_param_group)
             state_dict_param_groups.append(
-                {**param_groups_map[needed_groups], "params": inner_param_group['params']}
+                {
+                    # Raises if no saved group matches, including under the LR-change
+                    # fallback. Overwrites max_lr/min_lr from the live group, so a
+                    # resume at a new LR does not silently inherit the checkpoint's.
+                    **match_saved_param_group(
+                        needed_groups, param_groups_map, inner_param_group
+                    ),
+                    "params": inner_param_group['params'],
+                }
             )
 
         # Allocate or retrieve optimizer state (i.e., tensors).

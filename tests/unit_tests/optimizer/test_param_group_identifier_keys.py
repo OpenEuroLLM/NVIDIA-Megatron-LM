@@ -269,3 +269,174 @@ def test_filter_reorder_handles_nemo_pre_prefix():
     saved = [_make_pg(**common, pre_wd_mult=1.0, pre_lr_mult=1.0, _tag="from_nemo")]
     reordered = MegatronOptimizer._filter_and_reorder_param_groups(current, saved)
     assert reordered[0]["_tag"] == "from_nemo"
+
+
+def test_filter_reorder_allows_lr_change_on_resume():
+    """Resuming with a different peak LR must load, and must adopt the NEW LR.
+
+    ``max_lr``/``min_lr`` are part of the identifier, so an LR sweep or a manual anneal
+    changes every group's tuple at once and no group finds its saved counterpart. The
+    relaxed fallback matches on the remaining fields, which is unambiguous here.
+
+    The second half of the assertion is the one that matters: the returned group must
+    carry the CURRENT ``max_lr``, because ``OptimizerParamScheduler.get_lr`` reads
+    ``param_group.get('max_lr', self.max_lr)``. A group left holding the checkpoint's
+    ``max_lr`` would run the whole job at the old LR while ``--lr`` and
+    ``--override-opt_param-scheduler`` were silently ignored.
+    """
+    current = [
+        _make_pg(
+            wd_mult=1.0,
+            lr_mult=1.0,
+            is_expert_parallel=False,
+            is_decoupled_lr=False,
+            max_lr=1.76e-4,
+            min_lr=0.0,
+        )
+    ]
+    saved = [
+        _make_pg(
+            wd_mult=1.0,
+            lr_mult=1.0,
+            is_expert_parallel=False,
+            is_decoupled_lr=False,
+            max_lr=3e-4,
+            min_lr=0.0,
+            _tag="from_checkpoint",
+        )
+    ]
+
+    reordered = MegatronOptimizer._filter_and_reorder_param_groups(current, saved)
+
+    assert len(reordered) == 1
+    # Matched the saved group (so its optimizer-side config comes along)...
+    assert reordered[0]["_tag"] == "from_checkpoint"
+    # ...but the schedule now runs at the LR this job asked for, not the checkpoint's.
+    assert reordered[0]["max_lr"] == 1.76e-4
+
+
+def test_filter_reorder_lr_change_distinguishes_by_wd_mult():
+    """An LR change must still route each group by its remaining identity fields."""
+    current = [
+        _make_pg(
+            wd_mult=1.0,
+            lr_mult=1.0,
+            is_expert_parallel=False,
+            is_decoupled_lr=False,
+            max_lr=1.76e-4,
+            min_lr=0.0,
+        ),
+        _make_pg(
+            wd_mult=0.0,
+            lr_mult=1.0,
+            is_expert_parallel=False,
+            is_decoupled_lr=False,
+            max_lr=1.76e-4,
+            min_lr=0.0,
+        ),
+    ]
+    # Saved in the opposite order, at the old LR, to exercise the reorder too.
+    saved = [
+        _make_pg(
+            wd_mult=0.0,
+            lr_mult=1.0,
+            is_expert_parallel=False,
+            is_decoupled_lr=False,
+            max_lr=3e-4,
+            min_lr=0.0,
+            _tag="no_decay",
+        ),
+        _make_pg(
+            wd_mult=1.0,
+            lr_mult=1.0,
+            is_expert_parallel=False,
+            is_decoupled_lr=False,
+            max_lr=3e-4,
+            min_lr=0.0,
+            _tag="decay",
+        ),
+    ]
+
+    reordered = MegatronOptimizer._filter_and_reorder_param_groups(current, saved)
+
+    assert [g["_tag"] for g in reordered] == ["decay", "no_decay"]
+    assert all(g["max_lr"] == 1.76e-4 for g in reordered)
+
+
+def test_filter_reorder_lr_change_refuses_when_groups_differ_only_by_lr():
+    """The fallback must disable itself exactly where #4705's fix is load-bearing.
+
+    Two saved groups that differ ONLY in min/max LR collapse to the same tuple once the
+    LR fields are masked. Guessing between them is how the original bug produced wrong
+    LRs after restart, so this must raise rather than pick one.
+    """
+    import pytest
+
+    current = [
+        _make_pg(
+            wd_mult=1.0,
+            lr_mult=1.0,
+            is_expert_parallel=False,
+            is_decoupled_lr=False,
+            max_lr=1e-5,
+            min_lr=1e-6,
+        ),
+        _make_pg(
+            wd_mult=1.0,
+            lr_mult=1.0,
+            is_expert_parallel=False,
+            is_decoupled_lr=False,
+            max_lr=2e-5,
+            min_lr=2e-6,
+        ),
+    ]
+    saved = [
+        _make_pg(
+            wd_mult=1.0,
+            lr_mult=1.0,
+            is_expert_parallel=False,
+            is_decoupled_lr=False,
+            max_lr=5e-4,
+            min_lr=5e-5,
+        ),
+        _make_pg(
+            wd_mult=1.0,
+            lr_mult=1.0,
+            is_expert_parallel=False,
+            is_decoupled_lr=False,
+            max_lr=2e-4,
+            min_lr=2e-5,
+        ),
+    ]
+
+    with pytest.raises(ValueError, match="cannot choose between them"):
+        MegatronOptimizer._filter_and_reorder_param_groups(current, saved)
+
+
+def test_filter_reorder_still_raises_on_genuinely_absent_group():
+    """A group absent for a non-LR reason must still fail loudly, not fall back."""
+    import pytest
+
+    current = [
+        _make_pg(
+            wd_mult=0.5,
+            lr_mult=1.0,
+            is_expert_parallel=False,
+            is_decoupled_lr=False,
+            max_lr=3e-4,
+            min_lr=0.0,
+        )
+    ]
+    saved = [
+        _make_pg(
+            wd_mult=1.0,
+            lr_mult=1.0,
+            is_expert_parallel=False,
+            is_decoupled_lr=False,
+            max_lr=3e-4,
+            min_lr=0.0,
+        )
+    ]
+
+    with pytest.raises(ValueError, match="Could not find parameter group"):
+        MegatronOptimizer._filter_and_reorder_param_groups(current, saved)

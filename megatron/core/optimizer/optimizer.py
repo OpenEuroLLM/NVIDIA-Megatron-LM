@@ -147,6 +147,92 @@ param_group_identifier_keys = (
     'is_expert_parallel',
     'is_decoupled_lr',
 )
+
+# Fields inside ``param_group_identifier_keys`` that describe a group's LR SCHEDULE
+# rather than its identity. Resuming with a different peak LR -- an LR sweep, a manual
+# anneal -- changes exactly these and nothing else, so under a strict tuple match every
+# group fails to find its saved counterpart and the run dies inside load_state_dict with
+# a bare KeyError. ``--override-opt_param-scheduler`` cannot rescue it: that flag is read
+# by OptimizerParamScheduler.load_state_dict, which runs AFTER the optimizer has loaded.
+_lr_schedule_identifier_keys = ('max_lr', 'min_lr')
+
+
+def _identifier_value(group: Dict, key: str) -> Any:
+    """One identifier field of a param group, honouring NeMo's ``pre_`` aliases."""
+    if key in group:
+        return group[key]
+    if f"pre_{key}" in group:
+        return group[f"pre_{key}"]
+    # Treat missing and explicit None identifier values as equivalent.
+    return None
+
+
+def match_saved_param_group(
+    needed: Tuple, saved_map: Dict[Tuple, Dict], current_group: Dict
+) -> Dict:
+    """Find the saved param group for ``needed``, tolerating a changed LR.
+
+    The exact tuple is tried first and is the only path a resume that keeps its LR ever
+    takes, so this is a no-op for ordinary restarts. On a miss the tuple is retried with
+    ``_lr_schedule_identifier_keys`` masked out, and the relaxed match is accepted ONLY
+    if exactly one saved group survives. The ambiguity that #4705 extended
+    ``param_group_identifier_keys`` to resolve -- two groups differing only in min/max LR
+    -- collides under that mask and still raises, so the fallback disables itself
+    precisely where that fix is load-bearing.
+
+    The returned group is the saved one with the LR-schedule fields overwritten from
+    ``current_group``. That overwrite is the load-bearing half, not bookkeeping:
+    ``OptimizerParamScheduler.get_lr`` reads ``param_group.get('max_lr', self.max_lr)``,
+    so a group left carrying the checkpoint's ``max_lr`` would drive the whole run at the
+    CHECKPOINT's peak LR while ``--lr`` and ``--override-opt_param-scheduler`` are
+    silently ignored. Failing to start is recoverable; training thousands of steps at an
+    LR nobody asked for is not.
+
+    Optimizer state itself -- momentum, variance, step count -- is untouched by this and
+    is loaded exactly as saved.
+    """
+    if needed in saved_map:
+        return saved_map[needed]
+
+    masked = {
+        index
+        for index, key in enumerate(param_group_identifier_keys)
+        if key in _lr_schedule_identifier_keys
+    }
+
+    def _relax(key: Tuple) -> Tuple:
+        return tuple(None if index in masked else value for index, value in enumerate(key))
+
+    target = _relax(needed)
+    candidates = [group for key, group in saved_map.items() if _relax(key) == target]
+    if len(candidates) != 1:
+        available = '\n'.join(str(key) for key in saved_map)
+        detail = (
+            f"\n{len(candidates)} saved groups still match once "
+            f"{list(_lr_schedule_identifier_keys)} are ignored, so the LR-change fallback "
+            "cannot choose between them unambiguously."
+            if candidates
+            else ""
+        )
+        raise ValueError(
+            f"Could not find parameter group with key {needed} in loaded checkpoint.\n"
+            f"Available keys:\n{available}\n"
+            f"Parameter group key definition: {param_group_identifier_keys}{detail}"
+        )
+
+    group = dict(candidates[0])
+    was = {key: _identifier_value(candidates[0], key) for key in _lr_schedule_identifier_keys}
+    for key in _lr_schedule_identifier_keys:
+        group[key] = _identifier_value(current_group, key)
+    now = {key: group[key] for key in _lr_schedule_identifier_keys}
+    log_single_rank(
+        logger,
+        logging.WARNING,
+        f"Optimizer param group matched to the checkpoint ignoring "
+        f"{list(_lr_schedule_identifier_keys)}: checkpoint had {was}, this run uses {now}. "
+        "Optimizer state (momentum, variance, step) is loaded unchanged.",
+    )
+    return group
 MTP_GRAD_NORM_GROUP = 'mtp'
 GRAD_NORM_GROUP_ATTR = 'grad_norm_group'
 SEPARATE_GRAD_NORM_GROUPS = (MTP_GRAD_NORM_GROUP,)
@@ -634,17 +720,12 @@ class MegatronOptimizer(ABC):
         loaded_groups_map = {_identifier_for(group): group for group in state_dict_groups}
 
         final_groups = []
-        for key, params in zip(needed_groups, params_in_state_dict_order):
-            if key not in loaded_groups_map:
-                available_keys = '\n'.join(str(k) for k in loaded_groups_map.keys())
-                raise ValueError(
-                    f"Could not find parameter group with key {key} in loaded checkpoint.\n"
-                    f"Available keys:\n{available_keys}\n"
-                    f"Parameter group key definition: {param_group_identifier_keys}"
-                )
-
+        for current_group, key, params in zip(
+            current_groups, needed_groups, params_in_state_dict_order
+        ):
+            # Raises if no saved group matches, including under the LR-change fallback.
+            group = match_saved_param_group(key, loaded_groups_map, current_group)
             # Update group's parameters to preserve state dict ordering
-            group = loaded_groups_map[key]
             group['params'] = params
             final_groups.append(group)
 
