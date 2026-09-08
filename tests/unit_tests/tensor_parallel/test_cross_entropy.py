@@ -269,6 +269,53 @@ def test_fused_zloss_fp32_accum_matches_fp32_reference(monkeypatch):
     assert err_fp32 < err_bf16
 
 
+def test_fp32_grad_accum_makes_fused_agree_with_unfused(monkeypatch):
+    """fp32 accumulation makes the fused kernel reproduce the unfused reference.
+
+    The unfused `vocab_parallel_cross_entropy` never narrows its gradient: its softmax is
+    fp32 and it adds the logsumexp gradient at that width, so it has always accumulated
+    the z-loss correctly and takes no flag. The fused kernel is the one that rounds to
+    bf16 first. So the unfused path is the reference the flag is trying to match, and
+    "does the flag work" has an exact answer rather than a tolerance.
+
+    Observed bit-for-bit equal with the JIT fuser falling back to eager; asserted here as
+    closeness plus a strict ordering so the test does not depend on whether inductor is
+    available and whether it reassociates the fused arithmetic.
+    """
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda t, op=None, group=None: t)
+    torch.manual_seed(1234)
+    seq, batch, vocab, coeff = 32, 8, 128, 1e-4
+    logits = (torch.randn(seq, batch, vocab) * 2.0).bfloat16()
+    target = torch.randint(0, vocab, (seq, batch))
+    tp_group = _FakeTPGroup()
+
+    def run(fused, fp32_grad_accum=False):
+        shard = logits.detach().clone().requires_grad_(True)
+        if fused:
+            loss, logZ = fused_vocab_parallel_cross_entropy(
+                shard, target, tp_group, return_logsumexp=True, fp32_grad_accum=fp32_grad_accum
+            )
+        else:
+            loss, logZ = vocab_parallel_cross_entropy(
+                shard, target, tp_group=tp_group, return_logsumexp=True
+            )
+        (loss.sum() + (coeff * logZ**2).sum()).backward()
+        return shard.grad.float()
+
+    reference = run(fused=False)
+    with_flag = run(fused=True, fp32_grad_accum=True)
+    without_flag = run(fused=True, fp32_grad_accum=False)
+
+    err_with = (with_flag - reference).abs().sum()
+    err_without = (without_flag - reference).abs().sum()
+
+    assert err_with < err_without, "fp32 accumulation did not move the fused path closer"
+    torch.testing.assert_close(with_flag, reference, rtol=1e-3, atol=1e-8)
+    # And the default really is wrong, not merely less precise: the z-loss it dropped is
+    # large enough to separate it from the reference on a large fraction of elements.
+    assert (without_flag != reference).float().mean() > 0.1
+
+
 @pytest.mark.parametrize("fused", [True, False])
 def test_logsumexp_for_logging_only_adds_no_gradient(monkeypatch, fused):
     """log_output_logsumexp must be forward-only: same gradient as not asking for it at all.
