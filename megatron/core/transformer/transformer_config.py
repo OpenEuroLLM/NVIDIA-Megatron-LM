@@ -490,6 +490,22 @@ class TransformerConfig(ModelParallelConfig):
     close to zero for training stability (PaLM/Chinchilla). A starting value of 1e-4 is
     recommended. This is the LM-head analog of ``moe_z_loss_coeff`` for the router."""
 
+    log_output_logsumexp: bool = False
+    """If True, log the LM head's mean log-normalizer squared, mean(logsumexp(logits)**2),
+    even when ``output_z_loss_coeff`` is None. That statistic is normally a by-product of the
+    z-loss, so switching the z-loss off also removes the only view of the quantity it and
+    ``final_logit_softcapping`` both exist to control. Forward-only: the log-normalizer is
+    detached, so no gradient is added."""
+
+    output_z_loss_fp32_grad_accum: bool = False
+    """If True, sum the z-loss and cross-entropy logit gradients in fp32 before rounding the
+    total to the logits dtype. Only meaningful when ``output_z_loss_coeff`` is set and the
+    logits are in reduced precision. The fused ``native`` cross-entropy otherwise rounds the
+    CE gradient to bf16 FIRST and adds the z-loss gradient to it in bf16; since that gradient
+    is ``2 * coeff * logZ`` times the CE gradient (~1.6e-3 at coeff=1e-4, logZ~8) it lands at
+    or below bf16's 2**-9 unit roundoff and is largely lost. Costs one fp32 buffer the size of
+    the logits shard for the duration of the loss backward."""
+
     ####################
     # fusion
     ####################
@@ -1333,6 +1349,28 @@ class TransformerConfig(ModelParallelConfig):
         # Apply BF16 matmul precision setting if needed
         if self.bf16 and self.disable_bf16_reduced_precision_matmul:
             torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+
+        # The fp32 z-loss gradient accumulation has to be refused rather than silently ignored
+        # on the TE cross-entropy path: there the CE gradient is produced by an opaque kernel
+        # and meets the z-loss gradient at autograd's accumulator for `logits`, which sums in
+        # the logits dtype. Nothing inside this repository can widen that addition.
+        if self.output_z_loss_fp32_grad_accum:
+            if self.output_z_loss_coeff is None:
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    "output_z_loss_fp32_grad_accum is set but output_z_loss_coeff is None, "
+                    "so there is no z-loss gradient to accumulate. This is a no-op.",
+                )
+            if self.cross_entropy_loss_fusion and self.cross_entropy_fusion_impl == 'te':
+                raise ValueError(
+                    "output_z_loss_fp32_grad_accum is not supported with "
+                    "cross_entropy_fusion_impl='te'. The TE kernel returns only the CE "
+                    "gradient, so the z-loss gradient is accumulated onto it by autograd in "
+                    "the logits dtype. Use cross_entropy_fusion_impl='native' (fused, the "
+                    "flagship setting) or cross_entropy_loss_fusion=False (unfused, which "
+                    "already accumulates in fp32)."
+                )
 
         if self.num_attention_heads % self.tensor_model_parallel_size != 0:
             raise ValueError(

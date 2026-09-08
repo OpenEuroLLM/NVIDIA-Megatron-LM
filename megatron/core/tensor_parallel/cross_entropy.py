@@ -131,6 +131,12 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         if tp_group is None:
             tp_group = get_tensor_model_parallel_group()
 
+        # When logsumexp is returned for logging only (log_output_logsumexp without a z-loss
+        # coefficient) nothing consumes it, and materializing its gradient would allocate a
+        # zero-filled fp32 tensor the size of the logits shard for an add of zero. Ask
+        # autograd for None instead.
+        ctx.set_materialize_grads(False)
+
         vocab_parallel_logits, logits_max = VocabParallelCrossEntropy.calculate_logits_max(
             vocab_parallel_logits
         )

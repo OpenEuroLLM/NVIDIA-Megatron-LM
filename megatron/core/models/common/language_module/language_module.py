@@ -241,6 +241,10 @@ class LanguageModule(MegatronModule):
         # (no extra all-reduce), except the TE-fused kernel which does not expose it.
         z_loss_coeff = self.config.output_z_loss_coeff
         need_z_loss = z_loss_coeff is not None and self.training
+        # logZ is the quantity the z-loss and final_logit_softcapping both exist to control,
+        # so it stays observable when the z-loss is switched off in favour of softcapping.
+        # The cross-entropy kernels hand it back for free; only the gradient is dropped.
+        need_logsumexp = need_z_loss or (self.config.log_output_logsumexp and self.training)
         logsumexp = None
 
         if self.config.cross_entropy_loss_fusion:
@@ -265,7 +269,7 @@ class LanguageModule(MegatronModule):
                     # TE's fused kernel does not return the log-normalizer, so compute it
                     # separately (one extra TP all-reduce) only when the z-loss is enabled.
                     # Done before the TE call in case the kernel mutates logits in place.
-                    if need_z_loss:
+                    if need_logsumexp:
                         logsumexp = tensor_parallel.vocab_parallel_logsumexp(
                             logits, self.tp_group
                         )
@@ -276,16 +280,23 @@ class LanguageModule(MegatronModule):
                 else:
                     raise RuntimeError("Trying to use a TE block when it's not present.")
             elif self.config.cross_entropy_fusion_impl == 'native':
+                # This is the only path where the flag changes anything. The unfused path
+                # below already sums the two gradients in fp32 inside its own backward, and
+                # the TE path above cannot (rejected in TransformerConfig.__post_init__).
                 loss = fused_vocab_parallel_cross_entropy(
-                    logits, labels, self.pg_collection.tp, return_logsumexp=need_z_loss
+                    logits,
+                    labels,
+                    self.pg_collection.tp,
+                    return_logsumexp=need_logsumexp,
+                    fp32_grad_accum=self.config.output_z_loss_fp32_grad_accum,
                 )
-                if need_z_loss:
+                if need_logsumexp:
                     loss, logsumexp = loss
         else:
             loss = tensor_parallel.vocab_parallel_cross_entropy(
-                logits, labels, tp_group=self.tp_group, return_logsumexp=need_z_loss
+                logits, labels, tp_group=self.tp_group, return_logsumexp=need_logsumexp
             )
-            if need_z_loss:
+            if need_logsumexp:
                 loss, logsumexp = loss
 
         # Add the output z-loss as a pure gradient regularizer: it must shape the
@@ -295,14 +306,18 @@ class LanguageModule(MegatronModule):
         # preserved. So the logged "lm loss" stays pure CE and training dynamics are
         # unchanged vs. adding the raw term.
         if logsumexp is not None:
-            z_loss = z_loss_coeff * logsumexp**2
-            loss = loss + (z_loss - z_loss.detach())
+            if need_z_loss:
+                z_loss = z_loss_coeff * logsumexp**2
+                loss = loss + (z_loss - z_loss.detach())
 
             # Log the coefficient-independent diagnostic mean(logZ**2) separately (main head
             # only), so it is observable without polluting the reported cross-entropy loss.
+            # Detached: under log_output_logsumexp alone nothing else consumes logsumexp, and
+            # the cross-entropy Function disables grad materialization, so its backward sees
+            # grad_logsumexp=None and skips the gradient term entirely.
             if record_z_loss:
                 OutputZLossLoggingHelper.save_loss_to_tracker(
-                    (logsumexp**2).mean(), avg_group=self.pg_collection.dp_cp
+                    (logsumexp.detach() ** 2).mean(), avg_group=self.pg_collection.dp_cp
                 )
 
         # [s b] => [b, s]

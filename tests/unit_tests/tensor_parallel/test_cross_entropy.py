@@ -73,7 +73,11 @@ def test_language_module_unfused_loss_passes_tp_group(monkeypatch):
     )
 
     module = SimpleNamespace(
-        config=SimpleNamespace(cross_entropy_loss_fusion=False, output_z_loss_coeff=None),
+        config=SimpleNamespace(
+            cross_entropy_loss_fusion=False,
+            output_z_loss_coeff=None,
+            log_output_logsumexp=False,
+        ),
         tp_group=tp_group
     )
     labels = torch.tensor([[0, 1, 2], [2, 1, 0]])
@@ -189,3 +193,137 @@ def test_vocab_parallel_output_zloss(impl):
     assert torch.allclose(shard.grad.float(), ref_grad_shard, atol=atol)
 
     Utils.destroy_model_parallel()
+
+
+def _fused_zloss_grad(logits, target, coeff, fp32_grad_accum, monkeypatch, with_zloss=True):
+    """Backward of CE (+ coeff*logZ**2) through the fused kernel at TP=1, on CPU."""
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda t, op=None, group=None: t)
+
+    shard = logits.detach().clone().requires_grad_(True)
+    loss, logZ = fused_vocab_parallel_cross_entropy(
+        shard,
+        target,
+        _FakeTPGroup(),
+        return_logsumexp=True,
+        fp32_grad_accum=fp32_grad_accum,
+    )
+    total = loss.sum() + (coeff * logZ**2).sum() if with_zloss else loss.sum()
+    total.backward()
+    return shard.grad
+
+
+def test_fused_zloss_grad_is_annihilated_without_fp32_accum(monkeypatch):
+    """The z-loss logit gradient vanishes EXACTLY in bf16, and survives with fp32 accum.
+
+    `calculate_gradients` rounds the cross-entropy gradient to bf16 before the z-loss
+    gradient is added. For a non-target vocab entry both are proportional to the same
+    softmax probability, so their ratio is the constant r = 2 * coeff * logZ. bf16 keeps 8
+    significant bits, so a value already on the bf16 grid cannot move unless perturbed by
+    more than half an ulp -- at least 2**-9 in relative terms. When r < 2**-9 the addition
+    is a no-op on every single element.
+
+    This is not a rounding nuisance: at the 32B flagship's coeff=1e-4 and logZ~8,
+    r = 1.6e-3 sits below that floor and the regularizer contributes nothing at all.
+    """
+    torch.manual_seed(1234)
+    seq, batch, vocab, coeff = 16, 8, 64, 1e-4
+    logits = (torch.randn(seq, batch, vocab) * 2.0).bfloat16()
+    target = torch.randint(0, vocab, (seq, batch))
+
+    logZ = torch.logsumexp(logits.float(), dim=-1)
+    ratio = 2 * coeff * logZ.mean().item()
+    assert ratio < 2**-9, f"test setup must land below the bf16 half-ulp floor, got {ratio}"
+
+    ce_only = _fused_zloss_grad(logits, target, coeff, False, monkeypatch, with_zloss=False)
+    bf16_accum = _fused_zloss_grad(logits, target, coeff, False, monkeypatch)
+    fp32_accum = _fused_zloss_grad(logits, target, coeff, True, monkeypatch)
+
+    assert bf16_accum.dtype == fp32_accum.dtype == torch.bfloat16
+
+    # Adding the z-loss changes NOTHING when the CE gradient is rounded down first.
+    assert torch.equal(bf16_accum, ce_only)
+    # Summing in fp32 first lets it through on a meaningful fraction of elements.
+    moved = (fp32_accum != ce_only).float().mean().item()
+    assert moved > 0.01, f"fp32 accumulation delivered nothing either ({moved:.4%} moved)"
+
+
+def test_fused_zloss_fp32_accum_matches_fp32_reference(monkeypatch):
+    """With fp32 accumulation the gradient is closer to the exact fp32 sum of both terms."""
+    torch.manual_seed(0)
+    seq, batch, vocab, coeff = 16, 8, 64, 1e-4
+    logits = (torch.randn(seq, batch, vocab) * 2.0).bfloat16()
+    target = torch.randint(0, vocab, (seq, batch))
+
+    ref = logits.float().detach().requires_grad_(True)
+    logZ = torch.logsumexp(ref, dim=-1)
+    ce = torch.nn.functional.cross_entropy(
+        ref.reshape(-1, vocab), target.reshape(-1), reduction="none"
+    )
+    (ce.sum() + (coeff * logZ**2).sum()).backward()
+
+    bf16_accum = _fused_zloss_grad(logits, target, coeff, False, monkeypatch)
+    fp32_accum = _fused_zloss_grad(logits, target, coeff, True, monkeypatch)
+
+    err_bf16 = (bf16_accum.float() - ref.grad).abs().sum()
+    err_fp32 = (fp32_accum.float() - ref.grad).abs().sum()
+    assert err_fp32 < err_bf16
+
+
+@pytest.mark.parametrize("fused", [True, False])
+def test_logsumexp_for_logging_only_adds_no_gradient(monkeypatch, fused):
+    """log_output_logsumexp must be forward-only: same gradient as not asking for it at all.
+
+    Both cross-entropy Functions call `ctx.set_materialize_grads(False)`, so an unconsumed
+    logsumexp output arrives in backward as None rather than as a zero-filled tensor the
+    size of the logits shard.
+    """
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda t, op=None, group=None: t)
+    torch.manual_seed(7)
+    seq, batch, vocab = 16, 8, 64
+    logits = (torch.randn(seq, batch, vocab) * 2.0).bfloat16()
+    target = torch.randint(0, vocab, (seq, batch))
+    tp_group = _FakeTPGroup()
+
+    def run(return_logsumexp):
+        shard = logits.detach().clone().requires_grad_(True)
+        if fused:
+            out = fused_vocab_parallel_cross_entropy(
+                shard, target, tp_group, return_logsumexp=return_logsumexp
+            )
+        else:
+            out = vocab_parallel_cross_entropy(
+                shard, target, tp_group=tp_group, return_logsumexp=return_logsumexp
+            )
+        # Mirror compute_language_model_loss: the log-normalizer is detached and only read.
+        loss, logZ = out if return_logsumexp else (out, None)
+        loss.sum().backward()
+        return shard.grad, (logZ.detach() ** 2).mean() if logZ is not None else None
+
+    baseline, _ = run(False)
+    logged, stat = run(True)
+
+    assert torch.equal(baseline, logged)
+    assert torch.isfinite(stat)
+
+
+def test_fp32_grad_accum_rejects_te_cross_entropy():
+    """The flag must fail loudly on the TE path rather than silently doing nothing."""
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    kwargs = dict(num_layers=1, hidden_size=8, num_attention_heads=1)
+    # Accepted on the fused native path.
+    TransformerConfig(
+        **kwargs,
+        output_z_loss_coeff=1e-4,
+        output_z_loss_fp32_grad_accum=True,
+        cross_entropy_loss_fusion=True,
+        cross_entropy_fusion_impl='native',
+    )
+    with pytest.raises(ValueError, match="cross_entropy_fusion_impl='te'"):
+        TransformerConfig(
+            **kwargs,
+            output_z_loss_coeff=1e-4,
+            output_z_loss_fp32_grad_accum=True,
+            cross_entropy_loss_fusion=True,
+            cross_entropy_fusion_impl='te',
+        )

@@ -84,12 +84,49 @@ def calculate_gradients(
     return grad_input
 
 
+@jit_fuser
+def calculate_gradients_fp32(
+    softmax: torch.Tensor,
+    grad_output: torch.Tensor,
+    target_mask: torch.Tensor,
+    masked_target_1d: torch.Tensor,
+) -> torch.Tensor:
+    """Same as `calculate_gradients` but WITHOUT the cast down to bfloat16.
+
+    `softmax` is fp32 (`VocabParallelCrossEntropy.calculate_logits_max` upcasts), so this
+    returns the CE logit gradient in fp32. Used when another term -- the output z-loss --
+    still has to be added: rounding the CE gradient to bf16 first would round the small
+    z-loss contribution away before it is ever summed in.
+    """
+    (grad_2d, arange_1d, softmax_update, grad_input) = (
+        VocabParallelCrossEntropy.prepare_gradient_calculation_operands(softmax, target_mask)
+    )
+
+    grad_input = VocabParallelCrossEntropy.calculate_gradients(
+        grad_2d, arange_1d, masked_target_1d, softmax_update, grad_input, grad_output
+    )
+
+    return grad_input
+
+
 class _VocabParallelCrossEntropy(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, vocab_parallel_logits, target, tp_group, return_logsumexp=False):
+    def forward(
+        ctx, vocab_parallel_logits, target, tp_group, return_logsumexp=False, fp32_grad_accum=False
+    ):
         """
         Forward implementation for the cross entropy loss.
         """
+        # Captured before calculate_logits_max, which rebinds the name to an fp32 copy.
+        ctx.logits_dtype = vocab_parallel_logits.dtype
+        ctx.fp32_grad_accum = fp32_grad_accum
+
+        # When logsumexp is returned for logging only (log_output_logsumexp without a z-loss
+        # coefficient) nothing consumes it, and materializing its gradient would allocate a
+        # zero-filled fp32 tensor the size of the logits shard -- gigabytes at production
+        # vocab -- for an add of zero. Ask autograd for None instead.
+        ctx.set_materialize_grads(False)
+
         vocab_parallel_logits, logits_max = calculate_logits_max(vocab_parallel_logits)
         torch.distributed.all_reduce(logits_max, op=torch.distributed.ReduceOp.MAX, group=tp_group)
 
@@ -144,16 +181,31 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
             softmax * grad_logsumexp.unsqueeze(dim=-1) if grad_logsumexp is not None else None
         )
 
-        grad_input = calculate_gradients(softmax, grad_output, target_mask, masked_target_1d)
+        if logsumexp_grad is not None and ctx.fp32_grad_accum:
+            # Sum both terms at full precision, then round the TOTAL once. The default branch
+            # below instead rounds the CE gradient to bf16 first, and the z-loss gradient is
+            # 2 * coeff * logZ times its magnitude -- ~1.6e-3 at coeff=1e-4 and logZ~8, i.e.
+            # below bf16's 2**-9 unit roundoff, so adding it moves almost no elements.
+            grad_input = calculate_gradients_fp32(
+                softmax, grad_output, target_mask, masked_target_1d
+            )
+            # In place: grad_input is this Function's own softmax scratch buffer, and an
+            # out-of-place sum would cost another fp32 logits shard -- 2.1 GB at the 32B
+            # flagship's [4096, 2, 256000/4].
+            grad_input = grad_input.add_(logsumexp_grad).to(ctx.logits_dtype)
+        else:
+            grad_input = calculate_gradients(softmax, grad_output, target_mask, masked_target_1d)
 
-        if logsumexp_grad is not None:
-            grad_input = grad_input + logsumexp_grad.to(grad_input.dtype)
+            if logsumexp_grad is not None:
+                grad_input = grad_input + logsumexp_grad.to(grad_input.dtype)
 
-        return grad_input, None, None, None
+        # One None per forward input after ctx: target, tp_group, return_logsumexp,
+        # fp32_grad_accum.
+        return grad_input, None, None, None, None
 
 
 def fused_vocab_parallel_cross_entropy(
-    vocab_parallel_logits, target, tp_group, return_logsumexp=False
+    vocab_parallel_logits, target, tp_group, return_logsumexp=False, fp32_grad_accum=False
 ):
     """
     Performs cross entropy loss when logits are split across tensor parallel ranks
@@ -167,8 +219,12 @@ def fused_vocab_parallel_cross_entropy(
         return_logsumexp: if True, also return the per-token log-normalizer
             logsumexp(logits, dim=vocab) of shape [sequence_length, batch_size], differentiable
             w.r.t. the logits (used by the output z-loss).
+        fp32_grad_accum: if True, add the logsumexp gradient to the cross-entropy gradient in
+            fp32 and round the sum once, instead of rounding the cross-entropy gradient to
+            bf16 first. Only has an effect together with return_logsumexp. Costs one fp32
+            buffer the size of the logits shard during the backward pass.
 
     """
     return _VocabParallelCrossEntropy.apply(
-        vocab_parallel_logits, target, tp_group, return_logsumexp
+        vocab_parallel_logits, target, tp_group, return_logsumexp, fp32_grad_accum
     )
