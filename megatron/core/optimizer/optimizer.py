@@ -118,6 +118,40 @@ def _multi_tensor_copy_this_to_that(
 # on every param_group at construction time. They aren't part of ``ParamGroupOverride``
 # (users don't override them directly; they're implied by ``decoupled_lr`` config and
 # expert-parallel sharding), so we list them explicitly.
+_STRUCTURAL_GROUP_KEYS = ("lr_mult", "is_expert_parallel", "is_decoupled_lr")
+
+
+def _structural_identifier(group: dict) -> tuple:
+    """The identifier restricted to the structural keys (see
+    ``OptimizerConfig.allow_new_param_groups_on_load``)."""
+    return tuple(group.get(k, group.get(f"pre_{k}")) for k in _STRUCTURAL_GROUP_KEYS)
+
+
+def fallback_saved_param_group(current_group: dict, saved_groups) -> Optional[dict]:
+    """Saved param_group to load a NEW current group from: same structural keys, and among those
+    the one sharing the most identifier fields with the current group. Returns None if no saved
+    group is structurally equivalent. The caller keeps the current group's override fields."""
+    cands = [g for g in saved_groups if _structural_identifier(g) == _structural_identifier(current_group)]
+    if not cands:
+        return None
+
+    def score(g):
+        return sum(1 for k in param_group_identifier_keys if g.get(k, g.get(f"pre_{k}")) == current_group.get(k, current_group.get(f"pre_{k}")))
+
+    return max(cands, key=score)
+
+
+def merge_new_param_group(current_group: dict, saved_group: dict) -> dict:
+    """Saved group's state fields with the current group's override fields (wd_mult, max_lr, ...)."""
+    merged = dict(saved_group)
+    for k in param_group_identifier_keys:
+        if k in current_group:
+            merged[k] = current_group[k]
+        elif f"pre_{k}" in current_group:
+            merged[f"pre_{k}"] = current_group[f"pre_{k}"]
+    return merged
+
+
 def _param_group_override_keys() -> tuple[str, ...]:
     """Return every field declared on ``ParamGroupOverride``.
 
@@ -168,28 +202,46 @@ def _identifier_value(group: Dict, key: str) -> Any:
 
 
 def match_saved_param_group(
-    needed: Tuple, saved_map: Dict[Tuple, Dict], current_group: Dict
+    needed: Tuple,
+    saved_map: Dict[Tuple, Dict],
+    current_group: Dict,
+    saved_groups: Optional[List[Dict]] = None,
+    allow_new_groups: bool = False,
 ) -> Dict:
-    """Find the saved param group for ``needed``, tolerating a changed LR.
+    """Find the saved param group for ``needed``, tolerating a changed LR or a new group.
 
-    The exact tuple is tried first and is the only path a resume that keeps its LR ever
-    takes, so this is a no-op for ordinary restarts. On a miss the tuple is retried with
-    ``_lr_schedule_identifier_keys`` masked out, and the relaxed match is accepted ONLY
-    if exactly one saved group survives. The ambiguity that #4705 extended
-    ``param_group_identifier_keys`` to resolve -- two groups differing only in min/max LR
-    -- collides under that mask and still raises, so the fallback disables itself
-    precisely where that fix is load-bearing.
+    Three matchers, tried in widening order. Both callers -- ``MegatronOptimizer.
+    _filter_and_reorder_param_groups`` and ``DistributedOptimizer.load_state_dict`` -- go
+    through here, so a checkpoint that loads under one loads under the other.
 
-    The returned group is the saved one with the LR-schedule fields overwritten from
-    ``current_group``. That overwrite is the load-bearing half, not bookkeeping:
+    1. The exact identifier tuple. An ordinary resume never leaves this branch, so
+       everything below is reached only once the strict match has already failed.
+
+    2. The tuple with ``_lr_schedule_identifier_keys`` masked out, accepted ONLY if
+       exactly one saved group survives the mask. This is what lets a run resume at a new
+       peak LR. The ambiguity that #4705 extended ``param_group_identifier_keys`` to
+       resolve -- two groups differing only in min/max LR -- collides under the mask and
+       falls through to (3), so this step disables itself precisely where that fix is
+       load-bearing. Always on: it cannot mis-match a checkpoint that would otherwise
+       have loaded.
+
+    3. ``fallback_saved_param_group``: any saved group with the same STRUCTURAL keys, for
+       a current group that has no counterpart in the checkpoint at all because it was
+       added mid-run -- e.g. enabling ``--embedding-wd-mult``. Gated on
+       ``allow_new_groups`` (``--allow-new-param-groups-on-load``) because it also
+       ignores ``wd_mult`` and, unlike (2), picks the best-scoring candidate instead of
+       requiring uniqueness.
+
+    (2) and (3) both return the saved group with the current group's identifier fields
+    written over it. For (2) that overwrite is the load-bearing half, not bookkeeping:
     ``OptimizerParamScheduler.get_lr`` reads ``param_group.get('max_lr', self.max_lr)``,
     so a group left carrying the checkpoint's ``max_lr`` would drive the whole run at the
-    CHECKPOINT's peak LR while ``--lr`` and ``--override-opt_param-scheduler`` are
+    CHECKPOINT's peak LR while ``--lr`` and ``--override-opt_param-scheduler`` were
     silently ignored. Failing to start is recoverable; training thousands of steps at an
     LR nobody asked for is not.
 
-    Optimizer state itself -- momentum, variance, step count -- is untouched by this and
-    is loaded exactly as saved.
+    Per-parameter optimizer state -- momentum, variance, step count -- is untouched by
+    all three and is loaded exactly as saved.
     """
     if needed in saved_map:
         return saved_map[needed]
@@ -205,34 +257,53 @@ def match_saved_param_group(
 
     target = _relax(needed)
     candidates = [group for key, group in saved_map.items() if _relax(key) == target]
-    if len(candidates) != 1:
-        available = '\n'.join(str(key) for key in saved_map)
-        detail = (
-            f"\n{len(candidates)} saved groups still match once "
-            f"{list(_lr_schedule_identifier_keys)} are ignored, so the LR-change fallback "
-            "cannot choose between them unambiguously."
-            if candidates
-            else ""
+    if len(candidates) == 1:
+        group = dict(candidates[0])
+        was = {key: _identifier_value(candidates[0], key) for key in _lr_schedule_identifier_keys}
+        for key in _lr_schedule_identifier_keys:
+            group[key] = _identifier_value(current_group, key)
+        now = {key: group[key] for key in _lr_schedule_identifier_keys}
+        log_single_rank(
+            logger,
+            logging.WARNING,
+            f"Optimizer param group matched to the checkpoint ignoring "
+            f"{list(_lr_schedule_identifier_keys)}: checkpoint had {was}, this run uses {now}. "
+            "Optimizer state (momentum, variance, step) is loaded unchanged.",
         )
-        raise ValueError(
-            f"Could not find parameter group with key {needed} in loaded checkpoint.\n"
-            f"Available keys:\n{available}\n"
-            f"Parameter group key definition: {param_group_identifier_keys}{detail}"
-        )
+        return group
 
-    group = dict(candidates[0])
-    was = {key: _identifier_value(candidates[0], key) for key in _lr_schedule_identifier_keys}
-    for key in _lr_schedule_identifier_keys:
-        group[key] = _identifier_value(current_group, key)
-    now = {key: group[key] for key in _lr_schedule_identifier_keys}
-    log_single_rank(
-        logger,
-        logging.WARNING,
-        f"Optimizer param group matched to the checkpoint ignoring "
-        f"{list(_lr_schedule_identifier_keys)}: checkpoint had {was}, this run uses {now}. "
-        "Optimizer state (momentum, variance, step) is loaded unchanged.",
+    saved = None
+    if allow_new_groups:
+        if saved_groups is None:
+            saved_groups = list(saved_map.values())
+        saved = fallback_saved_param_group(current_group, saved_groups)
+    if saved is not None:
+        log_single_rank(
+            logger,
+            logging.WARNING,
+            f"param_group {needed} is not in the checkpoint; loading it from the "
+            f"structurally equivalent saved group "
+            f"{tuple(_identifier_value(saved, key) for key in param_group_identifier_keys)} "
+            "and keeping the current overrides (allow_new_param_groups_on_load).",
+        )
+        return merge_new_param_group(current_group, saved)
+
+    available = '\n'.join(str(key) for key in saved_map)
+    detail = (
+        f"\n{len(candidates)} saved groups still match once "
+        f"{list(_lr_schedule_identifier_keys)} are ignored, so the LR-change fallback "
+        "cannot choose between them unambiguously."
+        if candidates
+        else "\nA group added mid-run (e.g. embedding_wd_mult) has no counterpart in the "
+        "checkpoint at all and needs --allow-new-param-groups-on-load."
     )
-    return group
+    raise ValueError(
+        f"Could not find parameter group with key {needed} in loaded checkpoint.\n"
+        f"Available keys:\n{available}\n"
+        f"Parameter group key definition: {param_group_identifier_keys}{detail}"
+    )
+
+
 MTP_GRAD_NORM_GROUP = 'mtp'
 GRAD_NORM_GROUP_ATTR = 'grad_norm_group'
 SEPARATE_GRAD_NORM_GROUPS = (MTP_GRAD_NORM_GROUP,)
@@ -678,7 +749,7 @@ class MegatronOptimizer(ABC):
 
     @staticmethod
     def _filter_and_reorder_param_groups(
-        current_groups: List[Dict], state_dict_groups: List[Dict]
+        current_groups: List[Dict], state_dict_groups: List[Dict], allow_new_groups: bool = False
     ) -> List[Dict]:
         """Pair each current param_group with its saved counterpart by identifier tuple.
 
@@ -723,8 +794,15 @@ class MegatronOptimizer(ABC):
         for current_group, key, params in zip(
             current_groups, needed_groups, params_in_state_dict_order
         ):
-            # Raises if no saved group matches, including under the LR-change fallback.
-            group = match_saved_param_group(key, loaded_groups_map, current_group)
+            # Exact match, then the LR-change fallback, then -- if enabled -- a group
+            # added mid-run. Raises if all three miss.
+            group = match_saved_param_group(
+                key,
+                loaded_groups_map,
+                current_group,
+                saved_groups=state_dict_groups,
+                allow_new_groups=allow_new_groups,
+            )
             # Update group's parameters to preserve state dict ordering
             group['params'] = params
             final_groups.append(group)
@@ -1281,7 +1359,8 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
 
         # Filter and reorder param groups to match current optimizer
         state_dict[optimizer_key]['param_groups'] = self._filter_and_reorder_param_groups(
-            self.optimizer.param_groups, state_dict[optimizer_key]['param_groups']
+            self.optimizer.param_groups, state_dict[optimizer_key]['param_groups'],
+            allow_new_groups=getattr(self.config, 'allow_new_param_groups_on_load', False),
         )
         self.optimizer.load_state_dict(state_dict[optimizer_key])
 
@@ -1429,7 +1508,8 @@ class FP32Optimizer(MegatronOptimizer):
 
         # Filter and reorder param groups to match current optimizer
         state_dict['param_groups'] = self._filter_and_reorder_param_groups(
-            self.optimizer.param_groups, state_dict['param_groups']
+            self.optimizer.param_groups, state_dict['param_groups'],
+            allow_new_groups=getattr(self.config, 'allow_new_param_groups_on_load', False),
         )
         self.optimizer.load_state_dict(state_dict)
 

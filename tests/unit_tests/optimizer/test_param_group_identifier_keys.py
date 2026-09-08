@@ -440,3 +440,46 @@ def test_filter_reorder_still_raises_on_genuinely_absent_group():
 
     with pytest.raises(ValueError, match="Could not find parameter group"):
         MegatronOptimizer._filter_and_reorder_param_groups(current, saved)
+
+
+def test_filter_reorder_allows_new_group_only_with_opt_in():
+    """A group added mid-run (``--embedding-wd-mult``) has no saved counterpart at all.
+
+    It differs by ``wd_mult``, which the LR-change fallback does NOT mask, so the strict
+    path and the LR path both miss and the default is still a hard failure. Only
+    ``allow_new_groups`` (``--allow-new-param-groups-on-load``) loads it from the
+    structurally equivalent saved group, keeping the current group's overrides.
+    """
+    import pytest
+
+    common = dict(lr_mult=1.0, is_expert_parallel=False, is_decoupled_lr=False, max_lr=3e-4)
+    current = [_make_pg(wd_mult=0.0, **common)]
+    saved = [_make_pg(wd_mult=1.0, _tag="saved", **common)]
+
+    with pytest.raises(ValueError, match="allow-new-param-groups-on-load"):
+        MegatronOptimizer._filter_and_reorder_param_groups(current, saved)
+
+    reordered = MegatronOptimizer._filter_and_reorder_param_groups(
+        current, saved, allow_new_groups=True
+    )
+    assert reordered[0]["_tag"] == "saved"
+    assert reordered[0]["wd_mult"] == 0.0, "the new group must keep its OWN wd_mult"
+
+
+def test_filter_reorder_handles_new_group_and_lr_change_together():
+    """Both fallbacks at once: a group added mid-run in a run that also changed its LR.
+
+    The LR fallback runs first and misses (``wd_mult`` differs too), then the structural
+    fallback takes over. The result must carry the CURRENT ``max_lr`` — resuming at the
+    checkpoint's peak LR is the silent failure the whole matcher exists to prevent.
+    """
+    common = dict(lr_mult=1.0, is_expert_parallel=False, is_decoupled_lr=False)
+    current = [_make_pg(wd_mult=0.0, max_lr=2.5e-4, min_lr=2.5e-5, **common)]
+    saved = [_make_pg(wd_mult=1.0, max_lr=1.0e-4, min_lr=1.0e-5, _tag="saved", **common)]
+
+    reordered = MegatronOptimizer._filter_and_reorder_param_groups(
+        current, saved, allow_new_groups=True
+    )
+    assert reordered[0]["_tag"] == "saved"
+    assert reordered[0]["max_lr"] == 2.5e-4
+    assert reordered[0]["min_lr"] == 2.5e-5

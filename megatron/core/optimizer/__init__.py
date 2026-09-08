@@ -143,6 +143,18 @@ def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, Par
         param_wd_mult_key = ParamKey(name="*.bias", predicate=param_length_1_match)
         config_overrides[param_wd_mult_key] = ParamGroupOverride(wd_mult=0.0)
 
+    if config.embedding_wd_mult != 1.0:
+        # Word embeddings: a 2-D parameter, hence disjoint from every 1-D key above. The untied
+        # output layer (`output_layer.weight`) keeps the default multiplier on purpose: all of
+        # its rows receive a softmax gradient every step, so decay cannot erode them.
+        word_embedding = ParamWithNamePredicate(
+            name="word_embedding",
+            fn=lambda param, name: len(param.shape) == 2 and "word_embeddings" in name,
+        )
+        config_overrides[ParamKey(with_name_predicate=word_embedding)] = ParamGroupOverride(
+            wd_mult=config.embedding_wd_mult
+        )
+
     if config.decoupled_lr is not None:
         decoupled_lr_config: ParamGroupOverride = {"max_lr": config.decoupled_lr}
         decoupled_param_key = ParamKey(attr="is_embedding_or_output_parameter")

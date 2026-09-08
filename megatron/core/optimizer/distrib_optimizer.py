@@ -969,11 +969,18 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             needed_groups = make_needed_groups(inner_param_group)
             state_dict_param_groups.append(
                 {
-                    # Raises if no saved group matches, including under the LR-change
-                    # fallback. Overwrites max_lr/min_lr from the live group, so a
-                    # resume at a new LR does not silently inherit the checkpoint's.
+                    # Exact match, then the LR-change fallback, then -- if enabled -- a
+                    # group added mid-run; raises if all three miss. Overwrites the
+                    # identifier fields from the live group, so a resume at a new LR does
+                    # not silently inherit the checkpoint's.
                     **match_saved_param_group(
-                        needed_groups, param_groups_map, inner_param_group
+                        needed_groups,
+                        param_groups_map,
+                        inner_param_group,
+                        saved_groups=state_dict["optimizer"]["param_groups"],
+                        allow_new_groups=getattr(
+                            self.config, 'allow_new_param_groups_on_load', False
+                        ),
                     ),
                     "params": inner_param_group['params'],
                 }
