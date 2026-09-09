@@ -79,7 +79,7 @@ def calculate_gradients(
         grad_2d, arange_1d, masked_target_1d, softmax_update, grad_input, grad_output
     )
 
-    grad_input = grad_input.to(torch.bfloat16)
+    # Preserve FP32 through CE/z combination; autograd casts at the input boundary.
 
     return grad_input
 
@@ -147,7 +147,7 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         grad_input = calculate_gradients(softmax, grad_output, target_mask, masked_target_1d)
 
         if logsumexp_grad is not None:
-            grad_input = grad_input + logsumexp_grad.to(grad_input.dtype)
+            grad_input = grad_input + logsumexp_grad
 
         return grad_input, None, None, None
 
