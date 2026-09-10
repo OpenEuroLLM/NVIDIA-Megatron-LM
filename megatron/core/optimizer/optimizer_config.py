@@ -197,6 +197,12 @@ class OptimizerConfig:
     fields (wd_mult, max_lr, ...). The per-parameter optimizer state is unaffected. Default False
     keeps the strict match."""
 
+    final_norm_wd_mult: Optional[float] = None
+    """Optional separate decay multiplier for decoder.final_layernorm.weight.
+    None inherits residual_norm_wd_mult, preserving existing recipes.
+    An explicit value separates the final head-input norm from block norms.
+    """
+
     residual_norm_wd_mult: float = 0.0
     """Multiplier applied to `weight_decay` for the remaining norm gains: every 1-D non-bias
     parameter that is NOT a qk-layernorm gain. In practice these are the residual-stream norms --

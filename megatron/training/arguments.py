@@ -1473,7 +1473,8 @@ def validate_args(args, defaults={}):
     # generalisation of --apply-wd-to-qk-layernorm, so the two would otherwise
     # install overlapping wd_mult overrides on the same parameters.
     assert not (
-        (args.qk_layernorm_wd_mult != 0.0 or args.residual_norm_wd_mult != 0.0)
+        (args.qk_layernorm_wd_mult != 0.0 or args.residual_norm_wd_mult != 0.0
+         or args.final_norm_wd_mult is not None)
         and args.apply_wd_to_qk_layernorm
     ), \
         '--qk-layernorm-wd-mult/--residual-norm-wd-mult and --apply-wd-to-qk-layernorm ' \
@@ -2738,6 +2739,9 @@ def _add_regularization_args(parser):
                        'gamma_q * gamma_k and nothing in the loss opposes their growth. '
                        'Default 0.0 = historical Megatron behaviour (no decay on 1-D params). '
                        'Use 1.0 to decay them like every other weight.')
+    group.add_argument('--final-norm-wd-mult', type=float, default=None,
+                       help='Separate final decoder RMSNorm decay multiplier; '
+                            'unset inherits residual-norm-wd-mult.')
     group.add_argument('--residual-norm-wd-mult', type=float, default=0.0,
                        help='Multiplier on --weight-decay for the remaining norm gains: every '
                        '1-D non-bias param that is NOT a qk-layernorm gain, i.e. the '

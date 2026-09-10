@@ -104,6 +104,12 @@ def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, Par
     #  2. The Qwen3-Next approach of doing 1, other than qk layernorm parameters.
     #  3. The OLMo 2/3 approach of decaying norm gains, with the qk-layernorm gains
     #     and the residual-stream norm gains given independent multipliers.
+    final_wd = config.final_norm_wd_mult
+    if final_wd is not None:
+        if not 0.0 <= final_wd < float("inf"):
+            raise ValueError("final_norm_wd_mult must be finite and non-negative")
+        if config.apply_wd_to_qk_layernorm:
+            raise ValueError("final_norm_wd_mult conflicts with apply_wd_to_qk_layernorm")
     if config.apply_wd_to_qk_layernorm:
         shape_1_not_qkln_param = ParamWithNamePredicate(
             name="s1_not_qkln",
@@ -112,7 +118,8 @@ def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, Par
         )
         param_wd_mult_key = ParamKey(with_name_predicate=shape_1_not_qkln_param)
         config_overrides[param_wd_mult_key] = ParamGroupOverride(wd_mult=0.0)
-    elif config.qk_layernorm_wd_mult != 0.0 or config.residual_norm_wd_mult != 0.0:
+    elif (config.qk_layernorm_wd_mult != 0.0
+          or config.residual_norm_wd_mult != 0.0 or final_wd is not None):
         # Three DISJOINT keys: a parameter matching two of them would hit the conflict
         # check in combine_param_group_overrides() and raise. Biases stay exempt; the
         # qk-layernorm gains and the remaining (residual-stream) norm gains each get
@@ -128,7 +135,8 @@ def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, Par
             name="residual_norm_gain",
             fn=lambda param, name: len(param.shape) == 1
             and not name.endswith(".bias")
-            and not ("q_layernorm." in name or "k_layernorm." in name),
+            and not ("q_layernorm." in name or "k_layernorm." in name)
+            and not (final_wd is not None and name.endswith("decoder.final_layernorm.weight")),
         )
         config_overrides[ParamKey(with_name_predicate=qk_layernorm_gain)] = ParamGroupOverride(
             wd_mult=config.qk_layernorm_wd_mult
@@ -136,6 +144,15 @@ def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, Par
         config_overrides[ParamKey(with_name_predicate=residual_norm_gain)] = ParamGroupOverride(
             wd_mult=config.residual_norm_wd_mult
         )
+        if final_wd is not None:
+            final_norm_gain = ParamWithNamePredicate(
+                name="final_norm_gain",
+                fn=lambda param, name: len(param.shape) == 1
+                and name.endswith("decoder.final_layernorm.weight"),
+            )
+            config_overrides[ParamKey(with_name_predicate=final_norm_gain)] = ParamGroupOverride(
+                wd_mult=final_wd
+            )
     else:
         param_length_1_match = ParamPredicate(
             name="param_len_1", fn=lambda param: len(param.shape) == 1
