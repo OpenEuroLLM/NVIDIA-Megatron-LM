@@ -146,6 +146,10 @@ def _get_param_groups(
                 wd_mult = 0.0
             elif len(param.shape) == 1:
                 wd_mult = float(config_for_param.scaler_wd_mult)
+            elif len(param.shape) == 2 and "word_embeddings" in name:
+                # Input embedding only. The untied output layer (`output_layer.weight`) keeps
+                # the default: all of its rows receive a softmax gradient every step.
+                wd_mult = float(config_for_param.embedding_wd_mult)
             else:
                 wd_mult = 1.0
 

@@ -58,6 +58,17 @@ class OptimizerConfig:
     2-D weights. Biases are always excluded regardless of this setting.
     """
 
+    embedding_wd_mult: float = 1.0
+    """Multiplier applied to `weight_decay` for the word-embedding matrix (the 2-D parameter whose
+    name contains `word_embeddings`). Default 1.0 = decay like every other weight (historical
+    Megatron). OLMo 2/3 and Levanter/Marin exclude the embeddings from weight decay (0.0): decay
+    shrinks the rows of rare tokens, which receive few gradient updates. The untied output layer
+    is not affected by this multiplier.
+
+    Same flag and semantics as the 0.19 implementation (a37fd59b0, Jenia Jitsev), reimplemented
+    for this version's `_get_param_groups`.
+    """
+
     ##############
     # Precision
     ##############
