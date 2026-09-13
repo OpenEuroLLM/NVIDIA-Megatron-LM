@@ -17,6 +17,7 @@ from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
 from megatron.core.utils import StragglerDetector, get_attr_wrapped_model
 from megatron.training import get_args, get_timers, get_tokenizer, inprocess_restart, pretrain, print_rank_0
+from megatron.training.diagnostics import get_diagnostics
 from megatron.training.datasets.sft_dataset import SFTDataset
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.training.utils import (
@@ -58,7 +59,10 @@ SPIKY_LOSS_FACTOR = 10
 
 
 def loss_func(
-    loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optional[GPTModel] = None
+    loss_mask: torch.Tensor,
+    output_tensor: torch.Tensor,
+    model: Optional[GPTModel] = None,
+    labels: Optional[torch.Tensor] = None,
 ):
     """Loss function.
 
@@ -66,6 +70,8 @@ def loss_func(
         loss_mask (torch.Tensor): Used to mask out some portions of the loss
         output_tensor (torch.Tensor): The tensor with the losses
         model (GPTModel, optional): The model (can be wrapped)
+        labels (torch.Tensor, optional): Targets of this microbatch, passed only
+            when --diag-token-loss-dir is set (the per-token loss dump)
 
     Returns:
         the loss scalar for this micro-batch
@@ -78,6 +84,11 @@ def loss_func(
     if has_nvidia_modelopt and getattr(args, 'modelopt_enabled', False):  # [ModelOpt]
         loss, num_tokens, report = loss_func_modelopt(loss_mask, output_tensor, model=model)
     else:
+        if labels is not None:
+            diagnostics = get_diagnostics()
+            if diagnostics is not None:
+                # per-token CE losses [b, s] of this microbatch (--diag-token-loss-dir)
+                diagnostics.record_token_losses(labels, output_tensor, loss_mask)
         losses = output_tensor.view(-1).float()
         loss_mask = loss_mask.view(-1).float()
         loss = torch.sum(losses * loss_mask)
@@ -138,6 +149,8 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
         tokens, labels, loss_mask, attention_mask, position_ids = get_batch(data_iterator, vp_stage)
     timers('batch-generator').stop()
 
+    # labels reach the loss function only for the per-token loss dump
+    token_labels = labels if getattr(args, "diag_token_loss_dir", None) else None
     with stimer:
         if args.use_legacy_models:
             output_tensor = model(tokens, position_ids, attention_mask, labels=labels)
@@ -148,14 +161,14 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                 schedule_plan = model.build_schedule_plan(
                     tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask
                 )
-                return schedule_plan, partial(loss_func, loss_mask, model=model)
+                return schedule_plan, partial(loss_func, loss_mask, model=model, labels=token_labels)
             else:
                 output_tensor = model(
                     tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask
                 )
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
-    return output_tensor, partial(loss_func, loss_mask, model=model)
+    return output_tensor, partial(loss_func, loss_mask, model=model, labels=token_labels)
 
 
 def is_dataset_built_on_rank(vp_stage=None):

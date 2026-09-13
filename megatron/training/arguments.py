@@ -71,6 +71,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_mla_args(parser)
     parser = _add_heterogeneous_args(parser)
     parser = _add_logging_args(parser)
+    parser = _add_diagnostics_args(parser)
     parser = _add_straggler_detector_args(parser)
     parser = _add_workload_inspector_server_args(parser)
     parser = _add_inference_args(parser)
@@ -1899,6 +1900,104 @@ def _add_logging_args(parser):
                        help='Path to save the wandb results locally.')
     group.add_argument('--logging-level', type=int, default=None,
                        help='Set default logging level')
+    return parser
+
+
+def _add_diagnostics_args(parser):
+    """Opt-in per-layer training diagnostics (see megatron/training/diagnostics.py).
+
+    All of these are OFF by default and cost nothing when off. They exist for
+    long runs, where a degradation has to be localised in TIME (which iteration)
+    and in DEPTH (which layer) and checkpoints are too coarse to do either.
+
+    Backported verbatim from `oellm/v0.19`; the flag names and semantics are
+    identical on both branches so a config, a scan script or a tensorboard
+    dashboard works against either stack.
+    """
+    group = parser.add_argument_group(title='diagnostics')
+
+    group.add_argument('--diagnostics-interval', type=int, default=0,
+                       help='Collect per-layer diagnostics every N iterations. '
+                            '0 disables all of the --diag-* collectors below. '
+                            'The activation collector is the only expensive one; '
+                            '100 keeps its amortised cost under a thousandth of step time.')
+    group.add_argument('--diag-nonfinite', action='store_true',
+                       help='Scan every weight and gradient for NaN/Inf and print the '
+                            'offending parameter names. Unlike '
+                            '--check-for-nan-in-loss-and-grad this localises the '
+                            'problem instead of only aborting on it.')
+    group.add_argument('--diag-norm-gains', action='store_true',
+                       help='Log mean/std/min/max of every RMSNorm/LayerNorm gain, per '
+                            'layer. Norm gains are excluded from weight decay by default, '
+                            'so nothing opposes their drift.')
+    group.add_argument('--diag-layer-grad-norms', action='store_true',
+                       help='Log the L2 gradient norm of every transformer layer '
+                            'separately, plus embedding/output_layer. Exposes the '
+                            'early-vs-late layer asymmetry that the single global '
+                            'grad norm averages away. Also logs '
+                            'diag/grad_norm/total_check, which MUST equal the '
+                            'grad-norm Megatron computes independently.')
+    group.add_argument('--diag-activations', action='store_true',
+                       help='Log the RMSNorm denominator sqrt(mean(x^2)) and the mean of '
+                            'the input to every norm, plus a non-finite count, from the '
+                            'first microbatch of a diagnostic iteration. This is the one '
+                            'collector with a real cost (bandwidth-bound, ~20 GB of reads '
+                            'for a 64-layer 32B model).')
+    group.add_argument('--diag-clip-events', action='store_true',
+                       help='Track gradient-clipping events on EVERY step (a streak can '
+                            'only be counted that way) and report the streak length, the '
+                            'fired fraction, the smallest clip coefficient and the '
+                            'mean/min/max of the pre-clip total norm -- the clip '
+                            'denominator -- over the logging interval. Free, and '
+                            'independent of --diagnostics-interval.')
+    group.add_argument('--diag-weight-stats', action='store_true',
+                       help='Log min/max/mean/rms of every linear_qkv / linear_proj / '
+                            'linear_fc1 / linear_fc2 weight matrix per layer, plus the '
+                            'embedding and output layer. One pass over the local weight '
+                            'shards and three small all-reduces over the model-parallel '
+                            'group on a diagnostic iteration.')
+    group.add_argument('--diag-fp8-meta', action='store_true',
+                       help='Log the FP8 delayed-scaling window-max amax and current '
+                            'scale of the GEMM input, weight and output gradient of the '
+                            'four TE GEMMs of every layer. Empty under recipes without '
+                            'per-tensor state (blockwise, mxfp8) and for bf16 layers.')
+    group.add_argument('--te-debug-config', type=str, default=None,
+                       help='nvdlfw_inspect feature YAML applied to every Transformer '
+                            'Engine module (LogTensorStats, LogFp8TensorStats, ...). '
+                            'Writes PER-RANK statistics files, so use it only on small '
+                            'probes (<= 16 nodes). See megatron/training/te_debug.py.')
+    group.add_argument('--te-debug-log-dir', type=str, default=None,
+                       help='Directory for the nvdlfw_inspect logs; defaults to '
+                            '<tensorboard-dir>/te_debug.')
+    group.add_argument('--diag-logit-stats', action='store_true',
+                       help='Log mean/std/min/max of the output-layer logits, the mean '
+                            'per-token max logit and the mean/std of the per-token '
+                            'log-partition log Z on diagnostic iterations (forward hook '
+                            'on the output layer). NB these are PRE-softcap: '
+                            '--final-logit-softcapping is applied after the output layer '
+                            'returns, so the hook cannot see its effect.')
+    group.add_argument('--diag-token-loss-dir', type=str, default=None,
+                       help='Diagnostics only: on every diagnostic iteration write the '
+                            'per-token CE loss, label, loss mask, log Z and max logit of '
+                            'every microbatch to <dir>/it<iteration>_dp<rank>_cp<rank>.npz '
+                            '(TP rank 0 of the last pipeline stage). For checkpoint probes '
+                            'on a fixed batch.')
+    group.add_argument('--diag-swap-checkpoint', type=str, default=None,
+                       help='Diagnostics only: after the checkpoint load, reload the model '
+                            'tensors selected by --diag-swap-keys from this torch_dist '
+                            'checkpoint (checkpoint surgery for probes).')
+    group.add_argument('--diag-swap-keys', type=str, default=None,
+                       help='Comma-separated regexes matched against the checkpoint keys '
+                            '(global layer numbering, e.g. ^output_layer[.]weight or '
+                            '^decoder[.]layers[.]@56-63) selecting the tensors to reload '
+                            'from --diag-swap-checkpoint.')
+    group.add_argument('--diag-consumed-train-samples', type=int, default=None,
+                       help='Diagnostics only: after the checkpoint load, position the '
+                            'training dataloader at this consumed-sample count instead of '
+                            'the checkpoint\'s own, so a probe can run the weights of '
+                            'iteration X on the batches of iteration Y '
+                            '(Y * global batch size). Never use for real training.')
+
     return parser
 
 

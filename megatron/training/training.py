@@ -117,6 +117,8 @@ from megatron.core.num_microbatches_calculator import (
 )
 
 from .async_utils import maybe_finalize_async_save
+from .diagnostics import get_diagnostics, setup_diagnostics
+from .te_debug import attach_te_debug, init_te_debug, te_debug_step
 from .utils import (
     append_to_progress_log,
     calc_params_l2_norm,
@@ -633,6 +635,10 @@ def pretrain(
         ft_integration.setup(args)
         ft_integration.maybe_setup_simulated_fault()
 
+    # Opt-in TE tensor inspection (--te-debug-config). Must precede model
+    # construction: TE reads the inspect state when its modules are built.
+    init_te_debug(args)
+
     # Set pytorch JIT layer fusion options and warmup JIT functions.
     set_jit_fusion_options()
 
@@ -700,6 +706,14 @@ def pretrain(
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
     config = get_model_config(model[0])
+
+    # Per-layer diagnostics: builds the parameter->slot maps and installs the
+    # activation hooks. Constructing it is free when --diagnostics-interval is 0,
+    # and setup() returns immediately in that case.
+    setup_diagnostics(args).setup(model, optimizer)
+    # TE inspect: name the modules (global layer numbers) and align its step
+    # counter with the resumed iteration. No-op without --te-debug-config.
+    attach_te_debug(model, getattr(args, "iteration", 0) or 0)
 
     # Data stuff.
     app_metrics['app_build_dataiters_start_time'] = one_logger_utils.get_timestamp_in_ms()
@@ -1164,6 +1178,161 @@ def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
     return config, config_overrides
 
 
+def reapply_adam_hyperparams_after_load(optimizer):
+    """Make Adam betas/eps follow the arguments after a resume, and print what is in effect.
+
+    ``DistributedOptimizer.load_state_dict`` / ``torch.optim.Optimizer.load_state_dict``
+    replace every param_group entry with the checkpoint's, including ``betas`` and
+    ``eps``. Megatron re-applies only ``lr`` and ``weight_decay`` afterwards (through
+    ``OptimizerParamScheduler.step`` every iteration), so a resume with
+    ``--adam-beta1`` / ``--adam-beta2`` / ``--adam-eps`` different from the
+    checkpoint's would silently keep the checkpoint's values (Adam/FusedAdam read
+    ``group['betas']`` and ``group['eps']`` at every step). This re-applies the
+    argument values to every param group and prints, on rank 0, every group's
+    lr / weight_decay / betas / eps, so the job log proves which values are used.
+    """
+    args = get_args()
+    if optimizer is None or getattr(optimizer, 'is_stub_optimizer', False):
+        return
+    param_groups = optimizer.param_groups
+    if not param_groups:
+        print_rank_0('> adam hyperparameters after checkpoint load: no param groups on this rank')
+        return
+
+    def _num(v):
+        return float(v) if isinstance(v, torch.Tensor) else v
+
+    changed = []
+    if args.optimizer == 'adam':
+        wanted_betas = (args.adam_beta1, args.adam_beta2)
+        for idx, group in enumerate(param_groups):
+            if 'betas' in group and tuple(group['betas']) != wanted_betas:
+                changed.append(f"group {idx}: betas {tuple(group['betas'])} -> {wanted_betas}")
+                group['betas'] = wanted_betas
+            if 'eps' in group and group['eps'] != args.adam_eps:
+                changed.append(f"group {idx}: eps {group['eps']} -> {args.adam_eps}")
+                group['eps'] = args.adam_eps
+    for idx, group in enumerate(param_groups):
+        print_rank_0(
+            f"> adam hyperparameters after checkpoint load: param_group {idx}: "
+            f"n_params={len(group.get('params', []))} lr={_num(group.get('lr'))} "
+            f"max_lr={group.get('max_lr')} min_lr={group.get('min_lr')} "
+            f"weight_decay={_num(group.get('weight_decay'))} wd_mult={group.get('wd_mult')} "
+            f"betas={group.get('betas')} eps={group.get('eps')}"
+        )
+    if changed:
+        print_rank_0(
+            '> adam hyperparameters re-applied from the arguments, checkpoint values '
+            'overridden: ' + '; '.join(changed)
+        )
+    else:
+        print_rank_0(
+            '> adam hyperparameters: checkpoint values equal the arguments '
+            f"(betas=({args.adam_beta1}, {args.adam_beta2}), eps={args.adam_eps}); "
+            'nothing re-applied'
+        )
+
+
+def diag_swap_from_checkpoint(model, optimizer, args):
+    """Checkpoint surgery for probes (--diag-swap-checkpoint DIR --diag-swap-keys SEL[,SEL...]).
+
+    After the normal checkpoint load, reload selected model tensors from DIR (a torch_dist
+    iter_XXXXXXX directory, or a root holding latest_checkpointed_iteration.txt). A selector is a
+    regex on the CHECKPOINT key, optionally followed by @LO-HI restricting the global layer index.
+    The transformer layers share layer-agnostic checkpoint keys (decoder.layers.mlp.linear_fc1.weight)
+    with the layer index as the first sharding axis (ShardedTensor.global_offset[0]), so
+    "^decoder[.]layers[.]@56-63" selects layers 56-63 and "^output_layer[.]weight" the output layer.
+    Selectors without a range match tensors without a layer axis too; selectors with a range only
+    tensors with one. The selections of all model chunks go into ONE collective load with the
+    coverage validation off (a partial layer range is a partial coverage by design). Every swapped
+    tensor is logged with its norm before, after and of the difference (a self swap gives 0), and
+    the optimizer's master params are refreshed so an lr-0 step cannot write the old values back.
+
+    0.16: `oellm/v0.19` threads a `dp_cp_group` into `_build_sharded_state_dict_metadata`
+    (0.19 made the checkpoint process groups explicit). On 0.16 that function takes
+    `args` alone and reads the groups off the global `parallel_state`, so the
+    parameter is gone here rather than passed as None.
+    """
+    import re
+    from megatron.core import dist_checkpointing
+    from megatron.core.dist_checkpointing.mapping import ShardedTensor
+    from megatron.training.checkpointing import _build_sharded_state_dict_metadata
+
+    ckpt_dir = args.diag_swap_checkpoint
+    tracker = os.path.join(ckpt_dir, "latest_checkpointed_iteration.txt")
+    if os.path.isfile(tracker):
+        with open(tracker) as fh:
+            ckpt_dir = os.path.join(ckpt_dir, f"iter_{int(fh.read().strip()):07d}")
+    assert os.path.isfile(os.path.join(ckpt_dir, ".metadata")), f"no torch_dist checkpoint at {ckpt_dir}"
+    selectors = []
+    for sel in args.diag_swap_keys.split(","):
+        if not sel:
+            continue
+        if "@" in sel:
+            pat, rng = sel.rsplit("@", 1)
+            lo, hi = (int(x) for x in rng.split("-"))
+            selectors.append((re.compile(pat), (lo, hi)))
+        else:
+            selectors.append((re.compile(sel), None))
+    metadata = _build_sharded_state_dict_metadata(args)
+    report = mpu.get_tensor_model_parallel_rank() == 0 and mpu.get_data_parallel_rank() == 0
+    stage = mpu.get_pipeline_model_parallel_rank()
+    local_layer_re = re.compile(r"(?:^|\.)layers\.(\d+)\.")
+    chunks = unwrap_model(model)
+    nested, subs, befores = {}, [], []
+    for ci, chunk in enumerate(chunks):
+        ssd = chunk.sharded_state_dict(metadata=metadata)
+        # global layer index of every local layer: from any ShardedTensor of that layer whose
+        # first sharding axis is the layer axis
+        layer_of_local = {}
+        for k, v in ssd.items():
+            m = local_layer_re.search(k)
+            if m and isinstance(v, ShardedTensor) and getattr(v, "prepend_axis_num", 0) >= 1:
+                layer_of_local.setdefault(int(m.group(1)), int(v.global_offset[0]))
+        sub = {}
+        for k, v in ssd.items():
+            key = getattr(v, "key", None)
+            if key is None or "_extra_state" in key or not torch.is_tensor(getattr(v, "data", None)):
+                continue
+            m = local_layer_re.search(k)
+            layer = layer_of_local.get(int(m.group(1))) if m else None
+            for pat, rng in selectors:
+                if not pat.search(key):
+                    continue
+                if rng is None or (layer is not None and rng[0] <= layer <= rng[1]):
+                    sub[k] = v
+                    break
+        nested[f"model{ci}"] = sub
+        subs.append(sub)
+        befores.append({k: v.data.detach().float().clone() for k, v in sub.items()})
+    loaded = dist_checkpointing.load(nested, ckpt_dir, validate_access_integrity=False)
+    n_local = 0
+    for ci, chunk in enumerate(chunks):
+        if subs[ci]:
+            chunk.load_state_dict(loaded[f"model{ci}"], strict=False)
+        for k, v in subs[ci].items():
+            new, old = v.data.detach().float(), befores[ci][k]
+            n_local += 1
+            if report:
+                extra = f" layer {int(v.global_offset[0])}" if isinstance(v, ShardedTensor) and getattr(v, "prepend_axis_num", 0) >= 1 else ""
+                print(
+                    f"> diag swap [pp{stage} chunk{ci}] {v.key}{extra} ({k}): |before| {old.norm().item():.6g} "
+                    f"|after| {new.norm().item():.6g} |after-before| {(new - old).norm().item():.6g}",
+                    flush=True,
+                )
+    del befores
+    count = torch.tensor([n_local], dtype=torch.long, device=torch.cuda.current_device())
+    torch.distributed.all_reduce(count)
+    if torch.distributed.get_rank() == 0:
+        print(f"> diag swap: {count.item()} tensor shards reloaded from {ckpt_dir} "
+              f"(selectors: {args.diag_swap_keys})", flush=True)
+    assert count.item() > 0, "diag swap matched no tensor; check --diag-swap-keys"
+    if optimizer is not None:
+        optimizer.reload_model_params()
+        if torch.distributed.get_rank() == 0:
+            print("> diag swap: optimizer master params refreshed from the swapped model params", flush=True)
+
+
 def setup_model_and_optimizer(
     model_provider_func,
     model_type,
@@ -1266,6 +1435,11 @@ def setup_model_and_optimizer(
                 'load_checkpoint_time': timers('load-checkpoint').active_time(),
             }
         )
+        # Diagnostics: betas/eps come back from the checkpoint's param_groups;
+        # re-apply the arguments and log every group's hyperparameters (see the helper).
+        reapply_adam_hyperparams_after_load(optimizer)
+        if getattr(args, "diag_swap_checkpoint", None):
+            diag_swap_from_checkpoint(model, optimizer, args)
     else:
         args.iteration = 0
         args.num_floating_point_operations_so_far = 0
@@ -1320,6 +1494,18 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     args = get_args()
     timers = get_timers()
 
+    # Arms the activation hooks for this iteration (and clears their buffers).
+    # Must happen before the forward pass; a no-op unless --diagnostics-interval.
+    #
+    # 0.16: `oellm/v0.19` passes the iteration into train_step as an argument.
+    # Here it arrives through `args.curr_iteration`, which train() sets
+    # immediately before this call and which this function already relies on for
+    # the vision paths below -- so no signature change is needed.
+    diagnostics = get_diagnostics()
+    iteration = getattr(args, "curr_iteration", None)
+    if diagnostics is not None and iteration is not None:
+        diagnostics.begin_step(iteration)
+
     rerun_state_machine = get_rerun_state_machine()
     while rerun_state_machine.should_run_forward_backward(data_iterator):
         # Set grad to zero.
@@ -1371,6 +1557,13 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         unwrapped_model = unwrap_model(model[0])
         unwrapped_model.cancel_gradients_last_layer(args.curr_iteration)
 
+    # Per-layer diagnostics. Deliberately BEFORE optimizer.step(): the clip
+    # scales the gradients in place, and the quantity worth recording is the
+    # gradient the optimizer was handed, not the one it kept.
+    if diagnostics is not None and iteration is not None:
+        diagnostics.finish_activation_pass()
+        diagnostics.collect(iteration)
+
     # Update parameters.
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
@@ -1383,6 +1576,10 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     # grad_norm and num_zeros_in_grad will be None on ranks without trainable params,
     # so we must gather across mp ranks
     grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm)
+    # Every step, not just diagnostic ones: a clipping STREAK is only visible if
+    # every step is counted. Reads the already-reduced scalar, adds no collective.
+    if diagnostics is not None:
+        diagnostics.observe_clip(grad_norm)
     if args.log_num_zeros_in_grad:
         num_zeros_in_grad = reduce_max_stat_across_model_parallel_group(num_zeros_in_grad)
 
@@ -1549,6 +1746,15 @@ def training_log(
 
     # learning rate will be None on ranks without trainable params, so we must gather across mp ranks
     learning_rate = reduce_max_stat_across_model_parallel_group(learning_rate)
+
+    # Per-layer diagnostics. Called on EVERY rank so the clip accumulators reset
+    # in lockstep; the writers only exist on the last rank, so everywhere else
+    # emit() collects its numbers and drops them. The data itself was produced by
+    # collectives in train_step, so every rank already holds it.
+    diagnostics = get_diagnostics()
+    if diagnostics is not None and (iteration % args.tensorboard_log_interval == 0):
+        diagnostics.emit(iteration, writer, wandb_writer)
+
     # Tensorboard values.
     if writer and (iteration % args.tensorboard_log_interval == 0):
         if wandb_writer:
@@ -2410,6 +2616,8 @@ def train(
         ) = train_step(
             forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func
         )
+        # TE inspect: reduce and flush the per-step feature buffers.
+        te_debug_step()
         ft_integration.on_training_step_end()
         if should_checkpoint:
             save_checkpoint_and_time(
@@ -2898,6 +3106,16 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
     """Build pretraining data loaders."""
 
     args = get_args()
+
+    # Diagnostics-only override (--diag-consumed-train-samples): run the loaded
+    # weights on the batches of a different position of the data stream.
+    if getattr(args, "diag_consumed_train_samples", None) is not None:
+        print_rank_0(
+            f"> DIAGNOSTICS: positioning the train dataloader at consumed_train_samples="
+            f"{args.diag_consumed_train_samples} instead of the checkpoint's "
+            f"{args.consumed_train_samples}"
+        )
+        args.consumed_train_samples = int(args.diag_consumed_train_samples)
 
     (train_dataloader, valid_dataloaders, test_dataloader) = (None, None, None)
 
