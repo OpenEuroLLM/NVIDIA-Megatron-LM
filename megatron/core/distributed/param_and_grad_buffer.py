@@ -428,9 +428,16 @@ class _ParamAndGradBucketGroup:
         else:
             communication_group = self.data_parallel_group
 
-        # Coalesce communication kernels across buckets in the bucket group.
+        # Coalescing synchronous collectives can crash in ProcessGroupNCCL on
+        # ROCm for model-sized gradient buffers. Coalescing is only needed for
+        # asynchronous overlap; issue synchronous collectives directly.
         grad_reduce_handle = None
-        with stream_context, _coalescing_manager(communication_group, async_ops=async_op) as cm:
+        coalescing_context = (
+            _coalescing_manager(communication_group, async_ops=True)
+            if async_op
+            else nullcontext()
+        )
+        with stream_context, coalescing_context as cm:
             for idx, bucket in enumerate(self.buckets):
                 if self.ddp_config.use_distributed_optimizer and not force_all_reduce:
                     if self.cached_grad_buffer_shard_list[idx] is None:

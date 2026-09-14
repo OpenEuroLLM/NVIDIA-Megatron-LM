@@ -5,11 +5,14 @@ import math
 import torch
 
 from megatron.core.transformer.moe.moe_utils import (
+    _aggregate_layer_values,
     clear_expert_utilization_tracker,
     compute_expert_load_metrics,
     compute_normalized_entropy,
     compute_router_score_distribution,
+    expert_rms_statistics,
     get_expert_utilization_tracker,
+    local_expert_rms,
     save_to_expert_utilization_tracker,
     update_expert_near_dead_streaks,
 )
@@ -130,3 +133,59 @@ def test_near_dead_streak_rejects_mismatched_shapes():
         pass
     else:
         raise AssertionError("Expected mismatched streak and mask shapes to fail")
+
+
+def test_aggregate_layer_values():
+    assert _aggregate_layer_values([]) == {}
+    torch.testing.assert_close(
+        torch.tensor(list(_aggregate_layer_values([1.0, 3.0, 5.0]).values())),
+        torch.tensor([3.0, 1.0, 5.0]),
+    )
+
+
+def test_expert_rms_statistics_supports_grouped_mlp_layout():
+    class Config:
+        hidden_size = 4
+
+    class FakeGroupedMLP(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = Config()
+            self.weight1 = torch.nn.Parameter(torch.ones(4, 16))
+            self.weight2 = torch.nn.Parameter(torch.full((8, 4), 2.0))
+
+    experts = FakeGroupedMLP()
+    sq_sums, counts = expert_rms_statistics(experts, num_local_experts=2)
+    torch.testing.assert_close(counts, torch.tensor([48.0, 48.0]))
+    torch.testing.assert_close(sq_sums, torch.tensor([96.0, 96.0]))
+
+    rms = local_expert_rms(experts, num_local_experts=2)
+    torch.testing.assert_close(rms, torch.full((2,), math.sqrt(2.0)))
+
+
+def test_mask_routed_moe_layer_context():
+    from megatron.core.transformer.moe.moe_utils import (
+        mask_routed_moe_layer,
+        should_mask_routed_moe_layer,
+    )
+
+    assert not should_mask_routed_moe_layer(3)
+    with mask_routed_moe_layer(3):
+        assert should_mask_routed_moe_layer(3)
+        assert not should_mask_routed_moe_layer(4)
+    assert not should_mask_routed_moe_layer(3)
+
+
+def test_caching_data_iterator_replays_microbatches():
+    from megatron.core.transformer.moe.moe_utils import _CachingDataIterator
+
+    source = iter([{"batch": 1}, {"batch": 2}])
+    caching_iterator = _CachingDataIterator(source)
+
+    assert next(caching_iterator) == {"batch": 1}
+    assert next(caching_iterator) == {"batch": 2}
+
+    caching_iterator.rewind()
+    assert next(caching_iterator) == {"batch": 1}
+    assert next(caching_iterator) == {"batch": 2}
+
