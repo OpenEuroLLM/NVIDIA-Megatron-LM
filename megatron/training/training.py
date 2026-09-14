@@ -117,7 +117,7 @@ from megatron.core.num_microbatches_calculator import (
 )
 
 from .async_utils import maybe_finalize_async_save
-from .diagnostics import get_diagnostics, setup_diagnostics
+from .diagnostics import diagnostics_paused, get_diagnostics, setup_diagnostics
 from .te_debug import attach_te_debug, init_te_debug, te_debug_step
 from .utils import (
     append_to_progress_log,
@@ -2858,7 +2858,14 @@ def evaluate(
     if eval_iters is None:
         eval_iters = args.eval_iters
 
-    with torch.no_grad():
+    # The --diag-* hooks are armed by `begin_step` for the whole ITERATION, and
+    # evaluation runs later in the same loop body, so without this they are
+    # still live for every eval forward — which hung the 32B v2 flagship at its
+    # first eval boundary after the collectors were switched on. See
+    # `TrainingDiagnostics.paused`. Wrapping the no_grad block covers every
+    # forward in this function, including the `process_non_loss_data_func`
+    # branch, and the timelimit `return` below unwinds it correctly.
+    with torch.no_grad(), diagnostics_paused():
         iteration = 0
         if verbose:
             print_rank_0(f'Evaluating on {eval_iters * eval_batch_size} samples')
