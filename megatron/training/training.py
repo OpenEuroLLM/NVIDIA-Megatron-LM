@@ -559,6 +559,121 @@ def preprocess_common_state_dict(common_state_dict):
     return preprocessed_common_state_dict
 
 
+def install_stack_dumper():
+    """SIGUSR1 -> dump every thread's Python stack, on every rank, to stderr.
+
+    A silent hang is the one failure this tree cannot debug after the fact. The
+    32B v2 flagship has stalled at iteration 40000 seven times with no error, no
+    NCCL warning and no traceback; the log simply stops. `py-spy` cannot be used
+    on it because the ranks run inside an apptainer mount namespace and a py-spy
+    launched in a second instance of the same image cannot resolve the target's
+    binaries ("Failed to find python version from target process"). Registering
+    faulthandler sidesteps that entirely: the process dumps its OWN stack, from
+    inside its own namespace, straight into the job log.
+
+    To use it on a hung job, use `scripts/korbi/dump_stacks.sh <jobid>`. Do NOT
+    hand-roll `pkill -USR1 -f pretrain_gpt.py`: that pattern also matches the
+    pkill process itself AND the torchrun agent (`python -m
+    torch.distributed.run ... pretrain_gpt.py ...`). The agent never reaches
+    this function, so it has no handler, SIGUSR1's default action terminates
+    it, and every worker on the node goes down with it. Measured 2026-09-15 on
+    job 1798490: all four tasks died with "User defined signal 1" and not one
+    stack was printed. The script signals worker ranks only.
+
+    Every signalled rank prints `Stack (most recent call first)` for every
+    thread, into the job log. With --tee that is a lot of output, so target one
+    node first, and pick nodes on different pipeline stages: a p2p deadlock
+    looks like "everyone waiting in recv" until you find the one rank that is
+    somewhere else.
+
+    Safe to install unconditionally. SIGUSR1's default action is to TERMINATE
+    the process, so registering a handler strictly reduces the damage a stray
+    signal does, and nothing else in this stack uses it (the flagship's SLURM
+    `--signal` is TERM@240). `chain=False` because there is no prior handler to
+    call. Costs one signal handler and nothing at runtime.
+    """
+    import faulthandler
+    import signal
+
+    try:
+        faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
+    except Exception as exc:  # pragma: no cover - never worth failing a run over
+        print(f"> could not install the SIGUSR1 stack dumper: {exc}", flush=True)
+
+
+# Updated by the training loop; read by the watchdog thread.
+_HEARTBEAT = [0.0]
+
+
+def heartbeat():
+    """Mark forward progress. Cheap enough to call every iteration."""
+    _HEARTBEAT[0] = time.time()
+
+
+def install_hang_watchdog(stall_seconds: int = 600, repeat: int = 3):
+    """Dump every thread's stack automatically when the training loop goes quiet.
+
+    THIS IS THE ONE THAT ACTUALLY WORKS AT SCALE — prefer it to the SIGUSR1
+    route above, which is kept only for on-demand use.
+
+    A silent hang gives you nothing: no traceback, no NCCL warning, the log just
+    stops (32B v2 at iteration 40000, seven times). Both external options failed
+    here, measured, not assumed:
+
+      * `py-spy` cannot read the ranks at all — they live in an apptainer mount
+        namespace and py-spy in a second instance of the same image reports
+        "Failed to find python version from target process" (2026-09-15).
+      * SIGUSR1 + faulthandler.register delivered the signal (the ranks survived
+        it, so a handler was installed) but produced ZERO output anywhere — not
+        the slurm log, not the node's /tmp/torchelastic_* redirect dir
+        (job 1798491). Signal-handler writes do not reliably survive torchrun's
+        redirect/tee plumbing.
+
+    A watchdog THREAD sidesteps both: it runs inside the rank, in its own
+    namespace, and writes through the ordinary `sys.stderr` that torchrun
+    already tees into the job log — the same path every other log line takes.
+    It also needs no operator action, which matters because the hang is only
+    visible minutes after it starts.
+
+    `stall_seconds` must exceed the slowest legitimate gap between heartbeats.
+    The flagship's is a checkpoint save plus an evaluation, so 600 s is roughly
+    30x the 19 s eval and comfortably past a save; set it below that and every
+    healthy eval prints 2048 stack traces.
+
+    Fires at most `repeat` times so a genuinely wedged job does not fill the
+    shared log, and keeps going afterwards rather than killing anything —
+    deciding to kill is the monitor's job, not this thread's.
+    """
+    import faulthandler
+    import threading
+
+    def watch():
+        fired = 0
+        while True:
+            time.sleep(30)
+            last = _HEARTBEAT[0]
+            if last <= 0.0:
+                continue  # training has not started yet
+            stalled = time.time() - last
+            if stalled < stall_seconds:
+                fired = 0  # progress resumed; re-arm
+                continue
+            if fired >= repeat:
+                continue
+            fired += 1
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+            print(
+                f"\n>>> HANG WATCHDOG rank {rank}: no training progress for "
+                f"{stalled:.0f}s (dump {fired}/{repeat}) <<<",
+                file=sys.stderr,
+                flush=True,
+            )
+            faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+            sys.stderr.flush()
+
+    threading.Thread(target=watch, name="hang-watchdog", daemon=True).start()
+
+
 def pretrain(
     train_valid_test_dataset_provider,
     model_provider,
@@ -609,6 +724,11 @@ def pretrain(
         inprocess_call_wrapper: an optional instance of inprocess.CallWrapper,
             it is automatically injected when in-process restart is in use
     """
+
+    # Stack dumps for silent hangs. On-demand (SIGUSR1) and automatic (watchdog);
+    # both must be installed before anything can hang.
+    install_stack_dumper()
+    install_hang_watchdog()
 
     if inprocess_call_wrapper is not None:
         iteration = inprocess_call_wrapper.iteration
@@ -2657,6 +2777,11 @@ def train(
                         cuda_graph_helper.cuda_graph_set_manual_hooks()
 
         iteration += 1
+        # Forward progress, for the hang watchdog. Deliberately here and NOT
+        # inside evaluate()/save: a stall anywhere in the iteration — eval,
+        # checkpoint, the pipeline — must stop the heartbeat, or the watchdog
+        # cannot see the failure it exists for.
+        heartbeat()
 
         if getattr(args, 'perform_rl_step', False) and args.rl_use_sequence_packing:
             iteration_sequences = rl_utils.get_iteration_sequence_count(args)
