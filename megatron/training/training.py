@@ -605,6 +605,126 @@ def install_stack_dumper():
 _HEARTBEAT = [0.0]
 
 
+def _child_pids():
+    """Direct children of this process — the DataLoader workers and the ckpt worker."""
+    me = os.getpid()
+    out = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/status") as fh:
+                ppid = None
+                name = ""
+                for line in fh:
+                    if line.startswith("Name:"):
+                        name = line.split("\t", 1)[1].strip()
+                    elif line.startswith("PPid:"):
+                        ppid = int(line.split("\t", 1)[1])
+                        break
+            if ppid == me:
+                out.append((int(entry), name))
+        except (OSError, ValueError):
+            continue
+    return out
+
+
+def _sample_child(pid):
+    """State / kernel wait channel / CPU / bytes read, straight from /proc."""
+    s = {"state": "?", "wchan": "?", "cpu": -1.0, "read_bytes": -1, "rchar": -1}
+    try:
+        with open(f"/proc/{pid}/status") as fh:
+            for line in fh:
+                if line.startswith("State:"):
+                    s["state"] = line.split("\t", 1)[1].strip()
+                    break
+    except OSError:
+        pass
+    try:  # the kernel function it is sleeping in — names the subsystem for D-state
+        with open(f"/proc/{pid}/wchan") as fh:
+            s["wchan"] = fh.read().strip() or "0"
+    except OSError:
+        pass
+    try:
+        with open(f"/proc/{pid}/stat") as fh:
+            f = fh.read().rsplit(") ", 1)[1].split()
+        s["cpu"] = (int(f[11]) + int(f[12])) / os.sysconf("SC_CLK_TCK")
+    except (OSError, IndexError, ValueError):
+        pass
+    try:
+        # rchar = every byte returned by read(), including page-cache and
+        # network-filesystem reads. read_bytes = BLOCK-DEVICE traffic only, which
+        # on GPFS/fscratch can stay flat while the worker reads steadily — so
+        # rchar is the progress signal and read_bytes is the "is it hitting real
+        # storage" signal. Verified: a child reading /dev/urandom moves rchar and
+        # not read_bytes.
+        with open(f"/proc/{pid}/io") as fh:
+            for line in fh:
+                if line.startswith("rchar:"):
+                    s["rchar"] = int(line.split()[1])
+                elif line.startswith("read_bytes:"):
+                    s["read_bytes"] = int(line.split()[1])
+                    break
+    except OSError:
+        pass
+    return s
+
+
+def dump_child_state(path, gap_seconds=5):
+    """Why are the DataLoader workers not delivering? Answer it from /proc.
+
+    The watchdog dumps Python stacks for the RANK, but the ranks that hang at
+    iteration 40000 are blocked in `DataLoader._try_get_data` waiting on WORKER
+    PROCESSES whose stacks it never sees. Signalling the workers is not an
+    option here — faulthandler output does not survive torchrun's redirect
+    plumbing (see `install_hang_watchdog`) — but /proc answers the question that
+    actually matters without any signal at all.
+
+    Two samples `gap_seconds` apart, so the three possible causes separate
+    cleanly:
+
+      * state D + a filesystem/RPC `wchan`  -> stuck in uninterruptible kernel
+        I/O. That is a storage stall, not a Megatron bug.
+      * read_bytes ADVANCING between samples -> the workers are progressing,
+        just far too slowly; the eval is starved, not deadlocked.
+      * read_bytes frozen, state S, cpu flat -> blocked in userspace: a Python
+        lock, a queue, or a genuine deadlock.
+
+    Cheap and only runs when the watchdog has already decided the job is stuck.
+    """
+    kids = _child_pids()
+    first = {pid: _sample_child(pid) for pid, _ in kids}
+    time.sleep(gap_seconds)
+    second = {pid: _sample_child(pid) for pid, _ in kids}
+
+    lines = [f"{len(kids)} direct child processes, sampled {gap_seconds}s apart", ""]
+    lines.append(
+        f"{'pid':>8} {'name':<16} {'st':>2} {'wchan':<24} {'dCPUs':>7} "
+        f"{'drcharMB':>9} {'dblkMB':>8}"
+    )
+    n_dstate = n_moving = 0
+    for pid, name in sorted(kids):
+        a, b = first[pid], second[pid]
+        dcpu = (b["cpu"] - a["cpu"]) if a["cpu"] >= 0 and b["cpu"] >= 0 else -1
+        drc = (b["rchar"] - a["rchar"]) if a["rchar"] >= 0 and b["rchar"] >= 0 else -1
+        dblk = (b["read_bytes"] - a["read_bytes"]) if a["read_bytes"] >= 0 and b["read_bytes"] >= 0 else -1
+        if b["state"].startswith("D"):
+            n_dstate += 1
+        if drc > 0:
+            n_moving += 1
+        lines.append(
+            f"{pid:>8} {name[:16]:<16} {b['state'][:2]:>2} {b['wchan'][:24]:<24} "
+            f"{dcpu:>7.2f} {drc / 1e6:>9.2f} {dblk / 1e6:>8.2f}"
+        )
+    lines.insert(
+        1,
+        f"VERDICT HINT: {n_dstate}/{len(kids)} in uninterruptible I/O (D), "
+        f"{n_moving}/{len(kids)} made read() progress during the window",
+    )
+    with open(path, "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+
 def heartbeat():
     """Mark forward progress. Cheap enough to call every iteration."""
     _HEARTBEAT[0] = time.time()
@@ -687,6 +807,13 @@ def install_hang_watchdog(dump_dir: str = None, stall_seconds: int = 180, repeat
                     fh.flush()
                     faulthandler.dump_traceback(file=fh, all_threads=True)
                 where = path
+                # Why the workers are not delivering — see dump_child_state.
+                # Only a sample of ranks does this: it costs `gap_seconds` and
+                # a /proc scan, and 2048 copies of it would add nothing.
+                if rank % 64 == 0:
+                    dump_child_state(
+                        os.path.join(dump_dir, f"hang_children_rank{rank:05d}_{fired}.txt")
+                    )
             except Exception as exc:  # fall back to stderr rather than lose the stack
                 faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
                 where = f"<stderr; {exc}>"
