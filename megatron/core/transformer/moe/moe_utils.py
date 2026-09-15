@@ -1322,8 +1322,9 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         ctx.weight_dtype = weight.dtype
         inp_shape = inp.shape
         inp = inp.view(-1, inp_shape[-1])
-
-        if te_general_gemm is not None and router_dtype != torch.float64:
+        
+        # LUMI: need to handle float32 case separately with native torch.mm
+        if te_general_gemm is not None and router_dtype != torch.float64 and router_dtype != torch.float32:
             output = te_general_gemm(weight, inp, router_dtype, layout="TN", bias=bias)
             output = output[0]
         elif bias is None:
