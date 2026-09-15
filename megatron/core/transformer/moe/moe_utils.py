@@ -1133,6 +1133,114 @@ def track_moe_metrics(
     )
 
 
+def compute_router_score_distribution(*args, **kwargs):
+    from megatron.core.transformer.moe.moe_health import compute_router_score_distribution as _fn
+
+    return _fn(*args, **kwargs)
+
+
+def compute_normalized_entropy(*args, **kwargs):
+    from megatron.core.transformer.moe.moe_health import compute_normalized_entropy as _fn
+
+    return _fn(*args, **kwargs)
+
+
+def compute_expert_load_metrics(*args, **kwargs):
+    from megatron.core.transformer.moe.moe_health import compute_expert_load_metrics as _fn
+
+    return _fn(*args, **kwargs)
+
+
+def update_expert_near_dead_streaks(*args, **kwargs):
+    from megatron.core.transformer.moe.moe_health import update_expert_near_dead_streaks as _fn
+
+    return _fn(*args, **kwargs)
+
+
+def get_expert_utilization_tracker():
+    from megatron.core.transformer.moe.moe_health import get_expert_utilization_tracker as _fn
+
+    return _fn()
+
+
+def save_to_expert_utilization_tracker(*args, **kwargs):
+    from megatron.core.transformer.moe.moe_health import save_to_expert_utilization_tracker as _fn
+
+    return _fn(*args, **kwargs)
+
+
+def clear_expert_utilization_tracker():
+    from megatron.core.transformer.moe.moe_health import clear_expert_utilization_tracker as _fn
+
+    return _fn()
+
+
+def get_router_stats_tracker():
+    from megatron.core.transformer.moe.moe_health import get_router_stats_tracker as _fn
+
+    return _fn()
+
+
+def save_to_router_stats_tracker(*args, **kwargs):
+    from megatron.core.transformer.moe.moe_health import save_to_router_stats_tracker as _fn
+
+    return _fn(*args, **kwargs)
+
+
+def clear_router_stats_tracker():
+    from megatron.core.transformer.moe.moe_health import clear_router_stats_tracker as _fn
+
+    return _fn()
+
+
+def get_expert_viability_tracker():
+    from megatron.core.transformer.moe.moe_health import get_expert_viability_tracker as _fn
+
+    return _fn()
+
+
+def clear_expert_viability_tracker():
+    from megatron.core.transformer.moe.moe_health import clear_expert_viability_tracker as _fn
+
+    return _fn()
+
+
+def local_expert_rms(*args, **kwargs):
+    from megatron.core.transformer.moe.moe_health import local_expert_rms as _fn
+
+    return _fn(*args, **kwargs)
+
+
+def expert_rms_statistics(*args, **kwargs):
+    from megatron.core.transformer.moe.moe_health import expert_rms_statistics as _fn
+
+    return _fn(*args, **kwargs)
+
+
+def mask_routed_moe_layer(*args, **kwargs):
+    from megatron.core.transformer.moe.moe_health import mask_routed_moe_layer as _fn
+
+    return _fn(*args, **kwargs)
+
+
+def should_mask_routed_moe_layer(*args, **kwargs):
+    from megatron.core.transformer.moe.moe_health import should_mask_routed_moe_layer as _fn
+
+    return _fn(*args, **kwargs)
+
+
+def _aggregate_layer_values(*args, **kwargs):
+    from megatron.core.transformer.moe.moe_health import _aggregate_layer_values as _fn
+
+    return _fn(*args, **kwargs)
+
+
+def _CachingDataIterator(*args, **kwargs):
+    from megatron.core.transformer.moe.moe_health import _CachingDataIterator as _cls
+
+    return _cls(*args, **kwargs)
+
+
 def get_updated_expert_bias(
     tokens_per_expert: torch.Tensor,
     expert_bias: torch.Tensor,

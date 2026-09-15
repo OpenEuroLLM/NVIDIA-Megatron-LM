@@ -120,6 +120,11 @@ from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe import upcycling_utils
+from megatron.core.transformer.moe.moe_health import (
+    capture_expert_viability_parameter_stats,
+    report_moe_health_metrics,
+    run_masked_layer_validation,
+)
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 from megatron.core.transformer.moe.paged_stash import PagedStashRunner
 from megatron.core.transformer.moe.router_trace import get_moe_router_tracer, init_moe_router_tracer
@@ -2648,6 +2653,14 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         diagnostics.finish_activation_pass()
         diagnostics.collect(iteration)
 
+    if (
+        args.num_experts is not None
+        and args.moe_expert_viability_metrics
+        and iteration is not None
+        and iteration % args.log_interval == 0
+    ):
+        capture_expert_viability_parameter_stats(model)
+
     # Update parameters.
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
@@ -2991,6 +3004,15 @@ def training_log(
             mtp_num_layers=args.mtp_num_layers,
             pg_collection=pg_collection,
             total_loss_dict=total_loss_dict,
+        )
+        report_moe_health_metrics(
+            iteration=iteration,
+            writer=writer,
+            wandb_writer=wandb_writer,
+            total_loss_dict=total_loss_dict,
+            per_layer_logging=args.moe_per_layer_logging,
+            expert_viability_metrics=args.moe_expert_viability_metrics,
+            pg_collection=pg_collection,
         )
 
     # Log the output (LM head) z-loss. It is kept out of the reported cross-entropy loss on
@@ -4669,6 +4691,18 @@ def evaluate_and_print_results(
         # Timelimit hit during evaluation
         if timelimit:
             return
+        if args.moe_masked_layer_validation:
+            run_masked_layer_validation(
+                forward_step_func,
+                iterator,
+                model,
+                config,
+                iteration,
+                writer=writer,
+                wandb_writer=wandb_writer,
+                pg_collection=pg_collection,
+                p2p_communicator=p2p_communicator,
+            )
         string = f' validation{suffix} loss at {prefix} | '
         for key in total_loss_dict:
             string += '{} value: {:.6E} | '.format(key, total_loss_dict[key].item())

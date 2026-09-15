@@ -1739,6 +1739,17 @@ def validate_args(args, defaults={}):
         assert args.num_experts % args.expert_model_parallel_size == 0, \
             "Number of experts should be a multiple of expert model parallel_size."
 
+    if getattr(args, "moe_expert_viability_metrics", False) and not args.moe_per_layer_logging:
+        raise ValueError('--moe-expert-viability-metrics requires --moe-per-layer-logging')
+    if getattr(args, "moe_masked_layer_validation", False) and not args.moe_expert_viability_metrics:
+        raise ValueError('--moe-masked-layer-validation requires --moe-expert-viability-metrics')
+    if getattr(args, "moe_masked_layer_validation", False) and not (
+        getattr(args, 'do_valid', False) or (args.eval_interval and args.eval_iters > 0)
+    ):
+        raise ValueError('--moe-masked-layer-validation requires validation (--do-valid)')
+    if getattr(args, "moe_masked_layer_eval_iters", 8) <= 0:
+        raise ValueError('--moe-masked-layer-eval-iters must be positive')
+
     # MoE router check
     if isinstance(args.moe_router_load_balancing_type, list) and len(args.moe_router_load_balancing_type) == 1:
         args.moe_router_load_balancing_type = args.moe_router_load_balancing_type[0]

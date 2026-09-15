@@ -897,7 +897,20 @@ class TransformerConfig(ModelParallelConfig):
     """
 
     moe_per_layer_logging: bool = False
-    """Enable per-layer logging for MoE, currently supports auxiliary loss and z loss."""
+    """Enable per-layer logging for MoE, currently supports auxiliary loss, z loss,
+    router-score, and expert-utilization health metrics."""
+
+    moe_expert_viability_metrics: bool = False
+    """Enable opt-in per-layer routed-expert viability diagnostics.
+
+    Requires ``moe_per_layer_logging`` because the diagnostics are emitted per MoE layer.
+    """
+
+    moe_masked_layer_validation: bool = False
+    """Enable an opt-in paired validation probe that masks one routed MoE layer."""
+
+    moe_masked_layer_eval_iters: int = 8
+    """Dedicated validation batches used by each masked-layer probe."""
 
     moe_expert_capacity_factor: Optional[float] = None
     """moe_expert_capacity_factor (float): The capacity factor for each expert, None means no token
@@ -1670,6 +1683,13 @@ class TransformerConfig(ModelParallelConfig):
                 "moe_aux_loss_coeff must be a list of the same length as "
                 "moe_router_load_balancing_type"
             )
+
+        if self.moe_expert_viability_metrics and not self.moe_per_layer_logging:
+            raise ValueError("moe_expert_viability_metrics requires moe_per_layer_logging.")
+        if self.moe_masked_layer_validation and not self.moe_expert_viability_metrics:
+            raise ValueError("moe_masked_layer_validation requires moe_expert_viability_metrics.")
+        if self.moe_masked_layer_eval_iters <= 0:
+            raise ValueError("moe_masked_layer_eval_iters must be positive.")
 
         if self.moe_expert_capacity_factor is not None:
             if self.moe_expert_capacity_factor < 0:
