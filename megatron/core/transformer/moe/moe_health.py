@@ -123,11 +123,7 @@ def _aggregate_layer_values(values: List[float]) -> dict[str, float]:
     """Return mean/min/max aggregates over per-layer scalar metrics."""
     if not values:
         return {}
-    return {
-        "mean": sum(values) / len(values),
-        "min": min(values),
-        "max": max(values),
-    }
+    return {"mean": sum(values) / len(values), "min": min(values), "max": max(values)}
 
 
 def compute_router_score_distribution(
@@ -302,9 +298,7 @@ def record_router_health_metrics(
         reduce_group=reduce_group,
     )
     with torch.no_grad():
-        score_distribution = compute_router_score_distribution(
-            logits, score_function, expert_bias
-        )
+        score_distribution = compute_router_score_distribution(logits, score_function, expert_bias)
         max_scores = score_distribution.max(dim=-1).values
         score_entropy = compute_normalized_entropy(score_distribution)
         if valid is not None:
@@ -333,7 +327,9 @@ def _combined_rms(tensors: List[Optional[torch.Tensor]]) -> torch.Tensor:
     return torch.sqrt(square_sum / count)
 
 
-def _parameter_or_gradient(parameter: torch.nn.Parameter, gradients: bool) -> Optional[torch.Tensor]:
+def _parameter_or_gradient(
+    parameter: torch.nn.Parameter, gradients: bool
+) -> Optional[torch.Tensor]:
     if gradients:
         return getattr(parameter, "main_grad", parameter.grad)
     return parameter
@@ -412,7 +408,10 @@ def expert_rms_statistics(
     for tensors in groups:
         tensors = [tensor.detach().float() for tensor in tensors]
         stats.append(
-            (sum(tensor.square().sum() for tensor in tensors), sum(tensor.numel() for tensor in tensors))
+            (
+                sum(tensor.square().sum() for tensor in tensors),
+                sum(tensor.numel() for tensor in tensors),
+            )
         )
     return torch.stack([s[0] for s in stats]), torch.tensor(
         [s[1] for s in stats], device=stats[0][0].device, dtype=torch.float32
@@ -544,9 +543,9 @@ def report_moe_health_metrics(
         active_layers = selected_values.sum(dim=-1) > 0
         selected_means = selected_values.mean(dim=-1, keepdim=True)
         selected_zero_mask = (selected_values == 0) & active_layers.unsqueeze(-1)
-        selected_near_dead_mask = (selected_values < 0.1 * selected_means) & active_layers.unsqueeze(
-            -1
-        )
+        selected_near_dead_mask = (
+            selected_values < 0.1 * selected_means
+        ) & active_layers.unsqueeze(-1)
         near_dead_streaks = util_tracker.get("selected_near_dead_streaks")
         if near_dead_streaks is None or near_dead_streaks.shape != selected_values.shape:
             near_dead_streaks = torch.zeros_like(selected_values, dtype=torch.int32)
@@ -592,9 +591,15 @@ def report_moe_health_metrics(
                     writer.add_scalar(
                         f"moe/dispatched_expert_load_entropy_layer_{i}", entropy, iteration
                     )
+                    writer.add_scalar(
+                        f"moe/selected_expert_max_vio_layer_{i}", selected_max_vio, iteration
+                    )
                 if have_wandb:
                     wandb_layer_log[f"router-layers/dispatched_expert_load_entropy_layer_{i}"] = (
                         entropy
+                    )
+                    wandb_layer_log[f"router-layers/selected_expert_max_vio_layer_{i}"] = (
+                        selected_max_vio
                     )
 
         if dead_count_list:
@@ -617,7 +622,10 @@ def report_moe_health_metrics(
                 wandb_writer.log(
                     {
                         **wandb_layer_log,
-                        **{f"router-aggregates/{name}": value for name, value in aggregate_log.items()},
+                        **{
+                            f"router-aggregates/{name}": value
+                            for name, value in aggregate_log.items()
+                        },
                     },
                     iteration,
                 )
@@ -640,6 +648,7 @@ def report_moe_health_metrics(
 
         have_wandb_rs = per_layer_logging and (wandb_writer is not None)
         logit_spread_list = []
+        router_max_score_list = []
         router_score_entropy_list = []
         wandb_rs_log: dict = {}
         for i in range(sum_max_score.shape[0]):
@@ -651,14 +660,19 @@ def report_moe_health_metrics(
             mean_logit_i = (sum_logits[i] / cnt).cpu()
             logit_spread_i = mean_logit_i.std(unbiased=False).item()
             logit_spread_list.append(logit_spread_i)
+            router_max_score_list.append(mean_max_score_i)
             router_score_entropy_list.append(mean_score_entropy_i)
             if per_layer_logging:
                 if writer is not None:
-                    writer.add_scalar(f"moe/router_mean_max_prob_layer_{i}", mean_max_score_i, iteration)
+                    writer.add_scalar(
+                        f"moe/router_mean_max_prob_layer_{i}", mean_max_score_i, iteration
+                    )
                     writer.add_scalar(
                         f"moe/router_mean_score_entropy_layer_{i}", mean_score_entropy_i, iteration
                     )
-                    writer.add_scalar(f"moe/expert_logit_spread_layer_{i}", logit_spread_i, iteration)
+                    writer.add_scalar(
+                        f"moe/expert_logit_spread_layer_{i}", logit_spread_i, iteration
+                    )
                 if have_wandb_rs:
                     wandb_rs_log[f"router-layers/router_mean_max_prob_layer_{i}"] = mean_max_score_i
                     wandb_rs_log[f"router-layers/router_mean_score_entropy_layer_{i}"] = (
@@ -669,6 +683,7 @@ def report_moe_health_metrics(
         if logit_spread_list:
             agg_max_logit_spread = max(logit_spread_list)
             agg_mean_logit_spread = sum(logit_spread_list) / len(logit_spread_list)
+            agg_mean_router_max_score = sum(router_max_score_list) / len(router_max_score_list)
             agg_mean_router_score_entropy = sum(router_score_entropy_list) / len(
                 router_score_entropy_list
             )
@@ -679,6 +694,9 @@ def report_moe_health_metrics(
             if writer is not None:
                 writer.add_scalar("moe/expert_logit_spread_max", agg_max_logit_spread, iteration)
                 writer.add_scalar("moe/expert_logit_spread_mean", agg_mean_logit_spread, iteration)
+                writer.add_scalar(
+                    "moe/router_mean_max_prob_mean", agg_mean_router_max_score, iteration
+                )
                 writer.add_scalar(
                     "moe/router_mean_score_entropy_mean", agg_mean_router_score_entropy, iteration
                 )
@@ -694,6 +712,7 @@ def report_moe_health_metrics(
                         **wandb_rs_log,
                         "router-aggregates/expert_logit_spread_max": agg_max_logit_spread,
                         "router-aggregates/expert_logit_spread_mean": agg_mean_logit_spread,
+                        "router-aggregates/router_mean_max_prob_mean": (agg_mean_router_max_score),
                         "router-aggregates/router_mean_score_entropy_mean": (
                             agg_mean_router_score_entropy
                         ),
@@ -756,14 +775,9 @@ def report_moe_health_metrics(
                         iteration,
                     )
             if have_wandb_viability:
-                wandb_layer_log[f"viability-layers/routed_expert_output_rms_layer_{i}"] = routed_rms
                 wandb_layer_log[f"viability-layers/routed_expert_output_to_input_rms_layer_{i}"] = (
                     input_ratio
                 )
-                if output_ratio is not None:
-                    wandb_layer_log[
-                        f"viability-layers/routed_expert_output_to_layer_output_rms_layer_{i}"
-                    ] = output_ratio
             routed_rms_list.append(routed_rms)
             routed_to_input.append(input_ratio)
             if output_ratio is not None:
@@ -782,7 +796,8 @@ def report_moe_health_metrics(
             aggregates = _aggregate_layer_values(vals)
             for stat_name, value in aggregates.items():
                 layer_log[f"moe/{metric_name}_{stat_name}"] = value
-                wandb_aggregate_log[f"viability-aggregates/{metric_name}_{stat_name}"] = value
+                if metric_name == "routed_expert_output_to_input_rms":
+                    wandb_aggregate_log[f"viability-aggregates/{metric_name}_{stat_name}"] = value
         if routed_to_input and total_loss_dict is not None:
             total_loss_dict["routed_expert_output_to_input_rms_min"] = torch.tensor(
                 layer_log["moe/routed_expert_output_to_input_rms_min"]
@@ -794,11 +809,7 @@ def report_moe_health_metrics(
             wandb_writer.log({**wandb_layer_log, **wandb_aggregate_log}, iteration)
 
     if expert_viability_metrics and "weight_sq_sum" in viability_tracker:
-        groups = (
-            _tp_cp_group(pg_collection),
-            _pp_group(pg_collection),
-            _ep_group(pg_collection),
-        )
+        groups = (_tp_cp_group(pg_collection), _pp_group(pg_collection), _ep_group(pg_collection))
         for name in ("weight_sq_sum", "weight_count", "grad_sq_sum", "grad_count", "initial_rms"):
             value = viability_tracker[name]
             for group in groups:
@@ -827,7 +838,9 @@ def report_moe_health_metrics(
             grad_median = grads.median().item()
             relative_median = relative.median().item()
             if writer is not None:
-                writer.add_scalar(f"moe/expert_weight_rms_median_layer_{i}", weight_median, iteration)
+                writer.add_scalar(
+                    f"moe/expert_weight_rms_median_layer_{i}", weight_median, iteration
+                )
                 writer.add_scalar(
                     f"moe/expert_weight_rms_p10_layer_{i}",
                     torch.quantile(weights, 0.1).item(),
@@ -846,21 +859,12 @@ def report_moe_health_metrics(
                 )
                 writer.add_scalar(f"moe/expert_grad_rms_median_layer_{i}", grad_median, iteration)
             if have_wandb_param:
-                wandb_param_layer_log[f"viability-layers/expert_weight_rms_median_layer_{i}"] = (
-                    weight_median
-                )
-                wandb_param_layer_log[f"viability-layers/expert_weight_rms_p10_layer_{i}"] = (
-                    torch.quantile(weights, 0.1).item()
-                )
-                wandb_param_layer_log[f"viability-layers/expert_weight_rms_min_layer_{i}"] = (
-                    weights.min().item()
-                )
                 wandb_param_layer_log[
                     f"viability-layers/expert_weight_rms_relative_to_init_median_layer_{i}"
                 ] = relative_median
-                wandb_param_layer_log[f"viability-layers/expert_weight_collapsed_frac_layer_{i}"] = (
-                    collapsed
-                )
+                wandb_param_layer_log[
+                    f"viability-layers/expert_weight_collapsed_frac_layer_{i}"
+                ] = collapsed
                 wandb_param_layer_log[f"viability-layers/expert_grad_rms_median_layer_{i}"] = (
                     grad_median
                 )
@@ -880,7 +884,13 @@ def report_moe_health_metrics(
             aggregates = _aggregate_layer_values(vals)
             for stat_name, value in aggregates.items():
                 param_log[f"moe/{metric_name}_{stat_name}"] = value
-                wandb_param_aggregate_log[f"viability-aggregates/{metric_name}_{stat_name}"] = value
+                if metric_name in (
+                    "expert_weight_collapsed_frac",
+                    "expert_weight_rms_relative_to_init_median",
+                ):
+                    wandb_param_aggregate_log[f"viability-aggregates/{metric_name}_{stat_name}"] = (
+                        value
+                    )
         if collapsed_fractions and total_loss_dict is not None:
             total_loss_dict["expert_weight_collapsed_frac_max"] = torch.tensor(
                 param_log["moe/expert_weight_collapsed_frac_max"]

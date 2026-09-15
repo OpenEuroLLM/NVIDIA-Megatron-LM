@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import math
+from types import SimpleNamespace
 
 import torch
 
@@ -13,12 +14,24 @@ from megatron.core.transformer.moe.moe_health import (
     compute_router_score_distribution,
     expert_rms_statistics,
     get_expert_utilization_tracker,
+    get_expert_viability_tracker,
+    get_router_stats_tracker,
     local_expert_rms,
     mask_routed_moe_layer,
+    report_moe_health_metrics,
     save_to_expert_utilization_tracker,
     should_mask_routed_moe_layer,
     update_expert_near_dead_streaks,
 )
+from megatron.core.transformer.moe.moe_logging import MoEMetricsTracker
+
+
+class FakeWandb:
+    def __init__(self):
+        self.data = {}
+
+    def log(self, values, _iteration):
+        self.data.update(values)
 
 
 def test_expert_load_metrics_balanced_and_collapsed():
@@ -184,3 +197,87 @@ def test_caching_data_iterator_replays_microbatches():
     caching_iterator.rewind()
     assert next(caching_iterator) == {"batch": 1}
     assert next(caching_iterator) == {"batch": 2}
+
+
+def test_aux_metrics_use_router_wandb_groups():
+    tracker = MoEMetricsTracker()
+    tracker.record("load_balancing_loss", torch.tensor(1.0), layer_number=1, num_layers=2)
+    tracker.record("load_balancing_loss", torch.tensor(2.0), layer_number=2, num_layers=2)
+    wandb = FakeWandb()
+
+    tracker._log_scalars(
+        {"load_balancing_loss": torch.tensor(1.5)}, iteration=3, writer=None, wandb_writer=wandb
+    )
+    tracker._log_per_layer(
+        loss_scale=1.0,
+        metric_names=["load_balancing_loss"],
+        iteration=3,
+        writer=None,
+        wandb_writer=wandb,
+    )
+
+    assert set(wandb.data) == {
+        "router-aggregates/load_balancing_loss",
+        "router-layers/load_balancing_loss_layer_0",
+        "router-layers/load_balancing_loss_layer_1",
+    }
+
+
+def test_health_wandb_groups_are_compact(monkeypatch):
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda *_args, **_kwargs: None)
+    groups = SimpleNamespace(pp=object(), dp_cp_gtp_remat=object(), tp_cp=object(), ep=object())
+
+    utilization = get_expert_utilization_tracker()
+    utilization.clear()
+    utilization.update(
+        selected_values=torch.tensor([[6.0, 2.0], [4.0, 4.0]]),
+        dispatched_values=torch.tensor([[5.0, 1.0], [4.0, 4.0]]),
+        selected_near_dead_streaks=torch.zeros(2, 2, dtype=torch.int32),
+        reduce_group=None,
+    )
+
+    router = get_router_stats_tracker()
+    router.clear()
+    router.update(
+        sum_max_score=torch.tensor([1.5, 1.0]),
+        sum_score_entropy=torch.tensor([1.0, 1.5]),
+        sum_logits=torch.tensor([[2.0, 0.0], [1.0, 1.0]]),
+        token_count=torch.tensor([2.0, 2.0]),
+        reduce_group=None,
+    )
+
+    viability = get_expert_viability_tracker()
+    viability.clear()
+    viability.update(
+        routed_sq_sum=torch.tensor([4.0, 9.0]),
+        input_sq_sum=torch.tensor([4.0, 4.0]),
+        output_sq_sum=torch.tensor([4.0, 9.0]),
+        routed_count=torch.tensor([1.0, 1.0]),
+        input_count=torch.tensor([1.0, 1.0]),
+        output_count=torch.tensor([1.0, 1.0]),
+        weight_sq_sum=torch.tensor([[1.0, 4.0], [4.0, 9.0]]),
+        weight_count=torch.ones(2, 2),
+        grad_sq_sum=torch.ones(2, 2),
+        grad_count=torch.ones(2, 2),
+        initial_rms=torch.ones(2, 2),
+    )
+
+    wandb = FakeWandb()
+    report_moe_health_metrics(
+        iteration=3,
+        wandb_writer=wandb,
+        per_layer_logging=True,
+        expert_viability_metrics=True,
+        pg_collection=groups,
+    )
+
+    grouped = {}
+    for name in wandb.data:
+        prefix = name.split("/", 1)[0]
+        grouped[prefix] = grouped.get(prefix, 0) + 1
+    assert grouped == {
+        "router-layers": 10,
+        "router-aggregates": 15,
+        "viability-layers": 8,
+        "viability-aggregates": 9,
+    }
