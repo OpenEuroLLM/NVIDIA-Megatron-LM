@@ -47,7 +47,6 @@ There is exactly one device-to-host copy per diagnostic iteration: the stats
 accumulate into preallocated device tensors and are read back once, in `emit`.
 """
 
-import contextlib
 from typing import Dict, List, Tuple
 
 import torch
@@ -673,42 +672,6 @@ class TrainingDiagnostics:
         self._tok_logz = None
         self._tok_max = None
 
-    @contextlib.contextmanager
-    def paused(self):
-        """Disarm both hooks for a forward pass that is NOT the training step.
-
-        `begin_step` arms the hooks for the whole ITERATION, and `evaluate()`
-        runs later in the same loop body, so without this every hook is still
-        live during validation. That hung the 32B v2 flagship at iteration
-        40000 — its first `eval_interval` boundary after the collectors were
-        switched on (jobs 1786629, 1795035, 1795198, 1795608, 1795774; each
-        reached 40000, printed the `RerunMode.DISABLED` line that opens
-        `evaluate()`, and never printed a validation loss).
-
-        Both hooks are unsafe there, for different reasons:
-
-          * The LOGIT hook has no "already sampled" latch, so it fires on every
-            one of `eval_iters * num_microbatches` eval microbatches — 160 at
-            production shape — each doing four TP all-reduces plus the one in
-            `_vocab_parallel_logsumexp`, and materialising ~6 GB of transient
-            fp32 from `(x.float() - max).exp()` on `[4096, 2, 65536]`.
-          * The ACTIVATION pre-hook self-latches on `_act_seen`, but that guard
-            is `bool(self._act_seen[slot].item())` — a DEVICE SYNC that runs
-            before the early return. Armed through an eval that is ~10k
-            synchronising hook calls per rank inside the `forward_only=True`
-            interleaved schedule, blocking the CPU against the async p2p chain.
-
-        Restoring rather than clearing matters: evaluation is not always the end
-        of the iteration (`save_interval` can follow), and `collect`/`emit` read
-        `_is_diag_iter` too.
-        """
-        was_armed = self._is_diag_iter
-        self._is_diag_iter = False
-        try:
-            yield
-        finally:
-            self._is_diag_iter = was_armed
-
     def observe_clip(self, grad_norm):
         """Runs EVERY step. Records whether the clip fired and how long a run of
         clipped steps we are in. `grad_norm` is the pre-clip total norm, i.e.
@@ -1154,19 +1117,3 @@ def setup_diagnostics(args) -> TrainingDiagnostics:
 def get_diagnostics() -> TrainingDiagnostics | None:
     """The global diagnostics object, or None before `setup_diagnostics`."""
     return _GLOBAL_DIAGNOSTICS
-
-
-@contextlib.contextmanager
-def diagnostics_paused():
-    """`TrainingDiagnostics.paused()`, and a no-op before `setup_diagnostics`.
-
-    Call-site helper so `evaluate()` does not have to branch on whether
-    diagnostics exist yet — it does not on the final eval of a run that never
-    called `setup_diagnostics`.
-    """
-    diagnostics = _GLOBAL_DIAGNOSTICS
-    if diagnostics is None:
-        yield
-        return
-    with diagnostics.paused():
-        yield
