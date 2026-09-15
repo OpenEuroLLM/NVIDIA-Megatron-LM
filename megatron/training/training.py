@@ -610,7 +610,7 @@ def heartbeat():
     _HEARTBEAT[0] = time.time()
 
 
-def install_hang_watchdog(stall_seconds: int = 600, repeat: int = 3):
+def install_hang_watchdog(dump_dir: str = None, stall_seconds: int = 180, repeat: int = 2):
     """Dump every thread's stack automatically when the training loop goes quiet.
 
     THIS IS THE ONE THAT ACTUALLY WORKS AT SCALE — prefer it to the SIGUSR1
@@ -635,22 +635,36 @@ def install_hang_watchdog(stall_seconds: int = 600, repeat: int = 3):
     It also needs no operator action, which matters because the hang is only
     visible minutes after it starts.
 
-    `stall_seconds` must exceed the slowest legitimate gap between heartbeats.
-    The flagship's is a checkpoint save plus an evaluation, so 600 s is roughly
-    30x the 19 s eval and comfortably past a save; set it below that and every
-    healthy eval prints 2048 stack traces.
+    IT MUST FIRE BEFORE THE MONITOR CANCELS THE JOB. Measured on the six v2
+    hangs, the monitor's inactivity cancel came between **327 s** (job 1795035,
+    20:47:41 -> 20:53:08) and 20 min. A 600 s threshold would simply never have
+    fired on the fast ones. 180 s sits above the slowest legitimate gap — an
+    eval is 19 s at 512 nodes and an async save does not block the loop, so the
+    real worst case is well under a minute — and leaves room for two dumps
+    inside even the 327 s window.
 
-    Fires at most `repeat` times so a genuinely wedged job does not fill the
-    shared log, and keeps going afterwards rather than killing anything —
-    deciding to kill is the monitor's job, not this thread's.
+    STACKS GO TO PER-RANK FILES, NOT THE SHARED LOG. At 2048 ranks a full dump
+    is ~100k lines, and this tree has already lost a log to exactly that: srun
+    abandons IO and TRUNCATES when the shared stdout path gets chatty (job
+    1356626 froze at 28 MB under NCCL_DEBUG=info; the base config gates tqdm and
+    routes NCCL_DEBUG to a per-host file for the same reason). Dumping to stdout
+    would destroy the evidence it is trying to collect. Each rank writes its own
+    file and prints ONE line to stderr saying where — 2048 such lines is the
+    same order as the per-rank memory report already in every log.
+
+    Fires at most `repeat` times, re-arms if progress resumes, and never kills
+    anything — deciding to kill stays the monitor's job.
     """
     import faulthandler
     import threading
 
+    if dump_dir is None:
+        dump_dir = os.environ.get("OELLM_HANG_DUMP_DIR") or "hang_stacks"
+
     def watch():
         fired = 0
         while True:
-            time.sleep(30)
+            time.sleep(15)
             last = _HEARTBEAT[0]
             if last <= 0.0:
                 continue  # training has not started yet
@@ -662,14 +676,26 @@ def install_hang_watchdog(stall_seconds: int = 600, repeat: int = 3):
                 continue
             fired += 1
             rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+            path = os.path.join(dump_dir, f"hang_rank{rank:05d}_{fired}.txt")
+            try:
+                os.makedirs(dump_dir, exist_ok=True)
+                with open(path, "w") as fh:
+                    fh.write(
+                        f"rank {rank}: no training progress for {stalled:.0f}s "
+                        f"(dump {fired}/{repeat})\n\n"
+                    )
+                    fh.flush()
+                    faulthandler.dump_traceback(file=fh, all_threads=True)
+                where = path
+            except Exception as exc:  # fall back to stderr rather than lose the stack
+                faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+                where = f"<stderr; {exc}>"
             print(
-                f"\n>>> HANG WATCHDOG rank {rank}: no training progress for "
-                f"{stalled:.0f}s (dump {fired}/{repeat}) <<<",
+                f">>> HANG WATCHDOG rank {rank}: no progress for {stalled:.0f}s, "
+                f"stack -> {where}",
                 file=sys.stderr,
                 flush=True,
             )
-            faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
-            sys.stderr.flush()
 
     threading.Thread(target=watch, name="hang-watchdog", daemon=True).start()
 
@@ -725,10 +751,8 @@ def pretrain(
             it is automatically injected when in-process restart is in use
     """
 
-    # Stack dumps for silent hangs. On-demand (SIGUSR1) and automatic (watchdog);
-    # both must be installed before anything can hang.
+    # On-demand stack dump (SIGUSR1). Needs no args, so install it first thing.
     install_stack_dumper()
-    install_hang_watchdog()
 
     if inprocess_call_wrapper is not None:
         iteration = inprocess_call_wrapper.iteration
@@ -745,6 +769,17 @@ def pretrain(
 
     args = get_args()
     timers = get_timers()
+
+    # Automatic stack dump on a silent hang. Installed here rather than at the
+    # top of pretrain() because it needs `args` to pick a per-rank dump
+    # directory; still long before anything can stall.
+    install_hang_watchdog(
+        dump_dir=(
+            os.path.join(os.path.dirname(args.save.rstrip('/')), 'hang_stacks')
+            if getattr(args, 'save', None)
+            else None
+        )
+    )
 
     if args.log_progress:
         append_to_progress_log("Starting job")
