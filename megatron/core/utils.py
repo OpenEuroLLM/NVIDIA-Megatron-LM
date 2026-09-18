@@ -1245,6 +1245,10 @@ def drain_embedding_wgrad_compute(
         grad_output_buffer
     ), "Length of activation and gradient buffers need to be equal!"
 
+    if not embedding_activation_buffer:
+        assert not getattr(weight, "_deferred_wgrad_pending", False)
+        return
+
     import fused_weight_gradient_mlp_cuda
 
     from megatron.core.parallel_state import get_global_memory_buffer
@@ -1290,6 +1294,7 @@ def drain_embedding_wgrad_compute(
     # since we are pipelining the AllGather and GEMM,one buffer all gathers
     # the input while the other buffer reads from it for the GEMM. We use i
     # and (i+1) for indexing to enable this double buffering.
+    drain_idx = 0
     for i in range(len(embedding_activation_buffer)):
         input = embedding_activation_buffer.pop(0)
         if config.sequence_parallel:
@@ -1313,6 +1318,9 @@ def drain_embedding_wgrad_compute(
     grad_output = grad_output_buffer.pop(0)
     wgrad_compute(all_gathered_input[drain_idx], grad_output, weight)
     input, all_gathered_input[drain_idx], grad_output = None, None, None
+    # The GEMMs are queued on the current stream. The normal reduction launch
+    # establishes its stream dependency; no device-wide synchronization is needed.
+    weight._deferred_wgrad_pending = False
 
 
 def local_multi_tensor_applier(op, noop_flag_buffer, tensor_lists, *args):

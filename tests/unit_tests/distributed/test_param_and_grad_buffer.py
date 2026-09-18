@@ -1093,3 +1093,55 @@ def test_expert_parallel_params_get_separate_buffers(use_distributed_optimizer: 
             )
 
     Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("use_distributed_optimizer", [False, True])
+@pytest.mark.parametrize("explicit_launch", [False, True])
+def test_deferred_wgrad_blocks_incomplete_reduction(use_distributed_optimizer, explicit_launch):
+    """Late GEMMs must precede scaling/reduction, on initial and learned readiness steps."""
+    Utils.initialize_model_parallel()
+    try:
+        _, buffer, groups = get_model_and_buffers(
+            input_dim=16,
+            output_dim=16,
+            num_layers=2,
+            bias=False,
+            shared_embedding=False,
+            bucket_size=None,
+            use_distributed_optimizer=use_distributed_optimizer,
+            overlap_grad_reduce=True,
+            average_in_collective=False,
+        )
+        assert len(groups) == 1
+        group = groups[0]
+        pending = next(iter(group.params))
+        rank = parallel_state.get_data_parallel_rank()
+        world = parallel_state.get_data_parallel_world_size()
+        for step in range(3):
+            buffer.grad_data.fill_(rank + 1.0)
+            pending._deferred_wgrad_pending = True
+            for param in group.params:
+                group.register_grad_ready(param)
+            if explicit_launch:
+                group.start_grad_sync()
+                group.start_grad_sync()
+            assert group.grad_reduce_handle is None
+            assert torch.all(buffer.grad_data == rank + 1.0)
+            with pytest.raises(AssertionError, match="Deferred weight gradients"):
+                group.finish_grad_sync()
+            # Stand in for the final GEMMs on the same CUDA stream.
+            buffer.grad_data.add_(1.0)
+            pending._deferred_wgrad_pending = False
+            group.finish_grad_sync()
+            if use_distributed_optimizer:
+                shard_size = buffer.grad_data.numel() // world
+                reduced = buffer.grad_data[rank * shard_size : (rank + 1) * shard_size]
+            else:
+                reduced = buffer.grad_data
+            torch.testing.assert_close(reduced, torch.full_like(reduced, (world + 3) / 2))
+            before = reduced.clone()
+            group.finish_grad_sync()
+            torch.testing.assert_close(reduced, before, rtol=0, atol=0)
+            group.reset()
+    finally:
+        Utils.destroy_model_parallel()

@@ -276,6 +276,7 @@ class _ParamAndGradBucketGroup:
         # bucket group early-drain its predecessor without the end-of-step finalize loop
         # double-waiting. Reset by `reset()`.
         self.grad_reduce_finished = False
+        self.grad_reduce_deferred = False
 
         # Each time a local shard is created from bucket.param_data or bucket.grad_data, it
         # introduces some CPU overheads. We use these two lists to cache the created local
@@ -297,6 +298,7 @@ class _ParamAndGradBucketGroup:
         self.per_param_grad_ready_counts = {}
         self.is_last_microbatch = True
         self.grad_reduce_finished = False
+        self.grad_reduce_deferred = False
 
     def _post_param_sync(self):
         """Run post-processing after param all-gather completes."""
@@ -600,6 +602,13 @@ class _ParamAndGradBucketGroup:
         communication call. When ddp_config.overlap_grad_reduce is set to False, makes
         synchronous call.
         """
+        if any(getattr(param, "_deferred_wgrad_pending", False) for param in self.params):
+            # Covers both autograd readiness and the pipeline's explicit launch.
+            # Do not scale, copy, or communicate incomplete gradient storage.
+            self.grad_reduce_deferred = True
+            return
+        self.grad_reduce_deferred = False
+
         if self.is_first_batch and self.grad_reduce_handle is not None:
             # Make this start_grad_sync call a no-op if in first batch and collective has
             # already been dispatched.
@@ -795,6 +804,9 @@ class _ParamAndGradBucketGroup:
         non-overlap path preserves its original per-call dispatch+wait behaviour
         because it has no predecessor draining.
         """
+        assert not any(
+            getattr(param, "_deferred_wgrad_pending", False) for param in self.params
+        ), "Deferred weight gradients must be computed before finishing gradient synchronization"
         self.param_gather_dispatched = False
         # If overlap_grad_reduce is False, start (and finish) synchronous communication call here.
         if not self.ddp_config.overlap_grad_reduce:
@@ -806,7 +818,7 @@ class _ParamAndGradBucketGroup:
         # If first batch, start asynchronous communication here. register_grad_ready() launches
         # asynchronous communication only once self.golden_per_param_grad_ready_counts is
         # populated at the end of this first batch.
-        if self.is_first_batch:
+        if self.is_first_batch or self.grad_reduce_deferred:
             self.start_grad_sync(force_all_reduce=force_all_reduce)
         # When using multiple DistOpt instances, we don't need to sync here as we launch
         # communications on a separate communication stream.
