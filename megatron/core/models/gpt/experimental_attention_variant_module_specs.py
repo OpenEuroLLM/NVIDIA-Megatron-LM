@@ -4,6 +4,11 @@ from typing import List, Optional
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.backends import BackendSpecProvider
+from megatron.core.ssm.complex_kda import (
+    ComplexKDA,
+    ComplexKDAHybridAttention,
+    ComplexKDASubmodules,
+)
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNetSubmodules
 from megatron.core.ssm.mamba2_attention import Mamba2Attention
 from megatron.core.ssm.mamba_mixer import MambaMixerSubmodules
@@ -98,6 +103,43 @@ def get_mlstm_module_spec(
     return attention
 
 
+def get_complex_kda_module_spec(
+    config: TransformerConfig, backend: BackendSpecProvider = None
+) -> ModuleSpec:
+    """Build module spec for the Complex-KDA attention variant."""
+
+    # NOTE `fuse_input_layernorm` is False, unlike its neighbours. They fuse the
+    # pre-attention norm into a LayerNormColumnParallelLinear `in_proj`; this
+    # layer owns its projections and has no such slot, so the block builder has
+    # to place a real norm before it. Saying True here drops the norm entirely
+    # and the residual stream reaches the mixer unnormalised -- which still
+    # trains, still descends, and shows up only as a parameter count short by
+    # `hidden_size` per layer.
+    attention = ModuleSpec(
+        module=ComplexKDA,
+        submodules=ComplexKDASubmodules(),
+        metainfo={"fuse_input_layernorm": False},
+    )
+    return attention
+
+
+def get_complex_kda_hybrid_attention_module_spec(
+    config: TransformerConfig, backend: BackendSpecProvider = None
+) -> ModuleSpec:
+    """Build module spec for the full-attention layers of a Complex-KDA hybrid.
+
+    Only used when ``config.linear_hybrid_attention == "gated_nope"``; see that
+    field for why a hybrid's attention layers are not always Megatron's own.
+    """
+
+    attention = ModuleSpec(
+        module=ComplexKDAHybridAttention,
+        submodules=ComplexKDASubmodules(),
+        metainfo={"fuse_input_layernorm": False},
+    )
+    return attention
+
+
 def get_mamba_module_spec(
     config: TransformerConfig, backend: BackendSpecProvider = None
 ) -> ModuleSpec:
@@ -186,6 +228,8 @@ def get_experimental_attention_variant_module_spec(
         return get_mlstm_module_spec(config=config, backend=backend)
     elif config.experimental_attention_variant == "mamba":
         return get_mamba_module_spec(config=config, backend=backend)
+    elif config.experimental_attention_variant == "complex_kda":
+        return get_complex_kda_module_spec(config=config, backend=backend)
     elif config.experimental_attention_variant == "dsa":
         return get_dsa_module_spec_for_backend(config=config, backend=backend)
     else:
@@ -252,7 +296,17 @@ def get_transformer_block_with_experimental_attention_variant_spec(
         experimental_attention_spec = None
 
     if 0 in experimental_attention_pattern:
-        standard_attention_spec = _get_self_attention_module_spec(config=config, backend=backend)
+        if (
+            config.experimental_attention_variant == "complex_kda"
+            and config.linear_hybrid_attention == "gated_nope"
+        ):
+            standard_attention_spec = get_complex_kda_hybrid_attention_module_spec(
+                config=config, backend=backend
+            )
+        else:
+            standard_attention_spec = _get_self_attention_module_spec(
+                config=config, backend=backend
+            )
     else:
         standard_attention_spec = None
 
@@ -343,7 +397,7 @@ def get_transformer_block_with_experimental_attention_variant_spec(
 
 def is_linear_attention_variant(experimental_attention_variant: Optional[str]) -> bool:
     """Check if the experimental attention variant is a linear attention variant."""
-    linear_attention_variants = ["gated_delta_net", "mlstm", "mamba"]
+    linear_attention_variants = ["gated_delta_net", "mlstm", "mamba", "complex_kda"]
     return experimental_attention_variant in linear_attention_variants
 
 

@@ -820,6 +820,51 @@ def num_floating_point_operations(
                         * v_dim
                     )
                 )
+            elif args.experimental_attention_variant == "complex_kda":
+                # Approximate FLOPs for the Complex-KDA mixer. Like the Mamba
+                # branch below, this only affects the reported
+                # architecture-aware TFLOP/s, not training.
+                #
+                # GEOMETRY IS DERIVED, not read from `linear_*_head_dim` /
+                # `linear_num_*_heads`. Complex KDA has one head width and
+                # takes its head count from the model, exactly as
+                # `megatron/core/ssm/complex_kda.py` does -- reading the
+                # GatedDeltaNet fields here would silently price the model at
+                # their defaults for any run that does not set them.
+                head_dim = (
+                    args.linear_key_head_dim
+                    or args.kv_channels
+                    or (args.hidden_size // args.num_attention_heads)
+                )
+                ckda_heads = args.hidden_size // head_dim
+                qk_dim = v_dim = ckda_heads * head_dim
+                # The output gate is the one structural difference between the
+                # arms of this family, so it is priced rather than assumed.
+                out_gate = (
+                    args.hidden_size * head_dim + head_dim * v_dim
+                    if args.linear_output_gate == "lowrank"
+                    else args.hidden_size * v_dim
+                )
+                linear_self_attn_term = (
+                    forward_backward_expansion_factor
+                    * fma_expansion_factor
+                    * (
+                        ## in proj (q, k, v)
+                        args.hidden_size * (2 * qk_dim + v_dim)
+                        ## channel-wise decay gate, factored through one head
+                        + args.hidden_size * head_dim + head_dim * qk_dim
+                        ## beta, one scalar per head
+                        + args.hidden_size * ckda_heads
+                        ## output gate
+                        + out_gate
+                        ## short depthwise causal conv over q, k, v
+                        + args.linear_conv_kernel_dim * (2 * qk_dim + v_dim)
+                        ## delta rule: KK^T, VK^T, S(a(I-bKK^T)) and SQ
+                        + ckda_heads * (head_dim ** 2) * 4
+                        ## out proj
+                        + args.hidden_size * v_dim
+                    )
+                )
             elif args.experimental_attention_variant == "mamba":
                 # Approximate FLOPs for the Mamba2 (SSD) mixer. Only affects the
                 # reported architecture-aware TFLOP/s (throughput logging), not

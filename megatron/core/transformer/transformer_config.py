@@ -275,8 +275,11 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # attention variant
     ####################
-    experimental_attention_variant: Optional[Literal['gated_delta_net', 'mlstm', 'mamba', 'dsa']] = None
-    """Type of attention variant to use. Currently support gated_delta_net, mlstm and dsa."""
+    experimental_attention_variant: Optional[
+        Literal['gated_delta_net', 'mlstm', 'mamba', 'dsa', 'complex_kda']
+    ] = None
+    """Type of attention variant to use. Currently support gated_delta_net, mlstm, dsa and
+    complex_kda."""
 
     ####################
     # DSA
@@ -358,6 +361,78 @@ class TransformerConfig(ModelParallelConfig):
       "erase" point. The flat region makes that the stable default the model
       sits at unless the pre-activation is pushed away from 0, while still
       reaching contraction (beta<1) and reflection (beta>1) at the tails."""
+
+    ####################
+    # Complex KDA
+    ####################
+    # Complex KDA is Kimi Delta Attention with the ranges of BOTH recurrence
+    # parameters extended so the transition can be signed. The Householder rate
+    # beta is the shared `linear_beta_max` above -- 2.0 is the extended range --
+    # and the fields here are the decay gate, which is what Complex KDA adds
+    # over KDA and what no other variant in this file has.
+    #
+    # Every default below is the underlying layer's own, so declaring the
+    # variant and nothing else builds the shipped configuration.
+    linear_gate_activation: Literal[
+        'softplus', 'sigmoid', 'signed_sigmoid2', 'signed_tanh'
+    ] = 'signed_sigmoid2'
+    """Parameterisation of the channel-wise decay gate alpha, for complex_kda.
+
+    The transition is ``(I - beta k k^T) Diag(alpha)``. This selects how alpha
+    is produced from its pre-activation, and therefore its range:
+
+    - ``"softplus"``: ``alpha = exp(-softplus(x))`` in ``(0, 1]``. KDA's own
+      parameterisation; the transition cannot change sign.
+    - ``"sigmoid"``: ``alpha = sigmoid(x)`` in ``(0, 1)``. Bounded, unsigned.
+    - ``"signed_sigmoid2"`` (default): ``alpha = 2 sigmoid(x) - 1`` in
+      ``(-1, 1)``. Signed, so a channel can reflect rather than only decay.
+    - ``"signed_tanh"``: ``alpha = tanh(x)`` in ``(-1, 1)``. Signed, steeper
+      through zero.
+
+    Only the signed forms permit the rotations and reflections the extended
+    range exists for. Paired with ``linear_beta_max=2.0`` both eigenvalue
+    factors are signed, which is the full Complex-KDA setting."""
+
+    linear_gate_init_style: Literal['shipped', 'spread'] = 'shipped'
+    """Initialisation of the decay gate, for complex_kda. Signed gates only.
+
+    ``"shipped"`` starts every channel at the same point; ``"spread"``
+    initialises two populations. Ignored by unsigned gates."""
+
+    linear_gate_lower_bound: float = -5.0
+    """Lower bound on the decay gate's pre-activation, for complex_kda.
+
+    Clamps how fast a channel may forget within one step."""
+
+    linear_output_gate: Literal['lowrank', 'linear'] = 'lowrank'
+    """Shape of the output gate, for complex_kda.
+
+    ``"lowrank"`` factorises it through a bottleneck; ``"linear"`` is a single
+    projection. This changes the parameter count, so it is part of what a
+    parameter-matched comparison has to hold fixed."""
+
+    linear_hybrid_attention: Literal['standard', 'gated_nope'] = 'standard'
+    """What the FULL-ATTENTION layers of a complex_kda hybrid are.
+
+    ``"standard"`` (default) leaves them as Megatron's own attention.
+
+    ``"gated_nope"`` makes them output-gated attention without a position
+    embedding, which is what the published hybrids in this family use: Kimi
+    Linear interleaves NoPE full attention because the linear layers already
+    carry position, and Qwen3-Next gates its attention output. The gate alone
+    is ``hidden_size ** 2`` parameters per attention layer, so the two settings
+    are different models and not a preference -- a parameter-matched comparison
+    has to name which one it means."""
+
+    linear_drop_qkv_silu: bool = False
+    """Replace the q/k/v SiLU with the identity, for complex_kda.
+
+    SiLU is bounded below at about -0.278, so it pushes q/k/v toward the
+    non-negative orthant. ``k`` is the DIRECTION of the rank-1 update
+    ``(I - beta k k^T)``, so leaving the SiLU in restricts which update
+    directions are reachable -- which interacts with the signed gate and is
+    therefore a term a signed-vs-unsigned comparison must set deliberately
+    rather than inherit."""
 
     ####################
     # mLSTM
@@ -1273,6 +1348,49 @@ class TransformerConfig(ModelParallelConfig):
                 f"num_query_groups ({self.num_query_groups}) must be a multiple or divisor of "
                 f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
             )
+
+        if self.experimental_attention_variant == "complex_kda":
+            assert (
+                self.linear_attention_freq is not None
+            ), "linear_attention_freq must be set for complex_kda."
+
+            valid_gates = ("softplus", "sigmoid", "signed_sigmoid2", "signed_tanh")
+            assert self.linear_gate_activation in valid_gates, (
+                f"linear_gate_activation must be one of {valid_gates}, got "
+                f"{self.linear_gate_activation!r}"
+            )
+            assert self.linear_hybrid_attention in ("standard", "gated_nope"), (
+                f"linear_hybrid_attention must be 'standard' or 'gated_nope', "
+                f"got {self.linear_hybrid_attention!r}"
+            )
+            assert self.linear_output_gate in ("lowrank", "linear"), (
+                f"linear_output_gate must be 'lowrank' or 'linear', got "
+                f"{self.linear_output_gate!r}"
+            )
+            assert self.linear_beta_max in (1.0, 2.0), (
+                f"linear_beta_max must be 1.0 or 2.0 for complex_kda, got "
+                f"{self.linear_beta_max}; the layer forms beta as "
+                f"sigmoid(x) * linear_beta_max and only those two are tested"
+            )
+            # A spread initialisation needs two beta populations to spread
+            # between, which only the extended range has.
+            assert not (self.linear_gate_init_style == "spread" and self.linear_beta_max == 1.0), (
+                "linear_gate_init_style='spread' needs linear_beta_max=2.0"
+            )
+            # THE POINT OF THE VARIANT IS A SIGNED TRANSITION. An unsigned gate
+            # with the unextended beta is plain KDA -- which is a legitimate
+            # baseline and is how the comparison arm is built, so this is not
+            # an error. It is stated because "complex_kda" then names a model
+            # that is not complex, and a run that reached it by forgetting a
+            # flag should say so in its own log.
+            if not self.linear_gate_activation.startswith("signed") and self.linear_beta_max == 1.0:
+                warnings.warn(
+                    "experimental_attention_variant='complex_kda' with "
+                    f"linear_gate_activation={self.linear_gate_activation!r} and "
+                    "linear_beta_max=1.0 has no signed factor: this is KDA, not "
+                    "Complex KDA. Set a signed gate and/or linear_beta_max=2.0 "
+                    "for the extended ranges."
+                )
 
         if self.experimental_attention_variant == "gated_delta_net":
             assert (
