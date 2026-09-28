@@ -787,6 +787,57 @@ def num_floating_point_operations(
                         * v_dim
                     )
                 )
+            elif args.experimental_attention_variant in ("kda", "signed_kda", "panini"):
+                # FLOPs for the FLA hybrids (megatron/core/ssm/fla_hybrid.py).
+                # Same delta-rule skeleton as gated_delta_net, but the layer owns
+                # its projections, and counts what it builds:
+                #   q, k, v                hidden x qk_dim (x2), hidden x v_dim
+                #   decay gate f_proj      low rank: hidden -> v_head_dim -> qk_dim
+                #   output gate g_proj     low rank (kda always; signed_kda/panini
+                #                          with output_gate "lowrank") or
+                #                          hidden x v_dim ("linear")
+                #   value gate fv_proj     panini unless v_gate "none": low rank
+                #                          hidden -> v_head_dim -> v_dim
+                #   o_proj                 v_dim x hidden
+                # plus the short conv and the four delta-rule matmuls. b_proj
+                # (hidden x heads) is negligible and omitted.
+                qk_head_dim = args.linear_key_head_dim
+                num_heads = args.linear_num_key_heads
+                qk_dim = qk_head_dim * num_heads
+                v_dim = int(qk_dim * args.linear_fla_expand_v)
+                v_head_dim = v_dim // num_heads
+                variant = args.experimental_attention_variant
+
+                def _low_rank(out_dim):
+                    return args.hidden_size * v_head_dim + v_head_dim * out_dim
+
+                if variant == "kda" or args.linear_fla_output_gate == "lowrank":
+                    output_gate = _low_rank(v_dim)
+                else:
+                    output_gate = args.hidden_size * v_dim
+                value_gate = (
+                    _low_rank(v_dim)
+                    if variant == "panini" and args.linear_fla_v_gate != "none"
+                    else 0
+                )
+                linear_self_attn_term = (
+                    forward_backward_expansion_factor
+                    * fma_expansion_factor
+                    * (
+                        ## q, k, v projections
+                        args.hidden_size * (2 * qk_dim + v_dim)
+                        ## short conv over q, k, v
+                        + args.linear_conv_kernel_dim * (2 * qk_dim + v_dim)
+                        ## decay gate, output gate, value gate (panini)
+                        + _low_rank(qk_dim)
+                        + output_gate
+                        + value_gate
+                        ## delta rule
+                        + num_heads * (v_head_dim**2) * 4
+                        ## out proj
+                        + args.hidden_size * v_dim
+                    )
+                )
             elif args.experimental_attention_variant == "mlstm":
                 # Calculate the FLOPs for the mLSTM attention variant.
                 qk_head_dim = args.linear_key_head_dim

@@ -9,6 +9,7 @@ from megatron.core.ssm.complex_kda import (
     ComplexKDAHybridAttention,
     ComplexKDASubmodules,
 )
+from megatron.core.ssm.fla_hybrid import KDA, PaniniDeltaAttention, SignedKDA
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNetSubmodules
 from megatron.core.ssm.mamba2_attention import Mamba2Attention
 from megatron.core.ssm.mamba_mixer import MambaMixerSubmodules
@@ -138,6 +139,19 @@ def get_complex_kda_hybrid_attention_module_spec(
         metainfo={"fuse_input_layernorm": False},
     )
     return attention
+def get_fla_hybrid_module_spec(
+    config: TransformerConfig, backend: BackendSpecProvider = None
+) -> ModuleSpec:
+    """Build module spec for a self-contained FLA hybrid layer (kda / signed_kda / panini).
+
+    These layers own their projections, short conv, gates and output norm, so
+    there are no submodules to inject and no fused input layernorm -- the block
+    supplies its own norm before the mixer (fuse_input_layernorm False).
+    """
+    module = {"kda": KDA, "signed_kda": SignedKDA, "panini": PaniniDeltaAttention}[
+        config.experimental_attention_variant
+    ]
+    return ModuleSpec(module=module, metainfo={"fuse_input_layernorm": False})
 
 
 def get_mamba_module_spec(
@@ -230,6 +244,8 @@ def get_experimental_attention_variant_module_spec(
         return get_mamba_module_spec(config=config, backend=backend)
     elif config.experimental_attention_variant == "complex_kda":
         return get_complex_kda_module_spec(config=config, backend=backend)
+    elif config.experimental_attention_variant in ("kda", "signed_kda", "panini"):
+        return get_fla_hybrid_module_spec(config=config, backend=backend)
     elif config.experimental_attention_variant == "dsa":
         return get_dsa_module_spec_for_backend(config=config, backend=backend)
     else:
@@ -397,7 +413,7 @@ def get_transformer_block_with_experimental_attention_variant_spec(
 
 def is_linear_attention_variant(experimental_attention_variant: Optional[str]) -> bool:
     """Check if the experimental attention variant is a linear attention variant."""
-    linear_attention_variants = ["gated_delta_net", "mlstm", "mamba", "complex_kda"]
+    linear_attention_variants = ["gated_delta_net", "mlstm", "mamba", "kda", "signed_kda", "panini", "complex_kda"]
     return experimental_attention_variant in linear_attention_variants
 
 

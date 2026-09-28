@@ -644,3 +644,56 @@ class TestAccumulatorTopology:
             f"topology tp={tp} cp={cp} pp={pp} dp={dp_size}: "
             f"got seqlen_squared_sum={seqlen_squared_sum}, expected {expected_sum_sq}"
         )
+
+
+def _make_fla_args(variant, *, output_gate="linear", v_gate="signed_sigmoid2"):
+    """A pure FLA-hybrid stack (kda / signed_kda / panini), no attention layer."""
+    args = _make_gpt_args(num_layers=4, hidden_size=512, num_attention_heads=8)
+    args.experimental_attention_variant = variant
+    args.linear_attention_freq = args.num_layers + 1  # no (i+1) % freq == 0
+    args.linear_key_head_dim = 64
+    args.linear_num_key_heads = 8
+    args.linear_conv_kernel_dim = 4
+    args.linear_fla_expand_v = 1.0
+    args.linear_fla_output_gate = output_gate
+    args.linear_fla_v_gate = v_gate
+    return args
+
+
+class TestFLAHybridFlops:
+    """The FLA hybrid branch counts the projections each layer actually builds.
+
+    Pinned through differences, so only the term under test matters: each is
+    6 (fwd+bwd x FMA) x tokens x layers x the projection's weight count.
+    """
+
+    BATCH = 2
+    D, HV, V = 512, 64, 512  # hidden, value head dim, value dim
+
+    def _flops(self, args):
+        return num_floating_point_operations(args, self.BATCH)
+
+    def _scale(self, args):
+        return 6 * self.BATCH * args.seq_length * args.num_layers
+
+    def test_output_gate_linear_vs_lowrank(self):
+        linear = _make_fla_args("signed_kda", output_gate="linear")
+        lowrank = _make_fla_args("signed_kda", output_gate="lowrank")
+        full, factored = self.D * self.V, self.D * self.HV + self.HV * self.V
+        assert self._flops(linear) - self._flops(lowrank) == self._scale(linear) * (full - factored)
+
+    def test_kda_output_gate_is_always_lowrank(self):
+        assert self._flops(_make_fla_args("kda", output_gate="linear")) == self._flops(
+            _make_fla_args("kda", output_gate="lowrank")
+        )
+
+    def test_panini_value_gate(self):
+        with_gate = _make_fla_args("panini", v_gate="signed_sigmoid2")
+        without = _make_fla_args("panini", v_gate="none")
+        factored = self.D * self.HV + self.HV * self.V
+        assert self._flops(with_gate) - self._flops(without) == self._scale(with_gate) * factored
+
+    def test_panini_without_value_gate_is_signed_kda(self):
+        assert self._flops(_make_fla_args("panini", v_gate="none")) == self._flops(
+            _make_fla_args("signed_kda")
+        )

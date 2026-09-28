@@ -276,10 +276,10 @@ class TransformerConfig(ModelParallelConfig):
     # attention variant
     ####################
     experimental_attention_variant: Optional[
-        Literal['gated_delta_net', 'mlstm', 'mamba', 'dsa', 'complex_kda']
+        Literal['gated_delta_net', 'mlstm', 'mamba', 'dsa', 'kda', 'signed_kda', 'panini', 'complex_kda']
     ] = None
-    """Type of attention variant to use. Currently support gated_delta_net, mlstm, dsa and
-    complex_kda."""
+    """Type of attention variant to use. Currently support gated_delta_net, mlstm,
+    dsa, the FLA hybrids (kda, signed_kda, panini) and complex_kda."""
 
     ####################
     # DSA
@@ -326,6 +326,126 @@ class TransformerConfig(ModelParallelConfig):
     """Number of value and gate heads for the gated delta net."""
 
     linear_beta_max: float = 1.0
+
+    ####################
+    # FLA hybrid variants (signed_kda / panini). These wrap complete
+    # flash-linear-attention layers, which own their projections, so they need
+    # their own knobs rather than reusing the GDN linear_* ones (beyond
+    # linear_key_head_dim / linear_num_key_heads / linear_conv_kernel_dim).
+    # Defaults follow flash-linear-attention/lm/configs/signed-kda.json, the
+    # settings used for the published LM experiments.
+    ####################
+    linear_fla_expand_v: float = 1.0
+    """Value-dim expansion for the FLA hybrid layers (expand_v)."""
+
+    linear_fla_gate: str = "signed_sigmoid2"
+    """Decay-gate parameterisation. "softplus"/"sigmoid" give alpha in (0,1];
+    "signed_sigmoid2"/"signed_tanh" give alpha in [-1,1]. The signed forms plus
+    allow_neg_eigval are what admit a negative spectrum."""
+
+    linear_fla_output_gate: str = "linear"
+    """Output gate: "linear" (Kimi K3) or "lowrank" (Kimi Linear)."""
+
+    linear_fla_lower_bound: float = -5.0
+    """Floor of the log decay gate; also its eps floor. Must be in [-5, 0)."""
+
+    linear_fla_allow_neg_eigval: bool = True
+    """beta in (0, 2) rather than (0, 1), i.e. allow Householder reflections."""
+
+    linear_fla_drop_silu: bool = True
+    """signed_kda only: replace the q/k/v SiLU (after the short convs) with the
+    identity. True is what every signed_kda run so far used -- it was the legacy
+    layer's default and was never passed -- while the released
+    ComplexKimiDeltaAttention defaults to False, so it is passed explicitly."""
+
+    linear_fla_v_gate: str = "signed_sigmoid2"
+    """panini only: the value-index gate. "none" reduces panini to signed KDA."""
+
+    linear_fla_lower_bound_v: float = -2.0
+    """panini only: floor of log|c| for the value gate. Sets the gauge dynamic
+    range; deliberately tighter than the key gate's -5.
+
+    Only affects THROUGHPUT when linear_fla_v_gate_in_kernel is False, where it
+    sets value_segment_length() and hence the number of kernel launches. On the
+    in-kernel path it is a pure modelling knob."""
+
+    linear_fla_gate_init_style: str = "spread"
+    """FLA signed layers only: how the decay gate's dt_bias is initialised.
+
+    "shipped": every channel starts at alpha = +(1 - dt), i.e. exactly the
+    unsigned KDA baseline, and training must discover negative channels itself.
+    "spread" (this field's default, and the legacy layer's): the same magnitudes
+    with the sign flipped on a random half of the channels, plus f_proj's last
+    layer scaled by 0.1, so frac(alpha < 0) ~ 0.5 at init.
+
+    Parameter shapes are IDENTICAL either way -- this only changes initial
+    values -- so a "shipped" arm needs no re-matching of ffn.
+
+    This is a confound for the signed-vs-unsigned comparison: kda7 has no such
+    mechanism (all channels positive), so skda7/pda7 on "spread" differ from it
+    in BOTH parameterisation and initialisation. FLA's own docstring flags this,
+    and notes its init targets exp(-dt) to match the unsigned gates bit for bit.
+    The released ComplexKimiDeltaAttention defaults to "shipped"; the legacy
+    layer defaulted to "spread". It is always passed explicitly, so the default
+    here is what decides, and it stays "spread" to keep earlier runs as they
+    were."""
+
+    linear_fla_gate_neg_frac: Optional[float] = None
+    """FLA signed layers: fraction of decay-gate channels initialised NEGATIVE.
+
+    FLA offers only two bundled presets -- "shipped" = (neg_frac 0.0, fproj
+    scale 1.0) and "spread" = (neg_frac 0.5, fproj scale 0.1) -- which confound
+    sign diversity with the input-dependence of the gate. Setting this (and/or
+    linear_fla_gate_fproj_scale) builds the layer with the "shipped" init and
+    then re-signs dt_bias here, so the two are independent.
+
+    Sign and magnitude share one pre-activation u: |alpha| = eps + (1-eps)
+    |tanh(u/2)| and s = sign(u), so |alpha| -> eps at the crossing. A channel
+    born at the wrong sign can only cross by walking through near-total state
+    erasure, which is why the negative fraction is a real prior and not a free
+    initialisation choice."""
+
+    linear_fla_gate_fproj_scale: Optional[float] = None
+    """FLA signed layers: multiplier on f_proj's last layer at init.
+
+    FLA's "spread" hardcodes 0.1 so the assigned sign is not swamped by the
+    input-dependent term -- but that also damps how much the gate responds to
+    the input at all, which is the thing a per-key-dim gate is for. Set
+    explicitly to separate the two effects."""
+
+    linear_fla_v_gate_init_style: Optional[str] = None
+    """panini only: the same for the VALUE gate. None follows
+    linear_fla_gate_init_style, which is FLA's own behaviour."""
+
+    linear_fla_torch_compile: bool = False
+    """Wrap the FLA layer's forward in torch.compile to fuse the gate/projection
+    epilogues that sit around the Triton kernel.
+
+    CUDA graphs (cuda_graph_impl) already remove launch overhead but do not fuse,
+    so every elementwise gate op still round-trips HBM. Measured per-layer
+    fwd+bwd at B16/T4096/hidden512 on GH200, eager -> compiled: panini
+    24.24 -> 15.53 ms (1.56x), signed_kda 11.07 -> 8.90 (1.24x), but plain kda
+    6.92 -> 7.99 (0.87x -- SLOWER). Enable it per variant, not globally: layers
+    with little torch-side glue only pay the overhead.
+
+    Requires excluding running_sign from dynamo; see
+    _exclude_running_sign_from_dynamo in megatron/core/ssm/fla_hybrid.py."""
+
+    linear_fla_v_gate_in_kernel: bool = True
+    """panini only: apply the value gauge INSIDE the kernel instead of looping
+    over segments in Python.
+
+    Off (the FLA default), the layer re-bases the value gauge per segment around
+    chunk_kda, costing T/value_segment_length(lower_bound_v) launches per layer
+    per forward -- 64 launches at the default lower_bound_v=-2.0 with T=4096,
+    each on only 64 tokens. Measured at the matched-down 0.1B geometry that is
+    1179 ms/iter (67.3 TFLOP/s) versus 332 for plain kda. On the in-kernel path
+    the same re-basing rides in BC=16 tiles inside launches that already happen,
+    so lower_bound_v no longer trades against speed.
+
+    Defaults to True here, unlike FLA, whose False keeps the reference gauge as
+    the shipped path."""
+
     """Upper bound of the delta-rule step size beta for the gated delta net.
 
     beta is produced as ``linear_beta_max * sigmoid(x)``, so this sets the range
