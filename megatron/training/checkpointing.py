@@ -1938,6 +1938,13 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 assert not is_torch_dist
                 tracker_filename = get_checkpoint_tracker_filename(load_dir)
                 iteration, release = read_metadata(tracker_filename)
+                # Honour --ckpt-step as _load_base_checkpoint does. Without this
+                # the model loads the requested iteration but the optimizer's
+                # fp32 master params (and the returned iteration) come from the
+                # tracker's latest, so branching off an earlier save silently
+                # resumes the latest state instead.
+                if getattr(args, "ckpt_step", None):
+                    iteration = args.ckpt_step
                 model_checkpoint_name = \
                     get_checkpoint_name(load_dir, iteration, release)
                 optim_checkpoint_name = \
