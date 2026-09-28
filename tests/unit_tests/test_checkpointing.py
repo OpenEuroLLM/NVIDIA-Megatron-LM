@@ -304,6 +304,68 @@ def test_load_checkpoint(
         assert new_opt_param_scheduler.state_dict() == opt_param_scheduler.state_dict()
 
 
+class RecordingState(MockState):
+    """MockState that records which distributed-optimizer file it was given."""
+
+    def __init__(self, state_dict):
+        super().__init__(state_dict)
+        self.parameter_state_files = []
+
+    def load_parameter_state(self, filename, *args, **kwargs):
+        self.parameter_state_files.append(str(filename))
+
+
+def test_load_checkpoint_ckpt_step_selects_optimizer_state(
+    init_model_parallel, create_ckpt_load_args, tmp_path_dist_ckpt
+):
+    """--ckpt-step picks the iteration for the model AND the optimizer state.
+
+    A torch-format checkpoint keeps the distributed optimizer's parameter state
+    in a separate distrib_optim.pt. load_checkpoint used to locate it by
+    re-reading the tracker, so loading an earlier save of a run that had moved
+    on took the model from the requested iteration but the optimizer state --
+    and the returned iteration -- from the latest one.
+    """
+    args = create_ckpt_load_args
+    args.ckpt_format = "torch"
+    args.use_distributed_optimizer = True
+    args.use_dist_ckpt = False
+
+    with TempNamedDir(tmp_path_dist_ckpt / "test_ckpt_step", sync=True) as ckpt_dir:
+        args.load = ckpt_dir
+        args.save = ckpt_dir
+        set_args(args)
+        config = TransformerConfig(num_layers=1, kv_channels=1)
+
+        # Two saves; the tracker ends at the later one.
+        models = {}
+        for iteration, value in ((10, 1.0), (20, 2.0)):
+            model = MockModel(config)
+            torch.nn.init.constant_(model.l.weight, value)
+            models[iteration] = model
+            save_checkpoint(
+                iteration,
+                [model],
+                MockState({"optimizer": f"optimizer_state_{iteration}"}),
+                MockState({"opt_param_scheduler": f"scheduler_state_{iteration}"}),
+                0,
+            )
+        assert read_metadata(get_checkpoint_tracker_filename(ckpt_dir))[0] == 20
+
+        args.ckpt_step = 10
+        new_model = MockModel(config)
+        new_optimizer = RecordingState({"optimizer": "dummy"})
+        loaded_iter, _ = load_checkpoint(
+            [new_model], new_optimizer, MockState({"opt_param_scheduler": "dummy"}), strict=True
+        )
+
+        assert loaded_iter == 10
+        assert torch.equal(new_model.l.weight, models[10].l.weight)
+        assert new_optimizer.state_dict() == {"optimizer": "optimizer_state_10"}
+        assert len(new_optimizer.parameter_state_files) == 1
+        assert "iter_0000010" in new_optimizer.parameter_state_files[0]
+
+
 def test_dist_checkpoint_versioning(init_model_parallel, tmp_path_dist_ckpt, create_ckpt_load_args):
     """Test distributed checkpoint versioning."""
     args = create_ckpt_load_args
