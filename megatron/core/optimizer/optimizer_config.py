@@ -346,6 +346,77 @@ class OptimizerConfig:
     adaptive_muon_eps: float = 1e-8
     """The eps parameter for the Adaptive Muon optimizer."""
 
+    # AngularMuown.
+    angular_muown_momentum: float = 0.95
+    """Momentum coefficient for the U-gradient buffer in AngularMuown."""
+
+    angular_muown_nesterov: bool = True
+    """Whether to use Nesterov-style lookahead for the AngularMuown U update."""
+
+    angular_muown_beta1: float = 0.9
+    """Adam beta1 for the AngularMuown row magnitudes g."""
+
+    angular_muown_beta2: float = 0.95
+    """Adam beta2 for the AngularMuown row magnitudes g."""
+
+    angular_muown_split_qkv: bool = True
+    """Whether to split fused QKV parameters for AngularMuown orthogonalization."""
+
+    angular_muown_scale_mode: str = "spectral"
+    """Shape-dependent scale applied to the AngularMuown U direction. "spectral"
+    (sqrt(max(m, n))) with angular_muown_extra_scale_factor=0.2 (the default) reproduces
+    the standard Muon 0.2 * sqrt(max(m, n)) scaling, so Adam-tuned learning rates
+    transfer; "shape_scaling" (sqrt(max(1, m/n))) with extra scale factor 1.0 reproduces
+    the original AngularMuown ratio scaling."""
+
+    angular_muown_extra_scale_factor: float = 0.2
+    """Additional scale factor for the AngularMuown U direction. Defaults to 0.2 to
+    pair with "spectral" scaling (Muon convention)."""
+
+    angular_muown_fp32_matmul_prec: str = "medium"
+    """The precision to use for the fp32 matmul. Defaults to "medium"."""
+
+    angular_muown_coefficient_type: str = "simple"
+    """Newton-Schulz coefficient type for AngularMuown. "simple" matches the coefficients
+    of the original AngularMuown newtonschulz5 backend. Valid types are discovered
+    dynamically from the installed ``emerging_optimizers`` package."""
+
+    angular_muown_num_ns_steps: int = 5
+    """The number of iteration steps to use in the Newton-Schulz iteration."""
+
+    angular_muown_tp_mode: str = "duplicated"
+    """How to perform NS calculation for tensor parallel weights ("duplicated" or
+    "distributed"; both reproduce the single-GPU update). Muon's "blockwise" is not
+    supported for AngularMuown because it changes the per-row geometry."""
+
+    angular_muown_u_decay_schedule: str = "poly"
+    """Internal decay schedule for the AngularMuown directional step multiplier
+    (one of "poly" or "cosine")."""
+
+    angular_muown_u_decay_scale: Optional[float] = 0.001
+    """Scale for the "poly" schedule (1 + scale * steps_after_warmup) ** (-p).
+    None (or angular_muown_u_decay_p=0) disables the decay."""
+
+    angular_muown_u_decay_p: float = 1.0
+    """Exponent for the "poly" U-decay schedule."""
+
+    angular_muown_u_decay_warmup_steps: int = 0
+    """Steps before the AngularMuown U-decay schedule begins."""
+
+    angular_muown_u_decay_steps: Optional[int] = None
+    """Post-warmup steps over which the cosine schedule decays to
+    angular_muown_u_decay_min_multiplier (required for cosine)."""
+
+    angular_muown_u_decay_min_multiplier: float = 0.0
+    """Floor of the cosine U-decay schedule."""
+
+    angular_muown_batched_step: bool = True
+    """Stack same-shape parameters and run the AngularMuown update on the whole stack."""
+
+    muon_batched_step: bool = False
+    """Stack same-shape parameters and run the Muon update on the whole stack. Off by
+    default to preserve the upstream per-parameter behavior."""
+
     #######################
     # Distributed optimizer
     #######################
