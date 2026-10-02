@@ -28,7 +28,6 @@ from typing import Any, Dict, Optional, Tuple
 # Third-party.
 import torch
 import torch.distributed
-
 # Configure logging before importing first-party modules so that the MCore log
 # filter is installed before those modules emit any records at import time.
 from megatron.training.log_handler import CustomHandler
@@ -44,182 +43,138 @@ _LEGACY_TRAIN_START_TIME = time.time()  # NOTE(asolergi-nv): Legacy timestamp
 from megatron.core import mpu, nccl_allocator, tensor_parallel
 from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
 from megatron.core.distributed import DistributedDataParallel as DDP
-from megatron.core.distributed import (
-    DistributedDataParallelConfig,
-    TorchFullyShardedDataParallelConfig,
-    finalize_model_grads,
-)
-from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
-    FullyShardedDataParallel as megatron_FSDP,
-)
+from megatron.core.distributed import (DistributedDataParallelConfig,
+                                       TorchFullyShardedDataParallelConfig,
+                                       finalize_model_grads)
+from megatron.core.distributed.fsdp.mcore_fsdp_adapter import \
+    FullyShardedDataParallel as megatron_FSDP
 from megatron.core.enums import ModelType
 from megatron.core.fp8_utils import correct_amax_history_if_needed
-from megatron.core.full_cuda_graph import FullCudaGraphWrapper, get_shared_capture_stream
+from megatron.core.full_cuda_graph import (FullCudaGraphWrapper,
+                                           get_shared_capture_stream)
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.inference.unified_memory import create_unified_mempool
-from megatron.core.models.common.language_module.language_module import OutputZLossLoggingHelper
-from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
-    is_linear_attention_variant,
-)
+from megatron.core.models.common.language_module.language_module import \
+    OutputZLossLoggingHelper
+from megatron.core.models.gpt.experimental_attention_variant_module_specs import \
+    is_linear_attention_variant
 from megatron.core.msc_utils import maybe_msc
 from megatron.core.num_microbatches_calculator import (
-    destroy_num_microbatches_calculator,
-    get_current_global_batch_size,
-    get_current_running_global_batch_size,
-    get_num_microbatches,
-    update_num_microbatches,
-)
-from megatron.core.optimizer import (
-    OptimizerConfig,
-    ParamKey,
-    get_megatron_optimizer,
-    get_mup_config_overrides,
-    get_standard_config_overrides,
-)
+    destroy_num_microbatches_calculator, get_current_global_batch_size,
+    get_current_running_global_batch_size, get_num_microbatches,
+    update_num_microbatches)
+from megatron.core.optimizer import (OptimizerConfig, ParamKey,
+                                     get_megatron_optimizer,
+                                     get_mup_config_overrides,
+                                     get_standard_config_overrides)
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer.layer_wise_optimizer import (
-    LayerWiseDistributedOptimizer,
-    tag_params_for_buffer_routing,
-)
+    LayerWiseDistributedOptimizer, tag_params_for_buffer_routing)
 from megatron.core.optimizer.optimizer import param_group_identifier_keys
-from megatron.core.optimizer.optimizer_cuda_graph import OptimizerCudaGraphWrapper
+from megatron.core.optimizer.optimizer_cuda_graph import \
+    OptimizerCudaGraphWrapper
 from megatron.core.optimizer.qk_clip import clip_qk
 from megatron.core.optimizer_param_scheduler import (
-    OptimizerParamScheduler,
-    get_canonical_lr_for_logging,
-)
+    OptimizerParamScheduler, get_canonical_lr_for_logging)
 from megatron.core.parallel_state import (
-    create_all_gather_groups,
-    destroy_global_memory_buffer,
-    destroy_model_parallel,
-    get_context_parallel_group,
-    get_hybrid_data_context_parallel_groups,
-    update_pg_timeout,
-)
+    create_all_gather_groups, destroy_global_memory_buffer,
+    destroy_model_parallel, get_context_parallel_group,
+    get_hybrid_data_context_parallel_groups, update_pg_timeout)
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
-from megatron.core.pipeline_parallel.utils import (
-    is_pp_first_stage,
-    is_pp_last_stage,
-    is_vp_first_stage,
-    is_vp_last_stage,
-)
+from megatron.core.pipeline_parallel.utils import (is_pp_first_stage,
+                                                   is_pp_last_stage,
+                                                   is_vp_first_stage,
+                                                   is_vp_last_stage)
 from megatron.core.process_groups_config import (
-    MultiModuleProcessGroupCollection,
-    ProcessGroupCollection,
-)
-from megatron.core.rerun_state_machine import (
-    RerunDataIterator,
-    RerunMode,
-    destroy_rerun_state_machine,
-    get_rerun_state_machine,
-)
+    MultiModuleProcessGroupCollection, ProcessGroupCollection)
+from megatron.core.rerun_state_machine import (RerunDataIterator, RerunMode,
+                                               destroy_rerun_state_machine,
+                                               get_rerun_state_machine)
 from megatron.core.resharding.refit import swap_model_weights
 from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
-from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
+from megatron.core.transformer.experimental_attention_variant.dsa import \
+    DSAIndexerLossLoggingHelper
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 from megatron.core.transformer.moe.paged_stash import PagedStashRunner
-from megatron.core.transformer.moe.router_trace import get_moe_router_tracer, init_moe_router_tracer
-from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
-from megatron.core.utils import (
-    StragglerDetector,
-    check_param_hashes_across_dp_replicas,
-    configure_nvtx_profiling,
-    get_attr_wrapped_model,
-    get_batch_on_this_cp_rank,
-    get_batch_on_this_tp_rank,
-    get_model_config,
-    get_pg_rank,
-    get_pg_size,
-    unwrap_model,
-)
+from megatron.core.transformer.moe.router_trace import (get_moe_router_tracer,
+                                                        init_moe_router_tracer)
+from megatron.core.transformer.multi_token_prediction import \
+    MTPLossLoggingHelper
+from megatron.core.utils import (StragglerDetector,
+                                 check_param_hashes_across_dp_replicas,
+                                 configure_nvtx_profiling,
+                                 get_attr_wrapped_model,
+                                 get_batch_on_this_cp_rank,
+                                 get_batch_on_this_tp_rank, get_model_config,
+                                 get_pg_rank, get_pg_size, unwrap_model)
 from megatron.training import packed_doc_attention
-from megatron.training.checkpointing import (
-    checkpoint_exists,
-    get_loaded_iteration,
-    load_checkpoint,
-    save_checkpoint,
-    save_grads,
-)
+from megatron.training.checkpointing import (checkpoint_exists,
+                                             get_loaded_iteration,
+                                             load_checkpoint, save_checkpoint,
+                                             save_grads)
 from megatron.training.config import FaultInjectorConfig
 from megatron.training.config.container import PretrainConfigContainer
-from megatron.training.datasets.data_samplers import build_pretraining_data_loader
-from megatron.training.initialize import (
-    initialize_megatron,
-    set_jit_fusion_options,
-    write_args_to_tensorboard,
-)
-from megatron.training.utils import is_gtp_remat_active, is_hybrid_model, warn_rank_0
+from megatron.training.datasets.data_samplers import \
+    build_pretraining_data_loader
+from megatron.training.initialize import (initialize_megatron,
+                                          set_jit_fusion_options,
+                                          write_args_to_tensorboard)
+from megatron.training.utils import (is_gtp_remat_active, is_hybrid_model,
+                                     warn_rank_0)
 
 # Local.
 from . import ft_integration, one_logger_utils
-from .activation_logging import (
-    disable_activation_logging,
-    disable_tokens_per_expert_logging,
-    enable_activation_logging,
-    enable_tokens_per_expert_logging,
-    save_activations,
-    save_tokens_per_expert,
-)
+from .activation_logging import (disable_activation_logging,
+                                 disable_tokens_per_expert_logging,
+                                 enable_activation_logging,
+                                 enable_tokens_per_expert_logging,
+                                 save_activations, save_tokens_per_expert)
 from .async_utils import maybe_finalize_async_save
-from .dgrad_logging import disable_dgrad_logging, enable_dgrad_logging, save_dgrads
+from .dgrad_logging import (disable_dgrad_logging, enable_dgrad_logging,
+                            save_dgrads)
 from .diagnostics import get_diagnostics, setup_diagnostics
+from .global_vars import (destroy_global_vars, get_args, get_energy_monitor,
+                          get_one_logger, get_signal_handler,
+                          get_tensorboard_writer, get_timers, get_tokenizer,
+                          get_wandb_writer)
 from .te_debug import attach_te_debug, init_te_debug, te_debug_step
-from .global_vars import (
-    destroy_global_vars,
-    get_args,
-    get_energy_monitor,
-    get_one_logger,
-    get_signal_handler,
-    get_tensorboard_writer,
-    get_timers,
-    get_tokenizer,
-    get_wandb_writer,
-)
 from .theoretical_memory_usage import report_theoretical_memory
-from .utils import (
-    append_to_progress_log,
-    calc_params_l2_norm,
-    check_adlr_autoresume_termination,
-    is_last_rank,
-    logical_and_across_model_parallel_group,
-    print_rank_0,
-    print_rank_last,
-    reduce_max_stat_across_model_parallel_group,
-    report_memory,
-    to_empty_if_meta_device,
-    update_use_dist_ckpt,
-)
+from .utils import (append_to_progress_log, calc_params_l2_norm,
+                    check_adlr_autoresume_termination, is_last_rank,
+                    logical_and_across_model_parallel_group, print_rank_0,
+                    print_rank_last,
+                    reduce_max_stat_across_model_parallel_group, report_memory,
+                    to_empty_if_meta_device, update_use_dist_ckpt)
 
 # Optional dependencies. Each is guarded so the module imports cleanly when the
 # dependency is unavailable; the ``has_*``/``HAVE_*`` flags gate later usage.
 try:
     from megatron.rl import rl_utils
-    from megatron.rl.rl_profiling import (
-        RL_LOGGABLE_TIMER_NAMES,
-        initialize_rl_profiler,
-        log_iteration_profile,
-        shutdown_rl_profiler,
-    )
+    from megatron.rl.rl_profiling import (RL_LOGGABLE_TIMER_NAMES,
+                                          initialize_rl_profiler,
+                                          log_iteration_profile,
+                                          shutdown_rl_profiler)
 
     has_rl_utils = True
 except ImportError:
     has_rl_utils = False
 
 try:
-    from modelopt.torch.distill.plugins.megatron import get_tensor_shapes_adjust_fn_for_distillation
-
     from megatron.post_training.utils import maybe_enable_modelopt
+    from modelopt.torch.distill.plugins.megatron import \
+        get_tensor_shapes_adjust_fn_for_distillation
 
     has_nvidia_modelopt = True
 except ImportError:
     has_nvidia_modelopt = False
 
 try:
-    from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
+    from megatron.core.distributed import \
+        TorchFullyShardedDataParallel as torch_FSDP
 
     HAVE_FSDP2 = True
 except ImportError:
@@ -940,9 +895,7 @@ def num_floating_point_operations(
         from operator import itemgetter
 
         from megatron.core.models.hybrid.hybrid_layer_allocation import (
-            Symbols,
-            get_hybrid_layer_counts,
-        )
+            Symbols, get_hybrid_layer_counts)
         num_mamba_layers, num_gdn_layers, num_attn_layers, num_mlp_layers, num_moe_layers = (
             itemgetter(Symbols.MAMBA, Symbols.GDN, Symbols.ATTENTION, Symbols.MLP, Symbols.MOE)(
                 get_hybrid_layer_counts(args.hybrid_layer_pattern)
@@ -1200,7 +1153,8 @@ def pretrain(
     init_te_debug(args)
 
     if args.fine_grained_activation_offloading:
-        from megatron.core.pipeline_parallel.utils import set_ideal_affinity_for_current_gpu
+        from megatron.core.pipeline_parallel.utils import \
+            set_ideal_affinity_for_current_gpu
         set_ideal_affinity_for_current_gpu()
 
 
@@ -1285,16 +1239,12 @@ def pretrain(
     # Context used for persisting some state between checkpoint saves.
     if cfg_container.checkpoint.non_persistent_ckpt_type == 'local':
         try:
-            from nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager import (
-                LocalCheckpointManager,
-            )
+            from nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager import \
+                LocalCheckpointManager
             from nvidia_resiliency_ext.checkpointing.local.replication.group_utils import (
-                GroupWrapper,
-                parse_group_sequence,
-            )
-            from nvidia_resiliency_ext.checkpointing.local.replication.strategies import (
-                CliqueReplicationStrategy,
-            )
+                GroupWrapper, parse_group_sequence)
+            from nvidia_resiliency_ext.checkpointing.local.replication.strategies import \
+                CliqueReplicationStrategy
         except ModuleNotFoundError:
             raise RuntimeError(
                 "The 'nvidia_resiliency_ext' module is required for local "
@@ -1356,7 +1306,8 @@ def pretrain(
             or args.rl_inference_expert_tensor_model_parallel_size is not None
             or force_cp1_inference_model
         ):
-            from megatron.core.inference.shards import build_inference_pg_collection
+            from megatron.core.inference.shards import \
+                build_inference_pg_collection
 
             print_rank_0(
                 "Building separate RL inference model with custom parallelism: "
@@ -2187,9 +2138,11 @@ def diag_swap_from_checkpoint(model, optimizer, args, dp_cp_group=None):
     the optimizer's master params are refreshed so an lr-0 step cannot write the old values back.
     """
     import re
+
     from megatron.core import dist_checkpointing
     from megatron.core.dist_checkpointing.mapping import ShardedTensor
-    from megatron.training.checkpointing import _build_sharded_state_dict_metadata
+    from megatron.training.checkpointing import \
+        _build_sharded_state_dict_metadata
 
     ckpt_dir = args.diag_swap_checkpoint
     tracker = os.path.join(ckpt_dir, "latest_checkpointed_iteration.txt")
@@ -2318,7 +2271,8 @@ def setup_model_and_optimizer(
     # alignment governs how dim-0 shards are built). Placed here (not in get_model) so it
     # also covers the config-container builder path, which does not call get_model.
     if is_gtp_remat_active(args):
-        from megatron.core.tensor_parallel.gtp_api import configure_gtp_remat_from_recipe
+        from megatron.core.tensor_parallel.gtp_api import \
+            configure_gtp_remat_from_recipe
 
         configure_gtp_remat_from_recipe(
             fp4=getattr(args, 'fp4', None) is not None,
@@ -2334,7 +2288,8 @@ def setup_model_and_optimizer(
     # first forward. Placed here (not in get_model) so it also covers the config-container
     # builder path.
     if is_gtp_remat_active(args):
-        from megatron.core.tensor_parallel.gtp_api import classify_gtp_remat_chains
+        from megatron.core.tensor_parallel.gtp_api import \
+            classify_gtp_remat_chains
 
         classify_gtp_remat_chains(
             model,
@@ -2490,7 +2445,8 @@ def setup_model_and_optimizer(
     # Import locally to prevent circular import: megatron.post_training.checkpointing
     # imports `get_args` from megatron.training at module scope.
     if has_nvidia_modelopt:
-        from megatron.post_training.checkpointing import load_kd_teacher_checkpoint
+        from megatron.post_training.checkpointing import \
+            load_kd_teacher_checkpoint
 
         load_kd_teacher_checkpoint(model)
 
@@ -2675,6 +2631,19 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     args = get_args()
     timers = get_timers()
 
+    if config.tweo_loss_coeff != 0:
+        from megatron.core.transformer.tweo import (TWEOState, coefficient,
+                                                    validate)
+
+        validate(config)
+        if iteration is None:
+            raise ValueError("TWEO requires the absolute training iteration")
+        tweo_coefficient = coefficient(
+            config.tweo_loss_coeff, iteration, config.tweo_start_step, config.tweo_warmup_steps
+        )
+        for chunk in model:
+            get_model_config(chunk)._tweo_current_coeff = tweo_coefficient
+
     # Arms the activation hooks for this iteration (and clears their buffers).
     # Must happen before the forward pass; a no-op unless --diagnostics-interval.
     diagnostics = get_diagnostics()
@@ -2693,6 +2662,9 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     save_dgrads_in_this_iteration = (args.save_dgrads_interval is not None and
                                      (iteration + 1) % args.save_dgrads_interval == 0)
     while rerun_state_machine.should_run_forward_backward(data_iterator):
+        if config.tweo_loss_coeff != 0:
+            interval = config.tweo_diagnostics_interval
+            TWEOState.reset(collect=interval > 0 and (iteration + 1) % interval == 0)
         # Set grad to zero.
         for model_chunk in model:
             model_chunk.zero_grad_buffer()
@@ -2886,10 +2858,25 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     if args.empty_unused_memory_level >= 2:
         torch.cuda.empty_cache()
 
+    tweo_metrics = {}
+    if config.tweo_loss_coeff != 0 and TWEOState.collect:
+        from megatron.core.transformer.tweo import TWEOState
+
+        values = torch.zeros(
+            (config.num_layers, 2), dtype=torch.float64, device=torch.cuda.current_device()
+        )
+        for layer, record in TWEOState.moments.items():
+            values[layer - 1] = record
+        torch.distributed.all_reduce(values)
+        raw = (values[:, 0] / values[:, 1].clamp_min(1)).mean()
+        tweo_metrics = {"tweo raw loss": raw, "tweo loss": raw * tweo_coefficient,
+                        "tweo coefficient": raw.new_tensor(tweo_coefficient)}
+
     if is_last_stage and losses_reduced:
         # Average loss across microbatches.
         # Last stage may have no loss (e.g. MIMO encoder-grid ranks).
         loss_reduced = {}
+        loss_reduced.update(tweo_metrics)
         for key in losses_reduced[0].keys():
             val = [x[key].view(-1) for x in losses_reduced]
             if val[0].numel() == 2:
@@ -3139,9 +3126,7 @@ def training_log(
             from operator import itemgetter
 
             from megatron.core.ssm.mamba_hybrid_layer_allocation import (
-                Symbols,
-                get_hybrid_layer_counts,
-            )
+                Symbols, get_hybrid_layer_counts)
             layers = itemgetter(Symbols.MOE)(get_hybrid_layer_counts(args.hybrid_layer_pattern))
         else:
             layers = args.num_layers
@@ -3774,14 +3759,11 @@ def train(
         fault_injector_config.fault_injector_ranks is not None
         or fault_injector_config.fault_injector_num_ranks is not None
     ):
+        from megatron.core.fault_injector import \
+            maybe_raise_workload_exception as _maybe_raise_workload_exception
         from megatron.core.fault_injector import (
-            maybe_raise_workload_exception as _maybe_raise_workload_exception,
-        )
-        from megatron.core.fault_injector import (
-            setup_fault_injection,
-            should_setup_fault_injection_at_iteration,
-            should_setup_fault_injection_at_start,
-        )
+            setup_fault_injection, should_setup_fault_injection_at_iteration,
+            should_setup_fault_injection_at_start)
 
         if should_setup_fault_injection_at_start(fault_injector_config):
             setup_fault_injection(fault_injector_config)
@@ -3855,8 +3837,7 @@ def train(
         print_rank_0("> Reinitializing microbatch calculator for GRPO training...")
         from megatron.core.num_microbatches_calculator import (
             destroy_num_microbatches_calculator,
-            init_num_microbatches_calculator,
-        )
+            init_num_microbatches_calculator)
 
         # First destroy the existing calculator
         destroy_num_microbatches_calculator()

@@ -347,6 +347,12 @@ def forward_step_calc_loss(
     if config.timers is not None:
         config.timers('forward-compute').stop()
 
+    if config.tweo_loss_coeff != 0:
+        from megatron.core.transformer.tweo import TWEOState, validate
+
+        validate(config)
+        TWEOState.scale = _compute_loss_scale(config, get_tensor_device(output_tensor)) / num_microbatches
+
     # Set the loss scale for the auxiliary loss of the MoE layer.
     # Since we use a trick to do backward on the auxiliary loss, we need to set the scale
     # explicitly.

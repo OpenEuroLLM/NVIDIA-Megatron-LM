@@ -995,6 +995,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # won't result in memory savings (like the data loader, or
         # p2p_communication), it serves to document the origin of this
         # 'view' tensor.
+        if self.training and self.config.tweo_loss_coeff != 0:
+            from megatron.core.transformer.tweo import attach
+
+            hidden_states = attach(hidden_states, self.config, self.layer_number)
+
         output = make_viewless_tensor(
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )
