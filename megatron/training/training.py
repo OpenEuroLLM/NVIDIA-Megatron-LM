@@ -2620,6 +2620,23 @@ def get_pipeline_tensor_shapes(args, micro_batch_size=None):
     return args.seq_length, micro_batch_size
 
 
+def _params_norm_and_zeros_step(args, iteration):
+    """Whether --log-params-norm / --log-num-zeros-in-grad are computed for the step that is
+    logged as `iteration` (see --log-params-norm-and-zeros-interval)."""
+    interval = getattr(args, 'log_params_norm_and_zeros_interval', None)
+    return not interval or iteration is None or iteration % interval == 0
+
+
+def _set_count_zeros(optimizer, enabled):
+    """Switch the optimizers' zero counting for the next step() (each reads its config)."""
+    seen = set()
+    for opt in [optimizer] + list(getattr(optimizer, 'chained_optimizers', [])):
+        config = getattr(opt, 'config', None)
+        if config is not None and id(config) not in seen:
+            seen.add(id(config))
+            config.log_num_zeros_in_grad = enabled
+
+
 def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None, pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None, p2p_communicator: Optional[P2PCommunicator] = None):
     """Single training step.
 
@@ -2791,6 +2808,12 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     # Update parameters.
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
+    # This step is logged as iteration + 1 (the loop increments after train_step).
+    count_zeros = args.log_num_zeros_in_grad and _params_norm_and_zeros_step(
+        args, None if iteration is None else iteration + 1
+    )
+    if args.log_num_zeros_in_grad and getattr(args, 'log_params_norm_and_zeros_interval', None):
+        _set_count_zeros(optimizer, count_zeros)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
 
     # get max attention logit for logging and run clip_qk()
@@ -2828,10 +2851,12 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     # every step is counted. Reads the already-reduced scalar, adds no collective.
     if diagnostics is not None:
         diagnostics.observe_clip(grad_norm)
-    if args.log_num_zeros_in_grad:
+    if count_zeros:
         num_zeros_in_grad = reduce_max_stat_across_model_parallel_group(
             num_zeros_in_grad, group=mp_group
         )
+    elif args.log_num_zeros_in_grad:
+        num_zeros_in_grad = None  # a step skipped by --log-params-norm-and-zeros-interval
 
     # Vision momentum.
     if args.vision_pretraining and args.vision_pretraining_type == "dino":
@@ -4362,7 +4387,7 @@ def train(
             loss_scale = 1.0
         params_norm = None
 
-        if args.log_params_norm:
+        if args.log_params_norm and _params_norm_and_zeros_step(args, iteration):
             params_norm = calc_params_l2_norm(model)
         if optimizer is not None:
             learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)

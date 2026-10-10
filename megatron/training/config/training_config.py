@@ -318,6 +318,11 @@ class LoggerConfig:
     log_num_zeros_in_grad: bool = False
     """If set, calculate and log the number of zeros in gradient."""
 
+    log_params_norm_and_zeros_interval: int | None = None
+    """Compute --log-params-norm and --log-num-zeros-in-grad only on iterations that are a
+    multiple of this; None computes them every iteration. Each costs a pass over the local
+    parameters / gradients plus a collective on EVERY step, logged or not."""
+
     log_max_attention_logit: bool = False
     """Enable max attention logit logging to tensorboard."""
 
