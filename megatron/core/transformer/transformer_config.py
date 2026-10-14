@@ -1558,12 +1558,17 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.linear_value_head_dim is not None
             ), "linear_value_head_dim must be set for mlstm."
-            assert self.linear_num_key_heads == self.linear_num_value_heads, (
-                f"mlstm requires linear_num_key_heads ({self.linear_num_key_heads}) == "
-                f"linear_num_value_heads ({self.linear_num_value_heads}); the mLSTM kernels "
-                "have no grouped-query mode."
+            # Grouped-query mode: q/k at num_key_heads, repeated to the value
+            # heads inside the layer (the kernel itself has no GQA).
+            assert self.linear_num_value_heads % self.linear_num_key_heads == 0, (
+                f"mlstm requires linear_num_value_heads ({self.linear_num_value_heads}) to be "
+                f"a multiple of linear_num_key_heads ({self.linear_num_key_heads})."
             )
             tp_cp_size = self.tensor_model_parallel_size * self.context_parallel_size
+            assert self.linear_num_key_heads % tp_cp_size == 0, (
+                f"{self.linear_num_key_heads=} must be a multiple of "
+                f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
+            )
             assert self.linear_num_value_heads % tp_cp_size == 0, (
                 f"{self.linear_num_value_heads=} must be a multiple of "
                 f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."

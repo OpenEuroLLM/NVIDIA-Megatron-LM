@@ -74,10 +74,12 @@ class MLSTM(MegatronModule):
     preactivations, chunkwise-parallel mLSTM cell (mlstm_kernels TFLA),
     per-head RMSNorm, elementwise sigmoid output gate, output projection.
 
-    Uses the shared linear-attention config fields: linear_num_key_heads must
-    equal linear_num_value_heads (the kernel has no GQA), while
-    linear_key_head_dim and linear_value_head_dim may differ (e.g. the
-    canonical xLSTM qk_dim = v_dim / 2).
+    Uses the shared linear-attention config fields. linear_num_key_heads may be
+    a divisor of linear_num_value_heads (grouped-query mode, as GatedDeltaNet):
+    q and k are projected at num_key_heads and repeat_interleave'd up to the
+    value heads before the cell, since the kernel itself has no GQA. The i/f/o
+    gates stay per value head. linear_key_head_dim and linear_value_head_dim
+    may differ (e.g. the canonical xLSTM qk_dim = v_dim / 2).
 
     Context parallelism uses the GDN/Mamba all-to-all scheme: sequence
     sharding is converted to head sharding around the recurrence, so each CP
@@ -144,19 +146,23 @@ class MLSTM(MegatronModule):
         self.key_head_dim = config.linear_key_head_dim
         self.value_head_dim = config.linear_value_head_dim
         self.num_heads = config.linear_num_value_heads
-        assert config.linear_num_key_heads == config.linear_num_value_heads, (
-            "MLSTM requires linear_num_key_heads == linear_num_value_heads "
-            f"(got {config.linear_num_key_heads} vs {config.linear_num_value_heads}); "
-            "the mLSTM kernels have no grouped-query mode."
+        self.num_key_heads = config.linear_num_key_heads
+        assert self.num_heads % self.num_key_heads == 0, (
+            "MLSTM requires linear_num_value_heads to be a multiple of "
+            f"linear_num_key_heads (got {self.num_heads} vs {self.num_key_heads})."
         )
-        self.qk_dim = self.key_head_dim * self.num_heads
+        # q/k heads shared by each group of value heads (1 = no grouping).
+        self.qk_repeat = self.num_heads // self.num_key_heads
+        self.qk_dim = self.key_head_dim * self.num_key_heads
         self.v_dim = self.value_head_dim * self.num_heads
         # Context parallelism follows the GDN/Mamba approach: an all-to-all
         # converts sequence sharding into head sharding, so each CP rank runs
         # the full-sequence recurrence for num_heads/(tp*cp) heads — no
         # recurrent state has to be transferred between ranks.
-        assert self.num_heads % (self.tp_size * self.cp_size) == 0, (
-            f"num_heads ({self.num_heads}) must be divisible by "
+        # Key heads must shard too: each rank then holds whole groups, and a
+        # local repeat_interleave equals the global one.
+        assert self.num_key_heads % (self.tp_size * self.cp_size) == 0, (
+            f"num_key_heads ({self.num_key_heads}) must be divisible by "
             f"tp_size*cp_size ({self.tp_size}*{self.cp_size})."
         )
         self.qk_dim_local_tp = self.qk_dim // self.tp_size
@@ -446,6 +452,11 @@ class MLSTM(MegatronModule):
         q, k, v, i_preact, f_preact = self._prepare_qkvif(
             q, k, v, i_preact, f_preact, igate_bias_local_cp, fgate_bias_local_cp, batch, seq_len
         )
+        # Grouped-query mode: expand q/k heads to the value heads (same layout
+        # as GatedDeltaNet — consecutive value heads share a key head).
+        if self.qk_repeat > 1:
+            q = q.repeat_interleave(self.qk_repeat, dim=1)
+            k = k.repeat_interleave(self.qk_repeat, dim=1)
 
         nvtx_range_push(suffix="mlstm_cell")
         h = self.mlstm_fn(
