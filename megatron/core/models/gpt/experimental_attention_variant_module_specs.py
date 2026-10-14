@@ -253,6 +253,41 @@ def get_experimental_attention_variant_module_spec(
         )
 
 
+def get_hybrid_linear_layer_spec(
+    config: TransformerConfig, backend: BackendSpecProvider | None = None
+) -> ModuleSpec:
+    """Build the layer spec for a HybridModel `L` (linear mixer) position.
+
+    The mixer is `config.experimental_attention_variant`, built by the same
+    `get_experimental_attention_variant_module_spec` the GPT path uses, so a
+    variant behaves identically in both models. Unlike a GPT decoder layer it
+    carries no MLP: HybridModel places MLPs with its own `-`/`E` symbols.
+    """
+    if not is_linear_attention_variant(config.experimental_attention_variant):
+        raise ValueError(
+            "Hybrid layer pattern symbol 'L' needs experimental_attention_variant to be a "
+            f"linear attention variant, got {config.experimental_attention_variant!r}."
+        )
+    if backend is None:
+        backend = _get_backend_spec_provider(config=config)
+
+    attention = get_experimental_attention_variant_module_spec(config=config, backend=backend)
+    rms_norm = config.normalization == "RMSNorm"
+    input_layernorm = (
+        IdentityOp
+        if attention.metainfo["fuse_input_layernorm"]
+        else backend.layer_norm(rms_norm=rms_norm, for_qk=False)
+    )
+    return ModuleSpec(
+        module=TransformerLayer,
+        submodules=TransformerLayerSubmodules(
+            input_layernorm=input_layernorm,
+            self_attention=attention,
+            self_attn_bda=get_bias_dropout_add,
+        ),
+    )
+
+
 ##########
 # Experimental GPT Decoder Block Spec
 ##########

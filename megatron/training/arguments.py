@@ -3765,6 +3765,7 @@ def _add_experimental_args(parser):
                        '`transformer_block.py`, or `transformer_layer.py`')
     group.add_argument('--hybrid-layer-pattern', type=str, default=None,
                        help='Specify a hybrid layer pattern using M (mamba), G (gdn), '
+                       'L (the linear mixer named by --experimental-attention-variant), '
                        '* (attention), D (dsa), - (mlp), E (moe). Use | to define pipeline '
                        'stage boundaries for flexible virtual pipeline parallel (fVPP). '
                        'Use / to separate MTP patterns. '

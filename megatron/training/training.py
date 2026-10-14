@@ -555,9 +555,201 @@ def num_floating_point_operations(
             )
         )
 
+    def linear_mixer_fmas_per_token():
+        """Multiply-adds per token of ONE linear-mixer layer (forward only).
+
+        The mixer is `args.experimental_attention_variant`: placed by
+        `linear_attention_freq` in a GPT model, or by the `L` symbol of
+        `hybrid_layer_pattern` in a hybrid model. Callers apply the FMA and
+        forward/backward factors.
+        """
+        if args.experimental_attention_variant == "gated_delta_net":
+            # Calculate the FLOPs for the gated delta net attention.
+            qk_head_dim = args.linear_key_head_dim
+            v_head_dim = args.linear_value_head_dim
+            num_qk_heads = args.linear_num_key_heads
+            num_v_heads = args.linear_num_value_heads
+            qk_dim = qk_head_dim * num_qk_heads
+            v_dim = v_head_dim * num_v_heads
+            return (
+                (
+                    ## in proj
+                    args.hidden_size
+                    * (2 * qk_dim + 2 * v_dim + 2 * num_v_heads)
+                    ## conv1d
+                    + args.linear_conv_kernel_dim
+                    * (2 * qk_dim + v_dim)
+                    ## gated delta rule
+                    + num_v_heads
+                    * (v_head_dim ** 2)
+                    * 4  # KK^T, VK^T, S(a(I-bKK^T)), and SQ
+                    ## out proj
+                    + args.hidden_size
+                    * v_dim
+                )
+            )
+        elif args.experimental_attention_variant in ("kda", "signed_kda", "panini"):
+            # FLOPs for the FLA hybrids (megatron/core/ssm/fla_hybrid.py).
+            # Same delta-rule skeleton as gated_delta_net, but the layer owns
+            # its projections, and counts what it builds:
+            #   q, k, v                hidden x qk_dim (x2), hidden x v_dim
+            #   decay gate f_proj      low rank: hidden -> v_head_dim -> qk_dim
+            #   output gate g_proj     low rank (kda always; signed_kda/panini
+            #                          with output_gate "lowrank") or
+            #                          hidden x v_dim ("linear")
+            #   value gate fv_proj     panini unless v_gate "none": low rank
+            #                          hidden -> v_head_dim -> v_dim
+            #   o_proj                 v_dim x hidden
+            # plus the short conv and the four delta-rule matmuls. b_proj
+            # (hidden x heads) is negligible and omitted.
+            qk_head_dim = args.linear_key_head_dim
+            num_heads = args.linear_num_key_heads
+            qk_dim = qk_head_dim * num_heads
+            v_dim = int(qk_dim * args.linear_fla_expand_v)
+            v_head_dim = v_dim // num_heads
+            variant = args.experimental_attention_variant
+
+            def _low_rank(out_dim):
+                return args.hidden_size * v_head_dim + v_head_dim * out_dim
+
+            if variant == "kda" or args.linear_fla_output_gate == "lowrank":
+                output_gate = _low_rank(v_dim)
+            else:
+                output_gate = args.hidden_size * v_dim
+            value_gate = (
+                _low_rank(v_dim)
+                if variant == "panini" and args.linear_fla_v_gate != "none"
+                else 0
+            )
+            return (
+                (
+                    ## q, k, v projections
+                    args.hidden_size * (2 * qk_dim + v_dim)
+                    ## short conv over q, k, v
+                    + args.linear_conv_kernel_dim * (2 * qk_dim + v_dim)
+                    ## decay gate, output gate, value gate (panini)
+                    + _low_rank(qk_dim)
+                    + output_gate
+                    + value_gate
+                    ## delta rule
+                    + num_heads * (v_head_dim**2) * 4
+                    ## out proj
+                    + args.hidden_size * v_dim
+                )
+            )
+        elif args.experimental_attention_variant == "mlstm":
+            # Calculate the FLOPs for the mLSTM attention variant.
+            qk_head_dim = args.linear_key_head_dim
+            v_head_dim = args.linear_value_head_dim
+            num_heads = args.linear_num_value_heads
+            # Grouped-query mode: q/k are projected (and convolved) at the
+            # key heads only; the cell runs on all value heads after the
+            # repeat_interleave, so it is priced at num_heads below.
+            qk_dim = qk_head_dim * args.linear_num_key_heads
+            v_dim = v_head_dim * num_heads
+            return (
+                (
+                    ## in proj (q, k, v, output gate, i/f gates)
+                    args.hidden_size
+                    * (2 * qk_dim + 2 * v_dim + 2 * num_heads)
+                    ## optional short depthwise causal conv over q,k,v
+                    + (
+                        args.linear_conv_kernel_dim * (2 * qk_dim + v_dim)
+                        if getattr(args, "mlstm_conv1d", False)
+                        else 0
+                    )
+                    ## chunkwise mLSTM cell: inter-chunk state update (k v^T)
+                    ## and state readout (q^T C), plus the causal intra-chunk
+                    ## attention term at chunk size L (~L/2 per token).
+                    + num_heads
+                    * (
+                        2 * qk_head_dim * v_head_dim
+                        + args.mlstm_chunk_size * (qk_head_dim + v_head_dim) // 2
+                    )
+                    ## out proj
+                    + args.hidden_size
+                    * v_dim
+                )
+            )
+        elif args.experimental_attention_variant == "complex_kda":
+            # Approximate FLOPs for the Complex-KDA mixer. Like the Mamba
+            # branch below, this only affects the reported
+            # architecture-aware TFLOP/s, not training.
+            #
+            # GEOMETRY IS DERIVED, not read from `linear_*_head_dim` /
+            # `linear_num_*_heads`. Complex KDA has one head width and
+            # takes its head count from the model, exactly as
+            # `megatron/core/ssm/complex_kda.py` does -- reading the
+            # GatedDeltaNet fields here would silently price the model at
+            # their defaults for any run that does not set them.
+            head_dim = (
+                args.linear_key_head_dim
+                or args.kv_channels
+                or (args.hidden_size // args.num_attention_heads)
+            )
+            ckda_heads = args.hidden_size // head_dim
+            qk_dim = v_dim = ckda_heads * head_dim
+            # The output gate is the one structural difference between the
+            # arms of this family, so it is priced rather than assumed.
+            out_gate = (
+                args.hidden_size * head_dim + head_dim * v_dim
+                if args.linear_output_gate == "lowrank"
+                else args.hidden_size * v_dim
+            )
+            return (
+                (
+                    ## in proj (q, k, v)
+                    args.hidden_size * (2 * qk_dim + v_dim)
+                    ## channel-wise decay gate, factored through one head
+                    + args.hidden_size * head_dim + head_dim * qk_dim
+                    ## beta, one scalar per head
+                    + args.hidden_size * ckda_heads
+                    ## output gate
+                    + out_gate
+                    ## short depthwise causal conv over q, k, v
+                    + args.linear_conv_kernel_dim * (2 * qk_dim + v_dim)
+                    ## delta rule: KK^T, VK^T, S(a(I-bKK^T)) and SQ
+                    + ckda_heads * (head_dim ** 2) * 4
+                    ## out proj
+                    + args.hidden_size * v_dim
+                )
+            )
+        elif args.experimental_attention_variant == "mamba":
+            # Approximate FLOPs for the Mamba2 (SSD) mixer. Only affects the
+            # reported architecture-aware TFLOP/s (throughput logging), not
+            # training; compare Tok/s/GPU across architectures.
+            headdim = args.mamba_head_dim
+            d_state = args.mamba_state_dim
+            ngroups = args.mamba_num_groups
+            if args.mamba_num_heads is not None:
+                nheads = args.mamba_num_heads
+                d_inner = nheads * headdim
+            else:
+                d_inner = 2 * args.hidden_size  # expand=2 default
+                nheads = d_inner // headdim
+            d_conv = 4  # MambaMixer default causal-conv width
+            return (
+                (
+                    ## in proj (z, x, B, C, dt)
+                    args.hidden_size
+                    * (2 * d_inner + 2 * ngroups * d_state + nheads)
+                    ## conv1d over x, B, C channels
+                    + d_conv * (d_inner + 2 * ngroups * d_state)
+                    ## SSD scan: chunk state update (B x^T) and readout (C h)
+                    + nheads * headdim * d_state * 4
+                    ## out proj
+                    + args.hidden_size * d_inner
+                )
+            )
+        else:
+            raise ValueError(
+                "Invalid experimental_attention_variant: "
+                f"{args.experimental_attention_variant}"
+            )
+
     def hybrid_flops(total_tokens, seqlen_squared_sum, hidden_size,
                      num_attn_layers, num_mamba_layers, num_mlp_layers, num_moe_layers,
-                     num_gdn_layers=0,
+                     num_gdn_layers=0, num_linear_layers=0,
                      mamba_state_dim=128, mamba_head_dim=64,
                      mamba_num_groups=8, mamba_num_heads=128,
                      num_attn_heads=32, gqa=True,
@@ -586,6 +778,9 @@ def num_floating_point_operations(
                                                   gdn_qk_head_dim, gdn_v_head_dim,
                                                   gdn_num_qk_heads, gdn_num_v_heads,
                                                   gdn_conv_kernel_dim) +
+                # `L` layers: the same per-variant count the GPT path uses.
+                (num_linear_layers * 2 * total_tokens * linear_mixer_fmas_per_token()
+                 if num_linear_layers else 0) +
                 (2 * total_tokens * hidden_size * vocab_size * (1 + mtp_num_layers))  # logits computation
         )
         return flops_fwd * 3
@@ -783,199 +978,11 @@ def num_floating_point_operations(
             num_linear_attention_layers = sum(linear_attention_pattern)
             num_standard_attention_layers = num_layers - num_linear_attention_layers
 
-            if args.experimental_attention_variant == "gated_delta_net":
-                # Calculate the FLOPs for the gated delta net attention.
-                qk_head_dim = args.linear_key_head_dim
-                v_head_dim = args.linear_value_head_dim
-                num_qk_heads = args.linear_num_key_heads
-                num_v_heads = args.linear_num_value_heads
-                qk_dim = qk_head_dim * num_qk_heads
-                v_dim = v_head_dim * num_v_heads
-                linear_self_attn_term = (
-                    forward_backward_expansion_factor
-                    * fma_expansion_factor
-                    * (
-                        ## in proj
-                        args.hidden_size
-                        * (2 * qk_dim + 2 * v_dim + 2 * num_v_heads)
-                        ## conv1d
-                        + args.linear_conv_kernel_dim
-                        * (2 * qk_dim + v_dim)
-                        ## gated delta rule
-                        + num_v_heads
-                        * (v_head_dim ** 2)
-                        * 4  # KK^T, VK^T, S(a(I-bKK^T)), and SQ
-                        ## out proj
-                        + args.hidden_size
-                        * v_dim
-                    )
-                )
-            elif args.experimental_attention_variant in ("kda", "signed_kda", "panini"):
-                # FLOPs for the FLA hybrids (megatron/core/ssm/fla_hybrid.py).
-                # Same delta-rule skeleton as gated_delta_net, but the layer owns
-                # its projections, and counts what it builds:
-                #   q, k, v                hidden x qk_dim (x2), hidden x v_dim
-                #   decay gate f_proj      low rank: hidden -> v_head_dim -> qk_dim
-                #   output gate g_proj     low rank (kda always; signed_kda/panini
-                #                          with output_gate "lowrank") or
-                #                          hidden x v_dim ("linear")
-                #   value gate fv_proj     panini unless v_gate "none": low rank
-                #                          hidden -> v_head_dim -> v_dim
-                #   o_proj                 v_dim x hidden
-                # plus the short conv and the four delta-rule matmuls. b_proj
-                # (hidden x heads) is negligible and omitted.
-                qk_head_dim = args.linear_key_head_dim
-                num_heads = args.linear_num_key_heads
-                qk_dim = qk_head_dim * num_heads
-                v_dim = int(qk_dim * args.linear_fla_expand_v)
-                v_head_dim = v_dim // num_heads
-                variant = args.experimental_attention_variant
-
-                def _low_rank(out_dim):
-                    return args.hidden_size * v_head_dim + v_head_dim * out_dim
-
-                if variant == "kda" or args.linear_fla_output_gate == "lowrank":
-                    output_gate = _low_rank(v_dim)
-                else:
-                    output_gate = args.hidden_size * v_dim
-                value_gate = (
-                    _low_rank(v_dim)
-                    if variant == "panini" and args.linear_fla_v_gate != "none"
-                    else 0
-                )
-                linear_self_attn_term = (
-                    forward_backward_expansion_factor
-                    * fma_expansion_factor
-                    * (
-                        ## q, k, v projections
-                        args.hidden_size * (2 * qk_dim + v_dim)
-                        ## short conv over q, k, v
-                        + args.linear_conv_kernel_dim * (2 * qk_dim + v_dim)
-                        ## decay gate, output gate, value gate (panini)
-                        + _low_rank(qk_dim)
-                        + output_gate
-                        + value_gate
-                        ## delta rule
-                        + num_heads * (v_head_dim**2) * 4
-                        ## out proj
-                        + args.hidden_size * v_dim
-                    )
-                )
-            elif args.experimental_attention_variant == "mlstm":
-                # Calculate the FLOPs for the mLSTM attention variant.
-                qk_head_dim = args.linear_key_head_dim
-                v_head_dim = args.linear_value_head_dim
-                num_heads = args.linear_num_value_heads
-                # Grouped-query mode: q/k are projected (and convolved) at the
-                # key heads only; the cell runs on all value heads after the
-                # repeat_interleave, so it is priced at num_heads below.
-                qk_dim = qk_head_dim * args.linear_num_key_heads
-                v_dim = v_head_dim * num_heads
-                linear_self_attn_term = (
-                    forward_backward_expansion_factor
-                    * fma_expansion_factor
-                    * (
-                        ## in proj (q, k, v, output gate, i/f gates)
-                        args.hidden_size
-                        * (2 * qk_dim + 2 * v_dim + 2 * num_heads)
-                        ## optional short depthwise causal conv over q,k,v
-                        + (
-                            args.linear_conv_kernel_dim * (2 * qk_dim + v_dim)
-                            if getattr(args, "mlstm_conv1d", False)
-                            else 0
-                        )
-                        ## chunkwise mLSTM cell: inter-chunk state update (k v^T)
-                        ## and state readout (q^T C), plus the causal intra-chunk
-                        ## attention term at chunk size L (~L/2 per token).
-                        + num_heads
-                        * (
-                            2 * qk_head_dim * v_head_dim
-                            + args.mlstm_chunk_size * (qk_head_dim + v_head_dim) // 2
-                        )
-                        ## out proj
-                        + args.hidden_size
-                        * v_dim
-                    )
-                )
-            elif args.experimental_attention_variant == "complex_kda":
-                # Approximate FLOPs for the Complex-KDA mixer. Like the Mamba
-                # branch below, this only affects the reported
-                # architecture-aware TFLOP/s, not training.
-                #
-                # GEOMETRY IS DERIVED, not read from `linear_*_head_dim` /
-                # `linear_num_*_heads`. Complex KDA has one head width and
-                # takes its head count from the model, exactly as
-                # `megatron/core/ssm/complex_kda.py` does -- reading the
-                # GatedDeltaNet fields here would silently price the model at
-                # their defaults for any run that does not set them.
-                head_dim = (
-                    args.linear_key_head_dim
-                    or args.kv_channels
-                    or (args.hidden_size // args.num_attention_heads)
-                )
-                ckda_heads = args.hidden_size // head_dim
-                qk_dim = v_dim = ckda_heads * head_dim
-                # The output gate is the one structural difference between the
-                # arms of this family, so it is priced rather than assumed.
-                out_gate = (
-                    args.hidden_size * head_dim + head_dim * v_dim
-                    if args.linear_output_gate == "lowrank"
-                    else args.hidden_size * v_dim
-                )
-                linear_self_attn_term = (
-                    forward_backward_expansion_factor
-                    * fma_expansion_factor
-                    * (
-                        ## in proj (q, k, v)
-                        args.hidden_size * (2 * qk_dim + v_dim)
-                        ## channel-wise decay gate, factored through one head
-                        + args.hidden_size * head_dim + head_dim * qk_dim
-                        ## beta, one scalar per head
-                        + args.hidden_size * ckda_heads
-                        ## output gate
-                        + out_gate
-                        ## short depthwise causal conv over q, k, v
-                        + args.linear_conv_kernel_dim * (2 * qk_dim + v_dim)
-                        ## delta rule: KK^T, VK^T, S(a(I-bKK^T)) and SQ
-                        + ckda_heads * (head_dim ** 2) * 4
-                        ## out proj
-                        + args.hidden_size * v_dim
-                    )
-                )
-            elif args.experimental_attention_variant == "mamba":
-                # Approximate FLOPs for the Mamba2 (SSD) mixer. Only affects the
-                # reported architecture-aware TFLOP/s (throughput logging), not
-                # training; compare Tok/s/GPU across architectures.
-                headdim = args.mamba_head_dim
-                d_state = args.mamba_state_dim
-                ngroups = args.mamba_num_groups
-                if args.mamba_num_heads is not None:
-                    nheads = args.mamba_num_heads
-                    d_inner = nheads * headdim
-                else:
-                    d_inner = 2 * args.hidden_size  # expand=2 default
-                    nheads = d_inner // headdim
-                d_conv = 4  # MambaMixer default causal-conv width
-                linear_self_attn_term = (
-                    forward_backward_expansion_factor
-                    * fma_expansion_factor
-                    * (
-                        ## in proj (z, x, B, C, dt)
-                        args.hidden_size
-                        * (2 * d_inner + 2 * ngroups * d_state + nheads)
-                        ## conv1d over x, B, C channels
-                        + d_conv * (d_inner + 2 * ngroups * d_state)
-                        ## SSD scan: chunk state update (B x^T) and readout (C h)
-                        + nheads * headdim * d_state * 4
-                        ## out proj
-                        + args.hidden_size * d_inner
-                    )
-                )
-            else:
-                raise ValueError(
-                    "Invalid experimental_attention_variant: "
-                    f"{args.experimental_attention_variant}"
-                )
+            linear_self_attn_term = (
+                forward_backward_expansion_factor
+                * fma_expansion_factor
+                * linear_mixer_fmas_per_token()
+            )
         else:
             num_linear_attention_layers = 0
             linear_self_attn_term = 0
@@ -1057,11 +1064,10 @@ def num_floating_point_operations(
 
         from megatron.core.models.hybrid.hybrid_layer_allocation import (
             Symbols, get_hybrid_layer_counts)
-        num_mamba_layers, num_gdn_layers, num_attn_layers, num_mlp_layers, num_moe_layers = (
-            itemgetter(Symbols.MAMBA, Symbols.GDN, Symbols.ATTENTION, Symbols.MLP, Symbols.MOE)(
-                get_hybrid_layer_counts(args.hybrid_layer_pattern)
-            )
-        )
+        (num_mamba_layers, num_gdn_layers, num_linear_layers, num_attn_layers, num_mlp_layers,
+         num_moe_layers) = itemgetter(
+            Symbols.MAMBA, Symbols.GDN, Symbols.LINEAR, Symbols.ATTENTION, Symbols.MLP, Symbols.MOE
+        )(get_hybrid_layer_counts(args.hybrid_layer_pattern))
 
         mtp_num_layers = args.mtp_num_layers
         if mtp_num_layers is None:
@@ -1076,6 +1082,7 @@ def num_floating_point_operations(
             num_mlp_layers=num_mlp_layers,
             num_moe_layers=num_moe_layers,
             num_gdn_layers=num_gdn_layers,
+            num_linear_layers=num_linear_layers,
             mamba_state_dim=args.mamba_state_dim,
             mamba_head_dim=args.mamba_head_dim,
             mamba_num_groups=args.mamba_num_groups,

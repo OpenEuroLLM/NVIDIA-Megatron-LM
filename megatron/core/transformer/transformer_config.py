@@ -1641,7 +1641,8 @@ class TransformerConfig(ModelParallelConfig):
             )
 
         if self.experimental_attention_variant == "complex_kda":
-            assert (
+            # A hybrid model places its linear layers with the `L` pattern symbol.
+            assert self.is_hybrid_model or (
                 self.linear_attention_freq is not None
             ), "linear_attention_freq must be set for complex_kda."
 
@@ -1684,7 +1685,8 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
         if self.experimental_attention_variant == "gated_delta_net":
-            assert (
+            # A hybrid model places its linear layers with the `L` pattern symbol.
+            assert self.is_hybrid_model or (
                 self.linear_attention_freq is not None
             ), f"linear_attention_freq must be set for linear gated_delta_net."
 
@@ -1720,7 +1722,8 @@ class TransformerConfig(ModelParallelConfig):
                 f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
             )
         elif self.experimental_attention_variant == "mlstm":
-            assert (
+            # A hybrid model places its linear layers with the `L` pattern symbol.
+            assert self.is_hybrid_model or (
                 self.linear_attention_freq is not None
             ), "linear_attention_freq must be set for the mlstm attention variant."
             assert (

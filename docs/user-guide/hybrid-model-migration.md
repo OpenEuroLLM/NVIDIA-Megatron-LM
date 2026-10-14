@@ -26,6 +26,7 @@ described by `--hybrid-layer-pattern`:
 |--------|--------------|
 | `M` | Mamba-2 state-space layer |
 | `G` | Gated Delta Network (GDN) layer |
+| `L` | Linear sequence mixer selected by `--experimental-attention-variant` |
 | `*` | Self-attention layer |
 | `D` | DeepSeek Sparse Attention (DSA) layer |
 | `-` | Dense MLP layer |
@@ -170,8 +171,9 @@ Because each GPT layer supplies exactly one attention and one MLP sub-module,
 the loader rejects a pattern that:
 
 - contains MTP layers (a `/...` suffix), which have no GPT source weights;
-- uses a layer type it cannot translate, such as GDN (`G`) or DeepSeek Sparse
-  Attention (`D`), whose weight layouts differ from GPT attention;
+- uses a layer type it cannot translate, such as GDN (`G`), a linear mixer
+  (`L`) or DeepSeek Sparse Attention (`D`), whose weight layouts differ from GPT
+  attention;
 - mixes dense (`-`) and MoE (`E`) MLP positions in one pattern; or
 - has an unequal or zero number of `*` and MLP positions.
 
@@ -341,6 +343,15 @@ scratch can use compatible layer families supported by the selected HybridModel
 stack specification and can include an MTP suffix such as `M*M*/MM/MM`.
 Pattern constraints still apply; for example, standard attention `*` and DSA
 `D` cannot be used in the same model.
+
+`L` positions take their mixer from `--experimental-attention-variant`, which
+must name a linear variant (for example `gated_delta_net` or `mlstm`), and are
+configured by the same flags as in a GPT model. Each `L` is the mixer and its
+input norm only; place MLPs with `-` or `E`. Because the pattern places the
+linear layers, `--linear-attention-freq` must be left unset, and one model
+cannot combine `L` with `D`, which is also configured through
+`--experimental-attention-variant`. For example, a 7:1 linear-to-attention
+model with an MLP after every mixer is `L-L-L-L-L-L-L-*-` repeated.
 
 ### Account for expanded layer indices
 

@@ -274,6 +274,27 @@ class ArgumentGroupFactory:
         return field_docstrings
 
 
+def _check_hybrid_linear_layers(args) -> None:
+    """Reject an `L` hybrid pattern whose mixer or placement is ill-defined."""
+    from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+        is_linear_attention_variant,
+    )
+    from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+
+    if Symbols.LINEAR not in args.hybrid_layer_pattern:
+        return
+    if not is_linear_attention_variant(args.experimental_attention_variant):
+        raise ValueError(
+            "--hybrid-layer-pattern uses 'L', which needs --experimental-attention-variant "
+            f"to name a linear mixer, got {args.experimental_attention_variant!r}."
+        )
+    if args.linear_attention_freq is not None:
+        raise ValueError(
+            "--linear-attention-freq has no effect in a hybrid model: the 'L' positions of "
+            "--hybrid-layer-pattern place the linear layers. Unset it."
+        )
+
+
 def core_transformer_config_from_args(args, config_class=None):
     from megatron.core.activations import squared_relu
     from megatron.core.fusions.fused_bias_geglu import quick_gelu
@@ -347,6 +368,7 @@ def core_transformer_config_from_args(args, config_class=None):
         from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
         if Symbols.DS_ATTENTION in args.hybrid_layer_pattern:
             kw_args['experimental_attention_variant'] = 'dsa'
+        _check_hybrid_linear_layers(args)
 
     kw_args['inference_sampling_seed'] = args.seed
 

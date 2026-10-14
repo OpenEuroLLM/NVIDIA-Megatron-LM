@@ -16,6 +16,10 @@ class Symbols:
 
     MAMBA = "M"
     GDN = 'G'
+    # A linear sequence mixer selected by `experimental_attention_variant`
+    # (mlstm, gated_delta_net, kda, signed_kda, panini, complex_kda, mamba),
+    # built exactly as the GPT path builds its linear-attention layers.
+    LINEAR = 'L'
     ATTENTION = "*"
     DS_ATTENTION = "D"
     MLA = "+"
@@ -23,7 +27,7 @@ class Symbols:
     MOE = 'E'
     PIPE = '|'
     MTP_SEPARATOR = "/"
-    VALID_LAYERS = {MAMBA, GDN, ATTENTION, DS_ATTENTION, MLA, MLP, MOE}
+    VALID_LAYERS = {MAMBA, GDN, LINEAR, ATTENTION, DS_ATTENTION, MLA, MLP, MOE}
 
     @classmethod
     def name_sorted_valid_layer_symbols(cls) -> list[str]:
@@ -174,10 +178,10 @@ def get_hybrid_layer_counts(pattern: str) -> Dict[str, int]:
 
     Examples:
         >>> get_hybrid_layer_counts("M*M*")
-        {'*': 2, 'G': 0, 'D': 0, 'M': 2, '-': 0, 'E': 0}
+        {'*': 2, 'D': 0, 'G': 0, 'L': 0, 'M': 2, '+': 0, '-': 0, 'E': 0}
 
         >>> get_hybrid_layer_counts("M-M-|M-M*-/MM/MM")
-        {'*': 1, 'G': 0, 'D': 0, 'M': 8, '-': 4, 'E': 0}
+        {'*': 1, 'D': 0, 'G': 0, 'L': 0, 'M': 8, '+': 0, '-': 4, 'E': 0}
     """
     parsed = parse_hybrid_pattern(pattern)
     counts = {symbol: 0 for symbol in Symbols.name_sorted_valid_layer_symbols()}
@@ -297,6 +301,10 @@ def _validate_pattern(pattern: str, pattern_name: str, allow_pipe: bool = False)
     if Symbols.ATTENTION in pattern and (Symbols.DS_ATTENTION in pattern or Symbols.MLA in pattern):
         raise ValueError("Not supported to have both Attention and MLA/DSA in one model")
 
+    # `L` and `D` are both configured through `experimental_attention_variant`.
+    if Symbols.LINEAR in pattern and Symbols.DS_ATTENTION in pattern:
+        raise ValueError("Not supported to have both linear (L) and DSA (D) layers in one model")
+
 
 def validate_segment_layers(segment: str) -> List[str]:
     """Validate and convert a single pipeline segment pattern to a layer type list.
@@ -324,6 +332,10 @@ def validate_segment_layers(segment: str) -> List[str]:
     # Disallow Attention + MLA/DSA hybridity.
     if Symbols.ATTENTION in segment and (Symbols.DS_ATTENTION in segment or Symbols.MLA in segment):
         raise ValueError("Not supported to have both Attention and MLA/DSA in one model")
+
+    # `L` and `D` are both configured through `experimental_attention_variant`.
+    if Symbols.LINEAR in segment and Symbols.DS_ATTENTION in segment:
+        raise ValueError("Not supported to have both linear (L) and DSA (D) layers in one model")
 
     return layer_type_list
 

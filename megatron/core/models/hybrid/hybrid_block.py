@@ -44,6 +44,9 @@ class HybridStackSubmodules:
 
     mamba_layer: Union[ModuleSpec, type] = IdentityOp
     gdn_layer: Union[ModuleSpec, type] = IdentityOp
+    # `L` positions. None derives the layer from config.experimental_attention_variant
+    # (get_hybrid_linear_layer_spec), so stack specs need not name a mixer.
+    linear_layer: Optional[ModuleSpec] = None
     attention_layer: Union[ModuleSpec, type] = IdentityOp
     dsa_layer: Union[ModuleSpec, type] = IdentityOp
     mla_layer: Union[ModuleSpec, type] = IdentityOp
@@ -122,6 +125,7 @@ class HybridStack(MegatronModule):
 
         # Build layers from the pre-selected segment
         self.layers = nn.ModuleList()
+        self._linear_spec = None  # built on the first `L` position, see _linear_layer_spec
         for i, layer_type in enumerate(self.layer_type_list):
             layer_number = i + 1 + pp_layer_offset
             if self.config.fp8:
@@ -200,6 +204,16 @@ class HybridStack(MegatronModule):
                         add_layer_offset=False,
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
+                elif layer_type == LayerSymbols.LINEAR:
+                    layer = build_module(
+                        self._linear_layer_spec(submodules),
+                        config=self.config,
+                        layer_number=layer_number,
+                        pg_collection=pg_collection,
+                        # Set to False as we do not want to change offset.
+                        add_layer_offset=False,
+                        name=(name + f".layers.{i}") if name is not None else None,
+                    )
                 else:
                     raise ValueError("unexpected layer_type")
             self.layers.append(layer)
@@ -217,6 +231,20 @@ class HybridStack(MegatronModule):
                 hidden_size=self.config.hidden_size,
                 eps=self.config.layernorm_epsilon,
             )
+
+    def _linear_layer_spec(self, submodules: HybridStackSubmodules) -> ModuleSpec:
+        """The spec for `L` positions: the stack spec's, else the configured variant's."""
+        if submodules.linear_layer is not None:
+            return submodules.linear_layer
+        # Imported here: the GPT spec module imports the SSM mixers, which import
+        # from this package.
+        from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+            get_hybrid_linear_layer_spec,
+        )
+
+        if self._linear_spec is None:
+            self._linear_spec = get_hybrid_linear_layer_spec(self.config)
+        return self._linear_spec
 
     def _fuse_mla_down_proj(self, submodules: HybridStackSubmodules) -> HybridStackSubmodules:
         # Avoid modifying the original object so users don't get surprised about their `submodules`
