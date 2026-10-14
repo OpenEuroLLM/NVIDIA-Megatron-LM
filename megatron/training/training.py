@@ -866,7 +866,10 @@ def num_floating_point_operations(
                 qk_head_dim = args.linear_key_head_dim
                 v_head_dim = args.linear_value_head_dim
                 num_heads = args.linear_num_value_heads
-                qk_dim = qk_head_dim * num_heads
+                # Grouped-query mode: q/k are projected (and convolved) at the
+                # key heads only; the cell runs on all value heads after the
+                # repeat_interleave, so it is priced at num_heads below.
+                qk_dim = qk_head_dim * args.linear_num_key_heads
                 v_dim = v_head_dim * num_heads
                 linear_self_attn_term = (
                     forward_backward_expansion_factor
