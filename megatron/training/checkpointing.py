@@ -1086,8 +1086,18 @@ def save_checkpoint(
         else:
             onelogger_finalize_fn()
 
-    # Additional callback for wandb (last rank)
-    if not torch.distributed.is_initialized() or is_last_rank():
+    # Additional callback for wandb (last rank).
+    # Skip NON-PERSISTENT checkpoints: they are rolling/ephemeral (especially the
+    # 'local' type in /dev/shm), so logging them as a wandb artifact-by-reference
+    # either points at a non-durable path or one that does not match the local
+    # checkpoint manager's on-disk layout -> wandb's LocalFileHandler raises
+    # ValueError ("... must be a valid file or directory path") -> uncaught worker
+    # crash -> ft_launcher restart churn. (The on_load_checkpoint_success callback
+    # is try/excepted; this one is not.) Only durable checkpoints are meaningful
+    # to version as artifacts.
+    if (not non_persistent_ckpt) and (
+        not torch.distributed.is_initialized() or is_last_rank()
+    ):
 
         def wandb_finalize_fn():
             wandb_utils.on_save_checkpoint_success(

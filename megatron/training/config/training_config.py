@@ -318,6 +318,11 @@ class LoggerConfig:
     log_num_zeros_in_grad: bool = False
     """If set, calculate and log the number of zeros in gradient."""
 
+    log_params_norm_and_zeros_interval: int | None = None
+    """Compute --log-params-norm and --log-num-zeros-in-grad only on iterations that are a
+    multiple of this; None computes them every iteration. Each costs a pass over the local
+    parameters / gradients plus a collective on EVERY step, logged or not."""
+
     log_max_attention_logit: bool = False
     """Enable max attention logit logging to tensorboard."""
 
@@ -397,6 +402,11 @@ class CheckpointConfig:
 
     save_interval: int | None = field(default=None, metadata={"argparse_meta": {"arg_names": ["--save-interval", "--persistent-save-interval"]}})
     """Number of iterations between persistent checkpoint saves."""
+
+    save_extra_steps: list[int] = field(default_factory=list)
+    """Specific training iterations at which to save checkpoints, in addition to
+    the regular --save-interval cadence. Used to place checkpoints at points a
+    fixed interval cannot express, e.g. the start of a cooldown phase."""
 
     save_params_interval: int | None = None
     """Number of iterations between param.name->param.data mapping saves."""

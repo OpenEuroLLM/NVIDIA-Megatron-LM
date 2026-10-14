@@ -1245,6 +1245,10 @@ def drain_embedding_wgrad_compute(
         grad_output_buffer
     ), "Length of activation and gradient buffers need to be equal!"
 
+    if not embedding_activation_buffer:
+        assert not getattr(weight, "_deferred_wgrad_pending", False)
+        return
+
     import fused_weight_gradient_mlp_cuda
 
     from megatron.core.parallel_state import get_global_memory_buffer
@@ -1290,6 +1294,7 @@ def drain_embedding_wgrad_compute(
     # since we are pipelining the AllGather and GEMM,one buffer all gathers
     # the input while the other buffer reads from it for the GEMM. We use i
     # and (i+1) for indexing to enable this double buffering.
+    drain_idx = 0
     for i in range(len(embedding_activation_buffer)):
         input = embedding_activation_buffer.pop(0)
         if config.sequence_parallel:
@@ -1313,6 +1318,9 @@ def drain_embedding_wgrad_compute(
     grad_output = grad_output_buffer.pop(0)
     wgrad_compute(all_gathered_input[drain_idx], grad_output, weight)
     input, all_gathered_input[drain_idx], grad_output = None, None, None
+    # The GEMMs are queued on the current stream. The normal reduction launch
+    # establishes its stream dependency; no device-wide synchronization is needed.
+    weight._deferred_wgrad_pending = False
 
 
 def local_multi_tensor_applier(op, noop_flag_buffer, tensor_lists, *args):
@@ -2498,6 +2506,30 @@ def _get_batch_on_this_cp_rank_per_sequence_balancing(
             if key in METADATA_KEYS or val is None:
                 continue
             seq_dim = 2 if key == 'attention_mask' else 1
+            # OELLM PATCH: skip anything with no sequence dimension to split.
+            #
+            # The METADATA_KEYS list above is a fixed allow-list, so it cannot know about
+            # provenance fields the DATASET WRAPPERS add. BlendedDataset returns
+            # `{"dataset_id": ..., **sample}` (blended_dataset.py:109), which default_collate
+            # turns into a 1-D [micro_batch_size] tensor. It reaches here because get_batch
+            # normalises the BATCH_KEYS entries but does not strip unknown ones, and then
+            # `val.shape[seq_dim]` raises:
+            #     IndexError: tuple index out of range
+            # Measured on rank 16, job 1516834 (TP4 x CP2 x PP4, 32 nodes) -- zero iterations.
+            #
+            # This hits ANY context-parallel run on a BLENDED dataset, with or without
+            # inter-document masking; the masking path escapes it only because it routes to
+            # per-DOCUMENT balancing, which touches the four sequence tensors by name.
+            # Upstream is aware of the key at the RETURN -- get_batch's own comment cites
+            # "provenance fields wrappers like BlendedDataset add (e.g. dataset_id)" -- but the
+            # CP split runs before that return.
+            #
+            # Skipping on RANK rather than by name is deliberate: it fixes the whole class,
+            # not just dataset_id, and it cannot skip a real sequence tensor -- tokens,
+            # labels, loss_mask and position_ids are 2-D here (or [1, b*s] once packed) and
+            # attention_mask is 4-D, so none of them can have `dim() <= seq_dim`.
+            if not torch.is_tensor(val) or val.dim() <= seq_dim:
+                continue
             val = val.view(
                 *val.shape[0:seq_dim],
                 2 * cp_size,

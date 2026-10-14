@@ -103,14 +103,32 @@ def build_pretraining_data_loader(dataset, consumed_samples):
         extra_kwargs = {"collate_fn": lambda x: x,}
     else:
         extra_kwargs = {}
-    # Optional deeper per-worker prefetch buffer to hide slow shared-FS (GPFS)
-    # mmap read latency, which otherwise stalls the (CUDA-graph) training step
-    # waiting for the next batch. Env-driven so it syncs via PYTHONPATH with no
-    # container rebuild; unset keeps torch's default prefetch_factor=2.
-    if args.num_workers > 0:
-        _pf = os.environ.get("MEGATRON_DATALOADER_PREFETCH_FACTOR")
-        if _pf:
-            extra_kwargs["prefetch_factor"] = int(_pf)
+
+    # Make the DataLoader prefetch depth configurable. Upstream never passes
+    # prefetch_factor, so it silently takes torch's default of 2 batches queued
+    # per worker. On a shared parallel filesystem that buffer is the only thing
+    # absorbing read-latency spikes: once it drains, every rank in the collective
+    # waits for the slowest reader, which shows up as periodic dips in TFLOP/s
+    # rather than as an error.
+    #
+    # prefetch_factor is a better stabiliser than num_workers here, because it
+    # deepens the queue WITHOUT adding more concurrent readers -- raising
+    # num_workers at 1024 nodes multiplies the processes hammering the same GPFS
+    # and can make contention worse, not better.
+    #
+    # None (the default) preserves upstream behaviour exactly: the kwarg is not
+    # passed and torch applies its own default. torch also rejects
+    # prefetch_factor when num_workers == 0, hence the guard.
+    #
+    # MEGATRON_DATALOADER_PREFETCH_FACTOR is the older env-driven form of the
+    # same knob (it syncs via PYTHONPATH with no container rebuild); the flag
+    # wins when both are set.
+    prefetch_factor = getattr(args, "dataloader_prefetch_factor", None)
+    if prefetch_factor is None and os.environ.get("MEGATRON_DATALOADER_PREFETCH_FACTOR"):
+        prefetch_factor = int(os.environ["MEGATRON_DATALOADER_PREFETCH_FACTOR"])
+    if prefetch_factor is not None and args.num_workers > 0:
+        extra_kwargs["prefetch_factor"] = prefetch_factor
+
     return torch.utils.data.DataLoader(
         dataset,
         batch_sampler=batch_sampler,

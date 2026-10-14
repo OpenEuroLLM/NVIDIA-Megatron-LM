@@ -605,6 +605,10 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             if wgrad_deferral_limit == 0 or len(grad_output_buffer) < wgrad_deferral_limit:
                 grad_output_buffer.append(grad_output)
                 wgrad_compute = False
+                # Autograd still invokes the weight hook with a dummy gradient.
+                # Neither that hook nor an explicit pipeline sync may reduce the
+                # weight's bucket until the deferred GEMMs have been enqueued.
+                weight._deferred_wgrad_pending = True
 
         if wgrad_compute:
             if ctx.sequence_parallel:

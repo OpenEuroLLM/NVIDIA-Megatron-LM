@@ -25,9 +25,17 @@ def _get_inprocess_module():
 
 
 def destroy_state():
-    from . import training
+    from . import ft_integration, training
     training.destroy_global_state()
     rerun_state_machine.destroy_rerun_state_machine()
+    # In-process restart re-runs pretrain(), which calls ft_integration.setup()
+    # again. destroy_global_state() does not touch the FT rank-monitor client,
+    # and ft_integration.shutdown() is the only thing that clears the
+    # _GLOBAL_RANK_MONITOR_CLIENT global. Without resetting it here, setup()
+    # trips _ensure_var_is_not_initialized ('rank monitor client is already
+    # initialized') on every restart -> restart loop. shutdown() is a no-op if
+    # FT was never enabled.
+    ft_integration.shutdown()
 
 def inprocess_restart(train, args):
     inprocess = _get_inprocess_module()

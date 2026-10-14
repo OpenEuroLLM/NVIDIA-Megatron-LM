@@ -730,6 +730,38 @@ class TransformerConfig(ModelParallelConfig):
     prevent matmul from using reduced precision accumulation when using BF16."""
 
     ####################
+    # output layer (LM head)
+    ####################
+    final_logit_softcapping: Optional[float] = None
+    """If set, soft-cap the final output-layer (LM head) logits with
+    ``c * tanh(logits / c)`` where ``c`` is this value (e.g. 30.0 as in Gemma 2). Bounds the
+    logits to ``(-c, c)``. Applied on the local tensor-parallel shard before the loss."""
+
+    tweo_implementation: str = "fused"
+    """TWEO adjoint backend; reference retains the original debug implementation."""
+
+    tweo_diagnostics_interval: int = 100
+    """Full TWEO moments every N updates; zero disables only diagnostics."""
+
+    tweo_loss_coeff: float = 0.0
+    """Target coefficient of post-residual TWEO; zero preserves the original path."""
+
+    tweo_tau: float = 3.0
+    """Activation scale in the fourth-moment penalty (paper default 3)."""
+
+    tweo_start_step: int = 0
+    """Absolute consumed-update coordinate at which coefficient ramp begins."""
+
+    tweo_warmup_steps: int = 0
+    """Linear coefficient ramp duration; independent of learning-rate warmup."""
+
+    output_z_loss_coeff: Optional[float] = None
+    """Scaling coefficient for the output (LM head) z-loss, an auxiliary loss
+    ``coeff * mean(logsumexp(logits, dim=vocab) ** 2)`` that keeps the softmax log-normalizer
+    close to zero for training stability (PaLM/Chinchilla). A starting value of 1e-4 is
+    recommended. This is the LM-head analog of ``moe_z_loss_coeff`` for the router."""
+
+    ####################
     # fusion
     ####################
     bias_activation_fusion: bool = False
@@ -1550,6 +1582,17 @@ class TransformerConfig(ModelParallelConfig):
         details.
         """
         super().__post_init__()
+
+        # The Liger fused LM-head + CE returns the loss before the logits exist,
+        # so the logit softcap and the z-loss (both applied to the logits) would
+        # be skipped without a word.
+        if self.liger_fused_linear_cross_entropy:
+            assert self.final_logit_softcapping is None, (
+                "liger_fused_linear_cross_entropy does not apply final_logit_softcapping"
+            )
+            assert not self.output_z_loss_coeff, (
+                "liger_fused_linear_cross_entropy does not add the output z-loss"
+            )
 
         # When fp32 residual connections are enabled, pipeline parallel communication must
         # use fp32 to match the dtype of the residual stream between pipeline stages.

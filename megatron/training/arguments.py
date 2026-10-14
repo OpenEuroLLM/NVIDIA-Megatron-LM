@@ -66,6 +66,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_experimental_attention_variant_args(parser)
     parser = _add_heterogeneous_args(parser)
     parser = _add_logging_args(parser)
+    parser = _add_diagnostics_args(parser)
     parser = _add_logits_distillation_args(parser)
     parser = _add_straggler_detector_args(parser)
     parser = _add_workload_inspector_server_args(parser)
@@ -384,6 +385,124 @@ def tuple_type(x):
         return x
     assert isinstance(x, str)
     return tuple(int(i) for i in x.strip('()').split(','))
+
+def _validate_packed_doc_attention(args):
+    """OELLM PATCH: everything --dataloader-inter-document-masking silently needs.
+
+    Masking documents by handing Transformer Engine cu_seqlens instead of a dense mask puts
+    the model on TE's thd/varlen path, and that path has requirements the flag itself does
+    not state. Each one below is a configuration that would otherwise fail deep inside a
+    kernel, or -- worse -- run and be slower or wrong. See
+    megatron/training/packed_doc_attention.py.
+
+    NB --reset-attention-mask is NOT an alternative to this flag and never was: the GPT layer
+    specs pin attn_mask_type to `causal` (models/gpt/gpt_layer_specs.py) and TE only reads
+    `attention_mask` for `padding`/`arbitrary` mask types, so the dense [b, 1, s, s] mask the
+    dataloader builds is discarded. Every OELLM run before this flag trained with full
+    cross-document attention.
+    """
+    packed_length = args.seq_length * args.micro_batch_size
+
+    # The 0.16 fork also asserted `not args.use_legacy_models` here. 0.19 removed the legacy
+    # model path outright -- there is no such argument any more -- so the check is not merely
+    # redundant, it raises AttributeError on a real Namespace.
+    assert args.position_embedding_type in ('rope', 'yarn', 'none'), (
+        f'--dataloader-inter-document-masking expects rotary or absent position embeddings, '
+        f'got {args.position_embedding_type}. RoPE restarts per document via cu_seqlens; '
+        'learned_absolute would instead need --reset-position-ids, which is a separate path.'
+    )
+    assert args.attention_backend not in (AttnBackend.local, AttnBackend.unfused), (
+        f'--dataloader-inter-document-masking needs a TE varlen backend (flash, fused or '
+        f'auto), got {args.attention_backend}.'
+    )
+    assert args.spec is None or args.spec[0] != 'local', (
+        '--dataloader-inter-document-masking requires the transformer_engine spec, not '
+        '--spec local.'
+    )
+    assert args.cuda_graph_impl == 'none', (
+        '--dataloader-inter-document-masking builds a cu_seqlens tensor whose length changes '
+        'with the document count of every microbatch, which would force CUDA graph recapture '
+        'each step. Set --cuda-graph-impl none.'
+    )
+
+    # === ROPE VARIANTS =======================================================
+    # All three combinations are CORRECT; they differ in how much they cost.
+    #
+    #   rope/yarn + apply_rope_fusion  -> fused_apply_rotary_pos_emb_thd, cu_seqlens goes
+    #                                    straight to TE. The intended path.
+    #   rope/yarn, fusion off          -> _apply_rotary_pos_emb_thd, which per CALL does
+    #                                    `((cu_seqlens[1:] - cu_seqlens[:-1]) // cp).tolist()`
+    #                                    (rope_utils.py) and, on its offset-mapping branch,
+    #                                    `cu_seqlens[i].item()` PER DOCUMENT. Those are device
+    #                                    readbacks in upstream code, once per attention layer
+    #                                    per microbatch -- strictly worse than the single
+    #                                    per-iteration sync the scatter costs.
+    #   none                           -> no rope at all; cu_seqlens still masks documents in
+    #                                    the kernel. Nothing to do.
+    #
+    # yarn cannot satisfy this and is therefore unsupported: the "Legacy RoPE arguments" block
+    # force-disables apply_rope_fusion whenever position_embedding_type is not exactly 'rope',
+    # so it always lands in the unfused case and the user has no way to turn it back on. Say
+    # so, rather than asking for a flag that has already been overridden.
+    if args.position_embedding_type in ('rope', 'yarn') and not args.apply_rope_fusion:
+        if args.position_embedding_type == 'yarn':
+            remedy = (
+                'yarn cannot be used with --dataloader-inter-document-masking: '
+                'apply_rope_fusion is force-disabled for every position_embedding_type other '
+                'than rope, so the fused thd path is unreachable. Use '
+                'position_embedding_type=rope with --apply-rope-fusion, or none.'
+            )
+        else:
+            remedy = 'Set --apply-rope-fusion, or position_embedding_type=none.'
+        raise AssertionError(
+            f'--dataloader-inter-document-masking with position_embedding_type='
+            f'{args.position_embedding_type} and apply_rope_fusion off runs the UNFUSED thd '
+            f'rope path, which reads cu_seqlens back to the host once per ATTENTION CALL '
+            f'(rope_utils._apply_rotary_pos_emb_thd) instead of once per iteration -- one '
+            f'stream drain per layer, ~60x more at 32B. Numerically correct but slower than '
+            f'the dense mask it replaces, hence an error rather than a warning. {remedy}'
+        )
+
+    if args.sequence_parallel:
+        assert packed_length % args.tensor_model_parallel_size == 0, (
+            f'--dataloader-inter-document-masking folds the micro-batch into a single '
+            f'{packed_length}-token sequence, which sequence parallelism must be able to '
+            f'split across {args.tensor_model_parallel_size} tensor-parallel ranks.'
+        )
+
+    if args.context_parallel_size > 1 and not args.sft:
+        # TE's context-parallel thd path asserts "cu_seqlens_padded is required for THD
+        # format!" and partitions each document with thd_get_partitioned_indices, which needs
+        # every document length divisible by 2 * cp_size. GPTDataset produces neither, so
+        # packed_doc_attention.apply_cp_document_padding snaps the boundaries -- see its
+        # docstring for what that costs. The packed length itself must already be divisible,
+        # because the first and last boundaries are pinned.
+        assert packed_length % (2 * args.context_parallel_size) == 0, (
+            f'--dataloader-inter-document-masking at context_parallel_size='
+            f'{args.context_parallel_size} folds the micro-batch into a single '
+            f'{packed_length}-token sequence, which the context-parallel zigzag splits into '
+            f'{2 * args.context_parallel_size} chunks. seq_length * micro_batch_size must be '
+            f'divisible by 2 * context_parallel_size.'
+        )
+        warn_rank_0(
+            f'--dataloader-inter-document-masking with context_parallel_size='
+            f'{args.context_parallel_size}: document boundaries are snapped to multiples of '
+            f'{2 * args.context_parallel_size} tokens so TE\'s thd context-parallel kernels '
+            f'can partition them. Up to {2 * args.context_parallel_size - 1} tokens per '
+            f'boundary therefore still attend into the neighbouring document. '
+            f'See megatron/training/packed_doc_attention.py:snap_cu_seqlens_to_multiple.',
+            args.rank,
+        )
+
+    # create_attention_mask_in_dataloader is already forced off far earlier in validate_args
+    # (it has to be: the TP broadcast protocol is keyed off it). Asserted rather than set, so
+    # that if that block ever moves this fails loudly instead of silently broadcasting a mask
+    # TE would discard.
+    assert not args.create_attention_mask_in_dataloader, (
+        '--dataloader-inter-document-masking masks documents via cu_seqlens and must not also '
+        'build a dense mask in the dataloader.'
+    )
+
 
 def validate_args(args, defaults={}):
 
@@ -1350,6 +1469,19 @@ def validate_args(args, defaults={}):
             raise ValueError(f"Invalid no_weight_decay_cond_type: {args.no_weight_decay_cond_type}")
         args.no_weight_decay_cond_type = None
 
+    # --qk-layernorm-wd-mult / --residual-norm-wd-mult are the continuous
+    # generalisation of --apply-wd-to-qk-layernorm, so the two would otherwise
+    # install overlapping wd_mult overrides on the same parameters.
+    assert not (
+        (args.qk_layernorm_wd_mult != 0.0 or args.residual_norm_wd_mult != 0.0
+         or args.final_norm_wd_mult is not None)
+        and args.apply_wd_to_qk_layernorm
+    ), \
+        '--qk-layernorm-wd-mult/--residual-norm-wd-mult and --apply-wd-to-qk-layernorm ' \
+        'are mutually exclusive; --qk-layernorm-wd-mult 1.0 with ' \
+        '--residual-norm-wd-mult 0.0 reproduces --apply-wd-to-qk-layernorm for the norm ' \
+        'gains (it differs only on a qk-layernorm bias, which these multipliers exempt).'
+
     if args.weight_decay_incr_style == 'constant':
         assert args.start_weight_decay is None
         assert args.end_weight_decay is None
@@ -1572,6 +1704,12 @@ def validate_args(args, defaults={}):
         args.position_embedding_type = 'rope'
     if args.position_embedding_type != 'rope':
         args.apply_rope_fusion = False
+
+    # OELLM PATCH: packed (thd) document attention. Deliberately placed AFTER the legacy RoPE
+    # block above, because that block force-disables apply_rope_fusion and the check below
+    # depends on its final value. See megatron/training/packed_doc_attention.py.
+    if args.dataloader_inter_document_masking:
+        _validate_packed_doc_attention(args)
 
     # Would just need to add 'NoPE' as a position_embedding_type to support this, but for now
     # don't allow it to keep things simple
@@ -2495,6 +2633,98 @@ def _add_logging_args(parser):
     return parser
 
 
+def _add_diagnostics_args(parser):
+    """Opt-in per-layer training diagnostics (see megatron/training/diagnostics.py).
+
+    All of these are OFF by default and cost nothing when off. They exist for
+    long runs, where a degradation has to be localised in TIME (which iteration)
+    and in DEPTH (which layer) and checkpoints are too coarse to do either.
+    """
+    group = parser.add_argument_group(title='diagnostics')
+
+    group.add_argument('--diagnostics-interval', type=int, default=0,
+                       help='Collect per-layer diagnostics every N iterations. '
+                            '0 disables all of the --diag-* collectors below. '
+                            'The activation collector is the only expensive one; '
+                            '100 keeps its amortised cost under a thousandth of step time.')
+    group.add_argument('--diag-nonfinite', action='store_true',
+                       help='Scan every weight and gradient for NaN/Inf and print the '
+                            'offending parameter names. Unlike '
+                            '--check-for-nan-in-loss-and-grad this localises the '
+                            'problem instead of only aborting on it.')
+    group.add_argument('--diag-norm-gains', action='store_true',
+                       help='Log mean/std/min/max of every RMSNorm/LayerNorm gain, per '
+                            'layer. Norm gains get wd_mult=0 by default, so nothing '
+                            'opposes their drift; if they do go extreme the levers are '
+                            '--residual-norm-wd-mult / --qk-layernorm-wd-mult or '
+                            'zero-centred RMSNorm.')
+    group.add_argument('--diag-layer-grad-norms', action='store_true',
+                       help='Log the L2 gradient norm of every transformer layer '
+                            'separately, plus embedding/output_layer. Exposes the '
+                            'early-vs-late layer asymmetry that the single global '
+                            'grad norm averages away.')
+    group.add_argument('--diag-activations', action='store_true',
+                       help='Log the RMSNorm denominator sqrt(mean(x^2)) and the mean of '
+                            'the input to every norm, plus a non-finite count, from the '
+                            'first microbatch of a diagnostic iteration. This is the one '
+                            'collector with a real cost (bandwidth-bound, ~20 GB of reads '
+                            'for a 64-layer 32B model).')
+    group.add_argument('--diag-clip-events', action='store_true',
+                       help='Track gradient-clipping events on EVERY step (a streak can '
+                            'only be counted that way) and report the streak length, the '
+                            'fired fraction, the smallest clip coefficient and the '
+                            'mean/min/max of the pre-clip total norm -- the clip '
+                            'denominator -- over the logging interval. Free, and '
+                            'independent of --diagnostics-interval.')
+    group.add_argument('--diag-weight-stats', action='store_true',
+                       help='Log min/max/mean/rms of every linear_qkv / linear_proj / '
+                            'linear_fc1 / linear_fc2 weight matrix per layer, plus the '
+                            'embedding and output layer. One pass over the local weight '
+                            'shards and three small all-reduces over the model-parallel '
+                            'group on a diagnostic iteration.')
+    group.add_argument('--diag-fp8-meta', action='store_true',
+                       help='Log the FP8 delayed-scaling window-max amax and current '
+                            'scale of the GEMM input, weight and output gradient of the '
+                            'four TE GEMMs of every layer. Empty under recipes without '
+                            'per-tensor state (blockwise, mxfp8) and for bf16 layers.')
+    group.add_argument('--te-debug-config', type=str, default=None,
+                       help='nvdlfw_inspect feature YAML applied to every Transformer '
+                            'Engine module (LogTensorStats, LogFp8TensorStats, ...). '
+                            'Writes PER-RANK statistics files, so use it only on small '
+                            'probes (<= 16 nodes). See megatron/training/te_debug.py.')
+    group.add_argument('--te-debug-log-dir', type=str, default=None,
+                       help='Directory for the nvdlfw_inspect logs; defaults to '
+                            '<tensorboard-dir>/te_debug.')
+    group.add_argument('--diag-logit-stats', action='store_true',
+                       help='Log mean/std/min/max of the output-layer logits, the mean '
+                            'per-token max logit and the mean/std of the per-token '
+                            'log-partition log Z on diagnostic iterations (forward hook '
+                            'on the output layer).')
+    group.add_argument('--diag-token-loss-dir', type=str, default=None,
+                       help='Diagnostics only: on every diagnostic iteration write the '
+                            'per-token CE loss, label, loss mask, log Z and max logit of '
+                            'every microbatch to <dir>/it<iteration>_dp<rank>_cp<rank>.npz '
+                            '(TP rank 0 of the last pipeline stage). For checkpoint probes '
+                            'on a fixed batch.')
+    group.add_argument('--diag-swap-checkpoint', type=str, default=None,
+                       help='Diagnostics only: after the checkpoint load, reload the model '
+                            'tensors selected by --diag-swap-keys from this torch_dist '
+                            'checkpoint (checkpoint surgery for probes).')
+    group.add_argument('--diag-swap-keys', type=str, default=None,
+                       help='Comma-separated regexes matched against the checkpoint keys '
+                            '(global layer numbering, e.g. ^output_layer[.]weight or '
+                            '^decoder[.]layers[.]5[6-9][.]) selecting the tensors to reload '
+                            'from --diag-swap-checkpoint.')
+    group.add_argument('--diag-consumed-train-samples', type=int, default=None,
+                       help='Diagnostics only: after the checkpoint load, position the '
+                            'training dataloader at this consumed-sample count instead of '
+                            'the checkpoint\'s own, so a probe can run the weights of '
+                            'iteration X on the batches of iteration Y '
+                            '(Y * global batch size). Never use for real training.')
+
+    return parser
+
+
 def _add_regularization_args(parser):
     group = parser.add_argument_group(title='regularization')
 
@@ -2502,6 +2732,37 @@ def _add_regularization_args(parser):
                        help='Weight decay coefficient for L2 regularization.')
     group.add_argument('--apply-wd-to-qk-layernorm', action='store_true',
                        help='Apply weight decay to qk layernorm as a special case.')
+    group.add_argument('--qk-layernorm-wd-mult', type=float, default=0.0,
+                       help='Multiplier on --weight-decay for the qk-layernorm gains (1-D '
+                       'non-bias params whose name contains q_layernorm. or k_layernorm.). '
+                       'These need a restoring force the most: attention logits scale with '
+                       'gamma_q * gamma_k and nothing in the loss opposes their growth. '
+                       'Default 0.0 = historical Megatron behaviour (no decay on 1-D params). '
+                       'Use 1.0 to decay them like every other weight.')
+    group.add_argument('--final-norm-wd-mult', type=float, default=None,
+                       help='Separate final decoder RMSNorm decay multiplier; '
+                            'unset inherits residual-norm-wd-mult.')
+    group.add_argument('--residual-norm-wd-mult', type=float, default=0.0,
+                       help='Multiplier on --weight-decay for the remaining norm gains: every '
+                       '1-D non-bias param that is NOT a qk-layernorm gain, i.e. the '
+                       'residual-stream norms (input_layernorm, pre_mlp_layernorm, the final '
+                       'layernorm, and the TE-fused *.layer_norm_weight tensors). The final '
+                       'layernorm gain matters most, since it multiplies the LM head input '
+                       'directly. Default 0.0 = no decay. Use 1.0 to decay like every other '
+                       'weight (as OLMo 2/3 do), or a fraction for weaker decay. Biases are '
+                       'always excluded. Together with --qk-layernorm-wd-mult this generalises '
+                       '--apply-wd-to-qk-layernorm, so they are mutually exclusive with it.')
+    group.add_argument('--embedding-wd-mult', type=float, default=1.0,
+                       help='Multiplier on --weight-decay for the word-embedding matrix (2-D param '
+                       'whose name contains word_embeddings). Default 1.0 = decay like every other '
+                       'weight. 0.0 excludes the embeddings from weight decay as OLMo 2/3 and '
+                       'Levanter/Marin do (decay erodes the rows of rare tokens). The untied '
+                       'output layer is not affected.')
+    group.add_argument('--allow-new-param-groups-on-load', action='store_true',
+                       help='When the loaded optimizer checkpoint has no param_group matching a '
+                       'current group (a multiplier enabled mid-run creates a new group), load '
+                       'the new group from the structurally equivalent saved group and keep the '
+                       'current overrides instead of raising.')
     group.add_argument('--clip-grad', type=float, default=1.0,
                        help='Gradient clipping based on global L2 norm.')
     group.add_argument('--adam-beta1', type=float, default=0.9,
@@ -2871,8 +3132,6 @@ def _add_checkpointing_args(parser):
     ckpt_factory = ArgumentGroupFactory(CheckpointConfig, exclude=["most_recent_k", "save_tokenizer_assets", "save_optim", "save_rng", "load_optim", "load_rng"])
     group = ckpt_factory.build_group(parser, "checkpointing")
 
-    group.add_argument('--save-extra-steps', nargs='*', type=int, default=[],
-                       help='Specific training iterations at which to save checkpoints')
     group.add_argument('--no-save-optim', action='store_true', default=None,
                        help='Do not save current optimizer.')
     group.add_argument('--no-save-rng', action='store_true', default=None,
@@ -3153,6 +3412,12 @@ def _add_data_args(parser):
                        help='Probability of producing a short sequence.')
     group.add_argument('--num-workers', type=int, default=2,
                        help="Dataloader number of workers.")
+    group.add_argument('--dataloader-prefetch-factor', type=int, default=None,
+                       help='Number of batches each dataloader worker keeps '
+                       'prefetched. Deepens the buffer that absorbs parallel-'
+                       'filesystem read-latency spikes without adding more '
+                       'concurrent readers. Requires --num-workers > 0. '
+                       'Unset = torch default (2).')
     group.add_argument('--reset-position-ids', action='store_true',
                        help='Reset posistion ids after end-of-document token.')
     group.add_argument('--reset-attention-mask', action='store_true',
@@ -3161,7 +3426,21 @@ def _add_data_args(parser):
     group.add_argument('--dataloader-inter-document-masking', action='store_true',
                        help='Return cu_seqlens marking document boundaries '
                        'within each sample so that attention is restricted '
-                       'to individual documents.')
+                       'to individual documents. Note that --reset-attention-mask does NOT '
+                       'achieve this: the GPT layer specs pin attn_mask_type to causal and TE '
+                       'only reads attention_mask for padding and arbitrary mask types, so the '
+                       'dataloader mask is silently discarded. This also restarts RoPE at every '
+                       'document boundary, making --reset-position-ids redundant.')
+    group.add_argument('--packed-doc-attention-log-cu-seqlens', type=int, default=0,
+                       help='With --dataloader-inter-document-masking, print this rank\'s '
+                       'cu_seqlens for the first N calls to get_batch. cu_seqlens is a few '
+                       'dozen bytes, so logging it is far cheaper than any runtime cross-check '
+                       '-- and unlike a collective it cannot deadlock against the pipeline p2p '
+                       'chain. Every rank sharing a data-parallel index must print identical '
+                       'values for a given call index; verify with '
+                       'scripts/korbi/check_cu_seqlens_agreement.py. DEBUG ONLY: the readback '
+                       'it needs is the per-microbatch stream drain the scatter exists to '
+                       'remove. OELLM patch, see megatron/training/packed_doc_attention.py.')
     group.add_argument('--eod-mask-loss', action='store_true',
                        help='Mask loss for the end of document tokens.')
     group.add_argument('--no-create-attention-mask-in-dataloader', action='store_false',
