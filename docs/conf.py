@@ -27,7 +27,7 @@ import sys
 project = "Megatron Core"
 copyright = "2026, NVIDIA Corporation"
 author = "NVIDIA Corporation"
-release = "0.18.0"
+release = "0.19.0"
 
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
@@ -119,6 +119,9 @@ linkcheck_ignore = [
     ".*githubusercontent\\.com.*",
     "http://localhost.*",
 ]
+linkcheck_retries = 10
+linkcheck_rate_limit_timeout = 600
+linkcheck_workers = 1
 
 # PyTorch docs use a JS-rendered frontend; anchor IDs are injected at runtime
 # and are not present in the static HTML that linkcheck fetches.

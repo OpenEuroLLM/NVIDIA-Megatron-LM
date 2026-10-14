@@ -3,7 +3,7 @@
 
 
 MAJOR = 0
-MINOR = 18
+MINOR = 19
 PATCH = 2
 PRE_RELEASE = ""
 

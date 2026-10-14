@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import asyncio
+import functools
 import json
 import logging
 import time
@@ -74,6 +75,12 @@ def _get_field(obj, key, default=None):
     if isinstance(obj, dict):
         return obj.get(key, default)
     return getattr(obj, key, default)
+
+
+def _get_non_none(obj, key, default):
+    """Returns the value from the object or default if the key is missing or None."""
+    val = obj.get(key)
+    return default if val is None else val
 
 
 def _try_parse_jsonish(value):
@@ -317,20 +324,38 @@ def _sanitize_tools_for_template(tools):
     return sanitized
 
 
-def _reconstruct_reasoning_content(messages: list[dict]) -> list[dict]:
-    """Reconstruct <think> tags from reasoning_content fields on assistant messages.
+# Keys a client may never supply via `chat_template_kwargs`.
+#
+# `chat_template` replaces the Jinja template that the server renders for the
+# request. The template is server/tokenizer configuration (`--chat-template` or
+# the tokenizer's own template), never request data. Honoring a caller-supplied
+# template lets an unauthenticated POST hand us arbitrary Jinja that we then
+# compile and render synchronously: the sandbox blocks attribute escapes, but it
+# does not bound work, so nested `range()` loops or unbounded string
+# multiplication pin the worker and stall every other in-flight request on it.
+_DISALLOWED_CHAT_TEMPLATE_KWARGS = frozenset({"chat_template"})
 
-    For parity with vLLM, assistant messages may carry reasoning in the reasoning_content field.
-    Before applying the chat template, we must inline those tags back into content.
+
+def _sanitize_chat_template_kwargs(raw_kwargs):
+    """Drop request-supplied `chat_template_kwargs` entries that are not caller-controllable.
+
+    Returns a new dict; the caller's object is never mutated. Non-dict input
+    (including `None`) yields an empty dict.
     """
-    for message in messages:
-        if message.get("role") != "assistant":
-            continue
-        reasoning_content = message.pop("reasoning_content", None)
-        if reasoning_content is not None:
-            content = message.get("content") or ""
-            message["content"] = f"<think>{reasoning_content}</think>{content}"
-    return messages
+    if not isinstance(raw_kwargs, dict):
+        if raw_kwargs is not None:
+            logger.warning("Ignoring non-dict chat_template_kwargs: %s", type(raw_kwargs).__name__)
+        return {}
+
+    sanitized = {k: v for k, v in raw_kwargs.items() if k not in _DISALLOWED_CHAT_TEMPLATE_KWARGS}
+    rejected = sorted(set(raw_kwargs) - set(sanitized))
+    if rejected:
+        logger.warning(
+            "Ignoring disallowed chat_template_kwargs key(s) from request: %s. "
+            "The chat template is server configuration; use --chat-template to set it.",
+            ", ".join(rejected),
+        )
+    return sanitized
 
 
 def _replace_prefix_tokens(
@@ -343,12 +368,14 @@ def _replace_prefix_tokens(
     from the previous generation (rather than the ones from the chat template application)."""
 
     # Strip the EOS from the previous turn token ids if it exists
-    if previous_turn_token_ids[-1] == eos_token_id:
+    if previous_turn_token_ids and previous_turn_token_ids[-1] == eos_token_id:
         previous_turn_token_ids = previous_turn_token_ids[:-1]
 
     # Find the last EOS token id in the previous turn token ids
     last_eos_token_id_index = len(retokeenized_previous_turn_token_ids) - 1
-    for i in reversed(range(len(retokeenized_previous_turn_token_ids))):
+    # Note that the current conversation stat may be shorter than the previous conversation state.
+    scan_len = min(len(retokeenized_previous_turn_token_ids), len(current_turn_token_ids))
+    for i in reversed(range(scan_len)):
         if current_turn_token_ids[i] == eos_token_id:
             last_eos_token_id_index = i
             break
@@ -402,7 +429,9 @@ try:
 
     bp = Blueprint('chat_completions_api', __name__)
 
-    def apply_parsers(message_text, tools, parsers_list, tools_requested):
+    def apply_parsers(
+        message_text, tools, parsers_list, tools_requested, chat_template_kwargs=None
+    ):
         """Runs CPU-intensive text parsing."""
         meta = {}
         for parser in parsers_list:
@@ -410,7 +439,9 @@ try:
                 raise ValueError(f"Parser {parser} not found in PARSER_MAPPING")
 
             prev_text = message_text
-            parsed_text, new_info = PARSER_MAPPING[parser].parse(message_text, tools=tools)
+            parsed_text, new_info = PARSER_MAPPING[parser].parse(
+                message_text, tools=tools, chat_template_kwargs=chat_template_kwargs
+            )
             if "tool_calls" in new_info:
                 new_info["tool_calls"] = _normalize_tool_calls(
                     new_info.get("tool_calls", []), tools=tools
@@ -442,19 +473,13 @@ try:
         parallel_tool_calls = req.get("parallel_tool_calls", True)
         tools_requested = bool(tools) and tool_choice != "none"
         messages = req.get("messages")
-        chat_template_kwargs = req.get("chat_template_kwargs", {})
-        if not isinstance(chat_template_kwargs, dict):
-            logger.warning(
-                "Ignoring non-dict chat_template_kwargs: %s", type(chat_template_kwargs).__name__
-            )
-            chat_template_kwargs = {}
+        chat_template_kwargs = _sanitize_chat_template_kwargs(req.get("chat_template_kwargs"))
         # --- 1. Parse Messages ---
         if not messages:
             return Response("Missing 'messages' field", status=400)
         if not isinstance(messages, list):
             return Response("'messages' must be a list", status=400)
         template_messages = _sanitize_messages_for_template(messages)
-        template_messages = _reconstruct_reasoning_content(template_messages)
         template_tools = _sanitize_tools_for_template(tools)
 
         try:
@@ -462,13 +487,24 @@ try:
                 hasattr(tokenizer, 'apply_chat_template')
                 and getattr(tokenizer, "chat_template", None) is not None
             ):
+                # Template render + tokenization is synchronous and CPU-bound, so
+                # run it off the event loop. This is a latency mitigation, not a
+                # DoS defense: Jinja rendering is pure Python and holds the GIL,
+                # so an expensive template still degrades the loop badly (it just
+                # no longer hangs it outright). Request-supplied templates are
+                # rejected in _sanitize_chat_template_kwargs -- that is the actual
+                # fix. The real win here is the tokenizer half, which drops into
+                # Rust and releases the GIL for long conversations.
                 prompt_tokens = _coerce_to_token_id_list(
-                    tokenizer.apply_chat_template(
-                        template_messages,
-                        tokenize=True,
-                        add_generation_prompt=True,
-                        tools=template_tools,
-                        **chat_template_kwargs,
+                    await asyncio.to_thread(
+                        functools.partial(
+                            tokenizer.apply_chat_template,
+                            template_messages,
+                            tokenize=True,
+                            add_generation_prompt=True,
+                            tools=template_tools,
+                            **chat_template_kwargs,
+                        )
                     )
                 )
 
@@ -511,12 +547,15 @@ try:
 
                         # Get the templated tokenization of just the previous generation
                         retokenized_previous_turn_token_ids = _coerce_to_token_id_list(
-                            tokenizer.apply_chat_template(
-                                messages_to_last_assistant_message,
-                                tokenize=True,
-                                add_generation_prompt=False,
-                                tools=template_tools,
-                                **chat_template_kwargs,
+                            await asyncio.to_thread(
+                                functools.partial(
+                                    tokenizer.apply_chat_template,
+                                    messages_to_last_assistant_message,
+                                    tokenize=True,
+                                    add_generation_prompt=False,
+                                    tools=template_tools,
+                                    **chat_template_kwargs,
+                                )
                             )
                         )
 
@@ -555,20 +594,20 @@ try:
 
         # --- 2. Parse Sampling Params ---
         try:
-            temperature = float(req.get("temperature", 1.0))
-            top_p = float(req.get("top_p", 1.0))
-            top_k = int(req.get("top_k", 0))
-            n = int(req.get("n", 1))  # Number of choices to generate
+            temperature = float(_get_non_none(req, "temperature", 1.0))
+            top_p = float(_get_non_none(req, "top_p", 1.0))
+            top_k = int(_get_non_none(req, "top_k", 0))
+            n = int(_get_non_none(req, "n", 1))  # Number of choices to generate
 
             if temperature == 0.0:
                 top_k = 1
                 top_p = 0.0
 
             # Check for 'logprobs' (bool) and 'top_logprobs' (int)
-            return_log_probs = bool(req.get("logprobs", False))
-            top_n_logprobs = int(req.get("top_logprobs", 0)) if return_log_probs else 0
-            skip_prompt_log_probs = bool(req.get("skip_prompt_log_probs", True))
-            add_BOS = bool(req.get("add_BOS", False))
+            return_log_probs = bool(_get_non_none(req, "logprobs", False))
+            top_n_logprobs = int(_get_non_none(req, "top_logprobs", 0)) if return_log_probs else 0
+            skip_prompt_log_probs = bool(_get_non_none(req, "skip_prompt_log_probs", True))
+            add_BOS = bool(_get_non_none(req, "add_BOS", False))
 
             # The engine only handles add_BOS for string prompts, not pre-tokenized
             # input. Since we pre-tokenize via apply_chat_template, we must handle
@@ -584,6 +623,18 @@ try:
                     prompt_tokens = [tokenizer.bos] + prompt_tokens
 
             max_tokens = req.get("max_completion_tokens", None) or req.get("max_tokens", None)
+            ignore_eos = bool(req.get("ignore_eos", False))
+
+            # Does the client want the prompt tokens echoed back? Only then does the
+            # engine need to keep the prompt_tokens tensor on the response payload.
+            # return_tokenized_data (implied by prevent_retokenization) needs the ids;
+            # return_raw_text needs the ids to detokenize the prompt into raw_text.
+            prevent_retokenization = req.get("prevent_retokenization", True)
+            return_tokenized_data = (
+                req.get("return_tokenized_data", False) or prevent_retokenization
+            )
+            return_raw_text = req.get("return_raw_text", False)
+            return_prompt_tokens = return_tokenized_data or return_raw_text
 
             sampling_params = SamplingParams(
                 temperature=temperature,
@@ -594,6 +645,8 @@ try:
                 num_tokens_to_generate=(int(max_tokens) if max_tokens is not None else None),
                 skip_prompt_log_probs=skip_prompt_log_probs,
                 add_BOS=add_BOS,
+                termination_id=-1 if ignore_eos else None,
+                return_prompt_tokens=return_prompt_tokens,
             )
         except ValueError as e:
             return Response(f"Invalid sampling parameter: {e}", status=400)
@@ -654,15 +707,24 @@ try:
         choices = []
         total_completion_tokens = 0
         prompt_tokens_counts = []
+        cached_tokens_counts = []
 
+        # return_tokenized_data / return_raw_text / return_prompt_tokens were computed
+        # at submit time (above) and drive both the response shape here and whether the
+        # engine kept the prompt_tokens tensor on the payload.
         request_idx = 0
         for result_item in batch_results:
             result = unwrap_serialized_tensors(result_item)
 
-            prompt_tokens_out = result["prompt_tokens"]  # The engine can modify prompt_tokens.
             text_output = result["generated_text"]
-            prompt_tokens_count = len(prompt_tokens_out) if prompt_tokens_out is not None else 0
+            # The engine always reports prompt_length (for usage), but drops the
+            # prompt_tokens tensor unless return_prompt_tokens was set.
+            prompt_tokens_count = result.get("prompt_length")
+            if prompt_tokens_count is None:
+                prompt_tokens_out = result["prompt_tokens"]
+                prompt_tokens_count = len(prompt_tokens_out) if prompt_tokens_out is not None else 0
             prompt_tokens_counts.append(prompt_tokens_count)
+            cached_tokens_counts.append(result.get("num_cached_tokens", 0))
 
             logprobs_content = None
             if sampling_params.return_log_probs:
@@ -703,7 +765,11 @@ try:
 
             if parsers:
                 message_text, metadata = apply_parsers(
-                    message_text, tools, parsers, tools_requested
+                    message_text,
+                    tools,
+                    parsers,
+                    tools_requested,
+                    chat_template_kwargs=chat_template_kwargs,
                 )
 
             normalized_tool_calls = metadata.get("tool_calls", [])
@@ -728,9 +794,14 @@ try:
             if "reasoning" in metadata:
                 message["reasoning_content"] = metadata["reasoning"]
 
-            # Replicate data in the message field for compatibility.
-            message["prompt_token_ids"] = result["prompt_tokens"]
-            message["generation_token_ids"] = result["generated_tokens"]
+            if return_tokenized_data:
+                message["prompt_token_ids"] = result["prompt_tokens"]
+                message["generation_token_ids"] = result["generated_tokens"]
+            if return_raw_text:
+                prompt_str = tokenizer.detokenize(result["prompt_tokens"])
+                message["raw_text"] = prompt_str + text_output
+            # Small RL/debug scalars (a few bytes each); harmless to keep for
+            # NeMo-RL compatibility.
             message["generation_log_probs"] = result.get("generated_log_probs", [])
             message["policy_epoch"] = result["policy_epoch"]
             message["kv_cache_epoch"] = result["kv_cache_epoch"]
@@ -751,15 +822,13 @@ try:
             else:
                 finish_reason = "stop"
 
+            # Choice-level prompt/generation_token_ids, generation_log_probs and
+            # raw_text were duplicates of message-level data (or reconstructable);
+            # dropped to match vLLM's response shape and cut payload size.
             choice_data = {
                 "index": request_idx,
                 "message": message,
-                "prompt_token_ids": result["prompt_tokens"],
-                "generation_token_ids": result["generated_tokens"],
-                "generation_log_probs": result.get("generated_log_probs", []),
-                "raw_text": result["prompt"] + result["generated_text"],
                 # 'logprobs' in chat API is an object containing 'content'
-                # "logprobs": {"content": logprobs_content} if logprobs_content else None,
                 "logprobs": {"content": logprobs_content} if return_log_probs else None,
                 "finish_reason": finish_reason,
             }
@@ -774,7 +843,7 @@ try:
                     ]
 
             choices.append(choice_data)
-            if choice_data["generation_log_probs"] is None:
+            if result.get("generated_log_probs") is None:
                 logger.warning(
                     "Generation log probs is None for request:\n%s",
                     json.dumps(_redact_token_id_lists_for_logging(result), indent=4),
@@ -783,6 +852,7 @@ try:
             request_idx += 1
 
         prompt_token_count = max(prompt_tokens_counts) if prompt_tokens_counts else 0
+        cached_token_count = max(cached_tokens_counts) if cached_tokens_counts else 0
         response = {
             "id": f"chatcmpl-{uuid.uuid4().hex}",
             "created": int(time.time()),
@@ -793,6 +863,7 @@ try:
                 "prompt_tokens": prompt_token_count,
                 "completion_tokens": total_completion_tokens,
                 "total_tokens": prompt_token_count + total_completion_tokens,
+                "prompt_tokens_details": {"cached_tokens": cached_token_count},
             },
         }
 
