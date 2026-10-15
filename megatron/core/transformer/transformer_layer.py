@@ -447,6 +447,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # linear interpolation toward the L2-normalized sublayer output, keeping
         # the residual stream on the unit hypersphere. Disabled => None => the
         # standard bias-dropout-add path runs unchanged.
+        # A HybridStack layer carries one real sublayer (`*`/`L`/`C` an attention-
+        # slot mixer, `-`/`E` an MLP) and an identity for the other. The residual
+        # schemes below exist only for real sublayers: one on an identity would
+        # move the stream through a sublayer that computes nothing.
+        has_attn = not isinstance(self.self_attention, IdentityOp)
+        has_mlp = not isinstance(self.mlp, IdentityOp)
         self.ngpt_attn_residual = None
         self.ngpt_mlp_residual = None
         if getattr(self.config, "ngpt", False):
@@ -463,14 +469,17 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     eps=self.config.layernorm_epsilon,
                 )
 
-            self.ngpt_attn_residual = _make_residual(
-                self.config.ngpt_lerp_normalization_attn or self.config.ngpt_lerp_normalization,
-                self.config.ngpt_post_layer_norm_attn,
-            )
-            self.ngpt_mlp_residual = _make_residual(
-                self.config.ngpt_lerp_normalization_ffn or self.config.ngpt_lerp_normalization,
-                self.config.ngpt_post_layer_norm_ffn,
-            )
+            if has_attn:
+                self.ngpt_attn_residual = _make_residual(
+                    self.config.ngpt_lerp_normalization_attn
+                    or self.config.ngpt_lerp_normalization,
+                    self.config.ngpt_post_layer_norm_attn,
+                )
+            if has_mlp:
+                self.ngpt_mlp_residual = _make_residual(
+                    self.config.ngpt_lerp_normalization_ffn or self.config.ngpt_lerp_normalization,
+                    self.config.ngpt_post_layer_norm_ffn,
+                )
 
         # [Module 9c: depth-wise residual schemes]
         # mHC widens the residual into n streams mixed by a doubly stochastic
@@ -499,8 +508,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     eps=self.config.layernorm_epsilon,
                 )
 
-            self.mhc_attn_mixer = _make_mixer()
-            self.mhc_mlp_mixer = _make_mixer()
+            self.mhc_attn_mixer = _make_mixer() if has_attn else None
+            self.mhc_mlp_mixer = _make_mixer() if has_mlp else None
         elif getattr(self.config, "attn_res", False):
             from megatron.core.transformer.attn_res import BlockAttnRes
 
@@ -511,8 +520,21 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     query_init_std=self.config.attn_res_query_init_std,
                 )
 
-            self.attnres_attn = _make_attnres()
-            self.attnres_mlp = _make_attnres()
+            self.attnres_attn = _make_attnres() if has_attn else None
+            self.attnres_mlp = _make_attnres() if has_mlp else None
+        # These act per token, so each TP rank sees only its own tokens under
+        # sequence parallelism: their gradients are summed over TP like a norm's.
+        for module in (
+            self.ngpt_attn_residual,
+            self.ngpt_mlp_residual,
+            self.mhc_attn_mixer,
+            self.mhc_mlp_mixer,
+            self.attnres_attn,
+            self.attnres_mlp,
+        ):
+            if module is not None:
+                for param in module.parameters():
+                    param.sequence_parallel = self.config.sequence_parallel
 
         self.is_moe_layer = isinstance(self.mlp, MoELayer)
 
@@ -708,7 +730,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         if self.mhc_attn_mixer is not None:
             mhc_streams = hidden_states
             hidden_states, mhc_pending = self._mhc_read(self.mhc_attn_mixer, mhc_streams)
-        elif self._depth_enabled():
+        elif self._depth_enabled("attn"):
             hidden_states = self._depth_read("attn")
 
         # Optional Input Layer norm
@@ -783,7 +805,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             hidden_states = self._mhc_write(
                 self.mhc_attn_mixer, "attn", mhc_streams, attention_output_with_bias, mhc_pending
             )
-        elif self._depth_enabled():
+        elif self._depth_enabled("attn"):
             # Block AttnRes owns the residual bookkeeping entirely.
             hidden_states = self._depth_write("attn", attention_output_with_bias)
         elif self.ngpt_attn_residual is not None:
@@ -858,12 +880,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
         return output, context
 
-    def _depth_enabled(self) -> bool:
-        """True when Block AttnRes is active and its state has been stashed.
+    def _depth_enabled(self, kind: str = "attn") -> bool:
+        """True when Block AttnRes is active for sublayer ``kind`` and its state
+        has been stashed.
 
         mHC does not go through :attr:`_depth_state` -- see :meth:`_mhc_read`.
         """
-        return self._depth_state is not None and self.attnres_attn is not None
+        module = self.attnres_attn if kind == "attn" else self.attnres_mlp
+        return self._depth_state is not None and module is not None
 
     def _sublayer_output(self, output_with_bias) -> Tensor:
         """Unpack a sublayer's ``(output, bias)`` return, folding the bias in."""
@@ -967,7 +991,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         state = self._depth_state
         out = self._sublayer_output(output_with_bias)
         accumulate_block(state, out, lerp=self._depth_lerp(kind, self.config.attn_res_lerp))
-        if kind == "mlp" and state.should_seal(self.layer_number):
+        # Seal after the layer's last real sublayer (a HybridStack attention-slot
+        # layer has no MLP sublayer).
+        last = kind == "mlp" or self.attnres_mlp is None
+        if last and state.should_seal(self.layer_number):
             state.seal_block()
         return state.partial if state.partial is not None else out
 
@@ -1081,7 +1108,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         if self.mhc_mlp_mixer is not None:
             mhc_streams = hidden_states
             hidden_states, mhc_pending = self._mhc_read(self.mhc_mlp_mixer, mhc_streams)
-        elif self._depth_enabled():
+        elif self._depth_enabled("mlp"):
             hidden_states = self._depth_read("mlp")
 
         # Optional Layer norm post the cross-attention.
@@ -1263,7 +1290,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             hidden_states = self._mhc_write(
                 self.mhc_mlp_mixer, "mlp", mhc_streams, mlp_output_with_bias, mhc_pending
             )
-        elif self._depth_enabled():
+        elif self._depth_enabled("mlp"):
             # Block AttnRes owns the residual bookkeeping entirely.
             hidden_states = self._depth_write("mlp", mlp_output_with_bias)
         elif self.ngpt_mlp_residual is not None:

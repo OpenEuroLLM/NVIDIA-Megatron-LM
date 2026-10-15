@@ -193,12 +193,8 @@ class MLP(MegatronModule):
         if ffn_hidden_size is None:
             if is_expert:
                 raise ValueError("MoE MLP requires `ffn_hidden_size`, but it was not provided.")
-            warnings.warn(
-                "MLP requires ffn_hidden_size, but it was not provided. Using \
-                    config.ffn_hidden_size by default.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
+            warnings.warn("MLP requires ffn_hidden_size, but it was not provided. Using \
+                    config.ffn_hidden_size by default.", DeprecationWarning, stacklevel=2)
             ffn_hidden_size = not_none(self.config.ffn_hidden_size)
 
         # If this is a gated linear unit we double the output width
@@ -248,6 +244,11 @@ class MLP(MegatronModule):
             # fc1 emits 2x ffn for a gated unit (gate and up are concatenated).
             width = self.config.ffn_hidden_size * (2 if self.config.gated_linear_unit else 1)
             self.ngpt_suv = EigenLRScaler(width, self.config.ngpt_scaler_init, base)
+            # Kept at the global width (checkpoints stay TP-independent); each TP rank
+            # applies the slice matching its fc1 shard, [gate_r | up_r] for a gated
+            # unit, and the gradients -- disjoint slices -- are summed over TP.
+            self.ngpt_suv.weight.sum_gradients_across_tp_domain = True
+            self._suv_tp = (self.tp_group.size(), self.tp_group.rank())
 
         self.linear_fc2 = submodules.linear_fc2(
             not_none(self.config.ffn_hidden_size),
@@ -265,6 +266,15 @@ class MLP(MegatronModule):
             name=(name + ".linear_fc2") if name is not None else None,
         )
 
+    def _suv_local(self) -> torch.Tensor:
+        """This TP rank's slice of the nGPT s_uv scaler (effective values)."""
+        scale = self.ngpt_suv.effective()
+        tp_size, tp_rank = self._suv_tp
+        if tp_size == 1:
+            return scale
+        halves = scale.chunk(2) if self.config.gated_linear_unit else (scale,)
+        return torch.cat([h.chunk(tp_size)[tp_rank] for h in halves])
+
     def forward(
         self, hidden_states: torch.Tensor, per_token_scale: torch.Tensor | None = None, **kwargs
     ):
@@ -277,7 +287,9 @@ class MLP(MegatronModule):
         # nGPT s_uv: replaces the magnitude the fc1 rows can no longer carry once
         # they are normalized. Applied to the pre-activation intermediate.
         if self.ngpt_suv is not None:
-            intermediate_parallel = self.ngpt_suv(intermediate_parallel)
+            intermediate_parallel = intermediate_parallel * self._suv_local().to(
+                intermediate_parallel.dtype
+            )
 
         nvtx_range_push(suffix="activation")
         if self.config.use_te_activation_func:

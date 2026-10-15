@@ -97,6 +97,17 @@ class MambaLayer(GraphableMegatronModule):
         )
         self.mamba_bda = build_module(submodules.mamba_bda)
         self.bias_dropout_add_exec_handler = torch.enable_grad
+        # mHC / Block AttnRes / nGPT replace `h + mixer(norm(h))` (see
+        # residual_scheme_adapter.py); None keeps the plain residual.
+        from megatron.core.transformer.residual_scheme_adapter import (
+            ResidualSchemeAdapter,
+            residual_scheme_active,
+        )
+
+        self.residual_scheme = (
+            ResidualSchemeAdapter(config) if residual_scheme_active(config) else None
+        )
+        self._depth_state = None
 
     def create_mcore_cudagraph_manager(self, config):
         """Register the mamba layer for cudagraphs."""
@@ -143,6 +154,16 @@ class MambaLayer(GraphableMegatronModule):
         """
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
+
+        if self.residual_scheme is not None:
+            x, ctx = self.residual_scheme.read(hidden_states, self._depth_state)
+            x = apply_module(self.norm)(x.to(dtype=self.config.params_dtype))
+            out, bias = self.mixer(
+                x, inference_context=inference_context, packed_seq_params=packed_seq_params
+            )
+            if bias is not None:
+                out = out + bias
+            return self.residual_scheme.write(out, ctx, self._depth_state, self.layer_number)
 
         residual = hidden_states
         if self.config.fp32_residual_connection:

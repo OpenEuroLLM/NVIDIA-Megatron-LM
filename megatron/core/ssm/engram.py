@@ -223,6 +223,16 @@ class EngramLayer(MegatronModule):
         ):
             replicate_across_tp(module, self.tp_group)
         self._input_ids = None
+        # mHC / Block AttnRes / nGPT replace `h + Engram(h)` (residual_scheme_adapter.py).
+        from megatron.core.transformer.residual_scheme_adapter import (
+            ResidualSchemeAdapter,
+            residual_scheme_active,
+        )
+
+        self.residual_scheme = (
+            ResidualSchemeAdapter(config) if residual_scheme_active(config) else None
+        )
+        self._depth_state = None
 
     def reset_parameters(self):
         if not self.config.perform_initialization:
@@ -268,6 +278,9 @@ class EngramLayer(MegatronModule):
                 "EngramLayer needs the token ids; HybridStack passes them on the pipeline "
                 "stages that hold `N` layers."
             )
+        ctx = None
+        if self.residual_scheme is not None:
+            hidden_states, ctx = self.residual_scheme.read(hidden_states, self._depth_state)
         h = gather_replicated_input(hidden_states, self.config, self.tp_group)  # [s, b, h]
         e = self._memory(self._input_ids).to(h.dtype)
         k = self.key_proj(e)
@@ -279,6 +292,8 @@ class EngramLayer(MegatronModule):
         conv = self.conv1d(F.pad(v.permute(1, 2, 0), (pad, 0))).permute(2, 0, 1)
         y = F.silu(conv) + v
         y = scatter_replicated_output(y, self.config, self.tp_group)
+        if self.residual_scheme is not None:
+            return self.residual_scheme.write(y, ctx, self._depth_state, self.layer_number)
         return hidden_states + y
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):

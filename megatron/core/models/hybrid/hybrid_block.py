@@ -112,6 +112,7 @@ class HybridStack(MegatronModule):
         """
         super().__init__(config=config)
         self.pre_process = pre_process
+        self.pp_layer_offset = pp_layer_offset
         self.post_layer_norm = post_layer_norm
         self.post_process = post_process
         self.is_mtp_layer = is_mtp_layer
@@ -470,6 +471,14 @@ class HybridStack(MegatronModule):
                 return nullcontext()
 
         with outer_fp8_context:
+            depth_scheme = getattr(self.config, "mhc", False) or getattr(
+                self.config, "attn_res", False
+            )
+            if depth_scheme and self.config.recompute_granularity == 'full' and self.training:
+                raise NotImplementedError(
+                    "mHC / Block AttnRes do not support full activation recompute; use "
+                    "selective recompute."
+                )
             if self.config.recompute_granularity == 'full' and self.training:
                 hidden_states = checkpointed_forward(
                     self,
@@ -492,7 +501,12 @@ class HybridStack(MegatronModule):
                     # repeats. Only the quantization context reads it, and that is
                     # keyed per unique layer by design.
                     layer_order = [self.layers[i] for i in self._loop_schedule]
+                # mHC widens hidden_states to [s, b, n, h] streams; Block AttnRes keeps
+                # its block summaries in a state stashed on every layer.
+                hidden_states, depth_state = self._depth_enter(hidden_states)
                 for layer in layer_order:
+                    if depth_state is not None:
+                        layer._depth_state = depth_state
                     # Layers have 1-indexed layer numbers attribute.
                     inner_quant_context = get_inner_quant_context(
                         self.config, layer.layer_number - 1
@@ -521,6 +535,7 @@ class HybridStack(MegatronModule):
                     # for cross-attention, and is not needed in our model.
                     if isinstance(hidden_states, tuple):
                         hidden_states = hidden_states[0]
+                hidden_states = self._depth_exit(hidden_states, depth_state)
 
         # Final layer norm.
         if self.post_process and self.post_layer_norm:
@@ -532,6 +547,85 @@ class HybridStack(MegatronModule):
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )
 
+        return hidden_states
+
+    def _depth_enter(self, hidden_states: Tensor):
+        """Widen the residual for mHC or build the Block AttnRes state.
+
+        The HybridStack counterpart of ``TransformerBlock._depth_enter``: every layer
+        type -- TransformerLayer sublayers, Mamba (`M`) and Engram (`N`) through their
+        ResidualSchemeAdapter -- reads and writes the same state, so a hybrid pattern
+        uses mHC / Block AttnRes across all of its layers. Across a pipeline stage
+        boundary both travel as the fixed-width ``[s, b, slots * h]`` payload.
+
+        Returns:
+            ``(hidden_states, depth_state)``; ``hidden_states`` is ``[s, b, n, h]``
+            under mHC, ``depth_state`` is None unless Block AttnRes is active.
+        """
+        mhc = getattr(self.config, "mhc", False)
+        attn_res = getattr(self.config, "attn_res", False)
+        if not mhc and not attn_res:
+            return hidden_states, None
+        if mhc and attn_res:
+            raise ValueError("mhc and attn_res are mutually exclusive; enable at most one")
+
+        from megatron.core.transformer.depth_residual import depth_payload_slots, unpack_payload
+
+        slots = depth_payload_slots(self.config)
+        if mhc:
+            from megatron.core.transformer.mhc import expand_to_streams
+
+            if self.pre_process:
+                return expand_to_streams(hidden_states, slots), None
+            s, b, wide = hidden_states.shape
+            return hidden_states.reshape(s, b, slots, wide // slots), None
+
+        from megatron.core.transformer.attn_res import resolve_layers_per_block
+        from megatron.core.transformer.depth_residual import DepthResidualState
+
+        layers_per_block = resolve_layers_per_block(
+            self.config.num_layers, self.config.attn_res_num_blocks
+        )
+        if self.pre_process:
+            return hidden_states, DepthResidualState(
+                hidden_states, layers_per_block=layers_per_block
+            )
+        done = self.pp_layer_offset
+        has_partial = bool(done % layers_per_block)
+        live = 1 + done // layers_per_block + int(has_partial)
+        sources = unpack_payload(hidden_states, slots, live)
+        state = DepthResidualState(sources[0], layers_per_block=layers_per_block)
+        if has_partial:
+            state.blocks, state.partial = sources[:-1], sources[-1]
+        else:
+            state.blocks, state.partial = sources, None
+        return hidden_states, state
+
+    def _depth_exit(self, hidden_states: Tensor, depth_state) -> Tensor:
+        """Collapse the depth state on the last stage, else pack it for the next one."""
+        from megatron.core.transformer.depth_residual import depth_payload_slots, pack_payload
+
+        if getattr(self.config, "mhc", False) and hidden_states.dim() == 4:
+            from megatron.core.transformer.mhc import collapse_streams
+
+            if self.post_process:
+                return collapse_streams(hidden_states)
+            s, b, n, h = hidden_states.shape
+            return make_viewless_tensor(
+                inp=hidden_states.reshape(s, b, n * h), requires_grad=True, keep_graph=True
+            )
+        if depth_state is None:
+            return hidden_states
+        if self.post_process:
+            hidden_states = depth_state.collapse()
+        else:
+            hidden_states = make_viewless_tensor(
+                inp=pack_payload(depth_state.sources(), depth_payload_slots(self.config)),
+                requires_grad=True,
+                keep_graph=True,
+            )
+        for layer in self.layers:
+            layer._depth_state = None
         return hidden_states
 
     def sharded_state_dict(

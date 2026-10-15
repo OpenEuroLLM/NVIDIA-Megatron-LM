@@ -1755,6 +1755,10 @@ class SelfAttention(Attention):
             head_dim = self.hidden_size_per_attention_head
             self.ngpt_sq = EigenLRScaler(head_dim, self.config.ngpt_scaler_init, base)
             self.ngpt_sk = EigenLRScaler(head_dim, self.config.ngpt_scaler_init, base)
+            # Shared by every head, but a TP rank only holds its own heads: the
+            # true gradient is the sum over the TP group.
+            for scaler in (self.ngpt_sq, self.ngpt_sk):
+                scaler.weight.sum_gradients_across_tp_domain = True
 
     def run_realtime_tests(self):
         """Performs a consistency check.
