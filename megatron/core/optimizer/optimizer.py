@@ -1261,7 +1261,11 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         state_dict = {
             'param_keyed': True,
             'param_groups': {
-                str(i): {k: v for k, v in g.items() if k != 'params'}
+                str(i): {
+                    **{k: v for k, v in g.items() if k != 'params'},
+                    # LayerWiseDistributedOptimizer takes group metadata from an owner.
+                    '_has_params': bool(g['params']),
+                }
                 for i, g in enumerate(inner['param_groups'])
             },
             'param_state': param_state,
@@ -1289,6 +1293,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                     f"param_group {_param_group_identifier(cur)} not found in the checkpoint "
                     f"(available: {list(saved)})"
                 )
+            match = {k: v for k, v in match.items() if k != '_has_params'}
             groups.append({**match, 'params': cur['params']})
         main_params = [p for g in self.optimizer.param_groups for p in g['params']]
         keys = getattr(self, '_param_keyed_keys', None)

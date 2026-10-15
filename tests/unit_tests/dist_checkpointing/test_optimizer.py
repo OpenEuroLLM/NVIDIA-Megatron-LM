@@ -1050,6 +1050,15 @@ class TestFP32Optimizer:
                 assert not any(map(bool, diffs)), diffs
 
 
+def _checkpoint_tensors(plain: dict) -> dict:
+    """The tensors of a load_plain_tensors result, by checkpoint key.
+
+    load_plain_tensors merges the common state in; its nesting follows the optimizer
+    layout (chained index or not), which is exactly what a layout-change test varies.
+    """
+    return {k: v for k, v in plain.items() if isinstance(k, str) and torch.is_tensor(v)}
+
+
 class TestOptimizerResharding:
     def setup_method(self, method):
         pass
@@ -1230,10 +1239,22 @@ class TestOptimizerResharding:
                 assert not any(map(bool, diffs)), diffs
                 Utils.destroy_model_parallel()
 
-    @pytest.mark.parametrize('optimizer', ['muon', 'adam'])
+    @pytest.mark.parametrize(
+        ('optimizer', 'dist_opt'),
+        # dist_opt=True: the Muon family runs in LayerWiseDistributedOptimizer.
+        [
+            ('muon', False),
+            ('muown', False),
+            ('angular_muown', False),
+            ('adam', False),
+            ('muon', True),
+            ('muown', True),
+            ('angular_muown', True),
+        ],
+    )
     @pytest.mark.parametrize(('src_exp', 'dest_exp'), [(2, 1), (1, 2), (2, 4)])
     def test_param_keyed_float16_optimizer_expert_layout_change(
-        self, tmp_path_dist_ckpt, optimizer, src_exp, dest_exp
+        self, tmp_path_dist_ckpt, optimizer, dist_opt, src_exp, dest_exp
     ):
         """The non-distributed Float16 optimizer (Muon-family + its Adam fallback) under
         the fully reshardable, param-keyed format: loads across EP sizes and across the
@@ -1246,11 +1267,12 @@ class TestOptimizerResharding:
 
         def build(seed, ep):
             model, opt = setup_moe_model_and_optimizer(
-                seed=seed, tp=1, pp=1, ep=ep, bf16=True, dist_opt=False, optimizer=optimizer
+                seed=seed, tp=1, pp=1, ep=ep, bf16=True, dist_opt=dist_opt, optimizer=optimizer
             )
             torch.manual_seed(seed)
             for sub in opt.chained_optimizers:
-                for state in sub.optimizer.state.values():
+                inner = getattr(sub, 'chained_optimizers', [sub])
+                for state in (st for o in inner for st in o.optimizer.state.values()):
                     for value in state.values():
                         if isinstance(value, torch.Tensor) and value.is_floating_point():
                             value.copy_(torch.rand_like(value))
@@ -1286,8 +1308,9 @@ class TestOptimizerResharding:
                 Utils.destroy_model_parallel()
 
                 Utils.initialize_model_parallel(1, 1)
-                plain_A, plain_B = load_plain_tensors(ckpt_dir_A), load_plain_tensors(ckpt_dir_B)
-                assert any(k.startswith('optimizer.state.') for k in plain_A)
+                plain_A = _checkpoint_tensors(load_plain_tensors(ckpt_dir_A))
+                plain_B = _checkpoint_tensors(load_plain_tensors(ckpt_dir_B))
+                assert any(k.startswith('optimizer.') for k in plain_A), list(plain_A)[:5]
                 diffs = diff(plain_A, plain_B)
                 assert not any(map(bool, diffs)), diffs
                 Utils.destroy_model_parallel()
@@ -1340,6 +1363,9 @@ class TestOptimizerResharding:
                 Utils.destroy_model_parallel()
 
                 Utils.initialize_model_parallel(1, 1)
-                diffs = diff(load_plain_tensors(ckpt_dir_A), load_plain_tensors(ckpt_dir_B))
+                tensors_A = _checkpoint_tensors(load_plain_tensors(ckpt_dir_A))
+                tensors_B = _checkpoint_tensors(load_plain_tensors(ckpt_dir_B))
+                assert any(k.startswith('optimizer.') for k in tensors_A), list(tensors_A)[:5]
+                diffs = diff(tensors_A, tensors_B)
                 assert not any(map(bool, diffs)), diffs
                 Utils.destroy_model_parallel()

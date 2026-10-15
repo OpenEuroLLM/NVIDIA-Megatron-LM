@@ -66,11 +66,23 @@ def _build(cuda_graph_impl: str) -> TransformerBlock:
 
 
 def _fwd_bwd(block: TransformerBlock, x: torch.Tensor):
-    """One forward + backward; returns the output and the parameter gradients."""
+    """One forward + backward; returns the output and the parameter gradients.
+
+    Captured backward graphs accumulate weight gradients straight into ``main_grad``
+    (which DDP provides in training), eager backward into ``.grad``: give every
+    parameter a zeroed ``main_grad`` and read whichever of the two was filled.
+    """
+    for p in block.parameters():
+        p.main_grad = torch.zeros_like(p, dtype=torch.float32)
     out = block(hidden_states=x.clone().requires_grad_(True), attention_mask=None)
     block.zero_grad(set_to_none=True)
     out.square().mean().backward()
-    grads = {k: p.grad.clone() for k, p in block.named_parameters() if p.grad is not None}
+    grads = {}
+    for k, p in block.named_parameters():
+        if p.grad is not None:
+            grads[k] = p.grad.clone()
+        elif bool(p.main_grad.any()):
+            grads[k] = p.main_grad.to(p.dtype).clone()
     return out.detach().clone(), grads
 
 

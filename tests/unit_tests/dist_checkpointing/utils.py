@@ -347,7 +347,7 @@ def setup_moe_model_and_optimizer(
     if optimizer_type == 'dist_muon':
         optimizer = 'muon'
         use_layer_wise = True
-    if optimizer_type in ('muon', 'dist_muon') and dist_opt:
+    if optimizer_type in ('muon', 'dist_muon', 'muown', 'angular_muown') and dist_opt:
         use_layer_wise = True
 
     # See setup_model_and_optimizer for the use_param_layout semantics.
@@ -385,14 +385,14 @@ def setup_moe_model_and_optimizer(
         optimizer=optimizer,
     )
 
-    if optimizer_type in ('muon', 'dist_muon'):
+    if optimizer_type in ('muon', 'dist_muon', 'muown', 'angular_muown'):
         config.lr = 0.0
     optimizer = get_megatron_optimizer(config, model)
 
     torch.manual_seed(seed + 1)
     model_parallel_cuda_manual_seed(seed + 1)
 
-    if optimizer_type in ('muon', 'dist_muon'):
+    if optimizer_type in ('muon', 'dist_muon', 'muown', 'angular_muown'):
         for opt in optimizer.chained_optimizers:
             if not hasattr(opt, 'optimizer'):
                 opt.init_state_fn(opt)

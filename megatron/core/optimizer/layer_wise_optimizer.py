@@ -958,6 +958,23 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
         # Adjust dict rank 0 output correct global metadata into common_dict
         for sd in wrapped_sharded_state_dict.values():
+            if sd.get('param_keyed'):
+                # Param-keyed format (fully reshardable): each param's state is written by
+                # the DP rank that owns it, under the param's own key, so it loads under any
+                # DP / TP / EP layout. Only the common part needs the owners' values: rank 0
+                # writes it but may own no param of a group (missing step / group keys).
+                world = torch.distributed.get_world_size()
+                for key, group in sd['param_groups'].items():
+                    all_rank_groups = [None] * world
+                    torch.distributed.all_gather_object(all_rank_groups, group)
+                    owner = next((g for g in all_rank_groups if g.get('_has_params')), group)
+                    sd['param_groups'][key] = owner
+                steps = [None] * world
+                torch.distributed.all_gather_object(steps, sd.get('common_step'))
+                step = next((x for x in steps if x is not None), None)
+                if step is not None:
+                    sd['common_step'] = step
+                continue
             # wrap empty containers into LocalNonpersistentObject so it won't be saved/loaded
             # params is already wrapped, we only need to handle fp32_from_fp16_params and state
             # more details in load_state_dict comment
