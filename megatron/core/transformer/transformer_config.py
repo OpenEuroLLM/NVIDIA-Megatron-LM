@@ -383,6 +383,13 @@ class TransformerConfig(ModelParallelConfig):
     engram_conv_kernel_size: int = 4
     """Kernel of Engram's depthwise causal conv (dilation = the largest n-gram order)."""
 
+    engram_table_parallel: str = "tp"
+    """How Engram tables are distributed. "tp": rows sharded over tensor parallelism,
+    replicated over data parallelism (DDP reduces their dense gradient). "dp": rows
+    sharded over every rank of the pipeline stage (tensor x data x context parallel),
+    looked up with all-to-all and updated by EngramTableOptimizer from sparse row
+    gradients -- no table-sized gradient traffic; requires engram_table_fp32."""
+
     engram_table_fp32: bool = True
     """Keep the Engram tables as fp32 parameters under bf16/fp16 training. Their rows
     receive small, sparse gradients; an fp32 table accumulates them in fp32 and is

@@ -2568,6 +2568,12 @@ def setup_model_and_optimizer(
             use_gloo_process_groups=args.use_gloo_process_groups,
             dump_param_to_param_group_map=args.dump_param_to_param_group_map,
         )
+        if getattr(args, "engram_table_parallel", "tp") == "dp":
+            # Engram tables sharded over the whole stage are not DDP parameters; their
+            # optimizer joins the chain before the scheduler collects param groups.
+            from megatron.core.optimizer.engram_optimizer import attach_engram_table_optimizer
+
+            optimizer = attach_engram_table_optimizer(optimizer, model, config)
         opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
 
     one_logger and one_logger.log_metrics({"app_build_optimzer_finish_time": one_logger_utils.get_timestamp_in_ms()})
