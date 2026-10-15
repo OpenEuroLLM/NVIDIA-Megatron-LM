@@ -28,7 +28,7 @@ def _inputs(b, t, h, d, e, signed, gen):
     return q, k, v, q2, k2, g2, g, sign, beta_logits
 
 
-@pytest.mark.parametrize("e,d", [(1, 64), (2, 64), (4, 64), (2, 128)])
+@pytest.mark.parametrize("e,d", [(1, 64), (2, 64), (4, 64), (2, 128), (4, 128), (8, 64), (8, 128)])
 @pytest.mark.parametrize("base", ["gdn", "kda", "ckda"])
 def test_kernel_expansion_matches_third_order_recurrence(e, d, base):
     gen = torch.Generator(device="cuda").manual_seed(0)
@@ -54,13 +54,6 @@ def test_expansion_structure():
     torch.testing.assert_close(kk.norm(dim=-1), torch.ones(1, 5, 2, device="cuda"))
     torch.testing.assert_close(gg.view(1, 5, 2, 3, 8), g2[..., None] + g[..., None, :])
     assert (ss.view(1, 5, 2, 3, 8) == sign[..., None, :]).all()
-
-
-def test_too_wide_keys_are_rejected():
-    gen = torch.Generator(device="cuda").manual_seed(2)
-    q, k, v, q2, k2, g2, g, sign, bl = _inputs(1, 64, 1, 128, 4, False, gen)
-    with pytest.raises(ValueError, match="256"):
-        triadic.triadic_chunk(q, k, v.bfloat16(), q2, k2, g2, bl, g=g)
 
 
 @pytest.mark.parametrize("base", ["gdn", "kda", "ckda"])
@@ -138,3 +131,37 @@ def test_cute_kernel_matches_reference(e):
     qb, kb, vb = (x.bfloat16().requires_grad_() for x in (q, k, v))
     gdn_joint_call(qb, kb, vb, *leaves[:2], leaves[2], leaves[3], scale=d**-0.5).float().sum().backward()
     assert all(x.grad is not None and torch.isfinite(x.grad).all() for x in [qb, kb, vb] + leaves)
+
+
+@pytest.mark.parametrize("e,d", [(2, 64), (4, 128), (8, 64)])
+@pytest.mark.parametrize("base", ["gdn", "kda", "ckda"])
+def test_gradients_match_the_reference(e, d, base):
+    """Every input's gradient through the KDA pipeline (FLA's kernels below K = 256, the
+    wide-key state kernels above) against autograd through the third-order recurrence."""
+    gen = torch.Generator(device="cuda").manual_seed(4)
+    b, t, h = 1, 64, 2
+    q, k, v, q2, k2, g2, g, sign, bl = _inputs(b, t, h, d, e, base == "ckda", gen)
+    if base == "gdn":
+        g = None
+    neg = base == "ckda"
+    leaves = {"q": q, "k": k, "v": v, "q2": q2, "k2": k2, "g2": g2, "bl": bl}
+    if g is not None:
+        leaves["g"] = g
+    dy = torch.randn(b, t, h, d, device="cuda", generator=gen)
+    grads = []
+    for path in ("kernel", "reference"):
+        xs = {n: x.detach().clone().requires_grad_() for n, x in leaves.items()}
+        if path == "kernel":
+            out = triadic.triadic_chunk(xs["q"], xs["k"], xs["v"].bfloat16(), xs["q2"], xs["k2"],
+                                        xs["g2"], xs["bl"], g=xs.get("g"), sign=sign,
+                                        allow_neg_eigval=neg).float()
+        else:
+            beta = torch.sigmoid(xs["bl"]) * (2.0 if neg else 1.0)
+            out = triadic.triadic_reference(xs["q"], xs["k"], xs["v"], xs["q2"], xs["k2"],
+                                            xs["g2"], beta, g=xs.get("g"), sign=sign)
+        out.backward(dy)
+        grads.append({n: x.grad for n, x in xs.items()})
+    for name in leaves:
+        a, r = grads[0][name].float(), grads[1][name].float()
+        err = (a - r).norm() / r.norm().clamp(min=1e-6)
+        assert err < 5e-2, (name, float(err))

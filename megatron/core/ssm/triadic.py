@@ -94,12 +94,12 @@ def expand_triadic(q, k, q2, k2, g2, g=None, sign=None):
     return qq, kk, gg, ss
 
 
-@torch.no_grad()
 def triadic_reference(q, k, v, q2, k2, g2, beta, g=None, sign=None, scale=None):
     """Naive recurrence over the third-order state ``S`` [B, H, E, D, V] (fp32).
 
     ``q``, ``k`` [B, T, H, D] and ``q2``, ``k2`` [B, T, H, E] already unit norm,
-    ``beta`` [B, T, H] the final write strength."""
+    ``beta`` [B, T, H] the final write strength. Differentiable (autograd through the
+    loop), for gradient tests on short sequences."""
     b, t, h, d = q.shape
     e, vd = q2.shape[-1], v.shape[-1]
     scale = d**-0.5 if scale is None else scale
@@ -128,12 +128,10 @@ def triadic_chunk(q, k, v, q2, k2, g2, beta_logits, g=None, sign=None, allow_neg
     ``beta_logits`` [B, T, H]: the kernel applies the sigmoid (x2 with
     ``allow_neg_eigval``). Returns ``o`` [B, T, H, V]."""
     d, e = q.shape[-1], q2.shape[-1]
-    if e * d > 256:
-        raise ValueError(
-            f"triadic E * head_dim = {e * d} > 256, the widest key FLA's chunk_kda takes; "
-            "lower linear_triadic_e or the head dim"
-        )
     qq, kk, gg, ss = expand_triadic(q, k, q2, k2, g2, g, sign)
+    if e * d > 256:
+        return _chunk_kda_wide(qq.to(v.dtype), kk.to(v.dtype), v, gg.float(), beta_logits, ss,
+                               d**-0.5 if scale is None else scale, allow_neg_eigval, cu_seqlens)
     o, _ = chunk_kda(
         q=qq.to(v.dtype),
         k=kk.to(v.dtype),
@@ -149,6 +147,35 @@ def triadic_chunk(q, k, v, q2, k2, g2, beta_logits, g=None, sign=None, allow_neg
         safe_gate=False,
         state_v_first=True,
         cu_seqlens=cu_seqlens,
+    )
+    return o
+
+
+def _chunk_kda_wide(q, k, v, g, beta, sign, scale, allow_neg_eigval, cu_seqlens):
+    """FLA's KDA chunk pipeline for keys wider than its wrapper's ``K <= 256``: the
+    state recurrence runs on the wide-key kernels (triadic_wide.py, registered as an
+    FLA backend for K > 256, K-major state layout); FLA's other kernels tile the key
+    dimension themselves."""
+    from fla.ops.kda.chunk import ChunkKDAFunction
+    from fla.ops.kda.implementation import resolve_implementation
+
+    from megatron.core.ssm.triadic_wide import register_wide_key_backend
+
+    register_wide_key_backend()
+    implementation = resolve_implementation(None, q, v, False, None)
+    o, _ = ChunkKDAFunction.apply(
+        q, k, v, g, beta, sign,
+        None, None,          # A_log, dt_bias (gate computed outside the kernel)
+        scale,
+        None, False,         # initial_state, output_final_state
+        False, False, True,  # use_qk_l2norm_in_kernel, use_gate_in_kernel, use_beta_sigmoid
+        allow_neg_eigval,
+        False,               # state_v_first: the wide kernels use the K-major layout
+        cu_seqlens, None,    # cu_seqlens, cu_seqlens_cpu
+        False, None, 64,     # safe_gate, lower_bound, chunk_size
+        False, False,        # disable_recompute, return_intermediate_states
+        None,                # cp_context
+        implementation,
     )
     return o
 
