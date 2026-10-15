@@ -383,6 +383,15 @@ class TransformerConfig(ModelParallelConfig):
     engram_conv_kernel_size: int = 4
     """Kernel of Engram's depthwise causal conv (dilation = the largest n-gram order)."""
 
+    canon_layers: str = ""
+    """Canon layers (Allen-Zhu, Physics of LMs 4.1): any of "ABCD" -- A the token-mixer
+    input, B the attention q/k/v, C the MLP input, D the MLP fc1 output (fused with
+    SwiGLU). Short causal depthwise convolutions with a residual, zero-initialized; see
+    megatron/core/transformer/canon.py."""
+
+    canon_kernel_size: int = 4
+    """Kernel width of the Canon convolutions."""
+
     pkm_heads: int = 4
     """Memory heads of a product-key memory (`P`) layer; their reads are summed."""
 

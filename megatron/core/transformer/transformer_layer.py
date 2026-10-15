@@ -453,6 +453,30 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # move the stream through a sublayer that computes nothing.
         has_attn = not isinstance(self.self_attention, IdentityOp)
         has_mlp = not isinstance(self.mlp, IdentityOp)
+
+        # [Module 9a: Canon A / C] -- the inputs of the mixer / MLP sublayers.
+        self.canon_a = self.canon_c = None
+        canon = getattr(self.config, "canon_layers", "") or ""
+        if ("A" in canon and has_attn) or ("C" in canon and has_mlp):
+            from megatron.core.transformer.canon import Canon
+
+            if self.config.fused_residual_rmsnorm:
+                raise ValueError(
+                    "Canon A/C feed the sublayer, not the residual: they need "
+                    "an unfused input norm (fused_residual_rmsnorm=False)"
+                )
+
+            def _canon():
+                return Canon(
+                    self.config,
+                    self.config.hidden_size,
+                    tp_group=self.pg_collection.tp,
+                    cp_group=self.pg_collection.cp,
+                    sequence_sharded=self.config.sequence_parallel,
+                )
+
+            self.canon_a = _canon() if "A" in canon and has_attn else None
+            self.canon_c = _canon() if "C" in canon and has_mlp else None
         self.ngpt_attn_residual = None
         self.ngpt_mlp_residual = None
         if getattr(self.config, "ngpt", False):
@@ -471,8 +495,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
             if has_attn:
                 self.ngpt_attn_residual = _make_residual(
-                    self.config.ngpt_lerp_normalization_attn
-                    or self.config.ngpt_lerp_normalization,
+                    self.config.ngpt_lerp_normalization_attn or self.config.ngpt_lerp_normalization,
                     self.config.ngpt_post_layer_norm_attn,
                 )
             if has_mlp:
@@ -738,12 +761,19 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         if self.recompute_input_layernorm:
             self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
             with attn_norm_manager as hidden_states:
+                sublayer_input = (
+                    self.canon_a(hidden_states) if self.canon_a is not None else hidden_states
+                )
                 input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
-                    apply_module(self.input_layernorm), hidden_states
+                    apply_module(self.input_layernorm), sublayer_input
                 )
         else:
             with attn_norm_manager as hidden_states:
-                input_layernorm_output = apply_module(self.input_layernorm)(hidden_states)
+                # Canon A changes what the sublayer reads, not the residual.
+                sublayer_input = (
+                    self.canon_a(hidden_states) if self.canon_a is not None else hidden_states
+                )
+                input_layernorm_output = apply_module(self.input_layernorm)(sublayer_input)
 
         if isinstance(input_layernorm_output, tuple):
             if len(input_layernorm_output) != 2:
@@ -1029,12 +1059,19 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         if self.recompute_pre_mlp_layernorm:
             self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
             with self.mlp_norm_manager as hidden_states:
+                sublayer_input = (
+                    self.canon_c(hidden_states) if self.canon_c is not None else hidden_states
+                )
                 pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
-                    apply_module(self.pre_mlp_layernorm), hidden_states
+                    apply_module(self.pre_mlp_layernorm), sublayer_input
                 )
         else:
             with self.mlp_norm_manager as hidden_states:
-                pre_mlp_layernorm_output = apply_module(self.pre_mlp_layernorm)(hidden_states)
+                # Canon C changes what the MLP reads, not the residual.
+                sublayer_input = (
+                    self.canon_c(hidden_states) if self.canon_c is not None else hidden_states
+                )
+                pre_mlp_layernorm_output = apply_module(self.pre_mlp_layernorm)(sublayer_input)
 
         return pre_mlp_layernorm_output
 

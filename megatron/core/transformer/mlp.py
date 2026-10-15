@@ -235,6 +235,31 @@ class MLP(MegatronModule):
         else:
             self.activation_func = self.config.activation_func
 
+        # Canon D: a short causal conv on the fc1 output, fused with SwiGLU when the
+        # activation is plain SwiGLU (canon.py / fused_canon.py). Not for experts: their
+        # tokens arrive in dispatch order, not in sequence order.
+        self.canon_d = None
+        if "D" in (getattr(self.config, "canon_layers", "") or "") and not is_expert:
+            from megatron.core.transformer.canon import Canon
+
+            plain_swiglu = (
+                self.config.gated_linear_unit
+                and self.config.activation_func == F.silu
+                and getattr(self.config, "activation_func_clamp_value", None) is None
+                and not getattr(self.config, "glu_linear_offset", 0.0)
+            )
+            # migration fallback: MLP receives no CP group
+            from megatron.core import parallel_state
+
+            self.canon_d = Canon(
+                self.config,
+                ffn_hidden_size // self.tp_group.size(),
+                tp_group=self.tp_group,
+                cp_group=parallel_state.get_context_parallel_group(check_initialized=False),
+                tp_sharded_channels=True,
+                swiglu=plain_swiglu,
+            )
+
         self.ngpt_suv = None
         if getattr(self.config, "ngpt_use_suv", False):
             from megatron.core.transformer.ngpt import EigenLRScaler
@@ -291,8 +316,18 @@ class MLP(MegatronModule):
                 intermediate_parallel.dtype
             )
 
+        canon_activated = False
+        if self.canon_d is not None:
+            if bias_parallel is not None:
+                intermediate_parallel = intermediate_parallel + bias_parallel
+                bias_parallel = None
+            intermediate_parallel = self.canon_d(intermediate_parallel)
+            canon_activated = self.canon_d.swiglu  # the fused kernel applied SwiGLU too
+
         nvtx_range_push(suffix="activation")
-        if self.config.use_te_activation_func:
+        if canon_activated:
+            pass
+        elif self.config.use_te_activation_func:
             if bias_parallel is not None:
                 intermediate_parallel = intermediate_parallel + bias_parallel
             intermediate_parallel = self.activation_func(intermediate_parallel)
