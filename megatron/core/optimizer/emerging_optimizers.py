@@ -134,8 +134,20 @@ def _create_emerging_optimizer(config, param_groups, eopt_name, model_chunks, pg
 
 
 def _is_nonlinear_or_embedding(param):
-    """True for parameters that should NOT use the emerging optimizer."""
-    return getattr(param, 'is_embedding_or_output_parameter', False) or len(param.shape) != 2
+    """True for parameters that should NOT use the emerging optimizer.
+
+    Besides embeddings and non-matrices, that covers 2-D parameters that are not
+    linear maps: the Engram and product-key-memory lookup tables (embeddings, read
+    sparsely) and parameters tagged ``use_adam_with_emerging_optimizers`` (per-channel
+    conv kernels such as Canon's, and the mHC / routed residual stream mixers).
+    """
+    return (
+        getattr(param, 'is_embedding_or_output_parameter', False)
+        or len(param.shape) != 2
+        or getattr(param, 'is_engram_table', False)
+        or getattr(param, 'is_memory_table', False)
+        or getattr(param, 'use_adam_with_emerging_optimizers', False)
+    )
 
 
 def _get_qkv_split_shapes(model_cfg) -> list[int]:
@@ -1468,7 +1480,9 @@ _EMERGING_OPTIMIZERS.update(
                     predicate=ParamPredicate(
                         name="nonlinear_or_embedding", fn=_is_nonlinear_or_embedding
                     )
-                ): {'optimizer': 'adam'}
+                ): {'optimizer': 'adam'},
+                # Router/gate matrices are small and sensitive, so keep them on Adam.
+                ParamKey(name=('*router.weight', '*gate_weight')): {'optimizer': 'adam'},
             },
         ),
         "adaptive_muon": EmergingOptimizerEntry(
@@ -1506,7 +1520,8 @@ _EMERGING_OPTIMIZERS.update(
                     predicate=ParamPredicate(
                         name="nonlinear_or_embedding", fn=_is_nonlinear_or_embedding
                     )
-                ): {'optimizer': 'adam'}
+                ): {'optimizer': 'adam'},
+                ParamKey(name=('*router.weight', '*gate_weight')): {'optimizer': 'adam'},
             },
         ),
     }

@@ -98,6 +98,8 @@ class Canon(nn.Module):
             # Acts per token: under SP each TP rank sees only its slice of the tokens.
             self.weight.sequence_parallel = config.sequence_parallel
         self.tp_sharded_channels = tp_sharded_channels
+        # A per-channel conv kernel, not a linear map: no Muon-family update.
+        self.weight.use_adam_with_emerging_optimizers = True
 
     def _flat_weight(self):
         return self.weight.reshape(-1, self.k)  # D: [gate | up] channels

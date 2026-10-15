@@ -55,6 +55,8 @@ class RoutedStreamMixer(nn.Module):
         self.b_route = nn.Parameter(torch.zeros(n))
         self.b_post = nn.Parameter(torch.zeros(n))
         self.alpha_post = nn.Parameter(torch.full((1,), alpha_init))
+        # A router (as an MoE router): Adam, also under the Muon-family optimizers.
+        self.phi.use_adam_with_emerging_optimizers = True
         for p in (self.b_route, self.b_post, self.alpha_post):
             p.is_ngpt_scaler = True
         self.reset_parameters()

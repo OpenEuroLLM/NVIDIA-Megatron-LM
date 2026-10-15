@@ -457,6 +457,8 @@ class MHCMixer(nn.Module):
         self.alpha_post = nn.Parameter(torch.full((1,), alpha_init))
         self.alpha_res = nn.Parameter(torch.full((1,), alpha_init))
 
+        # The stream-coefficient projection is not a hidden-to-hidden linear map.
+        self.phi.use_adam_with_emerging_optimizers = True
         for p in (
             self.b_pre,
             self.b_post,
