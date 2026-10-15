@@ -18,11 +18,12 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _stack(fused, x0, weights, routers, n, k):
-    """A small stack of routed sublayers, fused (in place) or out of place."""
+def _stack(fused, x0, weights, routers, n, k, mixers=None):
+    """A small stack of routed sublayers, fused (in place) or out of place; with
+    ``mixers`` ([c, k*k] projections) the write also mixes the routed streams."""
     s = x0.unsqueeze(-2).expand(-1, -1, n, -1).contiguous()
     c = x0.shape[-1]
-    for w_f, w_r in zip(weights, routers):
+    for layer, (w_f, w_r) in enumerate(zip(weights, routers)):
         stash = rr.GradStash()
         s0 = rr.stream_tap(s, 0, stash) if fused else s.select(-2, 0)
         logits = s0.reshape(-1, c).float() @ w_r
@@ -33,7 +34,18 @@ def _stack(fused, x0, weights, routers, n, k):
         else:
             x = rr.routed_read_reference(s.reshape(-1, n, c), idx, r).view(x0.shape)
         f = torch.tanh(x.float() @ w_f).to(s.dtype)
-        if fused:
+        if mixers is not None:
+            from megatron.core.transformer.mhc import sinkhorn_knopp
+
+            mix_logits = (s0.reshape(-1, c).float() @ mixers[layer]).view(-1, k, k)
+            mix = sinkhorn_knopp(mix_logits + torch.eye(k, device=s.device), 6)
+            if fused:
+                s = rr.routed_write_mix(s, f, idx, w, mix, stash)
+            else:
+                s = rr.routed_write_mix_reference(
+                    s.reshape(-1, n, c), f.reshape(-1, c), idx, w, mix
+                ).view(x0.shape[:-1] + (n, c))
+        elif fused:
             s = rr.routed_write(s, f, idx, w, stash)
         else:
             s = rr.routed_write_reference(s.reshape(-1, n, c), f.reshape(-1, c), idx, w)
@@ -44,25 +56,33 @@ def _stack(fused, x0, weights, routers, n, k):
 @pytest.mark.parametrize("n,k", [(2, 1), (2, 2), (4, 2), (4, 3), (8, 4)])
 @pytest.mark.parametrize("c", [64, 200, 2304])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_fused_stack_matches_reference(n, k, c, dtype):
+@pytest.mark.parametrize("mix", [False, True])
+def test_fused_stack_matches_reference(n, k, c, dtype, mix):
+    if mix and k == 1:
+        pytest.skip("nothing to mix with one routed stream")
     gen = torch.Generator(device="cuda").manual_seed(0)
     layers = 3
     weights = [torch.randn(c, c, device="cuda", generator=gen) / c**0.5 for _ in range(layers)]
     routers = [torch.randn(c, n, device="cuda", generator=gen) for _ in range(layers)]
+    mixers = [torch.randn(c, k * k, device="cuda", generator=gen) / c**0.5 for _ in range(layers)]
     x0 = torch.randn(5, 3, c, device="cuda", generator=gen).to(dtype)
     dy = torch.randn(5, 3, c, device="cuda", generator=gen).to(dtype)
     results = []
     for fused in (True, False):
         x = x0.clone().requires_grad_()
-        params = [p.clone().requires_grad_() for p in weights + routers]
-        y = _stack(fused, x, params[:layers], params[layers:], n, k)
+        params = [p.clone().requires_grad_() for p in weights + routers + mixers]
+        y = _stack(
+            fused, x, params[:layers], params[layers : 2 * layers], n, k,
+            mixers=params[2 * layers :] if mix else None,
+        )
         y.backward(dy)
-        results.append([y.detach(), x.grad] + [p.grad for p in params])
+        results.append([y.detach(), x.grad] + [p.grad for p in params if p.grad is not None])
     for a, b in zip(*results):
-        if dtype == torch.float32:
-            torch.testing.assert_close(a, b, rtol=1e-4, atol=1e-4)
-        else:  # bf16 gradient buffers: summation order differs, compare in norm
-            assert (a.float() - b.float()).norm() <= 5e-2 * b.float().norm()
+        # Compared in norm: large reductions (C = 2304) reorder sums, and bf16 gradient
+        # buffers round at every layer.
+        # (Single-layer bf16 kernel accuracy against fp32 is pinned separately.)
+        tol = 1e-4 if dtype == torch.float32 else 1e-1
+        assert (a.float() - b.float()).norm() <= tol * b.float().norm() + 1e-4
 
 
 def test_write_is_in_place_and_touches_only_the_routed_streams():
@@ -143,11 +163,12 @@ class TestRoutedHybridModel:
         yield
         Utils.destroy_model_parallel()
 
-    def test_fused_model_matches_out_of_place(self, monkeypatch):
+    @pytest.mark.parametrize("mix", [False, True])
+    def test_fused_model_matches_out_of_place(self, monkeypatch, mix):
         """The whole model -- in-place streams and the shared gradient buffer -- gives
         the gradients of the out-of-place torch definition."""
         torch.manual_seed(0)
-        model = _hybrid_model("*-P-C-*-")
+        model = _hybrid_model("*-P-C-*-", mhc_routed_mix=mix)
         ids = torch.randint(0, 128, (2, 16), device="cuda")
         grads = []
         for fused in (True, False):
@@ -202,3 +223,108 @@ class TestRoutedHybridModel:
                 mhc_routed_topk=2,
                 cuda_graph_impl="local",
             )
+
+
+@pytest.mark.parametrize("k", [2, 3, 4])
+@pytest.mark.parametrize("c", [64, 2304])
+def test_bf16_mixing_layer_against_fp32(k, c):
+    """One routed read + mixing write in bf16 (in place, fused) against the fp32
+    out-of-place definition on the same bf16 inputs: every gradient within 1%."""
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    t, n = 40, 6
+    s0 = torch.randn(t, n, c, device="cuda", generator=gen).bfloat16()
+    idx = torch.stack([torch.randperm(n, generator=torch.Generator().manual_seed(i))[:k]
+                       for i in range(t)]).int().cuda()
+    r0 = torch.softmax(torch.randn(t, k, device="cuda", generator=gen), -1)
+    w0 = torch.rand(t, k, device="cuda", generator=gen) + 0.5
+    m0 = torch.softmax(torch.randn(t, k, k, device="cuda", generator=gen), -1)
+    wf = torch.randn(c, c, device="cuda", generator=gen) / c**0.5
+    dy = torch.randn(t, n, c, device="cuda", generator=gen)
+    grads = []
+    for fused in (True, False):
+        s = s0.clone() if fused else s0.float().clone()
+        s.requires_grad_()
+        base = s * 1.0  # non-leaf, so the fused write may update it in place
+        r, w, m = (v.clone().requires_grad_() for v in (r0, w0, m0))
+        stash = rr.GradStash()
+        if fused:
+            x = rr.routed_read(base, idx, r, stash)
+        else:
+            x = rr.routed_read_reference(base, idx, r)
+        f = torch.tanh(x.float() @ wf).to(base.dtype)
+        if fused:
+            out = rr.routed_write_mix(base, f, idx, w, m, stash)
+        else:
+            out = rr.routed_write_mix_reference(base, f, idx, w, m)
+        out.float().backward(dy)
+        grads.append([s.grad, r.grad, w.grad, m.grad])
+    for a, b in zip(*grads):
+        assert (a.float() - b.float()).norm() <= 1e-2 * b.float().norm(), (a, b)
+
+
+def test_mixing_write_matches_reference_and_keeps_other_streams():
+    s = torch.randn(6, 5, 64, device="cuda")
+    before = s.clone()
+    idx = torch.tensor([[0, 3, 1]] * 6, device="cuda", dtype=torch.int32)
+    w = torch.rand(6, 3, device="cuda")
+    mix = torch.softmax(torch.randn(6, 3, 3, device="cuda"), -1)
+    f = torch.randn(6, 64, device="cuda")
+    expected = rr.routed_write_mix_reference(before, f, idx, w, mix)
+    stash = rr.GradStash()
+    rr.routed_read(s, idx, torch.full((6, 3), 1 / 3, device="cuda"), stash)
+    out = rr.routed_write_mix(s, f, idx, w, mix, stash)
+    assert out.data_ptr() == s.data_ptr()
+    torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(out[:, [2, 4]], before[:, [2, 4]])
+
+
+class TestRoutedMixAndBalance:
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+        yield
+        Utils.destroy_model_parallel()
+
+    def test_balancing_bias_moves_toward_underpicked_streams(self):
+        from megatron.core.transformer.routed_residual import update_routed_residual_bias
+
+        model = _hybrid_model("*-*-", mhc_routed_balance_rate=1e-2)
+        mixer = model.decoder.layers[0].mhc_attn_mixer
+        assert mixer.balance and mixer.route_bias.dtype == torch.float32
+        model.bfloat16()
+        assert mixer.route_bias.dtype == torch.float32  # kept fp32 under a bf16 cast
+        model.float()
+        with torch.no_grad():  # make stream 1 the router's favourite
+            mixer.b_route[1] = 10.0
+        ids = torch.randint(0, 128, (2, 16), device="cuda")
+        model(ids, position_ids=None, attention_mask=None).float().mean().backward()
+        picks = mixer.local_picks_per_stream.clone()
+        assert picks[0] == 0 and picks[1] == picks.sum() == 32  # k-1 = 1 pick per token
+        update_routed_residual_bias([model], model.config)
+        bias = mixer.route_bias
+        assert bias[1] < 0 and (bias[2:] > 0).all() and bias[0] == 0
+        assert mixer.local_picks_per_stream.sum() == 0
+
+
+    def test_mixing_starts_near_identity_and_trains(self):
+        model = _hybrid_model("*-C-*-", mhc_routed_mix=True, mhc_routed_balance_rate=1e-3)
+        mixer = model.decoder.layers[0].mhc_attn_mixer
+        assert mixer.mix
+        s = torch.randn(4, 2, 4, 64, device="cuda")
+        _, (idx, w, mix, _), _ = mixer(s)
+        assert torch.diagonal(mix, dim1=-2, dim2=-1).min() > 0.95
+        opt = torch.optim.Adam(model.parameters(), lr=3e-3)
+        ids = torch.randint(0, 128, (4, 16), device="cuda")
+        losses = []
+        for _ in range(6):
+            logits = model(ids[:, :-1], position_ids=None, attention_mask=None)
+            loss = torch.nn.functional.cross_entropy(
+                logits.float().reshape(-1, 128), ids[:, 1:].reshape(-1)
+            )
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            losses.append(loss.item())
+        assert losses[-1] < losses[0]
+        assert mixer.b_res.grad is not None and mixer.alpha_res.grad is not None

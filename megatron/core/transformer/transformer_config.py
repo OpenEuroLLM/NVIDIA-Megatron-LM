@@ -1776,6 +1776,16 @@ class TransformerConfig(ModelParallelConfig):
     mixing, so it moves (2k+1) of the n streams instead of all of them. 0 is dense mHC.
     Requires mhc=True; not combinable with mhc_lerp."""
 
+    mhc_routed_mix: bool = False
+    """Routed residual streams: also mix the k selected streams with a per-token doubly
+    stochastic [k, k] matrix (mHC's H_res restricted to the selection), initialized near
+    the identity. Memory traffic stays (2k+1) of the n streams."""
+
+    mhc_routed_balance_rate: float = 0.0
+    """Routed residual streams: update rate of the aux-loss-free selection bias that
+    balances how often each stream is picked (as moe_router_bias_update_rate; 1e-3 is
+    DeepSeek-V3's). 0 disables."""
+
     ####################
     # Block Attention Residuals
     ####################
@@ -1846,6 +1856,9 @@ class TransformerConfig(ModelParallelConfig):
                 )
             if self.mhc_lerp:
                 raise ValueError("mhc_routed_topk is not combinable with mhc_lerp")
+        elif self.mhc_routed_mix or self.mhc_routed_balance_rate:
+            raise ValueError("mhc_routed_mix / mhc_routed_balance_rate need mhc_routed_topk > 0")
+        if self.mhc_routed_topk:
             if self.cuda_graph_impl != "none" or self.enable_cuda_graph:
                 # The per-step routing state (and the shared gradient buffer) lives in
                 # Python objects a captured graph would freeze.

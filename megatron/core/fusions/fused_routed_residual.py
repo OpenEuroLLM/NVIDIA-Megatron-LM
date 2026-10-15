@@ -24,6 +24,13 @@ and each sublayer touches ``(2k + 1) C`` of it -- no full-size zero fill and no
 full-size gradient sum. All tensors are taken as they are (no reshape views:
 an in-place write through a view would make autograd copy the whole gradient).
 
+Mixing. With a per-token ``[k, k]`` matrix ``M`` (doubly stochastic, as mHC's
+``H_res`` but over the routed streams only) the write becomes
+``streams[t, idx_j] <- sum_i M[t, j, i] streams[t, idx_i] + w[t, j] f[t]``: still
+``2k C`` elements moved, and the backward needs the pre-write rows, which the read
+already keeps (shared through the stash, not saved twice). Its backward turns the
+stream gradient of the routed rows into ``M^T g`` in place.
+
 ``*_reference`` are the out-of-place torch definitions the kernels are tested
 against.
 """
@@ -45,6 +52,15 @@ def routed_read_reference(streams, idx, r):
     """``streams`` [T, n, C], ``idx`` [T, k], ``r`` [T, k] -> ``x`` [T, C]."""
     rows = torch.gather(streams, 1, idx.long().unsqueeze(-1).expand(-1, -1, streams.shape[-1]))
     return (rows.float() * r.float().unsqueeze(-1)).sum(1).to(streams.dtype)
+
+
+def routed_write_mix_reference(streams, f, idx, w, mix):
+    """Out-of-place ``streams[t, idx_j] = sum_i mix[t, j, i] streams[t, idx_i] + w_j f``."""
+    index = idx.long().unsqueeze(-1).expand(-1, -1, streams.shape[-1])
+    rows = torch.gather(streams, 1, index).float()  # [T, k, C]
+    new = torch.einsum("tji,tic->tjc", mix.float(), rows)
+    new = new + w.float().unsqueeze(-1) * f.float().unsqueeze(1)
+    return streams.scatter(1, index, new.to(streams.dtype))
 
 
 def routed_write_reference(streams, f, idx, w):
@@ -134,6 +150,72 @@ if HAVE_TRITON:
         tl.store(dw_ptr + t * K + lanes, dots, mask=lanes < K)
 
 
+if HAVE_TRITON:
+
+    @triton.jit
+    def _write_mix_fwd(
+        s_ptr, f_ptr, idx_ptr, w_ptr, m_ptr, N, C,
+        K: tl.constexpr, KP: tl.constexpr, BLOCK: tl.constexpr,
+    ):
+        # All k rows of this channel block are loaded before any is stored, so the
+        # in-place update reads only pre-write values.
+        t = tl.program_id(0).to(tl.int64)
+        cb = tl.program_id(1)
+        c = cb * BLOCK + tl.arange(0, BLOCK)
+        cm = c < C
+        j = tl.arange(0, KP)
+        jm = j < K
+        idx = tl.load(idx_ptr + t * K + j, mask=jm, other=0).to(tl.int64)
+        w = tl.load(w_ptr + t * K + j, mask=jm, other=0.0).to(tl.float32)
+        mm = jm[:, None] & jm[None, :]
+        m = tl.load(m_ptr + t * K * K + j[:, None] * K + j[None, :], mask=mm, other=0.0)
+        m = m.to(tl.float32)
+        offs = (t * N + idx)[:, None] * C + c[None, :]
+        rm = jm[:, None] & cm[None, :]
+        rows = tl.load(s_ptr + offs, mask=rm, other=0.0).to(tl.float32)  # [KP, BLOCK]
+        f = tl.load(f_ptr + t * C + c, mask=cm, other=0.0).to(tl.float32)
+        new = tl.sum(m[:, :, None] * rows[None, :, :], axis=1) + w[:, None] * f[None, :]
+        tl.store(s_ptr + offs, new.to(s_ptr.dtype.element_ty), mask=rm)
+
+    @triton.jit
+    def _write_mix_bwd(
+        g_ptr, rows_ptr, f_ptr, idx_ptr, w_ptr, m_ptr, df_ptr, dw_ptr, dm_ptr, N, C,
+        K: tl.constexpr, KP: tl.constexpr, BLOCK: tl.constexpr,
+    ):
+        t = tl.program_id(0).to(tl.int64)
+        j = tl.arange(0, KP)
+        jm = j < K
+        idx = tl.load(idx_ptr + t * K + j, mask=jm, other=0).to(tl.int64)
+        w = tl.load(w_ptr + t * K + j, mask=jm, other=0.0).to(tl.float32)
+        mm = jm[:, None] & jm[None, :]
+        m = tl.load(m_ptr + t * K * K + j[:, None] * K + j[None, :], mask=mm, other=0.0)
+        m = m.to(tl.float32)
+        dm = tl.zeros([KP, KP], dtype=tl.float32)
+        dw = tl.zeros([KP], dtype=tl.float32)
+        for c0 in range(0, C, BLOCK):
+            c = c0 + tl.arange(0, BLOCK)
+            cm = c < C
+            rm = jm[:, None] & cm[None, :]
+            goffs = (t * N + idx)[:, None] * C + c[None, :]
+            g = tl.load(g_ptr + goffs, mask=rm, other=0.0).to(tl.float32)  # [KP(j), BLOCK]
+            roffs = (t * K + j)[:, None] * C + c[None, :]
+            rows = tl.load(rows_ptr + roffs, mask=rm, other=0.0).to(tl.float32)  # [KP(i), BLOCK]
+            f = tl.load(f_ptr + t * C + c, mask=cm, other=0.0).to(tl.float32)
+            dm += tl.sum(g[:, None, :] * rows[None, :, :], axis=2)  # dM[j, i] = <g_j, s_i>
+            dw += tl.sum(g * f[None, :], axis=1)
+            df = tl.sum(w[:, None] * g, axis=0)
+            tl.store(df_ptr + t * C + c, df.to(df_ptr.dtype.element_ty), mask=cm)
+            ds = tl.sum(m[:, :, None] * g[:, None, :], axis=0)  # (M^T g)_i
+            tl.store(g_ptr + goffs, ds.to(g_ptr.dtype.element_ty), mask=rm)
+        tl.store(dw_ptr + t * K + j, dw, mask=jm)
+        tl.store(dm_ptr + t * K * K + j[:, None] * K + j[None, :], dm, mask=mm)
+
+
+def _mix_block(c: int, kp: int) -> int:
+    # [KP, KP, BLOCK] register tiles: keep them around 4k elements.
+    return max(16, min(triton.next_power_of_2(c), 4096 // (kp * kp)))
+
+
 def _block(c: int) -> int:
     return min(1024, triton.next_power_of_2(c))
 
@@ -152,10 +234,11 @@ def _own(grad: torch.Tensor) -> torch.Tensor:
 class GradStash:
     """The stream gradient of one sublayer, shared by its tap, read and write."""
 
-    __slots__ = ("grad",)
+    __slots__ = ("grad", "rows")
 
     def __init__(self):
         self.grad = None
+        self.rows = None  # the read's gathered pre-write rows, for a mixing write
 
 
 def _dims(streams):
@@ -175,6 +258,7 @@ class _StreamTap(torch.autograd.Function):
             # The router's input is computed from the tap, so this backward is the
             # sublayer's last: release the buffer.
             grad, ctx.stash.grad = ctx.stash.grad, None
+            ctx.stash.rows = None
             grad.select(-2, ctx.main).add_(ds0)
             return None, None, None
         ds = ds0.new_zeros(ctx.shape)
@@ -193,6 +277,7 @@ class _RoutedRead(torch.autograd.Function):
         _read_fwd[(t, triton.cdiv(c, block))](streams, idx, r, x, rows, n, c, K=k, BLOCK=block)
         ctx.save_for_backward(rows, idx, r)
         ctx.n, ctx.stash, ctx.shape = n, stash, streams.shape
+        stash.rows = rows
         return x
 
     @staticmethod
@@ -233,6 +318,42 @@ class _RoutedWrite(torch.autograd.Function):
         return g, df, None, dw.to(w.dtype), None
 
 
+class _RoutedWriteMix(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, streams, f, idx, w, mix, stash):
+        t, n, c = _dims(streams)
+        k = idx.shape[-1]
+        kp = triton.next_power_of_2(k)
+        block = _mix_block(c, kp)
+        f = f.contiguous()
+        _write_mix_fwd[(t, triton.cdiv(c, block))](
+            streams, f, idx, w, mix, n, c, K=k, KP=kp, BLOCK=block
+        )
+        ctx.mark_dirty(streams)
+        ctx.save_for_backward(f, idx, w, mix)
+        ctx.n, ctx.stash = n, stash
+        return streams
+
+    @staticmethod
+    def backward(ctx, g):
+        f, idx, w, mix = ctx.saved_tensors
+        rows = ctx.stash.rows
+        if rows is None:
+            raise RuntimeError("a mixing routed write needs the routed read of its sublayer")
+        c = f.shape[-1]
+        t, k = idx.shape
+        kp = triton.next_power_of_2(k)
+        g = _own(g)
+        df = torch.empty_like(f)
+        dw = torch.empty(t, k, dtype=torch.float32, device=f.device)
+        dm = torch.empty(t, k, k, dtype=torch.float32, device=f.device)
+        _write_mix_bwd[(t,)](
+            g, rows, f, idx, w, mix, df, dw, dm, ctx.n, c, K=k, KP=kp, BLOCK=_mix_block(c, kp)
+        )
+        ctx.stash.grad = g
+        return g, df, None, dw.to(w.dtype), dm.to(mix.dtype), None
+
+
 def _fused(streams):
     return HAVE_TRITON and streams.is_cuda and streams.is_contiguous()
 
@@ -266,19 +387,46 @@ def routed_write(
     return out.view(streams.shape)
 
 
+def routed_write_mix(
+    streams: torch.Tensor,
+    f: torch.Tensor,
+    idx: torch.Tensor,
+    w: torch.Tensor,
+    mix: torch.Tensor,
+    stash: GradStash,
+) -> torch.Tensor:
+    """``streams[t, idx_j] = sum_i mix[t, j, i] streams[t, idx_i] + w[t, j] f[t]`` -- in
+    place when the kernel runs (after the sublayer's :func:`routed_read`)."""
+    if _fused(streams):
+        return _RoutedWriteMix.apply(
+            streams, f, idx.int().contiguous(), w.float().contiguous(),
+            mix.float().contiguous(), stash,
+        )
+    n, c = streams.shape[-2:]
+    out = routed_write_mix_reference(
+        streams.reshape(-1, n, c), f.reshape(-1, c), idx, w, mix
+    )
+    return out.view(streams.shape)
+
+
 def route_streams(
-    logits: torch.Tensor, k: int, main: Optional[int] = 0
+    logits: torch.Tensor,
+    k: int,
+    main: Optional[int] = 0,
+    select_bias: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Stream ``main`` plus the top-(k-1) others by ``logits`` [T, n].
 
     Returns ``(idx [T, k] int32, read weights [T, k])``, the read weights a softmax
     over the selected logits (a convex combination, as mHC's read; the router learns
-    through them, as an MoE gate does).
+    through them, as an MoE gate does). ``select_bias`` [n] shifts only the selection
+    (the aux-loss-free balancing bias), not the read weights.
     """
     t, n = logits.shape
     if not 1 <= k <= n:
         raise ValueError(f"routed top-k must be in [1, {n}], got {k}")
-    others = torch.cat([logits[:, :main], logits[:, main + 1 :]], dim=1)
+    scores = logits.detach() if select_bias is None else logits.detach() + select_bias
+    others = torch.cat([scores[:, :main], scores[:, main + 1 :]], dim=1)
     if k > 1:
         top = others.topk(k - 1, dim=-1).indices
         top = top + (top >= main).long()  # back to stream numbering

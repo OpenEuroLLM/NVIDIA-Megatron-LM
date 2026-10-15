@@ -675,6 +675,17 @@ def finalize_model_grads(
             )
         _update_router_expert_bias(model, config, tp_dp_cp_group=tp_dp_cp_group)
 
+    if getattr(config, "mhc_routed_balance_rate", 0.0):
+        from megatron.core.transformer.routed_residual import update_routed_residual_bias
+
+        if pg_collection is not None and getattr(pg_collection, "tp_dp_cp", None) is not None:
+            balance_group = pg_collection.tp_dp_cp
+        else:
+            balance_group = parallel_state.get_tensor_and_data_parallel_group(
+                with_context_parallel=True
+            )
+        update_routed_residual_bias(model, config, tp_dp_cp_group=balance_group)
+
     if config.moe_router_load_balancing_type == "quantile_balancing":
         _update_router_qb_beta(model, config, dp_cp_group=dp_cp_group)
 
