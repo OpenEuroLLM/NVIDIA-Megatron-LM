@@ -347,9 +347,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             grad = self.scaled_orthogonalize_fn_with_gtp_remat(p, grad, tp_group, partition_dim)
         return grad
 
-    def _tp_row_reduce_group(
-        self, p: torch.Tensor
-    ) -> Optional["torch.distributed.ProcessGroup"]:
+    def _tp_row_reduce_group(self, p: torch.Tensor) -> Optional["torch.distributed.ProcessGroup"]:
         """Return the TP group used for per-row reductions, if any."""
         return None
 
@@ -393,13 +391,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
 
         reduce_group = self._tp_row_reduce_group(p)
         qkv_split_shapes = self._effective_qkv_split_shapes(p)
-        key = (
-            tuple(p.shape),
-            partition_dim,
-            id(tp_group),
-            id(reduce_group),
-            qkv_split_shapes,
-        )
+        key = (tuple(p.shape), partition_dim, id(tp_group), id(reduce_group), qkv_split_shapes)
         return key, {
             "tp_group": tp_group,
             "reduce_group": reduce_group,
@@ -440,9 +432,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             )
         num_query_groups = rows // split_rows
         qkv = torch.split(
-            update.view(batch_size, num_query_groups, split_rows, cols),
-            qkv_split_shapes,
-            dim=2,
+            update.view(batch_size, num_query_groups, split_rows, cols), qkv_split_shapes, dim=2
         )
         outputs = [
             self._scaled_ns_batched(part.reshape(batch_size, -1, cols), batch).view(
@@ -739,9 +729,7 @@ def _batched_newton_schulz(
     # Per-matrix spectral-norm bound via Frobenius normalization.
     if is_tp and tp_mode == "distributed":
         x_sq_sum = (x * x).sum(dim=(-2, -1), keepdim=True)
-        torch.distributed.all_reduce(
-            x_sq_sum, op=torch.distributed.ReduceOp.SUM, group=tp_group
-        )
+        torch.distributed.all_reduce(x_sq_sum, op=torch.distributed.ReduceOp.SUM, group=tp_group)
         X = x / x_sq_sum.sqrt().clamp_min(eps)
         ns_group = tp_group
     else:
@@ -1000,9 +988,7 @@ class TensorParallelAngularMuown(TensorParallelMuon):
             return 1.0
         return (1.0 + self._u_decay_scale * steps_after_warmup) ** (-self._u_decay_p)
 
-    def _tp_row_reduce_group(
-        self, p: torch.Tensor
-    ) -> Optional["torch.distributed.ProcessGroup"]:
+    def _tp_row_reduce_group(self, p: torch.Tensor) -> Optional["torch.distributed.ProcessGroup"]:
         """Return the TP group to all-reduce per-row scalars over, or ``None``.
 
         The ``g`` seed, the row gradient ``grad_g``, and the ``u_step``
@@ -1027,9 +1013,7 @@ class TensorParallelAngularMuown(TensorParallelMuon):
         if getattr(p, "partition_dim", None) != 1:
             return None
         tp_group = (
-            self.pg_collection.expt_tp
-            if getattr(p, "expert_tp", False)
-            else self.pg_collection.tp
+            self.pg_collection.expt_tp if getattr(p, "expert_tp", False) else self.pg_collection.tp
         )
         if get_pg_size(tp_group) <= 1:
             return None
@@ -1188,8 +1172,14 @@ class TensorParallelAngularMuown(TensorParallelMuon):
                 return buf, list(buf.unbind(0))
 
             bufs = {}
-            for name, c in (("w", cols), ("grad", cols), ("m_u", cols),
-                            ("g", 1), ("m_g", 1), ("v_g", 1)):
+            for name, c in (
+                ("w", cols),
+                ("grad", cols),
+                ("m_u", cols),
+                ("g", 1),
+                ("m_g", 1),
+                ("v_g", 1),
+            ):
                 bufs[name], bufs[name + "_views"] = _mk(c)
             self._batch_buffers[cache_key] = bufs
         return bufs
@@ -1208,13 +1198,7 @@ class TensorParallelAngularMuown(TensorParallelMuon):
             static_key, metadata = self._batch_key_for(p)
             key = static_key + (state["step"],)
             batch = batches.setdefault(
-                key,
-                {
-                    **metadata,
-                    "params": [],
-                    "static_key": static_key,
-                    "step": state["step"],
-                },
+                key, {**metadata, "params": [], "static_key": static_key, "step": state["step"]}
             )
             batch["params"].append(p)
         for batch in batches.values():
@@ -1430,6 +1414,34 @@ def _muown_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, An
             )
 
         kwargs["orthogonalize_fn"] = _tp_orthogonalize
+
+    if pg_collection is not None:
+
+        def _tp_group(param):
+            return pg_collection.expt_tp if getattr(param, 'expert_tp', False) else pg_collection.tp
+
+        def _row_sum(partial, param):
+            # Column-sharded weights (RowParallelLinear: linear_proj / linear_fc2 / MoE
+            # down-proj) hold a column slice of every row.
+            group = _tp_group(param)
+            if getattr(param, "partition_dim", None) != 1 or get_pg_size(group) <= 1:
+                return partial
+            partial = partial.contiguous()
+            torch.distributed.all_reduce(partial, group=group)
+            return partial
+
+        def _tp_shape(param):
+            rows, cols = param.shape[-2:]
+            size = get_pg_size(_tp_group(param))
+            if size > 1 and getattr(param, "tensor_model_parallel", False):
+                if getattr(param, "partition_dim", None) == 0:
+                    rows *= size
+                elif getattr(param, "partition_dim", None) == 1:
+                    cols *= size
+            return rows, cols
+
+        kwargs["row_sum_fn"] = _row_sum
+        kwargs["tp_shape_fn"] = _tp_shape
     return kwargs
 
 

@@ -115,6 +115,13 @@ class Muown(torch.optim.Optimizer):
         eps: Numerical floor.
         orthogonalize_fn: Optional override for the orthogonalization routine,
             used to plug in a tensor-parallel-aware Newton-Schulz.
+        row_sum_fn: ``(partial_row_sums, param) -> row_sums``. Under tensor
+            parallelism a column-sharded weight (``partition_dim == 1``) holds a
+            column slice of every row, so each per-row reduction (row norm, radial
+            component, renormalization) is a partial sum to be all-reduced across
+            the TP group. None (single process) uses the local sums.
+        tp_shape_fn: ``param -> (rows, cols)`` of the unsharded matrix, for the
+            spectral scale. None uses the local shape.
     """
 
     def __init__(
@@ -131,6 +138,8 @@ class Muown(torch.optim.Optimizer):
         max_row_norm: float | None = None,
         eps: float = 1e-8,
         orthogonalize_fn: Callable[..., torch.Tensor] | None = None,
+        row_sum_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
+        tp_shape_fn: Callable[[torch.Tensor], tuple] | None = None,
     ) -> None:
         if num_ns_steps < 1:
             raise ValueError(f"num_ns_steps must be at least 1, got {num_ns_steps}")
@@ -152,6 +161,8 @@ class Muown(torch.optim.Optimizer):
         self._orthogonalize_fn = orthogonalize_fn or (
             lambda g, steps=5, **_: newton_schulz(g, steps=steps)
         )
+        self._row_sum = row_sum_fn or (lambda t, _p: t)
+        self._tp_shape = tp_shape_fn
         log_single_rank(logger, logging.INFO, "[Muown] initialized row-norm-controlled Muon")
 
     def _orthogonalize(self, grad: torch.Tensor, param: torch.Tensor, steps: int) -> torch.Tensor:
@@ -195,11 +206,12 @@ class Muown(torch.optim.Optimizer):
                 w = p.data.float()
 
                 # --- decompose W into row magnitude m and unit-row direction D ---
-                m = w.norm(dim=-1, keepdim=True).clamp(min=eps)
+                # Row reductions go through _row_sum: partial under column sharding.
+                m = self._row_sum(w.square().sum(dim=-1, keepdim=True), p).sqrt().clamp(min=eps)
                 d = w / m
 
                 # Radial component moves the magnitude; the remainder rotates D.
-                radial = (grad * d).sum(dim=-1, keepdim=True)
+                radial = self._row_sum((grad * d).sum(dim=-1, keepdim=True), p)
                 tangential = grad - radial * d
 
                 state = self.state[p]
@@ -228,12 +240,13 @@ class Muown(torch.optim.Optimizer):
                 # --- direction: Muon (orthogonalized) step, then renormalize ---
                 ortho = self._orthogonalize(dir_update, p, steps)
                 if group["scale_mode"] == "spectral":
-                    scale = max(ortho.shape[-2], ortho.shape[-1]) ** 0.5
+                    rows, cols = self._tp_shape(p) if self._tp_shape else ortho.shape[-2:]
+                    scale = max(rows, cols) ** 0.5
                 else:
                     scale = 1.0
                 scale *= group["extra_scale_factor"]
                 d = d - lr * scale * ortho
-                d = d / d.norm(dim=-1, keepdim=True).clamp(min=eps)
+                d = d / self._row_sum(d.square().sum(dim=-1, keepdim=True), p).sqrt().clamp(min=eps)
 
                 # --- magnitude: l-infinity steepest descent == sign step ---
                 m = m - mag_lr * torch.sign(mag_update)
