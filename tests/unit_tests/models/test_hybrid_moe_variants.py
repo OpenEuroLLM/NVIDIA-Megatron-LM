@@ -180,3 +180,25 @@ def test_muon_family_leaves_routers_tables_and_convs_to_adam(optimizer):
             s in n for s in ("linear_qkv.weight", "linear_proj.weight", "linear_fc1.weight")
         ):
             assert n not in adam, n
+
+
+@pytest.mark.parametrize("shared", ["routed_only", "shared"])
+def test_latent_moe_trains(shared):
+    """Latent MoE (moe_latent_size): tokens are projected down before dispatch, the
+    experts run at the latent width, the combine is projected back; the router and the
+    shared expert see the full hidden state."""
+    pattern = "*E*E"
+    config = _config(pattern, moe_latent_size=32, **SHARED[shared], **BALANCE["aux_loss_and_bias"])
+    model = _model(config, pattern)
+    moe = [m for m in model.modules() if hasattr(m, "fc1_latent_proj")]
+    assert len(moe) == 2
+    names = dict(model.named_parameters())
+    fc1 = [n for n in names if "experts" in n and "shared" not in n and n.endswith("weight1")
+           or ("experts" in n and "linear_fc1" in n and "shared" not in n)]
+    assert fc1 and all(32 in names[n].shape for n in fc1)  # experts read the latent width
+    ids = torch.randint(0, VOCAB, (2, 16), device="cuda")
+    logits = model(ids, position_ids=None, attention_mask=None)
+    assert torch.isfinite(logits).all()
+    logits.float().logsumexp(-1).mean().backward()
+    missing = [n for n, p in model.named_parameters() if p.requires_grad and p.grad is None]
+    assert not missing, missing
