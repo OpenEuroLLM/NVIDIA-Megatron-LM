@@ -491,6 +491,16 @@ class TransformerConfig(ModelParallelConfig):
     """panini only: the same for the VALUE gate. None follows
     linear_fla_gate_init_style, which is FLA's own behaviour."""
 
+    linear_fla_megatron_init: bool = False
+    """Re-initialize the projections of the self-contained FLA layers (kda, signed_kda,
+    panini, complex_kda and its gated NoPE attention) the Megatron way: every
+    ``nn.Linear`` weight with ``init_method``, the output projection ``o_proj`` with
+    ``output_layer_init_method``. FLA's own layers keep PyTorch's default init, whose
+    output projection is ~7x larger than Megatron's scaled init, so at the start of
+    training these mixers write much more into the residual stream than the other
+    mixers do. Gate parameters (A_log, dt_bias) and biases keep FLA's init. Off by
+    default so earlier runs stay reproducible."""
+
     linear_fla_torch_compile: bool = False
     """Wrap the FLA layer's forward in torch.compile to fuse the gate/projection
     epilogues that sit around the Triton kernel.

@@ -71,6 +71,23 @@ except ImportError:
     _FLAPanini = None
 
 
+def megatron_init_fla_layer(layer: torch.nn.Module, config: TransformerConfig) -> None:
+    """Re-initialize an FLA layer's projections with Megatron's init methods.
+
+    See ``TransformerConfig.linear_fla_megatron_init``. Runs before the layer is
+    replicated across TP, which broadcasts rank 0's values.
+    """
+    if not getattr(config, "linear_fla_megatron_init", False) or not config.perform_initialization:
+        return
+    with torch.no_grad():
+        for name, module in layer.named_modules():
+            if isinstance(module, torch.nn.Linear):
+                if name.split(".")[-1] == "o_proj":
+                    config.output_layer_init_method(module.weight)
+                else:
+                    config.init_method(module.weight)
+
+
 def _declared_kwargs(cls, kwargs):
     """``kwargs``, refusing any the constructor does not declare.
 
@@ -183,6 +200,7 @@ class _FLALayerWrapper(MegatronModule):
             )
 
         self.layer = self._build(config, head_dim, num_heads, layer_number)
+        megatron_init_fla_layer(self.layer, config)
         self._retune_signed_gate_init(config, layer_number)
         # Match the surrounding model's dtype; the FLA layers build in fp32.
         if config.bf16:

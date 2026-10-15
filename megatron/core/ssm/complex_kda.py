@@ -111,6 +111,9 @@ class _MegatronSelfAttentionAdapter(MegatronModule):
 
     def _replicate(self):
         """Called by subclasses once ``self.layer`` exists."""
+        from megatron.core.ssm.fla_hybrid import megatron_init_fla_layer
+
+        megatron_init_fla_layer(self.layer, self.config)
         replicate_across_tp(self.layer, self.tp_group)
 
     def forward(
