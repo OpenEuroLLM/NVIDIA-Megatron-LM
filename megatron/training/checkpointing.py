@@ -504,6 +504,16 @@ def _build_sharded_state_dict_metadata(
         else:
             metadata['distrib_optim_sharding_type'] = 'dp_reshardable'
 
+    if (
+        not has_distributed_optimizer
+        and args.ckpt_format != 'fsdp_dtensor'
+        and getattr(args, 'dist_ckpt_optim_fully_reshardable', False)
+    ):
+        # The non-distributed (Float16 / chained emerging) optimizers have a fully
+        # reshardable, param-keyed format too; without this the flag was dropped and
+        # their checkpoints could not change the expert-parallel layout.
+        metadata['distrib_optim_sharding_type'] = 'fully_reshardable'
+
     metadata['singleton_local_shards'] = False
     metadata['chained_optim_avoid_prefix'] = True
     # Add dp_cp_group to metadata. If not provided, fallback to global parallel state.

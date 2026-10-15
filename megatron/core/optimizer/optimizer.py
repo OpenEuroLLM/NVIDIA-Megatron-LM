@@ -1811,13 +1811,24 @@ class ChainedOptimizer(MegatronOptimizer):
             # the dist-checkpoint layout below can be re-split.
             return state_dict
 
-        def is_saved_entry(entry):
+        def is_leaf_entry(entry):
             # A saved optimizer's common state: DistributedOptimizer ('optimizer') or
             # the param-keyed Float16Optimizer format ('param_keyed').
             return isinstance(entry, dict) and ('optimizer' in entry or 'param_keyed' in entry)
 
-        saved_single = is_saved_entry(state_dict)
+        def is_saved_entry(entry):
+            # A leaf, or a nested chain holding saved states (a LayerWiseDistributed-
+            # Optimizer next to the Engram table optimizer saves {0: {0: .., 1: ..}, 1: ..}).
+            if is_leaf_entry(entry):
+                return True
+            return isinstance(entry, dict) and any(
+                is_saved_entry(v) for k, v in entry.items() if isinstance(k, int)
+            )
+
+        saved_single = is_leaf_entry(state_dict)
         int_keys = sorted(k for k in state_dict if isinstance(k, int))
+        # The current layout's keys are merged in on loading: count only entries that
+        # carry saved state.
         saved = (
             [state_dict]
             if saved_single
@@ -1825,6 +1836,11 @@ class ChainedOptimizer(MegatronOptimizer):
         )
         if len(saved) == n or n == 0:
             return state_dict
+        if not all(is_leaf_entry(entry) for entry in saved):
+            raise RuntimeError(
+                f'The checkpoint has {len(saved)} chained optimizer state(s), this run has '
+                f'{n}, and nested chains cannot be re-split.'
+            )
         param_keyed = all(entry.get('param_keyed') for entry in saved)
         for entry in saved:
             if not param_keyed and entry.get('param_state_sharding_type') != 'fully_reshardable':
