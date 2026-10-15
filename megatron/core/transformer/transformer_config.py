@@ -292,7 +292,10 @@ class TransformerConfig(ModelParallelConfig):
     # attention variant
     ####################
     experimental_attention_variant: Optional[
-        Literal['gated_delta_net', 'mlstm', 'mamba', 'dsa', 'kda', 'signed_kda', 'panini', 'complex_kda']
+        Literal[
+            'gated_delta_net', 'mlstm', 'mamba', 'dsa', 'kda', 'signed_kda', 'panini', 'complex_kda',
+            'triadic',
+        ]
     ] = None
     """Type of attention variant to use. Currently support gated_delta_net, mlstm,
     dsa, the FLA hybrids (kda, signed_kda, panini) and complex_kda."""
@@ -461,6 +464,14 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     linear_fla_expand_v: float = 1.0
     """Value-dim expansion for the FLA hybrid layers (expand_v)."""
+
+    linear_triadic_e: int = 2
+    """Triadic linear attention (variant "triadic", megatron/core/ssm/triadic.py): E, the
+    number of state slices per head (the second key's width); 1 is the base mixer."""
+
+    linear_triadic_base: str = "kda"
+    """The delta rule the triadic state extends: "gdn" (a decay per slice), "kda" (plus KDA's
+    per-channel decay) or "ckda" (the signed channel gate of linear_fla_gate, beta up to 2)."""
 
     linear_fla_gate: str = "signed_sigmoid2"
     """Decay-gate parameterisation. "softplus"/"sigmoid" give alpha in (0,1];

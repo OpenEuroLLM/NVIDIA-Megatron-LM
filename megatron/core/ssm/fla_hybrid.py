@@ -433,3 +433,35 @@ class PaniniDeltaAttention(_FLALayerWrapper):
                 ),
             )
         )
+
+
+class Triadic(_FLALayerWrapper):
+    """Triadic delta rule (Triadic GDN / KDA / Complex KDA) as a Megatron mixer; see
+    megatron/core/ssm/triadic.py. ``linear_triadic_e`` slices per head, the base by
+    ``linear_triadic_base``."""
+
+    _NAME = "triadic"
+    _NEEDS = "fla.ops.kda (ComplexKDA)"
+
+    @staticmethod
+    def _fla_class():
+        from megatron.core.ssm.triadic import HAVE_FLA, TriadicDeltaAttention
+
+        return TriadicDeltaAttention if HAVE_FLA else None
+
+    def _build(self, config, head_dim, num_heads, layer_number):
+        from megatron.core.ssm.triadic import TriadicDeltaAttention
+
+        return TriadicDeltaAttention(
+            hidden_size=config.hidden_size,
+            head_dim=head_dim,
+            num_heads=num_heads,
+            e=config.linear_triadic_e,
+            base=config.linear_triadic_base,
+            gate=config.linear_fla_gate,
+            allow_neg_eigval=config.linear_fla_allow_neg_eigval,
+            lower_bound=config.linear_fla_lower_bound,
+            conv_size=config.linear_conv_kernel_dim,
+            norm_eps=config.layernorm_epsilon,
+            layer_idx=layer_number,
+        )

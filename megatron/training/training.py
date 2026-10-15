@@ -644,6 +644,24 @@ def num_floating_point_operations(
                     + args.hidden_size * v_dim
                 )
             )
+        elif args.experimental_attention_variant == "triadic":
+            # megatron/core/ssm/triadic.py: KDA's skeleton with a second key / query
+            # (hidden x heads*E each, plus the slice-gate projection) and a delta rule
+            # over a (E*D) x D state, i.e. E times KDA's recurrence.
+            head_dim = args.linear_key_head_dim
+            num_heads = args.linear_num_key_heads
+            e = args.linear_triadic_e
+            dim = head_dim * num_heads
+            low_rank = args.hidden_size * head_dim + head_dim * dim
+            return (
+                args.hidden_size * 3 * dim                       # q, k, v
+                + args.linear_conv_kernel_dim * (3 * dim + 2 * num_heads * e)
+                + args.hidden_size * 3 * num_heads * e           # k2, q2, slice gate
+                + (low_rank if args.linear_triadic_base != "gdn" else 0)  # channel gate
+                + low_rank                                       # output gate
+                + num_heads * e * head_dim * head_dim * 4        # delta rule, E slices
+                + args.hidden_size * dim                         # out proj
+            )
         elif args.experimental_attention_variant == "mlstm":
             # Calculate the FLOPs for the mLSTM attention variant.
             qk_head_dim = args.linear_key_head_dim
