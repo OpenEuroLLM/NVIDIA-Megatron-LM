@@ -318,6 +318,7 @@ class TestGetHybridLayerCounts:
         assert get_hybrid_layer_counts("M*M*") == {
             '*': 2,
             'D': 0,
+            'N': 0,
             'G': 0,
             'L': 0,
             'M': 2,
@@ -332,6 +333,7 @@ class TestGetHybridLayerCounts:
         assert get_hybrid_layer_counts("MG*-E") == {
             '*': 1,
             'D': 0,
+            'N': 0,
             'G': 1,
             'L': 0,
             'M': 1,
@@ -343,6 +345,7 @@ class TestGetHybridLayerCounts:
         assert get_hybrid_layer_counts("MGD-E") == {
             '*': 0,
             'D': 1,
+            'N': 0,
             'G': 1,
             'L': 0,
             'M': 1,
@@ -354,6 +357,7 @@ class TestGetHybridLayerCounts:
         assert get_hybrid_layer_counts("MG+-E") == {
             '*': 0,
             'D': 0,
+            'N': 0,
             'G': 1,
             'L': 0,
             'M': 1,
@@ -368,6 +372,7 @@ class TestGetHybridLayerCounts:
         assert get_hybrid_layer_counts("M*|M*") == {
             '*': 2,
             'D': 0,
+            'N': 0,
             'G': 0,
             'L': 0,
             'M': 2,
@@ -379,6 +384,7 @@ class TestGetHybridLayerCounts:
         assert get_hybrid_layer_counts("M-M-|M-M*-") == {
             '*': 1,
             'D': 0,
+            'N': 0,
             'G': 0,
             'L': 0,
             'M': 4,
@@ -393,6 +399,7 @@ class TestGetHybridLayerCounts:
         assert get_hybrid_layer_counts("M*M*/MM/MM") == {
             '*': 2,
             'D': 0,
+            'N': 0,
             'G': 0,
             'L': 0,
             'M': 6,
@@ -408,6 +415,7 @@ class TestGetHybridLayerCounts:
         assert get_hybrid_layer_counts("M-M-|M-M*-/MM/MM") == {
             '*': 1,
             'D': 0,
+            'N': 0,
             'G': 0,
             'L': 0,
             'M': 8,
@@ -421,6 +429,7 @@ class TestGetHybridLayerCounts:
         assert get_hybrid_layer_counts("MEME") == {
             '*': 0,
             'D': 0,
+            'N': 0,
             'G': 0,
             'L': 0,
             'M': 2,
@@ -435,6 +444,7 @@ class TestGetHybridLayerCounts:
         assert get_hybrid_layer_counts("MMMM/*M/*M/*M") == {
             '*': 3,
             'D': 0,
+            'N': 0,
             'G': 0,
             'L': 0,
             'M': 7,
@@ -448,6 +458,7 @@ class TestGetHybridLayerCounts:
         assert get_hybrid_layer_counts("GMGM") == {
             '*': 0,
             'D': 0,
+            'N': 0,
             'G': 2,
             'L': 0,
             'M': 2,
@@ -462,6 +473,7 @@ class TestGetHybridLayerCounts:
         assert get_hybrid_layer_counts("G*GM*") == {
             '*': 2,
             'D': 0,
+            'N': 0,
             'G': 2,
             'L': 0,
             'M': 1,
@@ -475,6 +487,7 @@ class TestGetHybridLayerCounts:
         assert get_hybrid_layer_counts("DMDM") == {
             '*': 0,
             'D': 2,
+            'N': 0,
             'G': 0,
             'L': 0,
             'M': 2,
@@ -488,6 +501,7 @@ class TestGetHybridLayerCounts:
         assert get_hybrid_layer_counts("+M+M") == {
             '*': 0,
             'D': 0,
+            'N': 0,
             'G': 0,
             'L': 0,
             'M': 2,
@@ -501,6 +515,7 @@ class TestGetHybridLayerCounts:
         assert get_hybrid_layer_counts("") == {
             '*': 0,
             'D': 0,
+            'N': 0,
             'G': 0,
             'L': 0,
             'M': 0,
@@ -791,7 +806,7 @@ class TestGetLayerMapsFromLayerTypeList:
         """Standard symbols each produce a single-entry map at local index 0."""
         maps = get_layer_maps_from_layer_type_list(["*", "M", "-", "E"])
         # We always get all symbols returned, not only those contained in the pattern.
-        assert len(maps) == 9
+        assert len(maps) == 10
         attention_map, mamba_map, mlp_map, moe_map = operator.itemgetter(
             Symbols.ATTENTION, Symbols.MAMBA, Symbols.MLP, Symbols.MOE
         )(maps)

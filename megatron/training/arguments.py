@@ -2752,6 +2752,9 @@ def _add_regularization_args(parser):
                        'weight (as OLMo 2/3 do), or a fraction for weaker decay. Biases are '
                        'always excluded. Together with --qk-layernorm-wd-mult this generalises '
                        '--apply-wd-to-qk-layernorm, so they are mutually exclusive with it.')
+    group.add_argument('--engram-lr-mult', type=float, default=5.0,
+                       help='Learning-rate multiplier of the Engram (N-layer) tables, which '
+                       'also get no weight decay.')
     group.add_argument('--embedding-wd-mult', type=float, default=1.0,
                        help='Multiplier on --weight-decay for the word-embedding matrix (2-D param '
                        'whose name contains word_embeddings). Default 1.0 = decay like every other '
@@ -3766,7 +3769,7 @@ def _add_experimental_args(parser):
     group.add_argument('--hybrid-layer-pattern', type=str, default=None,
                        help='Specify a hybrid layer pattern using M (mamba), G (gdn), '
                        'L (the linear mixer named by --experimental-attention-variant), '
-                       'C (gated short convolution), '
+                       'C (gated short convolution), N (Engram n-gram memory), '
                        '* (attention), D (dsa), - (mlp), E (moe). Use | to define pipeline '
                        'stage boundaries for flexible virtual pipeline parallel (fVPP). '
                        'Use / to separate MTP patterns. '

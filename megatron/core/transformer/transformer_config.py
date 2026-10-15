@@ -367,6 +367,26 @@ class TransformerConfig(ModelParallelConfig):
     """Whether the gated short convolution's depthwise conv has a bias (LFM2's
     `conv_bias`). Its projections follow `add_bias_linear`."""
 
+    engram_ngram_orders: List[int] = field(default_factory=lambda: [2, 3])
+    """N-gram orders an Engram (`N`) layer hashes, e.g. 2 3 for bigrams and trigrams."""
+
+    engram_num_heads: int = 4
+    """Hash heads per n-gram order; each head has its own table."""
+
+    engram_table_size: int = 262144
+    """Rows per Engram hash table (rounded up to distinct primes, one per head)."""
+
+    engram_embed_dim: int = 64
+    """Width of one Engram table row; the memory vector concatenates
+    len(engram_ngram_orders) * engram_num_heads rows."""
+
+    engram_conv_kernel_size: int = 4
+    """Kernel of Engram's depthwise causal conv (dilation = the largest n-gram order)."""
+
+    engram_token_map: Optional[str] = None
+    """Path to a .npy int array mapping token id -> canonical id (Engram's tokenizer
+    compression, e.g. NFKC + lowercasing). None hashes the raw token ids."""
+
     linear_key_head_dim: Optional[int] = 128
     """Query and key head dimension for the gated delta net."""
 

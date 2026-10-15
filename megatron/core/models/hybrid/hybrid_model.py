@@ -522,6 +522,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             rotary_pos_emb=rotary_pos_emb,
             packed_seq_params=packed_seq_params,
             padding_mask=padding_mask,
+            input_ids=input_ids,
         )
 
         output_weight = None

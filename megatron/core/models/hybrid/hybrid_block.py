@@ -48,6 +48,7 @@ class HybridStackSubmodules:
     # (get_hybrid_linear_layer_spec), so stack specs need not name a mixer.
     linear_layer: Optional[ModuleSpec] = None
     short_conv_layer: Union[ModuleSpec, type] = IdentityOp
+    engram_layer: Union[ModuleSpec, type] = IdentityOp
     attention_layer: Union[ModuleSpec, type] = IdentityOp
     dsa_layer: Union[ModuleSpec, type] = IdentityOp
     mla_layer: Union[ModuleSpec, type] = IdentityOp
@@ -205,6 +206,13 @@ class HybridStack(MegatronModule):
                         add_layer_offset=False,
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
+                elif layer_type == LayerSymbols.ENGRAM:
+                    layer = build_module(
+                        submodules.engram_layer,
+                        config=self.config,
+                        layer_number=layer_number,
+                        pg_collection=pg_collection,
+                    )
                 elif layer_type == LayerSymbols.SHORT_CONV:
                     layer = build_module(
                         submodules.short_conv_layer,
@@ -307,6 +315,7 @@ class HybridStack(MegatronModule):
         inference_params: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         padding_mask=None,
+        input_ids: Optional[Tensor] = None,
     ):
         """
         Forward function of the HybridStack class.
@@ -327,6 +336,13 @@ class HybridStack(MegatronModule):
         """
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
+
+        # Engram (`N`) layers look up hashed n-grams of the token ids. Handing them over
+        # here, rather than through each layer call, keeps activation recompute and the
+        # other layer types unaware of them.
+        for layer_type, layer in zip(self.layer_type_list, self.layers):
+            if layer_type == LayerSymbols.ENGRAM:
+                layer.set_input_ids(input_ids)
 
         if not self.pre_process:
             # See set_input_tensor()

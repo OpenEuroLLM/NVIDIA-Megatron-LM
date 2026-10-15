@@ -172,6 +172,15 @@ def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, Par
             wd_mult=config.embedding_wd_mult
         )
 
+    # Engram tables (megatron/core/ssm/engram.py): their own learning rate and no weight
+    # decay, as in the paper. Matches nothing in a model without Engram layers.
+    if config.lr is not None:
+        config_overrides[ParamKey(attr="is_engram_table")] = ParamGroupOverride(
+            wd_mult=0.0,
+            max_lr=config.lr * config.engram_lr_mult,
+            min_lr=(config.min_lr or 0.0) * config.engram_lr_mult,
+        )
+
     if config.decoupled_lr is not None:
         decoupled_lr_config: ParamGroupOverride = {"max_lr": config.decoupled_lr}
         decoupled_param_key = ParamKey(attr="is_embedding_or_output_parameter")

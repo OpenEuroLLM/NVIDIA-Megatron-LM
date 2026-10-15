@@ -28,6 +28,7 @@ described by `--hybrid-layer-pattern`:
 | `G` | Gated Delta Network (GDN) layer |
 | `L` | Linear sequence mixer selected by `--experimental-attention-variant` |
 | `C` | Gated short convolution (LFM2-style), kernel width `--short-conv-kernel-size` |
+| `N` | Engram n-gram memory: hashed lookup into large embedding tables (`--engram-*`) |
 | `*` | Self-attention layer |
 | `D` | DeepSeek Sparse Attention (DSA) layer |
 | `-` | Dense MLP layer |
@@ -365,6 +366,16 @@ conv + attention model is, for example, `C-C-*-C-C-*-`.
 tensor parallelism every TP rank runs the whole layer, with gradients averaged
 across the TP group, which costs TP-times that layer's compute. They do not
 support context parallelism.
+
+`N` positions are Engram memory layers (Cheng et al., arXiv:2601.07372): the
+suffix n-grams of the token ids (orders `--engram-ngram-orders`) are hashed by
+`--engram-num-heads` heads into tables of `--engram-table-size` rows, and the
+looked-up vectors are gated into the residual stream. The tables are sharded
+across tensor parallelism by rows and trained with `--engram-lr-mult` times the
+learning rate and no weight decay; their parameters add no FLOPs. The layers
+need the token ids, so a pipeline stage holding `N` layers must receive them,
+and they support neither context parallelism nor packed sequences. Example:
+`N-L-L-*-L-L-*-` puts one Engram layer in front of the stack.
 
 ### Account for expanded layer indices
 
