@@ -28,6 +28,11 @@ from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegat
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
 from megatron.core.package_info import __version__ as mcore_version
+from megatron.core.models.hybrid.hybrid_layer_allocation import (
+    Symbols,
+    parse_hybrid_pattern,
+    select_pipeline_segment,
+)
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
@@ -78,6 +83,28 @@ except ImportError:
 
 stimer = StragglerDetector()
 
+
+@lru_cache(maxsize=None)
+def engram_on_this_rank(vp_stage=None) -> bool:
+    """Whether this pipeline stage (and virtual stage) holds an Engram (`N`) layer.
+
+    Engram layers look up n-grams of the token ids, so such a stage needs the batch
+    like the first and last stages (and MTP stages) do.
+    """
+    args = get_args()
+    pattern = args.hybrid_layer_pattern or ''
+    if Symbols.ENGRAM not in pattern or args.pipeline_model_parallel_size == 1:
+        return False
+    layer_types, _ = select_pipeline_segment(
+        parse_hybrid_pattern(pattern).main_pattern or '',
+        mpu.get_pipeline_model_parallel_group(),
+        vp_stage,
+        first_stage_layers=args.decoder_first_pipeline_num_layers,
+        last_stage_layers=args.decoder_last_pipeline_num_layers,
+    )
+    return Symbols.ENGRAM in layer_types
+
+
 # Canonical, ordered schema of the fields ``get_batch`` returns. Kept alphabetical
 # to match the historical ``sorted(batch.keys())`` order that callers unpack into.
 BATCH_KEYS = [
@@ -112,12 +139,10 @@ def get_batch(data_iterator, vp_stage=None):
         vp_stage=vp_stage,
     )
     is_hybrid_cp = args.hybrid_context_parallel
+    # Middle stages get the batch too when they run MTP or Engram layers.
+    needs_batch = mtp_on_this_rank or engram_on_this_rank(vp_stage)
 
-    if (
-        not is_first_or_last_pipeline_stage(vp_stage)
-        and not mtp_on_this_rank
-        and not has_cu_seqlens
-    ):
+    if not is_first_or_last_pipeline_stage(vp_stage) and not needs_batch and not has_cu_seqlens:
         return [None for _ in BATCH_KEYS]
 
     batch = {}
@@ -141,7 +166,7 @@ def get_batch(data_iterator, vp_stage=None):
         tp_rank=tp_rank,
         micro_batch_size=args.micro_batch_size,
         seq_length=args.seq_length,
-        mtp_on_this_rank=mtp_on_this_rank,
+        mtp_on_this_rank=needs_batch,
         pipeline_model_parallel_size=args.pipeline_model_parallel_size,
         is_pipeline_first_stage=mpu.is_pipeline_first_stage(),
         is_pipeline_last_stage=mpu.is_pipeline_last_stage(),
@@ -149,7 +174,7 @@ def get_batch(data_iterator, vp_stage=None):
 
     batch = flatten_batch_for_packed_sequences(batch)
 
-    if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank:
+    if not is_first_or_last_pipeline_stage(vp_stage) and not needs_batch:
         assert has_cu_seqlens
         return (
             None,
@@ -353,11 +378,15 @@ def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
         return False
     elif is_packed_sequence:
         return True
-    return is_first_or_last_pipeline_stage(vp_stage) or mtp_on_this_rank_func(
-        layout=config.pipeline_model_parallel_layout,
-        mtp_num_layers=config.mtp_num_layers,
-        ignore_virtual=False,
-        vp_stage=vp_stage,
+    return (
+        is_first_or_last_pipeline_stage(vp_stage)
+        or mtp_on_this_rank_func(
+            layout=config.pipeline_model_parallel_layout,
+            mtp_num_layers=config.mtp_num_layers,
+            ignore_virtual=False,
+            vp_stage=vp_stage,
+        )
+        or engram_on_this_rank(vp_stage)
     )
 
 
