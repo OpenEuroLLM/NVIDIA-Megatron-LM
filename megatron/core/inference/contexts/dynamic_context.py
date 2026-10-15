@@ -374,6 +374,10 @@ class DynamicInferenceContext(BaseInferenceContext):
                 raise NotImplementedError("Short-conv (C) layers are not supported for inference.")
             if Symbols.ENGRAM in mamba_inference_state_config.layer_type_list:
                 raise NotImplementedError("Engram (N) layers are not supported for inference.")
+            if Symbols.SWA_ATTENTION in mamba_inference_state_config.layer_type_list:
+                raise NotImplementedError(
+                    "Sliding-window attention (W) layers are not supported for inference."
+                )
             if Symbols.PRODUCT_KEY_MEMORY in mamba_inference_state_config.layer_type_list:
                 raise NotImplementedError(
                     "Product-key memory (P) layers are not supported for inference."

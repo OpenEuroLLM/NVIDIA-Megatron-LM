@@ -202,6 +202,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         parsed = parse_hybrid_pattern(self.hybrid_layer_pattern)
         self.mtp_pattern = parsed.mtp_pattern
         self.mtp_num_depths = parsed.mtp_num_depths
+        self._set_sliding_window_layers(parsed.main_pattern or '')
 
         logging_pg_kwargs = _hybrid_logging_pg_kwargs(self.pg_collection)
 
@@ -334,6 +335,27 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             if hasattr(module, 'finish_init'):
                 quant_config = get_quant_config_or_none(name, self.config.quant_recipe)
                 module.finish_init(quant_config)
+
+    def _set_sliding_window_layers(self, main_pattern: str) -> None:
+        """`W` layers are sliding-window attention, `*` layers global: express that as
+        the per-layer window_attn_skip_freq list (1 = windowed) that every attention
+        backend reads through is_layer_window_attention. Layer numbers count every
+        layer of the pattern, which an integer skip frequency could not follow."""
+        from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+
+        layers = main_pattern.replace(Symbols.PIPE, '')
+        if Symbols.SWA_ATTENTION not in layers:
+            return
+        if not self.config.window_size:
+            raise ValueError("`W` (sliding-window attention) layers need --window-size")
+        per_layer = [int(c == Symbols.SWA_ATTENTION) for c in layers]
+        current = self.config.window_attn_skip_freq
+        if current is not None and list(current) != per_layer:
+            raise ValueError(
+                "window_attn_skip_freq is derived from the `W` positions of the pattern; "
+                "do not set it as well"
+            )
+        self.config.window_attn_skip_freq = per_layer
 
     def set_input_tensor(self, input_tensor: Tensor) -> None:
         """Sets input tensor to the model.

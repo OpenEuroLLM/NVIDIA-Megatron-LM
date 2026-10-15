@@ -812,12 +812,21 @@ def num_floating_point_operations(
                      gdn_qk_head_dim=128, gdn_v_head_dim=128,
                      gdn_num_qk_heads=16, gdn_num_v_heads=32,
                      gdn_conv_kernel_dim=4,
-                     vocab_size=256000, mtp_num_layers=0):
+                     vocab_size=256000, mtp_num_layers=0,
+                     num_swa_layers=0, swa_window=None):
         """Calculate total FLOPs for the hybrid model."""
+        # Sliding-window layers: the projections as attention, the score / value part
+        # over at most `swa_window` keys per query.
+        swa_squared_sum = seqlen_squared_sum
+        if swa_window:
+            swa_squared_sum = min(seqlen_squared_sum, total_tokens * swa_window)
         flops_fwd = (
                 num_attn_layers * attn_layer_flops(total_tokens, seqlen_squared_sum,
                                                    hidden_size, num_attn_heads, gqa,
                                                    gqa_groups, kv_channels) +
+                num_swa_layers * attn_layer_flops(total_tokens, swa_squared_sum,
+                                                  hidden_size, num_attn_heads, gqa,
+                                                  gqa_groups, kv_channels) +
                 num_mlp_layers * mlp_layer_flops(total_tokens, hidden_size,
                                                  mlp_expansion, swiglu) +
                 num_mamba_layers * mamba_layer_flops(total_tokens, hidden_size,
@@ -1123,10 +1132,11 @@ def num_floating_point_operations(
         from megatron.core.models.hybrid.hybrid_layer_allocation import (
             Symbols, get_hybrid_layer_counts)
         (num_mamba_layers, num_gdn_layers, num_linear_layers, num_short_conv_layers,
-         num_engram_layers, num_pkm_layers, num_attn_layers, num_mlp_layers,
+         num_engram_layers, num_pkm_layers, num_attn_layers, num_swa_layers, num_mlp_layers,
          num_moe_layers) = itemgetter(
             Symbols.MAMBA, Symbols.GDN, Symbols.LINEAR, Symbols.SHORT_CONV, Symbols.ENGRAM,
-            Symbols.PRODUCT_KEY_MEMORY, Symbols.ATTENTION, Symbols.MLP, Symbols.MOE
+            Symbols.PRODUCT_KEY_MEMORY, Symbols.ATTENTION, Symbols.SWA_ATTENTION, Symbols.MLP,
+            Symbols.MOE
         )(get_hybrid_layer_counts(args.hybrid_layer_pattern))
 
         mtp_num_layers = args.mtp_num_layers
@@ -1151,6 +1161,8 @@ def num_floating_point_operations(
             ),
             engram_conv_kernel_size=args.engram_conv_kernel_size,
             num_pkm_layers=num_pkm_layers,
+            num_swa_layers=num_swa_layers,
+            swa_window=(args.window_size[0] + 1) if args.window_size else None,
             pkm_args=dict(
                 heads=args.pkm_heads,
                 num_keys=args.pkm_num_keys,

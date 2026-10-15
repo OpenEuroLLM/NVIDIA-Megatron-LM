@@ -157,7 +157,9 @@ class HybridStack(MegatronModule):
                         pg_collection=pg_collection,
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
-                elif layer_type == LayerSymbols.ATTENTION:
+                elif layer_type in (LayerSymbols.ATTENTION, LayerSymbols.SWA_ATTENTION):
+                    # `W` is the same layer; its window comes from config.window_size and
+                    # the per-layer window_attn_skip_freq HybridModel derives from the pattern.
                     layer = build_module(
                         submodules.attention_layer,
                         config=self.config,
