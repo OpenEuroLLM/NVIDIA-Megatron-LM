@@ -477,6 +477,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
             self.canon_a = _canon() if "A" in canon and has_attn else None
             self.canon_c = _canon() if "C" in canon and has_mlp else None
+        # Sandwich / peri-LN: normalize each sublayer output before the residual.
+        self.post_attn_norm = None
+        self.post_mlp_norm = None
+        if getattr(self.config, "post_sublayer_norm", False):
+            from megatron.core.transformer.post_norm import build_post_norm
+
+            self.post_attn_norm = build_post_norm(self.config) if has_attn else None
+            self.post_mlp_norm = build_post_norm(self.config) if has_mlp else None
         self.ngpt_attn_residual = None
         self.ngpt_mlp_residual = None
         if getattr(self.config, "ngpt", False):
@@ -821,6 +829,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             # as a gradient hook of attention_output_with_bias[0]
             self.input_layernorm_checkpoint.discard_output_and_register_recompute(
                 attention_output_with_bias[0]
+            )
+
+        if self.post_attn_norm is not None:
+            from megatron.core.transformer.post_norm import apply_post_norm
+
+            attention_output_with_bias = apply_post_norm(
+                self.post_attn_norm, attention_output_with_bias
             )
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself
@@ -1296,6 +1311,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].
         """
+
+        if self.post_mlp_norm is not None:
+            from megatron.core.transformer.post_norm import apply_post_norm
+
+            mlp_output_with_bias = apply_post_norm(self.post_mlp_norm, mlp_output_with_bias)
 
         if self.mhc_mlp_mixer is not None and mhc is None:
             # The MoE partial-cudagraph paths reach _forward_post_mlp without the

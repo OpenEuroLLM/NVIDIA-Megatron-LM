@@ -29,6 +29,7 @@ def residual_scheme_active(config) -> bool:
         getattr(config, "mhc", False)
         or getattr(config, "attn_res", False)
         or getattr(config, "ngpt", False)
+        or getattr(config, "post_sublayer_norm", False)
     )
 
 
@@ -46,6 +47,11 @@ class ResidualSchemeAdapter(nn.Module):
         self.mhc_mixer = None
         self.attnres = None
         self.ngpt_residual = None
+        self.post_norm = None
+        if getattr(config, "post_sublayer_norm", False):
+            from megatron.core.transformer.post_norm import build_post_norm
+
+            self.post_norm = build_post_norm(config)
         if getattr(config, "ngpt", False):
             from megatron.core.transformer.ngpt import NGPTResidual
 
@@ -107,6 +113,8 @@ class ResidualSchemeAdapter(nn.Module):
         self, out: Tensor, ctx: tuple, depth_state=None, layer_number: Optional[int] = None
     ) -> Tensor:
         """Fold the sublayer output ``out`` back into the residual state."""
+        if self.post_norm is not None:
+            out = self.post_norm(out)
         if self.mhc_mixer is not None:
             streams, h_post, h_res = ctx
             return self.mhc_mixer.write(
@@ -120,4 +128,6 @@ class ResidualSchemeAdapter(nn.Module):
                 depth_state.seal_block()
             return depth_state.partial if depth_state.partial is not None else out
         (residual,) = ctx
+        if self.ngpt_residual is None:  # post_sublayer_norm alone: the plain residual
+            return residual + out
         return self.ngpt_residual(out, residual)

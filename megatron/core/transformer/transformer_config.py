@@ -1776,6 +1776,12 @@ class TransformerConfig(ModelParallelConfig):
     mixing, so it moves (2k+1) of the n streams instead of all of them. 0 is dense mHC.
     Requires mhc=True; not combinable with mhc_lerp."""
 
+    post_sublayer_norm: bool = False
+    """Sandwich / peri-LN normalization: normalize every sublayer output (attention, MLP,
+    MoE, Mamba, linear mixers, Engram, PKM) with a learnable gain before it enters the
+    residual, h <- h + Norm(f(Norm(h))) (Gemma 2/3, OLMo 2). Unlike ngpt the residual stream
+    stays unnormalized; with mHC / AttnRes / nGPT the normalized output is what they mix."""
+
     mhc_routed_mix: bool = False
     """Routed residual streams: also mix the k selected streams with a per-token doubly
     stochastic [k, k] matrix (mHC's H_res restricted to the selection), initialized near
