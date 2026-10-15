@@ -1236,6 +1236,7 @@ class TestOptimizerResharding:
         [(2, 1), (1, 2), (4, 1)],
     )
     def test_chained_optimizer_expert_layout_change(self, tmp_path_dist_ckpt, src_exp, dest_exp):
+        Utils.initialize_distributed()  # the synced temp dirs below barrier first
         # As megatron/training saves it: fully reshardable, no chained prefix.
         metadata = {
             'distrib_optim_sharding_type': 'fully_reshardable',

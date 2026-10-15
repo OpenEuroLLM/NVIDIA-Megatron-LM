@@ -1649,6 +1649,10 @@ class ChainedOptimizer(MegatronOptimizer):
         the parameter state is where the current optimizers put it.
         """
         n = len(self.chained_optimizers)
+        if not isinstance(state_dict, dict):
+            # A plain list of per-optimizer states (non-distributed checkpoint): only
+            # the dist-checkpoint layout below can be re-split.
+            return state_dict
         saved_single = 'optimizer' in state_dict
         int_keys = sorted(k for k in state_dict if isinstance(k, int))
         saved = [state_dict] if saved_single else [state_dict[k] for k in int_keys]
