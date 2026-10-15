@@ -263,9 +263,18 @@ class MoELayer(BaseMoELayer):
 
         self.tp_group = pg_collection.tp
 
-        # Initialize router.
+        # Initialize router. With zero-computation experts it scores those too: it gets
+        # its own config with the extra experts, everything else sees the real ones.
+        self.num_zero_experts = getattr(self.config, "moe_zero_expert_num", 0)
+        router_config = self.config
+        if self.num_zero_experts:
+            import copy
+
+            router_config = copy.copy(self.config)
+            router_config.num_moe_experts = self.config.num_moe_experts + self.num_zero_experts
+        self._zero_expert_output = None
         self.router = self.submodules.router(
-            config=self.config, pg_collection=pg_collection, is_mtp_layer=is_mtp_layer
+            config=router_config, pg_collection=pg_collection, is_mtp_layer=is_mtp_layer
         )
         self.tp_group = pg_collection.tp
 
@@ -455,7 +464,31 @@ class MoELayer(BaseMoELayer):
         producing routing probabilities and a mapping.
         """
         probs, routing_map = apply_module(self.router)(hidden_states, padding_mask)
+        if self.num_zero_experts:
+            probs, routing_map = self._split_zero_experts(hidden_states, probs, routing_map)
         return probs, routing_map
+
+    def _split_zero_experts(self, hidden_states, probs, routing_map):
+        """Keep the real experts' routing for dispatch; the zero-computation experts'
+        gate weights give their (identity) output right here, added in postprocess."""
+        n = self.config.num_moe_experts
+        from megatron.core.transformer import arch_metrics
+
+        if arch_metrics.active():
+            # Share of the top-k slots that skip computation (dynamic compute per token).
+            arch_metrics.record_mean(
+                "moe_zero/slot_frac",
+                self.layer_number,
+                arch_metrics.num_layers_of(self.config),
+                routing_map[:, n:].float().sum(-1) / self.config.moe_router_topk,
+            )
+        if self.config.moe_zero_expert_type == "identity":
+            weight = (probs[:, n:] * routing_map[:, n:]).sum(-1)  # [tokens]
+            flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+            self._zero_expert_output = (weight.unsqueeze(-1).to(flat.dtype) * flat).view_as(
+                hidden_states
+            )
+        return probs[:, :n].contiguous(), routing_map[:, :n].contiguous()
 
     @maybe_skip_or_early_return_by_cudagraph("preprocess")
     def preprocess(
@@ -597,6 +630,9 @@ class MoELayer(BaseMoELayer):
         if self.config.moe_latent_size:
             output, _ = self.fc2_latent_proj(output)
 
+        if self._zero_expert_output is not None:
+            output = output + self._zero_expert_output
+            self._zero_expert_output = None
         if shared_expert_output is not None:
             output = output + shared_expert_output
         elif (

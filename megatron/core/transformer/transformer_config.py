@@ -1306,6 +1306,16 @@ class TransformerConfig(ModelParallelConfig):
     moe_apply_probs_on_input: bool = False
     """Apply probs on input of experts instead of applying after activation and glu."""
 
+    moe_zero_expert_num: int = 0
+    """Zero-computation experts (LongCat-Flash): the router also scores this many experts
+    that cost nothing -- a token's top-k slots routed to them are not dispatched, and their
+    gate weight multiplies the MoE input (moe_zero_expert_type="identity") or contributes
+    nothing ("zero"). Tokens thus use a variable number of real experts; balancing (aux loss,
+    expert bias) runs over all experts. alltoall / allgather dispatchers only."""
+
+    moe_zero_expert_type: str = "identity"
+    """Output of a zero-computation expert: "identity" (the input) or "zero"."""
+
     moe_latent_size: Optional[int] = None
     """Latent projection dimension for MoE. If None, MoE latent projections are not used."""
 
@@ -1869,6 +1879,17 @@ class TransformerConfig(ModelParallelConfig):
         """
         super().__post_init__()
 
+        if self.moe_zero_expert_num:
+            if self.moe_zero_expert_type not in ("identity", "zero"):
+                raise ValueError(
+                    f"moe_zero_expert_type must be identity or zero, got {self.moe_zero_expert_type}"
+                )
+            if self.moe_token_dispatcher_type not in ("alltoall", "allgather"):
+                raise ValueError("moe_zero_expert_num needs the alltoall or allgather dispatcher")
+            if self.moe_pad_expert_input_to_capacity:
+                raise ValueError("moe_zero_expert_num does not support padding to capacity")
+            if self.cuda_graph_impl != "none" or self.enable_cuda_graph:
+                raise ValueError("moe_zero_expert_num does not support CUDA graphs yet")
         if self.mhc_routed_topk:
             if not self.mhc:
                 raise ValueError("mhc_routed_topk requires mhc=True")

@@ -539,8 +539,10 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         if (
             self.config.moe_expert_capacity_factor is not None
             or self.config.moe_router_padding_for_quantization
+            or getattr(self.config, "moe_zero_expert_num", 0)
         ):
-            # When using token dropping or router padding, output size is dynamic.
+            # When using token dropping or router padding, output size is dynamic (so it is
+            # with zero-computation experts: a token's slots routed to them are not sent).
             # Need to sync output size GPU->CPU before allocating output buffer
             self.num_out_tokens = num_local_tokens_per_expert.sum()
             self._maybe_update_cuda_sync_point("before_permutation_1")

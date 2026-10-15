@@ -77,13 +77,27 @@ def _model(config, pattern):
     ).cuda()
 
 
+def _reset_moe_trackers():
+    # The router-health trackers are process-global and shaped [layers, experts]:
+    # models with another expert count (zero-computation experts) need fresh ones.
+    from megatron.core.transformer.moe import moe_health
+
+    get_moe_metrics_tracker().clear()
+    for tracker in (
+        moe_health._MOE_EXPERT_UTILIZATION_TRACKER,
+        moe_health._MOE_ROUTER_STATS_TRACKER,
+        moe_health._MOE_EXPERT_VIABILITY_TRACKER,
+    ):
+        tracker.clear()
+
+
 @pytest.fixture(autouse=True)
 def model_parallel():
     Utils.initialize_model_parallel(1, 1)
     model_parallel_cuda_manual_seed(123)
-    get_moe_metrics_tracker().clear()
+    _reset_moe_trackers()
     yield
-    get_moe_metrics_tracker().clear()
+    _reset_moe_trackers()
     Utils.destroy_model_parallel()
 
 
@@ -200,5 +214,56 @@ def test_latent_moe_trains(shared):
     logits = model(ids, position_ids=None, attention_mask=None)
     assert torch.isfinite(logits).all()
     logits.float().logsumexp(-1).mean().backward()
+    missing = [n for n, p in model.named_parameters() if p.requires_grad and p.grad is None]
+    assert not missing, missing
+
+
+@pytest.mark.parametrize("zero_type", ["identity", "zero"])
+def test_zero_computation_experts_skip_dispatch(zero_type, monkeypatch):
+    """With every top-k slot on a zero-computation expert, the MoE layer's output is the
+    gate-weighted input (identity) or nothing (zero), and no token is dispatched."""
+    from megatron.core.transformer.moe.moe_layer import MoELayer
+
+    pattern = "*E"
+    config = _config(pattern, moe_zero_expert_num=2, moe_zero_expert_type=zero_type)
+    model = _model(config, pattern)
+    moe = next(m for m in model.modules() if isinstance(m, MoELayer))
+    assert moe.router.weight.shape[0] == EXPERTS + 2
+
+    def all_on_zero_experts(hidden_states, padding_mask=None):
+        t = hidden_states.reshape(-1, hidden_states.shape[-1]).shape[0]
+        probs = torch.zeros(t, EXPERTS + 2, device="cuda")
+        probs[:, EXPERTS:] = 0.25  # weights sum to 0.5 over the two zero experts
+        routing_map = torch.zeros(t, EXPERTS + 2, dtype=torch.bool, device="cuda")
+        routing_map[:, EXPERTS:] = True
+        return probs, routing_map
+
+    monkeypatch.setattr(moe.router, "forward", all_on_zero_experts)
+    x = torch.randn(8, 2, 64, device="cuda")
+    out, _ = moe(x)
+    expected = 0.5 * x if zero_type == "identity" else torch.zeros_like(x)
+    torch.testing.assert_close(out, expected)
+
+
+def test_zero_computation_experts_train_with_balancing():
+    from megatron.core.transformer import arch_metrics
+
+    pattern = "*E*E"
+    config = _config(pattern, moe_zero_expert_num=2, **BALANCE["aux_loss_and_bias"])
+    model = _model(config, pattern)
+    arch_metrics.reset()
+    arch_metrics.set_active(True)
+    try:
+        ids = torch.randint(0, VOCAB, (2, 16), device="cuda")
+        logits = model(ids, position_ids=None, attention_mask=None)
+        logits.float().logsumexp(-1).mean().backward()
+        out = arch_metrics.collect()
+    finally:
+        arch_metrics.set_active(False)
+        arch_metrics.reset()
+    assert 0.0 <= out["moe_zero/slot_frac"] <= 1.0
+    routers = [m for m in model.modules() if getattr(m, "expert_bias", None) is not None]
+    assert routers and all(m.expert_bias.numel() == EXPERTS + 2 for m in routers)
+    assert all(m.local_tokens_per_expert.sum() == ids.numel() * TOPK for m in routers)
     missing = [n for n, p in model.named_parameters() if p.requires_grad and p.grad is None]
     assert not missing, missing
