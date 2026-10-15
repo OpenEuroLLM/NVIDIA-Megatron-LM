@@ -12,10 +12,11 @@ job is only:
   * contract: return ``(output, bias)`` with ``bias=None``.
   * config: map ``TransformerConfig`` onto the FLA constructor.
 
-TENSOR PARALLELISM IS NOT SUPPORTED. The FLA layers build plain ``nn.Linear``
-projections internally, so there is nothing to shard; running them under TP>1
-would silently replicate the mixer while the rest of the model shards, giving
-wrong gradients rather than an error. Both wrappers therefore assert TP==CP==1.
+TENSOR PARALLELISM REPLICATES THE LAYER. The FLA layers build plain ``nn.Linear``
+projections internally, so there is nothing to shard; under TP>1 every TP rank runs
+the whole layer (see megatron/core/ssm/tp_replicated.py: identical start, averaged
+gradients, sequence gathered under sequence parallelism). Context parallelism is not
+supported and asserts CP==1.
 
 The 0.3.2 FLA in the training container carries none of these layers: prepend
 a checkout that does to PYTHONPATH so it shadows the installed package --
@@ -32,6 +33,11 @@ from torch import Tensor
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm.tp_replicated import (
+    gather_replicated_input,
+    replicate_across_tp,
+    scatter_replicated_output,
+)
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import MegatronModule
 
@@ -158,14 +164,12 @@ class _FLALayerWrapper(MegatronModule):
         self.config = config
         self.layer_number = layer_number
 
-        tp = pg_collection.tp.size() if pg_collection is not None else 1
+        self.tp_group = pg_collection.tp if pg_collection is not None else None
         cp = pg_collection.cp.size() if pg_collection is not None else 1
-        if tp != 1 or cp != 1:
+        if cp != 1:
             raise NotImplementedError(
-                f"{self._NAME} does not support tensor/context parallelism "
-                f"(got tp={tp}, cp={cp}). The FLA layer owns plain nn.Linear "
-                "projections with nothing to shard, so TP>1 would replicate the "
-                "mixer against a sharded model and corrupt gradients."
+                f"{self._NAME} does not support context parallelism (got cp={cp}): the "
+                "FLA layer runs its recurrence over the sequence it is given."
             )
 
         head_dim = config.linear_key_head_dim
@@ -185,6 +189,8 @@ class _FLALayerWrapper(MegatronModule):
             self.layer = self.layer.to(torch.bfloat16)
         elif config.fp16:
             self.layer = self.layer.to(torch.float16)
+        # One full copy per TP rank (no-op at TP=1).
+        replicate_across_tp(self.layer, self.tp_group)
 
         # Compile the BOUND FORWARD, not the module. torch.compile(module)
         # returns an OptimizedModule that prefixes every state_dict key with
@@ -254,12 +260,14 @@ class _FLALayerWrapper(MegatronModule):
         """[s, b, h] -> [s, b, h]; returns (output, bias=None)."""
         if packed_seq_params is not None:
             raise NotImplementedError(f"{self._NAME} does not support packed sequences yet.")
+        hidden_states = gather_replicated_input(hidden_states, self.config, self.tp_group)
         # Megatron is sequence-first, FLA is batch-first.
         x = hidden_states.transpose(0, 1).contiguous()
         # attention_mask is Megatron's causal mask; these layers are causal by
         # construction and expect a [B, T] *padding* mask, so pass None.
         out, _, _ = self._fla_forward(hidden_states=x, attention_mask=None, use_cache=False)
-        return out.transpose(0, 1).contiguous(), None
+        out = out.transpose(0, 1).contiguous()
+        return scatter_replicated_output(out, self.config, self.tp_group), None
 
 
 class KDA(_FLALayerWrapper):

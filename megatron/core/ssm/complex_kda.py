@@ -51,6 +51,11 @@ except ImportError:
     FLAAttention = None
     HAVE_FLA = False
 
+from megatron.core.ssm.tp_replicated import (
+    gather_replicated_input,
+    replicate_across_tp,
+    scatter_replicated_output,
+)
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -82,24 +87,31 @@ def _head_dim(config: TransformerConfig) -> int:
 
 
 class _MegatronSelfAttentionAdapter(MegatronModule):
-    """Shared plumbing: layout, the ``(output, bias)`` contract, TP refusal."""
+    """Shared plumbing: layout, the ``(output, bias)`` contract, TP replication.
 
-    def __init__(self, config: TransformerConfig):
+    The fla layer owns plain nn.Linear projections, so under TP>1 every TP rank runs
+    the whole layer (megatron/core/ssm/tp_replicated.py). Context parallelism is not
+    supported.
+    """
+
+    def __init__(self, config: TransformerConfig, pg_collection=None):
         super().__init__(config=config)
         if not HAVE_FLA:
             raise ImportError(
                 "Complex KDA needs flash-linear-attention; install `fla` or "
                 "choose another experimental_attention_variant"
             )
-        if config.tensor_model_parallel_size != 1:
+        if config.context_parallel_size != 1:
             raise NotImplementedError(
-                "experimental_attention_variant='complex_kda' supports "
-                "tensor_model_parallel_size == 1 only; got "
-                f"{config.tensor_model_parallel_size}. The fla layer owns its "
-                "projections and they are not parallel linears, so a larger TP "
-                "would replicate the mixer while sharding the rest."
+                "experimental_attention_variant='complex_kda' does not support context "
+                f"parallelism (got context_parallel_size={config.context_parallel_size})."
             )
+        self.tp_group = pg_collection.tp if pg_collection is not None else None
         self.layer = None  # set by the subclass
+
+    def _replicate(self):
+        """Called by subclasses once ``self.layer`` exists."""
+        replicate_across_tp(self.layer, self.tp_group)
 
     def forward(
         self,
@@ -129,16 +141,18 @@ class _MegatronSelfAttentionAdapter(MegatronModule):
                 "metadata would have to reach the recurrence, and silently "
                 "ignoring it would run the sequences into each other"
             )
+        hidden_states = gather_replicated_input(hidden_states, self.config, self.tp_group)
         # (s, b, h) -> (b, s, h)
         x = hidden_states.transpose(0, 1).contiguous()
         out = self.layer(x)
         y = out[0] if isinstance(out, tuple) else out
         # Megatron's TransformerLayer expects (output, bias); the bias is
         # folded into the projections here, so there is none to return.
-        return y.transpose(0, 1).contiguous(), None
+        y = y.transpose(0, 1).contiguous()
+        return scatter_replicated_output(y, self.config, self.tp_group), None
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
-        """Replicated tensors: TP is 1, so nothing here is sharded."""
+        """Replicated tensors: the layer is a full copy on every TP rank."""
         from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 
         return make_sharded_tensors_for_checkpoint(
@@ -157,7 +171,7 @@ class ComplexKDA(_MegatronSelfAttentionAdapter):
         attn_mask_type=None,
         **kwargs,
     ):
-        super().__init__(config=config)
+        super().__init__(config=config, pg_collection=kwargs.get("pg_collection"))
         head_dim = _head_dim(config)
         num_heads = config.hidden_size // head_dim
         if num_heads * head_dim != config.hidden_size:
@@ -181,6 +195,7 @@ class ComplexKDA(_MegatronSelfAttentionAdapter):
             norm_eps=config.layernorm_epsilon,
             layer_idx=layer_number - 1,
         )
+        self._replicate()
 
 
 class ComplexKDAHybridAttention(_MegatronSelfAttentionAdapter):
@@ -207,7 +222,7 @@ class ComplexKDAHybridAttention(_MegatronSelfAttentionAdapter):
         attn_mask_type=None,
         **kwargs,
     ):
-        super().__init__(config=config)
+        super().__init__(config=config, pg_collection=kwargs.get("pg_collection"))
         head_dim = _head_dim(config)
         # No `head_dim` and no `norm_eps`: fla's Attention derives the head
         # width from hidden_size // num_heads and has no norm epsilon of its
@@ -223,3 +238,4 @@ class ComplexKDAHybridAttention(_MegatronSelfAttentionAdapter):
             use_rope=False,
             layer_idx=layer_number - 1,
         )
+        self._replicate()
