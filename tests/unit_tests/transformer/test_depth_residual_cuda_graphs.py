@@ -82,12 +82,12 @@ def _fwd_bwd(block: TransformerBlock, x: torch.Tensor):
     out = block(hidden_states=x.clone().requires_grad_(True), attention_mask=None)
     block.zero_grad(set_to_none=True)
     out.square().mean().backward()
+    # Every parameter is reported (an all-zero main_grad included): a parameter whose
+    # gradient the graph drops must show up as a mismatch, not as "absent in both".
     grads = {}
     for k, p in block.named_parameters():
-        if p.grad is not None:
-            grads[k] = p.grad.clone()
-        elif bool(p.main_grad.any()):
-            grads[k] = p.main_grad.to(p.dtype).clone()
+        grad = p.grad if p.grad is not None else p.main_grad.to(p.dtype)
+        grads[k] = grad.clone()
     return out.detach().clone(), grads
 
 
@@ -113,7 +113,15 @@ class TestMHCCudaGraphs:
         x = torch.randn(S, B, H, device="cuda")
 
         eager = _build("none")
+        # phi starts at zero, which makes the gate scalars' gradients exactly zero;
+        # perturb it so every mHC parameter has a gradient the replay must reproduce.
+        with torch.no_grad():
+            for name, p in eager.named_parameters():
+                if name.endswith(".phi"):
+                    p.normal_(0.0, 0.02)
         ref_out, ref_grads = _fwd_bwd(eager, x)
+        alphas = [k for k in ref_grads if ".alpha_" in k]
+        assert alphas and all(ref_grads[k].abs().sum() > 0 for k in alphas)
 
         graphed = _build("local")
         graphed.load_state_dict(eager.state_dict())
