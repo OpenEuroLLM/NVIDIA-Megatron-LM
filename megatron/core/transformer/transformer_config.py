@@ -3624,13 +3624,39 @@ class MLATransformerConfig(TransformerConfig):
        Otherwise fall back to the unfused MLA.
     """
 
+    mla_num_query_groups: Optional[int] = None
+    """Grouped-query MLA: the number of key/value heads the KV latent is up-projected to
+    (each shared by num_attention_heads / mla_num_query_groups query heads). None = one per
+    query head (standard MLA). Separate from num_query_groups, which configures the
+    standard-attention layers of a hybrid. qk_pos_emb_head_dim = 0 makes MLA NoPE (no
+    decoupled RoPE key)."""
+
     def __post_init__(self):
         super().__post_init__()
         if self.multi_latent_attention and self.apply_rope_fusion and self.rope_type != "yarn":
             raise ValueError("apply_rope_fusion for MLA only works with YARN RoPE.")
 
-        if self.attention_output_gate:
-            raise NotImplementedError("Output gate is not supported for MLA yet.")
+        if self.mla_num_query_groups is not None:
+            if self.num_attention_heads % self.mla_num_query_groups:
+                raise ValueError(
+                    f"num_attention_heads ({self.num_attention_heads}) must be a multiple of "
+                    f"mla_num_query_groups ({self.mla_num_query_groups})"
+                )
+            if self.qk_clip:
+                raise NotImplementedError("qk_clip is not implemented for grouped-query MLA")
+        if self.qk_pos_emb_head_dim == 0 and self.apply_rope_fusion:
+            raise ValueError("NoPE MLA (qk_pos_emb_head_dim=0) has no RoPE to fuse")
+        extensions = {
+            "attention_output_gate": self.attention_output_gate,
+            "exclusive_self_attention": self.exclusive_self_attention,
+            "mla_num_query_groups": self.mla_num_query_groups is not None,
+            "qk_pos_emb_head_dim=0": self.qk_pos_emb_head_dim == 0,
+        }
+        if self.cache_mla_latents and any(extensions.values()):
+            raise NotImplementedError(
+                "cache_mla_latents (the absorbed MLA decode path) does not support "
+                + ", ".join(k for k, v in extensions.items() if v)
+            )
 
         if self.cache_mla_latents:
             assert (

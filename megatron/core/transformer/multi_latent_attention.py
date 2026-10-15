@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
 
+import copy
 import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, NoReturn, Optional, Union
@@ -174,11 +175,24 @@ class MultiLatentAttention(Attention):
         )
         self.qkv_up_checkpoint = None
 
+        # Grouped-query MLA: the KV latent is up-projected to fewer key/value heads.
+        self.num_kv_heads = self.config.mla_num_query_groups or self.config.num_attention_heads
+        self.num_kv_heads_per_partition = self.num_kv_heads // self.pg_collection.tp.size()
+        if self.num_kv_heads % self.pg_collection.tp.size():
+            raise ValueError(
+                f"MLA key/value heads ({self.num_kv_heads}) must be divisible by the "
+                f"tensor-parallel size ({self.pg_collection.tp.size()})"
+            )
+
         mscale = _yarn_get_mscale(self.config.rotary_scaling_factor, self.config.mscale_all_dim)
         self.softmax_scale = mscale * mscale / math.sqrt(self.q_head_dim)
         self.cache_mla_latents = self.config.cache_mla_latents
 
-        if self.config.rope_type == "rope":
+        if self.config.qk_pos_emb_head_dim == 0:
+            # NoPE MLA: no decoupled RoPE key, no YaRN attention scaling.
+            self.rotary_pos_emb = None
+            self.softmax_scale = 1.0 / math.sqrt(self.q_head_dim)
+        elif self.config.rope_type == "rope":
             self.rotary_pos_emb = RotaryEmbedding(
                 self.config.qk_pos_emb_head_dim,
                 rotary_percent=self.config.rotary_percent,
@@ -204,9 +218,15 @@ class MultiLatentAttention(Attention):
                 "'rope' and 'yarn'"
             )
 
+        # The core attention reads the key/value head count from num_query_groups, which
+        # in a hybrid belongs to the standard-attention layers.
+        core_config = self.config
+        if core_config.num_query_groups != self.num_kv_heads:
+            core_config = copy.copy(self.config)
+            core_config.num_query_groups = self.num_kv_heads
         self.core_attention = build_module(
             submodules.core_attention,
-            config=self.config,
+            config=core_config,
             layer_number=self.layer_number,
             attn_mask_type=self.attn_mask_type,
             attention_type=self.attention_type,
@@ -366,6 +386,11 @@ class MultiLatentAttention(Attention):
         # Value is none during decode for absorption
         if value is not None:
             value = value.contiguous()
+        # Exclusive self attention reads this step's own values after core attention.
+        own_value = value if self.config.exclusive_self_attention else None
+        gate = None
+        if getattr(self, "linear_out_gate", None) is not None:
+            gate, _ = self.linear_out_gate(q_compressed)
 
         thd_packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
 
@@ -451,6 +476,13 @@ class MultiLatentAttention(Attention):
             # note that batch is a dummy dimension in the packed case
             core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
 
+        from megatron.core.transformer import arch_metrics
+
+        if arch_metrics.active():
+            self._record_arch_metrics(core_attn_out, own_value, gate)
+        if own_value is not None or gate is not None:
+            core_attn_out = self._exclusive_and_gate(core_attn_out, own_value, gate)
+
         if self.recompute_up_proj:
             assert self.qkv_up_checkpoint is not None
             self.qkv_up_checkpoint.discard_output_and_register_recompute(core_attn_out)
@@ -465,6 +497,21 @@ class MultiLatentAttention(Attention):
         output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])
 
         return output, bias
+
+
+    def _exclusive_and_gate(self, core_attn_out, own_value, gate):
+        """XSA against the own values (key/value heads, GQA) fused with the output
+        gate (fused_xsa.py), or the gate alone."""
+        if own_value is None:
+            return self._apply_output_gate(core_attn_out, gate)
+        from megatron.core.fusions.fused_xsa import exclusive_self_attention
+
+        shape = core_attn_out.shape
+        dim = self.config.v_head_dim
+        o = core_attn_out.reshape(-1, shape[-1] // dim, dim)
+        v = own_value.reshape(-1, own_value.shape[-2], dim)
+        g = gate.reshape(o.shape) if gate is not None else None
+        return exclusive_self_attention(o, v, g).view(shape)
 
 
 class MLASelfAttention(MultiLatentAttention):
@@ -603,7 +650,7 @@ class MLASelfAttention(MultiLatentAttention):
         self.linear_kv_up_proj = build_module(
             layer_classes["linear_kv_up_proj"],
             self.config.kv_lora_rank,
-            self.config.num_attention_heads * (self.config.qk_head_dim + self.config.v_head_dim),
+            self.num_kv_heads * (self.config.qk_head_dim + self.config.v_head_dim),
             config=self.config,
             init_method=self.config.init_method,
             gather_output=False,
@@ -626,6 +673,33 @@ class MLASelfAttention(MultiLatentAttention):
             hidden_size=self.config.kv_lora_rank,
             config=self.config,
             eps=self.config.layernorm_epsilon,
+        )
+        self._build_output_gate(layer_classes, name)
+
+    def _build_output_gate(self, layer_classes, name):
+        """Gated attention: a sigmoid gate per query-head output channel, projected
+        from the query latent (or the hidden states without a query latent) -- the
+        same input the query up-projection reads, already sequence-gathered under SP."""
+        self.linear_out_gate = None
+        if not self.config.attention_output_gate:
+            return
+        key = "linear_q_proj" if self.config.q_lora_rank is None else "linear_q_up_proj"
+        in_size = (
+            self.config.hidden_size if self.config.q_lora_rank is None else self.config.q_lora_rank
+        )
+        self.linear_out_gate = build_module(
+            layer_classes[key],
+            in_size,
+            self.config.num_attention_heads * self.config.v_head_dim,
+            config=self.config,
+            init_method=self.config.init_method,
+            gather_output=False,
+            bias=False,
+            skip_bias_add=False,
+            is_expert=False,
+            tp_comm_buffer_name=None,
+            tp_group=self.pg_collection.tp,
+            name=(name + ".linear_out_gate") if name is not None else None,
         )
 
     def _resolve_qk_norm_config(
@@ -691,16 +765,19 @@ class MLASelfAttention(MultiLatentAttention):
         # =========================================
         # Prepare RoPE and seqlen related params
         # =========================================
-        rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-            inference_context, None, hidden_states, self.config, packed_seq_params
-        )
-
         # rotary_pos_emb:[s, b, 1, 64]
         mscale = 1.0
         rotary_pos_cos = None
         rotary_pos_sin = None
+        rotary_pos_emb = None
         thd_packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
-        if self.config.rope_type == "rope":
+        if self.rotary_pos_emb is not None:
+            rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
+                inference_context, None, hidden_states, self.config, packed_seq_params
+            )
+        if self.rotary_pos_emb is None:
+            pass  # NoPE
+        elif self.config.rope_type == "rope":
             rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=thd_packed_seq)
         else:
             if self.config.apply_rope_fusion:
@@ -865,18 +942,24 @@ class MLASelfAttention(MultiLatentAttention):
             # kv: [num_tokens, n * (qk_head_dim + v_head_dim)]
             kv, _ = self.linear_kv_up_proj(kv_compressed)
 
-            # kv: [num_tokens, n, (qk_head_dim + v_head_dim)]
+            # kv: [num_tokens, n_kv, (qk_head_dim + v_head_dim)]
             kv = kv.view(
                 *kv.size()[:-1],
-                self.num_attention_heads_per_partition,
+                self.num_kv_heads_per_partition,
                 self.config.qk_head_dim + self.config.v_head_dim,
             )
 
             # [num_tokens, qk_pos_emb_head_dim] -> [num_tokens, 1, qk_pos_emb_head_dim]
             k_pos_emb = torch.unsqueeze(k_pos_emb, -2)
 
+            if self.config.qk_pos_emb_head_dim == 0:
+                # NoPE: the content parts are the whole query and key.
+                key, value = torch.split(
+                    kv, [self.config.qk_head_dim, self.config.v_head_dim], dim=-1
+                )
+                query = q
             # todo add assert about fusions and caching
-            if self.config.apply_rope_fusion:
+            elif self.config.apply_rope_fusion:
                 cp_rank = self.pg_collection.cp.rank()
                 cp_size = self.pg_collection.cp.size()
                 query = fused_apply_mla_rope_for_q(
@@ -957,10 +1040,10 @@ class MLASelfAttention(MultiLatentAttention):
 
                 # key: [num_tokens, n, (qk_head_dim + v_head_dim)]
                 if k_pos_emb.ndim == 4:
-                    k_pos_emb = k_pos_emb.expand(-1, -1, self.num_attention_heads_per_partition, -1)
+                    k_pos_emb = k_pos_emb.expand(-1, -1, self.num_kv_heads_per_partition, -1)
                 else:
                     assert k_pos_emb.ndim == 3
-                    k_pos_emb = k_pos_emb.expand(-1, self.num_attention_heads_per_partition, -1)
+                    k_pos_emb = k_pos_emb.expand(-1, self.num_kv_heads_per_partition, -1)
                 key = torch.cat([k_no_pe, k_pos_emb], dim=-1)
 
             query = query.contiguous()
@@ -1316,7 +1399,7 @@ class FusedMLASelfAttention(MLASelfAttention):
         self.linear_kv_up_proj = build_module(
             layer_classes["linear_kv_up_proj"],
             self.config.kv_lora_rank,
-            self.config.num_attention_heads * (self.config.qk_head_dim + self.config.v_head_dim),
+            self.num_kv_heads * (self.config.qk_head_dim + self.config.v_head_dim),
             config=self.config,
             init_method=self.config.init_method,
             gather_output=False,
@@ -1338,6 +1421,7 @@ class FusedMLASelfAttention(MLASelfAttention):
             config=self.config,
             eps=self.config.layernorm_epsilon,
         )
+        self._build_output_gate(layer_classes, name)
 
     def _qkv_down_projection(self, hidden_states):
         """Fused q/kv down projection path."""

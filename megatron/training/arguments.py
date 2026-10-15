@@ -3874,6 +3874,9 @@ def _add_mla_args(parser):
                        help="Mscale for YaRN RoPE in multi-latent attention.")
     group.add_argument('--mscale-all-dim', type=float, default=0.0,
                        help="Mscale all dimensions for YaRN RoPE in multi-latent attention.")
+    group.add_argument('--mla-num-query-groups', type=int, default=None,
+                       help="Grouped-query MLA: key/value heads up-projected from the KV latent "
+                       "(None = one per query head). --qk-pos-emb-head-dim 0 makes MLA NoPE.")
     group.add_argument('--cache-mla-latents', action='store_true', default=False,
                        help="If set caches the mla down projected latents with mla flash decode.")
     group.add_argument(
