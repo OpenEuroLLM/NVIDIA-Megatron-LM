@@ -473,6 +473,11 @@ class TransformerConfig(ModelParallelConfig):
     """The delta rule the triadic state extends: "gdn" (a decay per slice), "kda" (plus KDA's
     per-channel decay) or "ckda" (the signed channel gate of linear_fla_gate, beta up to 2)."""
 
+    linear_triadic_kernel: str = "auto"
+    """Triadic backend: "kda" (FLA's chunk_kda on the expanded keys; every base, E*D <= 256),
+    "cute" (cute-triadic-gdn's CuTe kernels: base gdn, head dim 128, sm90+) or "auto" (cute
+    when it applies and is installed, else kda)."""
+
     linear_fla_gate: str = "signed_sigmoid2"
     """Decay-gate parameterisation. "softplus"/"sigmoid" give alpha in (0,1];
     "signed_sigmoid2"/"signed_tanh" give alpha in [-1,1]. The signed forms plus

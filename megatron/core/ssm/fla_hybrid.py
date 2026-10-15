@@ -464,4 +464,5 @@ class Triadic(_FLALayerWrapper):
             conv_size=config.linear_conv_kernel_dim,
             norm_eps=config.layernorm_epsilon,
             layer_idx=layer_number,
+            kernel=config.linear_triadic_kernel,
         )

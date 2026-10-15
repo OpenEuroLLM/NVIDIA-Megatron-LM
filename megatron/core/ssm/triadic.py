@@ -22,9 +22,14 @@ slice, with a separable gate::
 the signed channel gate of Complex KDA, with ``beta`` up to 2). ``E = 1`` is the base
 mixer itself.
 
-This module computes it through the existing KDA chunk kernel on the expanded
-``kappa`` / ``q2 (x) q`` (step 1): exact, any GPU the kernel runs on, but the keys are
-``E`` times wider in memory and FLA's ``chunk_kda`` takes ``E * D <= 256``.
+Two backends (``linear_triadic_kernel``):
+
+* "kda": the existing KDA chunk kernel on the expanded ``kappa`` / ``q2 (x) q`` -- exact,
+  every base, any GPU the kernel runs on, but the keys are ``E`` times wider in memory
+  and FLA's ``chunk_kda`` takes ``E * D <= 256``.
+* "cute": the CuTe DSL kernels of cute-triadic-gdn (Hopper / Blackwell), which never
+  form ``kappa``: Triadic GDN only (no channel gate), ``D = 128``, ``E`` in
+  {1, 2, 4, 8, 12, 16}. "auto" takes them when they apply and are installed.
 :func:`triadic_reference` is the naive recurrence over the third-order state the
 expansion is tested against.
 """
@@ -46,6 +51,23 @@ except ImportError:  # pragma: no cover
     HAVE_FLA = False
 
 BASES = ("gdn", "kda", "ckda")
+KERNELS = ("auto", "kda", "cute")
+CUTE_E = (1, 2, 4, 8, 12, 16)
+
+
+def _cute_gdn():
+    """cute_triadic_gdn.gdn_joint_call, or None when not installed / not sm90+."""
+    try:
+        from cute_triadic_gdn import gdn_joint_call
+    except Exception:  # pragma: no cover - not installed
+        return None
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9:
+        return None
+    return gdn_joint_call
+
+
+def cute_applies(base: str, head_dim: int, e: int) -> bool:
+    return base == "gdn" and head_dim == 128 and e in CUTE_E
 
 
 def _l2norm(x: torch.Tensor) -> torch.Tensor:
@@ -148,12 +170,24 @@ class TriadicDeltaAttention(nn.Module):
         conv_size: int = 4,
         norm_eps: float = 1e-5,
         layer_idx: Optional[int] = None,
+        kernel: str = "auto",
     ) -> None:
         super().__init__()
         if not HAVE_FLA:
             raise ImportError("the triadic variant needs flash-linear-attention (ComplexKDA)")
         if base not in BASES:
             raise ValueError(f"triadic base must be one of {BASES}, got {base!r}")
+        if kernel not in KERNELS:
+            raise ValueError(f"triadic kernel must be one of {KERNELS}, got {kernel!r}")
+        self.cute = None
+        if kernel != "kda" and cute_applies(base, head_dim, e):
+            self.cute = _cute_gdn()
+        if kernel == "cute" and self.cute is None:
+            raise ValueError(
+                "linear_triadic_kernel=cute needs cute-triadic-gdn on an sm90+ GPU and "
+                f"base=gdn, head_dim=128, E in {CUTE_E} (got base={base}, head_dim={head_dim}, "
+                f"E={e})"
+            )
         self.h, self.d, self.e, self.base = num_heads, head_dim, e, base
         self.gate = "softplus" if base == "kda" else gate
         self.allow_neg_eigval = allow_neg_eigval or base == "ckda"
@@ -227,8 +261,14 @@ class TriadicDeltaAttention(nn.Module):
             k2 = q2 = torch.ones(b, t, self.h, 1, device=x.device, dtype=torch.float32)
         g2, g, sign = self._gates(x)
         beta = self.b_proj(x).float()
-        o = triadic_chunk(q, k, v, q2, k2, g2, beta, g=g, sign=sign,
-                          allow_neg_eigval=self.allow_neg_eigval)
+        if self.cute is not None and t % 64 == 0:
+            # Triadic GDN without forming kappa (beta in (0, 1): sigmoid here).
+            o = self.cute(q.to(torch.bfloat16), k.to(torch.bfloat16), v.to(torch.bfloat16),
+                          k2.contiguous(), q2.contiguous(), g2.contiguous(),
+                          torch.sigmoid(beta), scale=self.d**-0.5)
+        else:
+            o = triadic_chunk(q, k, v, q2, k2, g2, beta, g=g, sign=sign,
+                              allow_neg_eigval=self.allow_neg_eigval)
         gate = self.g_proj(x).view(b, t, self.h, self.d)
         o = self.o_norm(o, gate)
         return self.o_proj(o.reshape(b, t, self.h * self.d)), None, None

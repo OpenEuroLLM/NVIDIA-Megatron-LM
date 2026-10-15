@@ -112,3 +112,29 @@ def test_hybrid_model_with_triadic_layers_trains(base):
         assert not missing, missing
     finally:
         Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("e", [1, 2, 4, 8])
+def test_cute_kernel_matches_reference(e):
+    """cute-triadic-gdn (Triadic GDN, D = 128, sm90+) against the third-order recurrence,
+    forward and gradients; and against the KDA expansion where both apply."""
+    gdn_joint_call = triadic._cute_gdn()
+    if gdn_joint_call is None:
+        pytest.skip("needs cute-triadic-gdn on an sm90+ GPU")
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    b, t, h, d = 1, 128, 2, 128
+    q, k, v, q2, k2, g2, _, _, bl = _inputs(b, t, h, d, e, False, gen)
+    beta = torch.sigmoid(bl)
+    ref = triadic.triadic_reference(q, k, v, q2, k2, g2, beta)
+    out = gdn_joint_call(q.bfloat16(), k.bfloat16(), v.bfloat16(), k2, q2, g2, beta,
+                         scale=d**-0.5).float()
+    assert (out - ref).norm() / ref.norm() < 2e-2
+    if e * d <= 256:
+        via_kda = triadic.triadic_chunk(q, k, v.bfloat16(), q2, k2, g2, bl).float()
+        assert (out - via_kda).norm() / via_kda.norm() < 2e-2
+    # gradients: the CuTe backward against autograd through the KDA expansion is
+    # covered by cute-triadic-gdn's own tests; here, that they exist and are finite
+    leaves = [x.clone().requires_grad_() for x in (q2, k2, g2, beta)]
+    qb, kb, vb = (x.bfloat16().requires_grad_() for x in (q, k, v))
+    gdn_joint_call(qb, kb, vb, *leaves[:2], leaves[2], leaves[3], scale=d**-0.5).float().sum().backward()
+    assert all(x.grad is not None and torch.isfinite(x.grad).all() for x in [qb, kb, vb] + leaves)
