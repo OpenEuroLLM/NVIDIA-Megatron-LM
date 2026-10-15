@@ -101,6 +101,22 @@ class Canon(nn.Module):
         # A per-channel conv kernel, not a linear map: no Muon-family update.
         self.weight.use_adam_with_emerging_optimizers = True
 
+    def sharded_state_dict(self, prefix: str = "", sharded_offsets: tuple = (), metadata=None):
+        """B / D weights are channel slices of a TP-sharded projection output: declare
+        the axis, or a checkpoint stores one rank's slice as the whole tensor and a
+        resume at another TP size fails. A / C weights are replicated."""
+        from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
+
+        axis = {"weight": self.weight.partition_dim} if self.tp_sharded_channels else {}
+        return make_sharded_tensors_for_checkpoint(
+            self.state_dict(prefix="", keep_vars=True),
+            prefix,
+            axis,
+            sharded_offsets,
+            tp_group=self.tp_group,
+            dp_cp_group=(metadata or {}).get("dp_cp_group"),
+        )
+
     def _flat_weight(self):
         return self.weight.reshape(-1, self.k)  # D: [gate | up] channels
 

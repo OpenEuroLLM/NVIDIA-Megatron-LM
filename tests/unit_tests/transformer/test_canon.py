@@ -157,3 +157,26 @@ def test_distributed_matches_whole_sequence(mode, swiglu):
         torch.testing.assert_close(wgrad, ref_w.grad, rtol=1e-4, atol=1e-4)
     finally:
         Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("tp_size", [1, 2])
+@pytest.mark.parametrize("swiglu,sharded", [(False, False), (False, True), (True, True)])
+def test_sharded_state_dict_declares_the_tp_axis(tp_size, swiglu, sharded):
+    """B / D weights are TP slices: the checkpoint must know their global shape."""
+    if Utils.world_size < tp_size:
+        pytest.skip("needs 2 GPUs")
+    Utils.initialize_model_parallel(tensor_model_parallel_size=tp_size)
+    try:
+        tp = parallel_state.get_tensor_model_parallel_group()
+        canon = Canon(
+            _config(tensor_model_parallel_size=tp_size), 32 // tp_size if sharded else 32,
+            tp_group=tp, cp_group=None, tp_sharded_channels=sharded, swiglu=swiglu,
+        )
+        sd = canon.sharded_state_dict(prefix="layer.canon.")
+        sh = sd["layer.canon.weight"]
+        expected = list(canon.weight.shape)
+        if sharded:
+            expected[canon.weight.partition_dim] *= tp_size
+        assert sh.global_shape == tuple(expected)
+    finally:
+        Utils.destroy_model_parallel()
