@@ -45,6 +45,7 @@ sublayer output, so block summaries stay on the unit sphere instead of growing
 with block size.
 """
 
+import math
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -206,6 +207,29 @@ class BlockAttnRes(nn.Module):
                 self.query.zero_()
             self.key_norm_weight.fill_(1.0)
 
+    @torch.no_grad()
+    def _record_arch_metrics(self, sources: list[torch.Tensor]) -> None:
+        """Depth attention: its normalized entropy over the sources (0 = one source,
+        1 = uniform) and the weight on the current partial block (the plain residual)."""
+        from megatron.core.transformer import arch_metrics
+
+        tag = arch_metrics.tag_of(self)
+        if tag is None or len(sources) < 2:
+            return
+        kind, layer, n = tag
+        qg = (self.query.float() * self.key_norm_weight.float()).to(sources[0].dtype)
+        logits = torch.stack(
+            [
+                torch.einsum("sbd,d->sb", v, qg).float()
+                * torch.rsqrt(v.float().pow(2).mean(-1) + self.eps)
+                for v in sources
+            ]
+        )
+        w = torch.softmax(logits, dim=0)
+        entropy = -(w * w.clamp(min=1e-12).log()).sum(0) / math.log(len(sources))
+        arch_metrics.record_mean(f"attnres_{kind}/entropy", layer, n, entropy)
+        arch_metrics.record_mean(f"attnres_{kind}/current_weight", layer, n, w[-1])
+
     def forward(self, sources: list[torch.Tensor]) -> torch.Tensor:
         """Aggregate prior representations with learned depth-wise attention.
 
@@ -216,6 +240,10 @@ class BlockAttnRes(nn.Module):
         Returns:
             The attended hidden state, ``[s, b, d]``.
         """
+        from megatron.core.transformer import arch_metrics
+
+        if arch_metrics.active():
+            self._record_arch_metrics(sources)
         # One fused, compiled aggregation instead of ~2k per-source kernels.
         # Stacking is cheap relative to the launch overhead it removes, and
         # Inductor fuses the norm/softmax/weighted-sum chain into a few kernels.

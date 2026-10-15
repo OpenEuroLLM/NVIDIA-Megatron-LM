@@ -1611,6 +1611,11 @@ class Attention(MegatronModule, ABC):
             core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
         nvtx_range_pop(suffix="core_attention")
 
+        from megatron.core.transformer import arch_metrics
+
+        if arch_metrics.active():
+            self._record_arch_metrics(core_attn_out, own_value, gate)
+
         if own_value is not None:
             # Exclusive self attention, fused with the output gate (fused_xsa.py).
             from megatron.core.fusions.fused_xsa import exclusive_self_attention
@@ -1644,6 +1649,25 @@ class Attention(MegatronModule, ABC):
         return output, bias
 
     @jit_fuser
+    @torch.no_grad()
+    def _record_arch_metrics(self, core_attn_out, own_value, gate):
+        """Output-gate openness (mean, and the fraction of nearly closed entries: the
+        attention-sink signature) and, under XSA, how much of each head's output is
+        a copy of the token's own value (|cos(o, v)|, removed by XSA)."""
+        from megatron.core.transformer import arch_metrics
+
+        layer, n = self.layer_number, arch_metrics.num_layers_of(self.config)
+        if gate is not None:
+            g = torch.sigmoid(gate.float())
+            arch_metrics.record_mean("attn_gate/mean", layer, n, g)
+            arch_metrics.record_mean("attn_gate/closed", layer, n, g < 0.05)
+        if own_value is not None:
+            hkv, dim = own_value.shape[-2], own_value.shape[-1]
+            o = core_attn_out.reshape(-1, core_attn_out.shape[-1] // dim, dim).float()
+            v = own_value.reshape(-1, hkv, dim).float().repeat_interleave(o.shape[1] // hkv, 1)
+            cos = torch.nn.functional.cosine_similarity(o, v, dim=-1, eps=1e-6)
+            arch_metrics.record_mean("xsa/self_cos", layer, n, cos.abs())
+
     def _apply_output_gate(self, x, gate):
         x_dtype = x.dtype
         gate = gate.contiguous()

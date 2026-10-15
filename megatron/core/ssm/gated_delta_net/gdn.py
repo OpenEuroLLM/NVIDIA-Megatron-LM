@@ -8,6 +8,7 @@
 from functools import partial
 from typing import Optional
 
+import math
 import torch
 import torch.nn.functional as F
 
@@ -244,6 +245,17 @@ class GatedDeltaNet(_GDNBase):
             self.config.linear_beta_activation,
         )
         nvtx_range_pop(suffix="g_and_beta")
+        from megatron.core.transformer import arch_metrics
+
+        if arch_metrics.active():
+            with torch.no_grad():
+                n = arch_metrics.num_layers_of(self.config)
+                arch_metrics.record_mean("gdn/log_decay", self.layer_number, n, g)
+                # decay > 0.99 per token: a memory horizon beyond ~100 tokens
+                arch_metrics.record_mean(
+                    "gdn/long_memory", self.layer_number, n, g > math.log(0.99)
+                )
+                arch_metrics.record_mean("gdn/beta", self.layer_number, n, beta)
 
         nvtx_range_push(suffix="gated_delta_rule")
         core_attn_out, _ = self.gated_delta_rule(

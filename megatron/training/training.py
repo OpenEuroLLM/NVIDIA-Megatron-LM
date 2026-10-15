@@ -99,6 +99,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import \
     DSAIndexerLossLoggingHelper
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe import upcycling_utils
+from megatron.core.transformer import arch_metrics
 from megatron.core.transformer.moe.moe_health import (
     capture_expert_viability_parameter_stats,
     report_moe_health_metrics,
@@ -3401,6 +3402,14 @@ def training_log(
             writer.add_scalar('max_attention_logit', max_attention_logit, iteration)
             if wandb_writer:
                 wandb_writer.log({'max_attention_logit': max_attention_logit}, iteration)
+    # Architecture diagnostics (gates, residual streams, memories); a collective, so
+    # every rank takes part.
+    if args.arch_metrics_interval and iteration % args.arch_metrics_interval == 0:
+        arch_log_string = arch_metrics.report(
+            iteration, writer, wandb_writer, per_layer=args.moe_per_layer_logging
+        )
+        if arch_log_string:
+            print_rank_last(f" arch metrics at iteration {iteration}: {arch_log_string}")
     # Log MoE metrics.
     moe_log_string = ""
     if args.num_experts is not None:
@@ -4527,6 +4536,11 @@ def train(
             max_attention_logit = None
         else:
             ft_integration.on_training_step_start()
+            # Architecture diagnostics are recorded on the steps training_log reports.
+            arch_metrics.set_active(
+                bool(args.arch_metrics_interval)
+                and (iteration + 1) % args.arch_metrics_interval == 0
+            )
             (
                 loss_dict,
                 skipped_iter,
@@ -4541,6 +4555,7 @@ def train(
                 pg_collection=pg_collection,
                 p2p_communicator=p2p_communicator,
             )
+            arch_metrics.set_active(False)
             # TE inspect: reduce and flush the per-step feature buffers.
             te_debug_step()
             ft_integration.on_training_step_end()

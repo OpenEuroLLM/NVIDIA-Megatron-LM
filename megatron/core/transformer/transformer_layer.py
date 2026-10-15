@@ -536,6 +536,17 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
             self.attnres_attn = _make_attnres() if has_attn else None
             self.attnres_mlp = _make_attnres() if has_mlp else None
+        from megatron.core.transformer import arch_metrics
+
+        for kind, module in (
+            ("attn", self.ngpt_attn_residual),
+            ("mlp", self.ngpt_mlp_residual),
+            ("attn", self.mhc_attn_mixer),
+            ("mlp", self.mhc_mlp_mixer),
+            ("attn", self.attnres_attn),
+            ("mlp", self.attnres_mlp),
+        ):
+            arch_metrics.tag(module, kind, self.layer_number, self.config)
         # These act per token, so each TP rank sees only its own tokens under
         # sequence parallelism: their gradients are summed over TP like a norm's.
         for module in (
@@ -958,6 +969,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             keeps the layer capturable.
         """
         h_pre, h_post, h_res = mixer(streams)
+        from megatron.core.transformer import arch_metrics
+
+        if arch_metrics.active():
+            mixer.record_metrics(streams, (h_pre, h_post, h_res))
         return mixer.read(streams, h_pre), (h_post, h_res)
 
     def _mhc_write(self, mixer, kind: str, streams: Tensor, output_with_bias, pending) -> Tensor:

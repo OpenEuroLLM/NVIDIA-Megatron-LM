@@ -81,6 +81,28 @@ class RoutedStreamMixer(nn.Module):
         w = torch.gather(w, 1, idx.long())
         return (idx, r, stash), (idx, w, stash), None
 
+
+    @torch.no_grad()
+    def record_metrics(self, streams: torch.Tensor, coeffs) -> None:
+        """Stream selection of this sublayer (arch_metrics): the share of each
+        non-main stream among the routed picks (entropy, and min_rel 0 = a stream
+        never picked), the read weight left on the main stream, the write strength."""
+        from megatron.core.transformer import arch_metrics
+
+        tag = arch_metrics.tag_of(self)
+        if tag is None:
+            return
+        kind, layer, num_layers = tag
+        (idx, r, _), (_, w, _), _ = coeffs
+        p = f"routed_{kind}"
+        if self.k > 1 and self.n > 2:
+            picks = idx[:, 1:].long() - 1  # non-main streams, numbered 0..n-2
+            onehot = torch.zeros(idx.shape[0], self.n - 1, device=idx.device)
+            onehot.scatter_(1, picks, 1.0 / picks.shape[1])
+            arch_metrics.record_share(f"{p}/pick_share", layer, num_layers, onehot)
+        arch_metrics.record_mean(f"{p}/main_read", layer, num_layers, r[:, 0])
+        arch_metrics.record_mean(f"{p}/write", layer, num_layers, w)
+
     def read(self, streams: torch.Tensor, h_pre) -> torch.Tensor:
         idx, r, stash = h_pre
         return routed_read(streams, idx, r, stash)

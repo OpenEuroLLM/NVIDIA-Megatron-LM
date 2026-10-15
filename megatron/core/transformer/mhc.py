@@ -548,6 +548,28 @@ class MHCMixer(nn.Module):
             sinkhorn_knopp(h_res, self.num_sinkhorn_iters),
         )
 
+    @torch.no_grad()
+    def record_metrics(self, streams: torch.Tensor, coeffs) -> None:
+        """Stream usage of this sublayer (arch_metrics): how the read spreads over
+        the streams, the write strength, and how much the mixer keeps the streams
+        apart (diagonal mass 1) or mixes them (1/n)."""
+        from megatron.core.transformer import arch_metrics
+
+        tag = arch_metrics.tag_of(self)
+        if tag is None:
+            return
+        kind, layer, num_layers = tag
+        h_pre, h_post, h_res = coeffs
+        p = f"mhc_{kind}"
+        read = h_pre.float()
+        arch_metrics.record_share(
+            f"{p}/read_share", layer, num_layers, read / read.sum(-1, keepdim=True).clamp(min=1e-12)
+        )
+        arch_metrics.record_mean(f"{p}/write", layer, num_layers, h_post)
+        arch_metrics.record_mean(
+            f"{p}/res_diag", layer, num_layers, torch.diagonal(h_res, dim1=-2, dim2=-1)
+        )
+
     def read(self, streams: torch.Tensor, h_pre: torch.Tensor) -> torch.Tensor:
         """Aggregate the ``n`` streams into a single ``C``-dim layer input."""
         global _mhc_read_compiled

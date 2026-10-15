@@ -10,6 +10,7 @@ import logging
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -455,6 +456,17 @@ class MLSTM(MegatronModule):
         q, k, v, i_preact, f_preact = self._prepare_qkvif(
             q, k, v, i_preact, f_preact, igate_bias_local_cp, fgate_bias_local_cp, batch, seq_len
         )
+        from megatron.core.transformer import arch_metrics
+
+        if arch_metrics.active():
+            with torch.no_grad():
+                n = arch_metrics.num_layers_of(self.config)
+                log_f = torch.nn.functional.logsigmoid(f_preact.float())
+                arch_metrics.record_mean("mlstm/log_fgate", self.layer_number, n, log_f)
+                arch_metrics.record_mean(
+                    "mlstm/long_memory", self.layer_number, n, log_f > math.log(0.99)
+                )
+                arch_metrics.record_mean("mlstm/igate_preact", self.layer_number, n, i_preact)
         # Grouped-query mode: expand q/k heads to the value heads (same layout
         # as GatedDeltaNet — consecutive value heads share a key head).
         if self.qk_repeat > 1:

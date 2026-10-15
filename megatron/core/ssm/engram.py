@@ -258,7 +258,7 @@ class EngramLayer(MegatronModule):
         )
 
         self.residual_scheme = (
-            ResidualSchemeAdapter(config) if residual_scheme_active(config) else None
+            ResidualSchemeAdapter(config, layer_number) if residual_scheme_active(config) else None
         )
         self._depth_state = None
 
@@ -370,6 +370,13 @@ class EngramLayer(MegatronModule):
         v = self.value_proj(e)
         gate = (self.hidden_norm(h).float() * self.key_norm(k).float()).sum(-1, keepdim=True)
         alpha = torch.sigmoid(gate / math.sqrt(h.shape[-1])).to(h.dtype)
+        from megatron.core.transformer import arch_metrics
+
+        if arch_metrics.active():
+            n = arch_metrics.num_layers_of(self.config)
+            arch_metrics.record_mean("engram/gate", self.layer_number, n, alpha)
+            arch_metrics.record_mean("engram/gate_closed", self.layer_number, n, alpha < 0.05)
+            arch_metrics.record_mean("engram/gate_open", self.layer_number, n, alpha > 0.95)
         v = alpha * v
         pad = (self.kernel_size - 1) * self.dilation
         conv = self.conv1d(F.pad(v.permute(1, 2, 0), (pad, 0))).permute(2, 0, 1)

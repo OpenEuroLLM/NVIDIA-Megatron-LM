@@ -303,6 +303,11 @@ class NGPTResidual(nn.Module):
         # cast once.
         alpha32 = self._alpha_activation_fn(self.alpha.float() * self.alpha_scaler)
         alpha = alpha32.to(input_dtype)
+        from megatron.core.transformer import arch_metrics
+
+        tag = arch_metrics.tag_of(self)
+        if tag is not None and arch_metrics.active():
+            arch_metrics.record_mean(f"ngpt_{tag[0]}/lerp_rate", tag[1], tag[2], alpha32)
 
         if self.post_layer_norm:
             # vector_norm saves only its input and output, so no [s, b, h]

@@ -105,7 +105,7 @@ class MambaLayer(GraphableMegatronModule):
         )
 
         self.residual_scheme = (
-            ResidualSchemeAdapter(config) if residual_scheme_active(config) else None
+            ResidualSchemeAdapter(config, layer_number) if residual_scheme_active(config) else None
         )
         self._depth_state = None
 

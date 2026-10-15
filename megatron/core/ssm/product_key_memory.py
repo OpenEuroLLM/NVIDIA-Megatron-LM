@@ -179,7 +179,7 @@ class ProductKeyMemoryLayer(MegatronModule):
         )
 
         self.residual_scheme = (
-            ResidualSchemeAdapter(config) if residual_scheme_active(config) else None
+            ResidualSchemeAdapter(config, layer_number) if residual_scheme_active(config) else None
         )
         self._depth_state = None
         for module in (self.norm, self.query_proj, self.query_norm, self.gate_proj, self.out_proj):
@@ -267,6 +267,18 @@ class ProductKeyMemoryLayer(MegatronModule):
             out = reduce_from_tensor_model_parallel_region(out, group=self.tp_group)
         return out.to(dtype)
 
+    @torch.no_grad()
+    def _record_arch_metrics(self, rows, weights):
+        """Memory usage: the fraction of value rows read since the last report (low =
+        dead memory), and how peaked the read over the top-k rows is."""
+        from megatron.core.transformer import arch_metrics
+
+        n = arch_metrics.num_layers_of(self.config)
+        arch_metrics.record_union("pkm/rows_used", self.layer_number, n, self.total_rows, rows)
+        w = weights.float()
+        entropy = -(w * w.clamp(min=1e-12).log()).sum(-1) / math.log(max(w.shape[-1], 2))
+        arch_metrics.record_mean("pkm/read_entropy", self.layer_number, n, entropy)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -287,6 +299,10 @@ class ProductKeyMemoryLayer(MegatronModule):
         q = self.query_norm(q).flatten(-2)  # [T, H, k_dim], halves normalized separately
         scores, rows = product_key_topk(q, self.keys1, self.keys2, self.topk)
         weights = torch.softmax(scores, dim=-1)
+        from megatron.core.transformer import arch_metrics
+
+        if arch_metrics.active():
+            self._record_arch_metrics(rows, weights)
         read = self._read(rows, weights, x.dtype)  # [T, value_dim]
         if self.gate_proj is not None:
             read = read * F.silu(self.gate_proj(x))

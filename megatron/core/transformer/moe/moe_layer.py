@@ -213,6 +213,9 @@ class BaseMoELayer(MegatronModule, ABC):
         """Set the layer number for the MoE layer."""
         self.layer_number = layer_number
         self.router.set_layer_number(layer_number)
+        from megatron.core.transformer import arch_metrics
+
+        arch_metrics.tag(self.shared_experts, "mlp", layer_number, self.config)
 
 
 class MoELayer(BaseMoELayer):

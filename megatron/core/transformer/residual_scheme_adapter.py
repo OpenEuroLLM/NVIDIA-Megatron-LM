@@ -40,7 +40,7 @@ class ResidualSchemeAdapter(nn.Module):
     either kind costs and behaves the same in a stack.
     """
 
-    def __init__(self, config) -> None:
+    def __init__(self, config, layer_number: Optional[int] = None) -> None:
         super().__init__()
         self.config = config
         self.mhc_mixer = None
@@ -71,6 +71,10 @@ class ResidualSchemeAdapter(nn.Module):
                 eps=config.layernorm_epsilon,
                 query_init_std=config.attn_res_query_init_std,
             )
+        from megatron.core.transformer import arch_metrics
+
+        for module in (self.mhc_mixer, self.attnres, self.ngpt_residual):
+            arch_metrics.tag(module, "mixer", layer_number, config)
         # Per-token modules: under sequence parallelism each TP rank sees only its own
         # tokens, so their gradients are summed over TP like a norm's.
         for param in self.parameters():
@@ -88,6 +92,10 @@ class ResidualSchemeAdapter(nn.Module):
         if self.mhc_mixer is not None:
             streams = hidden_states  # [s, b, n, h]
             h_pre, h_post, h_res = self.mhc_mixer(streams)
+            from megatron.core.transformer import arch_metrics
+
+            if arch_metrics.active():
+                self.mhc_mixer.record_metrics(streams, (h_pre, h_post, h_res))
             return self.mhc_mixer.read(streams, h_pre), (streams, h_post, h_res)
         if self.attnres is not None:
             if depth_state is None:

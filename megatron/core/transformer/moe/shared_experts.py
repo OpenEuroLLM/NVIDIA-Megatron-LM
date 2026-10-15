@@ -192,12 +192,20 @@ class SharedExpertMLP(MLP):
                 SharedExpertMLP.stream = torch.cuda.Stream()
             self.stream = SharedExpertMLP.stream
 
+    def _record_gate(self, gate_score: torch.Tensor) -> None:
+        from megatron.core.transformer import arch_metrics
+
+        tag = arch_metrics.tag_of(self)
+        if tag is not None and arch_metrics.active():
+            arch_metrics.record_mean("shared_expert/gate", tag[1], tag[2], gate_score)
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Forward function"""
         output, _ = super().forward(hidden_states)
         if self.use_shared_expert_gate:
             logits = torch.nn.functional.linear(hidden_states, self.gate_weight)
             gate_score = torch.nn.functional.sigmoid(logits)
+            self._record_gate(gate_score)
             output = output * gate_score
         return output
 
@@ -563,6 +571,7 @@ class FusedSharedExpertMLP(SharedExpertMLP):
         if self.use_shared_expert_gate:
             logits = torch.nn.functional.linear(hidden_states, self.gate_weight)
             gate_score = torch.nn.functional.sigmoid(logits)
+            self._record_gate(gate_score)
             output = output * gate_score
         return output
 
