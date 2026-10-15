@@ -1230,6 +1230,68 @@ class TestOptimizerResharding:
                 assert not any(map(bool, diffs)), diffs
                 Utils.destroy_model_parallel()
 
+    @pytest.mark.parametrize('optimizer', ['muon', 'adam'])
+    @pytest.mark.parametrize(('src_exp', 'dest_exp'), [(2, 1), (1, 2), (2, 4)])
+    def test_param_keyed_float16_optimizer_expert_layout_change(
+        self, tmp_path_dist_ckpt, optimizer, src_exp, dest_exp
+    ):
+        """The non-distributed Float16 optimizer (Muon-family + its Adam fallback) under
+        the fully reshardable, param-keyed format: loads across EP sizes and across the
+        EP=1 / EP>1 change of the chained optimizers."""
+        Utils.initialize_distributed()
+        metadata = {
+            'distrib_optim_sharding_type': 'fully_reshardable',
+            'chained_optim_avoid_prefix': True,
+        }
+
+        def build(seed, ep):
+            model, opt = setup_moe_model_and_optimizer(
+                seed=seed, tp=1, pp=1, ep=ep, bf16=True, dist_opt=False, optimizer=optimizer
+            )
+            torch.manual_seed(seed)
+            for sub in opt.chained_optimizers:
+                for state in sub.optimizer.state.values():
+                    for value in state.values():
+                        if isinstance(value, torch.Tensor) and value.is_floating_point():
+                            value.copy_(torch.rand_like(value))
+            return model, opt
+
+        with TempNamedDir(tmp_path_dist_ckpt / 'test_param_keyed_A', sync=True) as ckpt_dir_A:
+            with TempNamedDir(tmp_path_dist_ckpt / 'test_param_keyed_B', sync=True) as ckpt_dir_B:
+                Utils.initialize_model_parallel(1, 1, expert_model_parallel_size=src_exp)
+                model_A, optimizer_A = build(2, src_exp)
+                save(
+                    optimizer_A.sharded_state_dict(
+                        model_A[0].sharded_state_dict(), metadata=metadata
+                    ),
+                    ckpt_dir_A,
+                )
+                Utils.destroy_model_parallel()
+
+                Utils.initialize_model_parallel(1, 1, expert_model_parallel_size=dest_exp)
+                model_B, optimizer_B = build(3, dest_exp)
+                state_dict = load(
+                    optimizer_B.sharded_state_dict(
+                        model_B[0].sharded_state_dict(), metadata=metadata, is_loading=True
+                    ),
+                    ckpt_dir_A,
+                )
+                optimizer_B.load_state_dict(state_dict)
+                save(
+                    optimizer_B.sharded_state_dict(
+                        model_B[0].sharded_state_dict(), metadata=metadata
+                    ),
+                    ckpt_dir_B,
+                )
+                Utils.destroy_model_parallel()
+
+                Utils.initialize_model_parallel(1, 1)
+                plain_A, plain_B = load_plain_tensors(ckpt_dir_A), load_plain_tensors(ckpt_dir_B)
+                assert any(k.startswith('optimizer.state.') for k in plain_A)
+                diffs = diff(plain_A, plain_B)
+                assert not any(map(bool, diffs)), diffs
+                Utils.destroy_model_parallel()
+
     @pytest.mark.parametrize(
         ('src_exp', 'dest_exp'),
         # EP=1 puts the experts into the dense optimizer, EP>1 into their own.

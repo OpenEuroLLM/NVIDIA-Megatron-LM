@@ -189,6 +189,21 @@ param_group_identifier_keys = (
     'is_expert_parallel',
     'is_decoupled_lr',
 )
+
+
+def _param_group_identifier(group: dict) -> tuple:
+    """The ``param_group_identifier_keys`` tuple of a param group (missing == None)."""
+    out = []
+    for key in param_group_identifier_keys:
+        if key in group:
+            out.append(group[key])
+        elif f"pre_{key}" in group:
+            out.append(group[f"pre_{key}"])
+        else:
+            out.append(None)
+    return tuple(out)
+
+
 MTP_GRAD_NORM_GROUP = 'mtp'
 GRAD_NORM_GROUP_ATTR = 'grad_norm_group'
 SEPARATE_GRAD_NORM_GROUPS = (MTP_GRAD_NORM_GROUP,)
@@ -1191,30 +1206,140 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         state_dict['fp32_from_fp16_params'] = self.fp32_from_float16_groups
         return state_dict
 
+    def _optimizer_model_params(self) -> List[torch.nn.Parameter]:
+        """The model parameter behind every optimizer param, in optimizer-state id order.
+
+        Optimizer state ids enumerate ``param_groups[*]['params']``, which hold the fp32
+        main copy of each fp16/bf16 parameter and fp32 model parameters themselves.
+        """
+        main_to_model = {
+            id(main): model
+            for model_group, main_group in zip(self.float16_groups, self.fp32_from_float16_groups)
+            for model, main in zip(model_group, main_group)
+        }
+        return [
+            main_to_model.get(id(p), p) for g in self.optimizer.param_groups for p in g['params']
+        ]
+
+    def _param_keyed_sharded_state_dict(self, model_sharded_state_dict, is_loading):
+        """Parallel-layout-independent format (``fully_reshardable``).
+
+        Optimizer state and fp32 main params are ShardedTensors of the model parameter
+        they belong to, in a dict (never a list), and group hyper-parameters are a dict
+        matched by identifier on load. Nothing depends on how parameters are grouped into optimizers or how
+        many of them a rank holds, so a checkpoint loads under another TP / PP / EP
+        layout and across the EP=1 / EP>1 change of the chained optimizers.
+        """
+        if is_loading:
+            self.init_state_fn(self.optimizer, self.config)
+        inner = self.optimizer.state_dict()
+        model_params = self._optimizer_model_params()
+        id_map = get_param_id_to_sharded_param_map(model_sharded_state_dict, model_params)
+        _backfill_gtp_sharded_param_map(id_map, [model_params], model_sharded_state_dict)
+        main_params = [p for g in self.optimizer.param_groups for p in g['params']]
+        step = self._extract_common_per_param_step(inner)
+        self._param_keyed_keys = {}
+        param_state = {}
+        for pid, sharded in id_map.items():
+            entry = {
+                'fp32_param': make_sharded_optimizer_tensor(
+                    sharded, main_params[pid], prefix='optimizer.state.fp32_param'
+                )
+            }
+            for name, value in inner['state'].get(pid, {}).items():
+                if name == 'step' or not isinstance(value, torch.Tensor):
+                    continue
+                entry[name] = make_sharded_optimizer_tensor(
+                    sharded, value, prefix=f'optimizer.state.{name}'
+                )
+            # The checkpoint identity is in each ShardedTensor (key + offsets); this dict
+            # key only has to be unique on this rank -- stacked layers share one
+            # sharded key and differ by offset.
+            local_key = f"{pid}:{sharded.key}"
+            param_state[local_key] = entry
+            self._param_keyed_keys[pid] = local_key
+        state_dict = {
+            'param_keyed': True,
+            'param_groups': {
+                str(i): {k: v for k, v in g.items() if k != 'params'}
+                for i, g in enumerate(inner['param_groups'])
+            },
+            'param_state': param_state,
+        }
+        if step is not None:
+            state_dict['common_step'] = step
+        if self.grad_scaler:
+            state_dict['grad_scaler'] = self.grad_scaler.state_dict()
+        return state_dict
+
+    def _load_param_keyed(self, state_dict):
+        """Load counterpart of :meth:`_param_keyed_sharded_state_dict`."""
+        current = self.optimizer.state_dict()
+        saved = {_param_group_identifier(g): g for g in state_dict['param_groups'].values()}
+        allow_new = getattr(self.config, 'allow_new_param_groups_on_load', False)
+        groups = []
+        for live, cur in zip(self.optimizer.param_groups, current['param_groups']):
+            match = saved.get(_param_group_identifier(cur))
+            if match is None and allow_new:
+                fallback = fallback_saved_param_group(cur, list(saved.values()))
+                if fallback is not None:
+                    match = merge_new_param_group(cur, fallback)
+            if match is None:
+                raise ValueError(
+                    f"param_group {_param_group_identifier(cur)} not found in the checkpoint "
+                    f"(available: {list(saved)})"
+                )
+            groups.append({**match, 'params': cur['params']})
+        main_params = [p for g in self.optimizer.param_groups for p in g['params']]
+        keys = getattr(self, '_param_keyed_keys', None)
+        if keys is None:
+            raise RuntimeError("sharded_state_dict(is_loading=True) must run before loading")
+        state = {}
+        for pid, key in keys.items():
+            entry = state_dict['param_state'][key]
+            with torch.no_grad():
+                main_params[pid].copy_(entry['fp32_param'])
+            optim_state = {k: v for k, v in entry.items() if k != 'fp32_param'}
+            if 'common_step' in state_dict:
+                optim_state['step'] = copy.deepcopy(state_dict['common_step'])
+            if optim_state:
+                state[pid] = optim_state
+        self.optimizer.load_state_dict({'state': state, 'param_groups': groups})
+        if 'grad_scaler' in state_dict and self.grad_scaler:
+            self.grad_scaler.load_state_dict(state_dict['grad_scaler'])
+
     def sharded_state_dict(
         self,
         model_sharded_state_dict: ShardedStateDict,
         is_loading: bool = False,
         metadata: Optional[dict] = None,
     ):
+        if (metadata or {}).get('distrib_optim_sharding_type') == 'fully_reshardable':
+            return self._param_keyed_sharded_state_dict(model_sharded_state_dict, is_loading)
 
         if is_loading:
             self.init_state_fn(self.optimizer, self.config)
 
         state_dict = self.state_dict()
 
+        # Optimizer state ids enumerate every param of every group, fp32 model params
+        # (kept as they are) included; mapping only the fp16/bf16 ones would shift the
+        # ids of everything after an fp32 param in its group.
+        model_params = self._optimizer_model_params()
         id_to_sharded_param_map = get_param_id_to_sharded_param_map(
-            model_sharded_state_dict, chain.from_iterable(g for g in self.float16_groups)
+            model_sharded_state_dict, model_params
         )
 
+        # One flat "group" in optimizer-id order keeps the backfill's ids aligned.
         _backfill_gtp_sharded_param_map(
-            id_to_sharded_param_map, self.float16_groups, model_sharded_state_dict
+            id_to_sharded_param_map, [model_params], model_sharded_state_dict
         )
 
-        # Convert fp32_from_fp16_params
+        # Convert fp32_from_fp16_params (the main copies of the fp16/bf16 params only).
         assert len(state_dict['fp32_from_fp16_params']) == len(
             state_dict['optimizer']['param_groups']
         )
+        main_ids = {id(p) for g in self.fp32_from_float16_groups for p in g}
         state_dict['fp32_from_fp16_params'] = [
             [
                 make_sharded_optimizer_tensor(
@@ -1222,10 +1347,19 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                     fp32_param,
                     prefix=f'optimizer.state.fp32_param',
                 )
-                for param_id, fp32_param in zip(state_group['params'], fp32_group)
+                for param_id, fp32_param in zip(
+                    [
+                        pid
+                        for pid, live in zip(state_group['params'], live_group['params'])
+                        if id(live) in main_ids
+                    ],
+                    fp32_group,
+                )
             ]
-            for fp32_group, state_group in zip(
-                state_dict['fp32_from_fp16_params'], state_dict['optimizer']['param_groups']
+            for fp32_group, state_group, live_group in zip(
+                state_dict['fp32_from_fp16_params'],
+                state_dict['optimizer']['param_groups'],
+                self.optimizer.param_groups,
             )
         ]
 
@@ -1245,6 +1379,8 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         return state_dict
 
     def load_state_dict(self, state_dict):
+        if state_dict.get('param_keyed'):
+            return self._load_param_keyed(state_dict)
         # Optimizer.
         optimizer_key = 'optimizer'
         if optimizer_key not in state_dict:
@@ -1653,13 +1789,24 @@ class ChainedOptimizer(MegatronOptimizer):
             # A plain list of per-optimizer states (non-distributed checkpoint): only
             # the dist-checkpoint layout below can be re-split.
             return state_dict
-        saved_single = 'optimizer' in state_dict
+
+        def is_saved_entry(entry):
+            # A saved optimizer's common state: DistributedOptimizer ('optimizer') or
+            # the param-keyed Float16Optimizer format ('param_keyed').
+            return isinstance(entry, dict) and ('optimizer' in entry or 'param_keyed' in entry)
+
+        saved_single = is_saved_entry(state_dict)
         int_keys = sorted(k for k in state_dict if isinstance(k, int))
-        saved = [state_dict] if saved_single else [state_dict[k] for k in int_keys]
+        saved = (
+            [state_dict]
+            if saved_single
+            else [state_dict[k] for k in int_keys if is_saved_entry(state_dict[k])]
+        )
         if len(saved) == n or n == 0:
             return state_dict
+        param_keyed = all(entry.get('param_keyed') for entry in saved)
         for entry in saved:
-            if entry.get('param_state_sharding_type') != 'fully_reshardable':
+            if not param_keyed and entry.get('param_state_sharding_type') != 'fully_reshardable':
                 raise RuntimeError(
                     f'The checkpoint has {len(saved)} chained optimizer(s), this run has {n} '
                     '(expert parameters have their own optimizer only under expert '
@@ -1670,19 +1817,31 @@ class ChainedOptimizer(MegatronOptimizer):
             param_states = [state_dict.get('param_state')]
         else:
             param_states = [state_dict.get(i, {}).get('param_state') for i in range(n)]
-        saved_groups = [g for entry in saved for g in entry['optimizer']['param_groups']]
+        if param_keyed:
+            saved_groups = [g for entry in saved for g in entry['param_groups'].values()]
+        else:
+            saved_groups = [g for entry in saved for g in entry['optimizer']['param_groups']]
         out = []
         for optimizer, param_state in zip(self.chained_optimizers, param_states):
             flags = {bool(g.get('is_expert_parallel', False)) for g in optimizer.param_groups}
             assert len(flags) == 1, f'mixed is_expert_parallel in one optimizer: {flags}'
             flag = flags.pop()
-            entry = {
-                'optimizer': {
-                    **{k: v for k, v in saved[0]['optimizer'].items() if k != 'param_groups'},
-                    'param_groups': [{**g, 'is_expert_parallel': flag} for g in saved_groups],
-                },
-                'param_state_sharding_type': 'fully_reshardable',
-            }
+            groups = [{**g, 'is_expert_parallel': flag} for g in saved_groups]
+            if param_keyed:
+                entry = {
+                    'param_keyed': True,
+                    'param_groups': {str(j): g for j, g in enumerate(groups)},
+                }
+                if 'common_step' in saved[0]:
+                    entry['common_step'] = saved[0]['common_step']
+            else:
+                entry = {
+                    'optimizer': {
+                        **{k: v for k, v in saved[0]['optimizer'].items() if k != 'param_groups'},
+                        'param_groups': groups,
+                    },
+                    'param_state_sharding_type': 'fully_reshardable',
+                }
             if 'grad_scaler' in saved[0]:
                 entry['grad_scaler'] = saved[0]['grad_scaler']
             if param_state is not None:
