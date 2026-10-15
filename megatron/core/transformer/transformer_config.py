@@ -1830,6 +1830,13 @@ class TransformerConfig(ModelParallelConfig):
     stochastic [k, k] matrix (mHC's H_res restricted to the selection), initialized near
     the identity. Memory traffic stays (2k+1) of the n streams."""
 
+    mhc_routed_reversible: bool = False
+    """Routed residual streams: keep per sublayer only the change it makes (its output and
+    routing weights) and undo the writes in the backward to recover the streams its read
+    and router saw, instead of saving the gathered rows and the router input. Exact up to
+    the stream dtype's rounding, which reaches only the router gradients. Not with
+    mhc_routed_mix."""
+
     mhc_routed_balance_rate: float = 0.0
     """Routed residual streams: update rate of the aux-loss-free selection bias that
     balances how often each stream is picked (as moe_router_bias_update_rate; 1e-3 is
@@ -1916,8 +1923,10 @@ class TransformerConfig(ModelParallelConfig):
                 )
             if self.mhc_lerp:
                 raise ValueError("mhc_routed_topk is not combinable with mhc_lerp")
-        elif self.mhc_routed_mix or self.mhc_routed_balance_rate:
-            raise ValueError("mhc_routed_mix / mhc_routed_balance_rate need mhc_routed_topk > 0")
+        elif self.mhc_routed_mix or self.mhc_routed_balance_rate or self.mhc_routed_reversible:
+            raise ValueError(
+                "mhc_routed_mix / _balance_rate / _reversible need mhc_routed_topk > 0"
+            )
         if self.mhc_routed_topk:
             if self.cuda_graph_impl != "none" or self.enable_cuda_graph:
                 # The per-step routing state (and the shared gradient buffer) lives in

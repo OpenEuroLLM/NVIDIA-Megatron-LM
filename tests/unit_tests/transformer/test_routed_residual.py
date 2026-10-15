@@ -336,3 +336,59 @@ class TestRoutedMixAndBalance:
             losses.append(loss.item())
         assert losses[-1] < losses[0]
         assert mixer.b_res.grad is not None and mixer.alpha_res.grad is not None
+
+
+class TestReversibleRoutedResidual:
+    """mhc_routed_reversible: per sublayer only the change is kept; the backward undoes
+    the writes to recover the streams the reads and routers saw."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+        yield
+        Utils.destroy_model_parallel()
+
+    def _grads(self, reversible, dtype):
+        torch.manual_seed(0)
+        model_parallel_cuda_manual_seed(0)
+        model = _hybrid_model("*-P-C-*-", mhc_routed_reversible=reversible)
+        if dtype == torch.float32:
+            model = model.float()
+        ids = torch.randint(0, 128, (2, 16), device="cuda",
+                            generator=torch.Generator("cuda").manual_seed(3))
+        logits = model(ids, position_ids=None, attention_mask=None)
+        logits.float().logsumexp(-1).mean().backward()
+        return logits.detach(), {n: p.grad.clone() for n, p in model.named_parameters()}
+
+    @pytest.mark.parametrize("dtype", [torch.float32])
+    def test_matches_the_stored_backward(self, dtype):
+        out_a, ga = self._grads(False, dtype)
+        out_b, gb = self._grads(True, dtype)
+        torch.testing.assert_close(out_a, out_b)
+        assert set(ga) == set(gb)
+        for name in ga:
+            # the residual path does not read the restored state: exact; the routers
+            # do, up to the undo's rounding
+            tol = 1e-4 if "mixer" in name else 1e-5
+            torch.testing.assert_close(gb[name], ga[name], rtol=tol, atol=tol, msg=name)
+
+    def test_streams_are_restored_after_backward(self):
+        from megatron.core.transformer.routed_residual import RoutedStreamMixer
+
+        mixer = RoutedStreamMixer(64, 4, 2, reversible=True).cuda()
+        s = torch.randn(8, 2, 4, 64, device="cuda")
+        start = s.clone()
+        base = s.clone().requires_grad_()
+        streams = base * 1.0
+        pre, post, _ = mixer(streams)
+        x = mixer.read(streams, pre)
+        out = mixer.write(streams, torch.tanh(x), post)
+        out.sum().backward()
+        torch.testing.assert_close(streams.detach(), start, rtol=1e-6, atol=1e-6)
+
+    def test_rejects_mixing(self):
+        with pytest.raises(ValueError, match="mhc_routed_reversible"):
+            from megatron.core.transformer.routed_residual import RoutedStreamMixer
+
+            RoutedStreamMixer(64, 4, 2, mix=True, reversible=True)

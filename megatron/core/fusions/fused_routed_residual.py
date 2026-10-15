@@ -31,6 +31,16 @@ Mixing. With a per-token ``[k, k]`` matrix ``M`` (doubly stochastic, as mHC's
 already keeps (shared through the stash, not saved twice). Its backward turns the
 stream gradient of the routed rows into ``M^T g`` in place.
 
+Reversible mode. A sublayer only changes ``k`` rows by ``w f``, so its backward can
+undo that write in place (``s <- s - w f``) and recover the streams exactly as its
+read and router saw them. Then nothing but the change itself (``f``, ``w``, ``idx``)
+is kept per sublayer: no gathered rows, no copy of the router's input -- those are
+re-read from the restored state. The undo is exact up to the rounding of the
+stream dtype; only the router's gradients (the read weights, the routing
+projection) read the restored values, the residual path's do not. One stream state
+per pipeline stage stays alive until the backward. Mixing is not invertible in
+general and does not combine with it.
+
 ``*_reference`` are the out-of-place torch definitions the kernels are tested
 against.
 """
@@ -354,6 +364,118 @@ class _RoutedWriteMix(torch.autograd.Function):
         )
         ctx.stash.grad = g
         return g, df, None, dw.to(w.dtype), dm.to(mix.dtype), None
+
+
+class _RouterCoeffsReversible(torch.autograd.Function):
+    """``coeff_fn(stream main, phi)`` without keeping the stream: the backward
+    recomputes it from the restored state."""
+
+    @staticmethod
+    def forward(ctx, streams, phi, main, coeff_fn, stash):
+        with torch.no_grad():
+            out = coeff_fn(streams.select(-2, main), phi)
+        ctx.streams, ctx.main, ctx.coeff_fn, ctx.stash = streams, main, coeff_fn, stash
+        ctx.save_for_backward(phi)
+        return out
+
+    @staticmethod
+    def backward(ctx, dout):
+        (phi,) = ctx.saved_tensors
+        streams = ctx.streams
+        with torch.enable_grad():
+            s0 = streams.select(-2, ctx.main).detach().clone().requires_grad_()
+            p = phi.detach().requires_grad_()
+            ds0, dphi = torch.autograd.grad(ctx.coeff_fn(s0, p), (s0, p), dout)
+        ctx.streams = None
+        stash = ctx.stash
+        if stash.grad is not None:
+            # This is the sublayer's last backward: release the buffer.
+            grad, stash.grad = stash.grad, None
+            grad.select(-2, ctx.main).add_(ds0.to(grad.dtype))
+            return None, dphi, None, None, None
+        ds = ds0.new_zeros(streams.shape)
+        ds.select(-2, ctx.main).copy_(ds0)
+        return ds, dphi, None, None, None
+
+
+class _RoutedReadReversible(torch.autograd.Function):
+    """The read without saved rows: the backward gathers them from the restored state."""
+
+    @staticmethod
+    def forward(ctx, streams, idx, r, stash):
+        t, n, c = _dims(streams)
+        k = idx.shape[-1]
+        x = streams.new_empty(streams.shape[:-2] + (c,))
+        rows = streams.new_empty(t, k, c)  # scratch, freed after the forward
+        block = _block(c)
+        _read_fwd[(t, triton.cdiv(c, block))](streams, idx, r, x, rows, n, c, K=k, BLOCK=block)
+        ctx.save_for_backward(idx, r)
+        ctx.streams, ctx.n, ctx.stash = streams, n, stash
+        return x
+
+    @staticmethod
+    def backward(ctx, dx):
+        idx, r = ctx.saved_tensors
+        streams = ctx.streams
+        ctx.streams = None
+        t, n, c = _dims(streams)
+        k = idx.shape[-1]
+        flat = streams.view(t, n, c)
+        rows = torch.gather(flat, 1, idx.long().unsqueeze(-1).expand(-1, -1, c))
+        own = ctx.stash.grad is None
+        ds = rows.new_zeros(streams.shape) if own else ctx.stash.grad
+        dr = torch.empty(t, k, dtype=torch.float32, device=rows.device)
+        _read_bwd[(t,)](dx.contiguous(), rows, idx, r, ds, dr, n, c, K=k, BLOCK=_block(c))
+        return (ds if own else None), None, dr.to(r.dtype), None
+
+
+class _RoutedWriteReversible(torch.autograd.Function):
+    """The write; its backward also undoes it in place (``s -= w f``)."""
+
+    @staticmethod
+    def forward(ctx, streams, f, idx, w, stash):
+        t, n, c = _dims(streams)
+        k = idx.shape[-1]
+        block = _block(c)
+        f = f.contiguous()
+        _write_fwd[(t, triton.cdiv(c, block))](streams, f, idx, w, n, c, K=k, BLOCK=block)
+        ctx.mark_dirty(streams)
+        ctx.save_for_backward(f, idx, w)
+        ctx.streams, ctx.n, ctx.stash = streams.detach(), n, stash
+        return streams
+
+    @staticmethod
+    def backward(ctx, g):
+        f, idx, w = ctx.saved_tensors
+        c = f.shape[-1]
+        t, k = idx.shape
+        g = _own(g)
+        df = torch.empty_like(f)
+        dw = torch.empty(t, k, dtype=torch.float32, device=f.device)
+        block = max(_block(c), triton.next_power_of_2(k))
+        _write_bwd[(t,)](g, f, idx, w, df, dw, ctx.n, c, K=k, BLOCK=block)
+        # Restore the streams as this sublayer's read and router saw them.
+        wb = _block(c)
+        _write_fwd[(t, triton.cdiv(c, wb))](ctx.streams, f, idx, -w, ctx.n, c, K=k, BLOCK=wb)
+        ctx.streams = None
+        ctx.stash.grad = g
+        return g, df, None, dw.to(w.dtype), None
+
+
+def router_coeffs_reversible(streams, phi, coeff_fn, stash, main: int = 0):
+    """``coeff_fn(streams[..., main, :], phi)``, recomputed in the backward from the
+    restored streams (reversible routed residual)."""
+    return _RouterCoeffsReversible.apply(streams, phi, main, coeff_fn, stash)
+
+
+def routed_read_reversible(streams, idx, r, stash):
+    """:func:`routed_read` that keeps no rows (reversible routed residual)."""
+    return _RoutedReadReversible.apply(streams, idx.int().contiguous(), r.float().contiguous(), stash)
+
+
+def routed_write_reversible(streams, f, idx, w, stash):
+    """:func:`routed_write` whose backward undoes the write (reversible routed residual)."""
+    return _RoutedWriteReversible.apply(streams, f, idx.int().contiguous(), w.float().contiguous(), stash)
 
 
 def _fused(streams):

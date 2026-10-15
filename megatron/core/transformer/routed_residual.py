@@ -47,7 +47,10 @@ from megatron.core.fusions.fused_routed_residual import (
     route_streams,
     routed_read,
     routed_write,
+    routed_read_reversible,
     routed_write_mix,
+    routed_write_reversible,
+    router_coeffs_reversible,
     stream_tap,
 )
 
@@ -66,8 +69,12 @@ class RoutedStreamMixer(nn.Module):
         sinkhorn_iters: int = 8,
         identity_bias: float = 5.0,
         balance: bool = False,
+        reversible: bool = False,
     ) -> None:
         super().__init__()
+        if reversible and mix:
+            raise ValueError("mhc_routed_reversible does not combine with mhc_routed_mix")
+        self.reversible = reversible
         if not 1 <= topk <= expansion_rate:
             raise ValueError(f"mhc_routed_topk must be in [1, {expansion_rate}], got {topk}")
         self.hidden_size, self.n, self.k, self.eps = hidden_size, expansion_rate, topk, eps
@@ -115,10 +122,10 @@ class RoutedStreamMixer(nn.Module):
     def forward(self, streams: torch.Tensor):
         """``streams`` ``[s, b, n, C]`` -> ``(pre, post, None)`` routing state."""
         stash = GradStash()
-        s0 = stream_tap(streams, 0, stash).reshape(-1, self.hidden_size)
-        rms = torch.linalg.vector_norm(s0, dim=-1, keepdim=True).float()
-        rms = (rms / self.hidden_size**0.5).clamp(min=self.eps)
-        coeffs = torch.matmul(s0, self.phi.to(s0.dtype)).float() / rms
+        if self._reversible_now(streams):
+            coeffs = router_coeffs_reversible(streams, self.phi, self._coeffs, stash)
+        else:
+            coeffs = self._coeffs(stream_tap(streams, 0, stash), self.phi)
         z, post = coeffs[:, : self.n], coeffs[:, self.n : 2 * self.n]
         select_bias = self.route_bias if self.balance else None
         idx, r = route_streams(z + self.b_route.float(), self.k, select_bias=select_bias)
@@ -168,8 +175,22 @@ class RoutedStreamMixer(nn.Module):
                 f"{p}/mix_diag", layer, num_layers, torch.diagonal(mix, dim1=-2, dim2=-1)
             )
 
+    def _coeffs(self, s0: torch.Tensor, phi: torch.Tensor) -> torch.Tensor:
+        """The router's projection of the RMS-normalized main stream, ``[T, *]`` fp32."""
+        s0 = s0.reshape(-1, self.hidden_size)
+        rms = torch.linalg.vector_norm(s0, dim=-1, keepdim=True).float()
+        rms = (rms / self.hidden_size**0.5).clamp(min=self.eps)
+        return torch.matmul(s0, phi.to(s0.dtype)).float() / rms
+
+    def _reversible_now(self, streams: torch.Tensor) -> bool:
+        from megatron.core.fusions.fused_routed_residual import _fused
+
+        return self.reversible and _fused(streams) and torch.is_grad_enabled()
+
     def read(self, streams: torch.Tensor, h_pre) -> torch.Tensor:
         idx, r, stash = h_pre
+        if self._reversible_now(streams):
+            return routed_read_reversible(streams, idx, r, stash)
         return routed_read(streams, idx, r, stash)
 
     def write(self, streams, sublayer_out, h_post, h_res=None, lerp=None) -> torch.Tensor:
@@ -179,6 +200,8 @@ class RoutedStreamMixer(nn.Module):
         f = sublayer_out.to(streams.dtype)
         if mix is not None:
             return routed_write_mix(streams, f, idx, w, mix, stash)
+        if self._reversible_now(streams):
+            return routed_write_reversible(streams, f, idx, w, stash)
         return routed_write(streams, f, idx, w, stash)
 
 
@@ -195,6 +218,7 @@ def build_stream_mixer(config) -> nn.Module:
             mix=getattr(config, "mhc_routed_mix", False),
             sinkhorn_iters=config.mhc_sinkhorn_iters,
             balance=bool(getattr(config, "mhc_routed_balance_rate", 0.0)),
+            reversible=getattr(config, "mhc_routed_reversible", False),
         )
     from megatron.core.transformer.mhc import MHCMixer
 
