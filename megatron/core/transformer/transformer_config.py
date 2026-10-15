@@ -359,6 +359,14 @@ class TransformerConfig(ModelParallelConfig):
     linear_conv_kernel_dim: Optional[int] = 4
     """Conv kernel dimension for the gated delta net."""
 
+    short_conv_kernel_size: int = 3
+    """Kernel width of the gated short convolution, the `C` layers of a hybrid model
+    (LFM2's `conv_L_cache`)."""
+
+    short_conv_bias: bool = False
+    """Whether the gated short convolution's depthwise conv has a bias (LFM2's
+    `conv_bias`). Its projections follow `add_bias_linear`."""
+
     linear_key_head_dim: Optional[int] = 128
     """Query and key head dimension for the gated delta net."""
 

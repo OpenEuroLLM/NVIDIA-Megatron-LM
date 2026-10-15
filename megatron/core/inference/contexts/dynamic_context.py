@@ -370,6 +370,8 @@ class DynamicInferenceContext(BaseInferenceContext):
                 raise NotImplementedError("GDN layers are not supported for inference.")
             if Symbols.LINEAR in mamba_inference_state_config.layer_type_list:
                 raise NotImplementedError("Linear (L) layers are not supported for inference.")
+            if Symbols.SHORT_CONV in mamba_inference_state_config.layer_type_list:
+                raise NotImplementedError("Short-conv (C) layers are not supported for inference.")
 
             self.num_attention_layers = len(attention_layer_map) + len(dsa_layer_map)
             self.num_mamba_layers = len(mamba_layer_map)

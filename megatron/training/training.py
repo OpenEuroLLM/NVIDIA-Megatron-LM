@@ -747,9 +747,21 @@ def num_floating_point_operations(
                 f"{args.experimental_attention_variant}"
             )
 
+    def short_conv_layer_flops(total_tokens, hidden_size, kernel_size=3):
+        """Calculate FLOPs for a gated short convolution (LFM2) layer."""
+        return 2 * total_tokens * (
+            # in_proj: hidden_size -> B, C, x
+            hidden_size * 3 * hidden_size
+            # depthwise causal conv over B * x
+            + kernel_size * hidden_size
+            # out_proj
+            + hidden_size * hidden_size
+        )
+
     def hybrid_flops(total_tokens, seqlen_squared_sum, hidden_size,
                      num_attn_layers, num_mamba_layers, num_mlp_layers, num_moe_layers,
-                     num_gdn_layers=0, num_linear_layers=0,
+                     num_gdn_layers=0, num_linear_layers=0, num_short_conv_layers=0,
+                     short_conv_kernel_size=3,
                      mamba_state_dim=128, mamba_head_dim=64,
                      mamba_num_groups=8, mamba_num_heads=128,
                      num_attn_heads=32, gqa=True,
@@ -778,6 +790,8 @@ def num_floating_point_operations(
                                                   gdn_qk_head_dim, gdn_v_head_dim,
                                                   gdn_num_qk_heads, gdn_num_v_heads,
                                                   gdn_conv_kernel_dim) +
+                num_short_conv_layers * short_conv_layer_flops(total_tokens, hidden_size,
+                                                               short_conv_kernel_size) +
                 # `L` layers: the same per-variant count the GPT path uses.
                 (num_linear_layers * 2 * total_tokens * linear_mixer_fmas_per_token()
                  if num_linear_layers else 0) +
@@ -1064,9 +1078,10 @@ def num_floating_point_operations(
 
         from megatron.core.models.hybrid.hybrid_layer_allocation import (
             Symbols, get_hybrid_layer_counts)
-        (num_mamba_layers, num_gdn_layers, num_linear_layers, num_attn_layers, num_mlp_layers,
-         num_moe_layers) = itemgetter(
-            Symbols.MAMBA, Symbols.GDN, Symbols.LINEAR, Symbols.ATTENTION, Symbols.MLP, Symbols.MOE
+        (num_mamba_layers, num_gdn_layers, num_linear_layers, num_short_conv_layers,
+         num_attn_layers, num_mlp_layers, num_moe_layers) = itemgetter(
+            Symbols.MAMBA, Symbols.GDN, Symbols.LINEAR, Symbols.SHORT_CONV, Symbols.ATTENTION,
+            Symbols.MLP, Symbols.MOE
         )(get_hybrid_layer_counts(args.hybrid_layer_pattern))
 
         mtp_num_layers = args.mtp_num_layers
@@ -1083,6 +1098,8 @@ def num_floating_point_operations(
             num_moe_layers=num_moe_layers,
             num_gdn_layers=num_gdn_layers,
             num_linear_layers=num_linear_layers,
+            num_short_conv_layers=num_short_conv_layers,
+            short_conv_kernel_size=args.short_conv_kernel_size,
             mamba_state_dim=args.mamba_state_dim,
             mamba_head_dim=args.mamba_head_dim,
             mamba_num_groups=args.mamba_num_groups,

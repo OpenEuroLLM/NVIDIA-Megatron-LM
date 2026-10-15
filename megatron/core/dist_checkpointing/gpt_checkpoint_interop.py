@@ -66,8 +66,9 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import (
 # or that are explicitly initialized from scratch ('M'). Attention layers map
 # onto GPT ``self_attention`` sub-modules; dense and MoE MLP layers map onto
 # GPT ``mlp`` sub-modules (both models keep MoE tensors under ``mlp.*``).
-# GDN ('G'), linear-mixer ('L') and DS-attention ('D') layers use different weight
-# layouts than GPT attention and are rejected rather than silently mistranslated.
+# GDN ('G'), linear-mixer ('L'), short-conv ('C') and DS-attention ('D') layers use
+# different weight layouts than GPT attention and are rejected rather than silently
+# mistranslated.
 _GPT_SOURCED_SYMBOLS = (Symbols.ATTENTION, Symbols.MLP, Symbols.MOE)
 _FRESH_INIT_SYMBOLS = (Symbols.MAMBA,)
 

@@ -47,6 +47,7 @@ class HybridStackSubmodules:
     # `L` positions. None derives the layer from config.experimental_attention_variant
     # (get_hybrid_linear_layer_spec), so stack specs need not name a mixer.
     linear_layer: Optional[ModuleSpec] = None
+    short_conv_layer: Union[ModuleSpec, type] = IdentityOp
     attention_layer: Union[ModuleSpec, type] = IdentityOp
     dsa_layer: Union[ModuleSpec, type] = IdentityOp
     mla_layer: Union[ModuleSpec, type] = IdentityOp
@@ -197,6 +198,16 @@ class HybridStack(MegatronModule):
                 elif layer_type == LayerSymbols.GDN:
                     layer = build_module(
                         submodules.gdn_layer,
+                        config=self.config,
+                        layer_number=layer_number,
+                        pg_collection=pg_collection,
+                        # Set to False as we do not want to change offset.
+                        add_layer_offset=False,
+                        name=(name + f".layers.{i}") if name is not None else None,
+                    )
+                elif layer_type == LayerSymbols.SHORT_CONV:
+                    layer = build_module(
+                        submodules.short_conv_layer,
                         config=self.config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,

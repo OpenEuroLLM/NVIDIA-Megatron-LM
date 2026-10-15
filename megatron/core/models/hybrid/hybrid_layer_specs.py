@@ -16,6 +16,7 @@ from megatron.core.models.gpt.moe_module_specs import (
 )
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNetSubmodules
+from megatron.core.ssm.short_conv import ShortConv, ShortConvSubmodules
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
 from megatron.core.ssm.mlp_layer import MLPLayer
@@ -111,6 +112,18 @@ hybrid_stack_spec = ModuleSpec(
                         in_proj=TELayerNormColumnParallelLinear,
                         out_norm=TENorm,
                         out_proj=TERowParallelLinear,
+                    ),
+                ),
+                self_attn_bda=get_bias_dropout_add,
+            ),
+        ),
+        short_conv_layer=ModuleSpec(
+            module=TransformerLayer,
+            submodules=TransformerLayerSubmodules(
+                self_attention=ModuleSpec(
+                    module=ShortConv,
+                    submodules=ShortConvSubmodules(
+                        in_proj=TELayerNormColumnParallelLinear, out_proj=TERowParallelLinear
                     ),
                 ),
                 self_attn_bda=get_bias_dropout_add,

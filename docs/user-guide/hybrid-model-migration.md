@@ -27,6 +27,7 @@ described by `--hybrid-layer-pattern`:
 | `M` | Mamba-2 state-space layer |
 | `G` | Gated Delta Network (GDN) layer |
 | `L` | Linear sequence mixer selected by `--experimental-attention-variant` |
+| `C` | Gated short convolution (LFM2-style), kernel width `--short-conv-kernel-size` |
 | `*` | Self-attention layer |
 | `D` | DeepSeek Sparse Attention (DSA) layer |
 | `-` | Dense MLP layer |
@@ -172,8 +173,8 @@ the loader rejects a pattern that:
 
 - contains MTP layers (a `/...` suffix), which have no GPT source weights;
 - uses a layer type it cannot translate, such as GDN (`G`), a linear mixer
-  (`L`) or DeepSeek Sparse Attention (`D`), whose weight layouts differ from GPT
-  attention;
+  (`L`), a short convolution (`C`) or DeepSeek Sparse Attention (`D`), whose
+  weight layouts differ from GPT attention;
 - mixes dense (`-`) and MoE (`E`) MLP positions in one pattern; or
 - has an unequal or zero number of `*` and MLP positions.
 
@@ -352,6 +353,12 @@ linear layers, `--linear-attention-freq` must be left unset, and one model
 cannot combine `L` with `D`, which is also configured through
 `--experimental-attention-variant`. For example, a 7:1 linear-to-attention
 model with an MLP after every mixer is `L-L-L-L-L-L-L-*-` repeated.
+
+`C` positions are gated short convolutions as in LFM2: `B`, `C` and `x`
+projections, a causal depthwise convolution of `B * x`, gated by `C`. They shard
+across tensor parallelism like the other mixers but support neither context
+parallelism nor packed sequences. An LFM2-style conv + attention model is, for
+example, `C-C-*-C-C-*-`.
 
 ### Account for expanded layer indices
 
