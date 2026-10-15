@@ -1229,3 +1229,54 @@ class TestOptimizerResharding:
                 diffs = diff(plain_state_dict_A, plain_state_dict_B)
                 assert not any(map(bool, diffs)), diffs
                 Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize(
+        ('src_exp', 'dest_exp'),
+        # EP=1 puts the experts into the dense optimizer, EP>1 into their own.
+        [(2, 1), (1, 2), (4, 1)],
+    )
+    def test_chained_optimizer_expert_layout_change(self, tmp_path_dist_ckpt, src_exp, dest_exp):
+        # As megatron/training saves it: fully reshardable, no chained prefix.
+        metadata = {
+            'distrib_optim_sharding_type': 'fully_reshardable',
+            'chained_optim_avoid_prefix': True,
+        }
+        with TempNamedDir(tmp_path_dist_ckpt / 'test_expert_layout_A', sync=True) as ckpt_dir_A:
+            with TempNamedDir(tmp_path_dist_ckpt / 'test_expert_layout_B', sync=True) as ckpt_dir_B:
+                Utils.initialize_model_parallel(1, 1, expert_model_parallel_size=src_exp)
+                model_A, optimizer_A = setup_moe_model_and_optimizer(
+                    seed=2, tp=1, pp=1, ep=src_exp, bf16=True, dist_opt=True
+                )
+                assert len(optimizer_A.chained_optimizers) == (2 if src_exp > 1 else 1)
+                save(
+                    optimizer_A.sharded_state_dict(
+                        model_A[0].sharded_state_dict(), metadata=metadata
+                    ),
+                    ckpt_dir_A,
+                )
+                Utils.destroy_model_parallel()
+
+                Utils.initialize_model_parallel(1, 1, expert_model_parallel_size=dest_exp)
+                model_B, optimizer_B = setup_moe_model_and_optimizer(
+                    seed=3, tp=1, pp=1, ep=dest_exp, bf16=True, dist_opt=True
+                )
+                assert len(optimizer_B.chained_optimizers) == (2 if dest_exp > 1 else 1)
+                state_dict = load(
+                    optimizer_B.sharded_state_dict(
+                        model_B[0].sharded_state_dict(), metadata=metadata, is_loading=True
+                    ),
+                    ckpt_dir_A,
+                )
+                optimizer_B.load_state_dict(state_dict)
+                save(
+                    optimizer_B.sharded_state_dict(
+                        model_B[0].sharded_state_dict(), metadata=metadata
+                    ),
+                    ckpt_dir_B,
+                )
+                Utils.destroy_model_parallel()
+
+                Utils.initialize_model_parallel(1, 1)
+                diffs = diff(load_plain_tensors(ckpt_dir_A), load_plain_tensors(ckpt_dir_B))
+                assert not any(map(bool, diffs)), diffs
+                Utils.destroy_model_parallel()

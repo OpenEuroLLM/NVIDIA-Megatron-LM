@@ -131,12 +131,20 @@ def fallback_saved_param_group(current_group: dict, saved_groups) -> Optional[di
     """Saved param_group to load a NEW current group from: same structural keys, and among those
     the one sharing the most identifier fields with the current group. Returns None if no saved
     group is structurally equivalent. The caller keeps the current group's override fields."""
-    cands = [g for g in saved_groups if _structural_identifier(g) == _structural_identifier(current_group)]
+    cands = [
+        g
+        for g in saved_groups
+        if _structural_identifier(g) == _structural_identifier(current_group)
+    ]
     if not cands:
         return None
 
     def score(g):
-        return sum(1 for k in param_group_identifier_keys if g.get(k, g.get(f"pre_{k}")) == current_group.get(k, current_group.get(f"pre_{k}")))
+        return sum(
+            1
+            for k in param_group_identifier_keys
+            if g.get(k, g.get(f"pre_{k}")) == current_group.get(k, current_group.get(f"pre_{k}"))
+        )
 
     return max(cands, key=score)
 
@@ -675,7 +683,9 @@ class MegatronOptimizer(ABC):
                     logger.warning(
                         "param_group %s not in the checkpoint; loading it from the structurally "
                         "equivalent saved group %s and keeping the current overrides "
-                        "(allow_new_param_groups_on_load)", key, _identifier_for(saved)
+                        "(allow_new_param_groups_on_load)",
+                        key,
+                        _identifier_for(saved),
                     )
                     group = merge_new_param_group(current_groups[idx], saved)
                     group['params'] = params
@@ -1246,7 +1256,8 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
 
         # Filter and reorder param groups to match current optimizer
         state_dict[optimizer_key]['param_groups'] = self._filter_and_reorder_param_groups(
-            self.optimizer.param_groups, state_dict[optimizer_key]['param_groups'],
+            self.optimizer.param_groups,
+            state_dict[optimizer_key]['param_groups'],
             allow_new_groups=getattr(self.config, 'allow_new_param_groups_on_load', False),
         )
         self.optimizer.load_state_dict(state_dict[optimizer_key])
@@ -1395,7 +1406,8 @@ class FP32Optimizer(MegatronOptimizer):
 
         # Filter and reorder param groups to match current optimizer
         state_dict['param_groups'] = self._filter_and_reorder_param_groups(
-            self.optimizer.param_groups, state_dict['param_groups'],
+            self.optimizer.param_groups,
+            state_dict['param_groups'],
             allow_new_groups=getattr(self.config, 'allow_new_param_groups_on_load', False),
         )
         self.optimizer.load_state_dict(state_dict)
@@ -1618,7 +1630,70 @@ class ChainedOptimizer(MegatronOptimizer):
                 sharded_state_dict[optimizer_idx] = optim_state_dict
             return sharded_state_dict
 
+    def _match_saved_optimizer_layout(self, state_dict):
+        """Re-split a checkpoint saved with a different number of chained optimizers.
+
+        Expert parameters get their own optimizer only under expert parallelism (or an
+        expert TP size other than the TP size); at EP=1 they join the dense one. So the
+        checkpoint of an EP>1 run holds two optimizer entries ``{0: dense, 1: expert}``
+        and that of an EP=1 run one, and changing between them would not load. With the
+        ``fully_reshardable`` format the parameter state is keyed by parameter (no
+        chained prefix), so only the param groups, which carry ``is_expert_parallel``,
+        need redistributing: each current optimizer receives every saved group with its
+        own ``is_expert_parallel`` and matches its groups by identifier as usual. Within
+        one run, dense and expert groups with otherwise equal identifiers share their
+        hyper-parameters, so the collapse is harmless.
+
+        Dist-checkpointing merges the saved (common) layout with the sharded tensors
+        loaded into the current layout: the saved entries are where ``optimizer`` is,
+        the parameter state is where the current optimizers put it.
+        """
+        n = len(self.chained_optimizers)
+        saved_single = 'optimizer' in state_dict
+        int_keys = sorted(k for k in state_dict if isinstance(k, int))
+        saved = [state_dict] if saved_single else [state_dict[k] for k in int_keys]
+        if len(saved) == n or n == 0:
+            return state_dict
+        for entry in saved:
+            if entry.get('param_state_sharding_type') != 'fully_reshardable':
+                raise RuntimeError(
+                    f'The checkpoint has {len(saved)} chained optimizer(s), this run has {n} '
+                    '(expert parameters have their own optimizer only under expert '
+                    'parallelism). Changing that needs a checkpoint saved with '
+                    '--dist-ckpt-optim-fully-reshardable.'
+                )
+        if n == 1:
+            param_states = [state_dict.get('param_state')]
+        else:
+            param_states = [state_dict.get(i, {}).get('param_state') for i in range(n)]
+        saved_groups = [g for entry in saved for g in entry['optimizer']['param_groups']]
+        out = []
+        for optimizer, param_state in zip(self.chained_optimizers, param_states):
+            flags = {bool(g.get('is_expert_parallel', False)) for g in optimizer.param_groups}
+            assert len(flags) == 1, f'mixed is_expert_parallel in one optimizer: {flags}'
+            flag = flags.pop()
+            entry = {
+                'optimizer': {
+                    **{k: v for k, v in saved[0]['optimizer'].items() if k != 'param_groups'},
+                    'param_groups': [{**g, 'is_expert_parallel': flag} for g in saved_groups],
+                },
+                'param_state_sharding_type': 'fully_reshardable',
+            }
+            if 'grad_scaler' in saved[0]:
+                entry['grad_scaler'] = saved[0]['grad_scaler']
+            if param_state is not None:
+                entry['param_state'] = param_state
+            out.append(entry)
+        logger.info(
+            'Loading %d chained optimizer state(s) into %d optimizer(s) (expert-parallel '
+            'layout changed)',
+            len(saved),
+            n,
+        )
+        return out[0] if n == 1 else dict(enumerate(out))
+
     def load_state_dict(self, state_dict):
+        state_dict = self._match_saved_optimizer_layout(state_dict)
         # If there is only one optimizer, we read the state dict as a single optimizer.
         if len(self.chained_optimizers) == 1:
             self.chained_optimizers[0].load_state_dict(state_dict)
