@@ -182,10 +182,9 @@ class EngramLayer(MegatronModule):
         self.rows_per_rank = self.total_rows // tp_size
         self.row_start = tp_rank * self.rows_per_rank
         device = torch.cuda.current_device()
+        table_dtype = torch.float32 if config.engram_table_fp32 else config.params_dtype
         self.table = nn.Parameter(
-            torch.empty(
-                self.rows_per_rank, self.embed_dim, device=device, dtype=config.params_dtype
-            )
+            torch.empty(self.rows_per_rank, self.embed_dim, device=device, dtype=table_dtype)
         )
         setattr(self.table, "tensor_model_parallel", True)
         setattr(self.table, "partition_dim", 0)
@@ -233,6 +232,27 @@ class EngramLayer(MegatronModule):
             ResidualSchemeAdapter(config) if residual_scheme_active(config) else None
         )
         self._depth_state = None
+
+    def _apply(self, fn, recurse=True):
+        """Keep an fp32 table (``engram_table_fp32``) through the model's bf16/fp16 cast.
+
+        Float16Module converts the whole model with ``module.bfloat16()``; a dtype
+        conversion is detected by probing ``fn`` and then applied to everything but
+        the table, which only follows device moves.
+        """
+        if not self.config.engram_table_fp32 or "table" not in self._parameters:
+            return super()._apply(fn, recurse)
+        probe = fn(torch.zeros(1, dtype=torch.float32, device=self.table.device))
+        if probe.dtype == torch.float32:
+            return super()._apply(fn, recurse)
+        table = self._parameters.pop("table")
+        try:
+            super()._apply(fn, recurse)
+        finally:
+            if table.device != probe.device:
+                table.data = table.data.to(probe.device)
+            self._parameters["table"] = table
+        return self
 
     def reset_parameters(self):
         if not self.config.perform_initialization:

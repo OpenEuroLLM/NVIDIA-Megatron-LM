@@ -115,6 +115,15 @@ class TestEngramLayer:
         torch.testing.assert_close(base[:15], changed[:15])
         assert not torch.allclose(base[15], changed[15])
 
+    def test_table_stays_fp32_through_the_bf16_cast(self):
+        self.layer.bfloat16()  # what Float16Module does to the whole model
+        assert self.layer.table.dtype == torch.float32
+        assert self.layer.key_proj.weight.dtype == torch.bfloat16
+        ids = torch.randint(0, 50000, (2, 16), device="cuda")
+        self.layer.set_input_ids(ids)
+        out = self.layer(torch.randn(16, 2, HIDDEN, device="cuda", dtype=torch.bfloat16))
+        assert out.dtype == torch.bfloat16
+
     def test_missing_token_ids_raise(self):
         self.layer.set_input_ids(None)
         with pytest.raises(RuntimeError, match="needs the token ids"):
