@@ -1617,6 +1617,151 @@ class TransformerConfig(ModelParallelConfig):
     insert these joins. This feature is particularly useful when using with full-iteration CUDA
     graphs"""
 
+    ####################
+    # nGPT (normalized transformer on the hypersphere)
+    ####################
+    ngpt: bool = False
+    """Enable nGPT geometry (arXiv:2410.01131): the additive residual is replaced by a LERP
+    toward the L2-normalized sublayer output, keeping hidden states on the unit hypersphere.
+    All other nGPT knobs are inert when this is False, and the model is bit-identical to
+    upstream Megatron."""
+
+    ngpt_lerp_normalization: str = "approx"
+    """How the LERP residual is renormalized. 'approx' is nGPT's closed form assuming an
+    orthogonal update; 'analytic' is the exact factor using cos(theta) between the residual and
+    the sublayer output (full-rank Jacobian); 'direct' applies an explicit L2 normalization;
+    'both', 'direct_ste', 'both_ste' and 'approx_fwd' are ablation variants that decouple the
+    forward normalization from the backward Jacobian."""
+
+    ngpt_lerp_normalization_attn: str = ""
+    """Overrides ngpt_lerp_normalization for the attention residual when non-empty."""
+
+    ngpt_lerp_normalization_ffn: str = ""
+    """Overrides ngpt_lerp_normalization for the MLP residual when non-empty."""
+
+    ngpt_alpha_init_value: float = 0.05
+    """Effective LERP step size (nGPT 'eigen learning rate') at initialization."""
+
+    ngpt_base_scale: float = -1.0
+    """Raw-parameter initialization for the alpha eigen-LR reparameterization.
+    -1 selects 1/sqrt(hidden_size)."""
+
+    ngpt_alpha_activation: str = "abs"
+    """Mapping from the raw alpha parameter to the effective LERP coefficient.
+    'abs' is unbounded (nGPT default); 'half_sigmoid' and 'half_tanh_sq' cap alpha at the
+    principled LERP ceiling of 0.5; 'tanh_smooth_bound' caps it at 0.95."""
+
+    ngpt_post_layer_norm_attn: bool = True
+    """L2-normalize the attention output before the LERP residual update."""
+
+    ngpt_post_layer_norm_ffn: bool = True
+    """L2-normalize the MLP output before the LERP residual update."""
+
+    ngpt_use_sqk: bool = False
+    """Learnable per-channel scalers on Q and K (nGPT's s_qk). Once Q/K are
+    L2-normalized their dot product is a cosine, so the attention logits lose all
+    scale; s_qk puts it back as a learned quantity. Pair with qk_l2_norm."""
+
+    ngpt_use_suv: bool = False
+    """Learnable per-channel scaler on the MLP intermediate (nGPT's s_uv). Takes
+    the place of the fixed 1/sqrt(ffn/hidden) up-scale when the fc1 weights are
+    row-normalized and can no longer carry that magnitude themselves."""
+
+    ngpt_scaler_init: float = 1.0
+    """Effective value of the nGPT scalers at initialization."""
+
+    ngpt_scaler_base_scale: float = -1.0
+    """Raw-parameter init for the scaler eigen-LR reparameterization; -1 selects
+    1/sqrt(hidden_size). The optimizer sees a parameter of this scale while the
+    effective value starts at ngpt_scaler_init, decoupling the two."""
+
+    ####################
+    # mHC (manifold-constrained hyper-connections)
+    ####################
+    mhc: bool = False
+    """Enable mHC (arXiv:2512.24880): widen the residual into mhc_expansion_rate parallel
+    streams mixed by a doubly stochastic matrix. Doubly stochastic mixing is non-expansive and
+    closed under composition, so the composite depth mapping stays norm-preserving - this is
+    what plain Hyper-Connections lose. Mutually exclusive with attn_res. Requires
+    pipeline_model_parallel_size == 1 for now."""
+
+    mhc_expansion_rate: int = 4
+    """Number of residual streams n. n=1 degenerates to a standard residual. The paper uses
+    n=4, reporting 6.7% training-time overhead at that setting. Costs n-times the residual
+    activation memory and n-times the pipeline inter-stage payload."""
+
+    mhc_sinkhorn_iters: int = 20
+    """Sinkhorn-Knopp sweeps used to project the stream mixer onto the Birkhoff polytope."""
+
+    mhc_alpha_init: float = 0.01
+    """Initial value of the learnable gates on the input-dependent (dynamic) part of the
+    connection matrices. Small values keep the dynamic term near zero at init, so the static
+    biases set the initial connectivity."""
+
+    mhc_res_init: str = "identity"
+    """Initial stream connectivity. 'identity' biases the Sinkhorn input toward the identity so
+    the streams start independent and the identity mapping is preserved at init; 'uniform'
+    starts from the uniform doubly stochastic matrix."""
+
+    mhc_lerp: bool = False
+    """Compose mHC with the nGPT LERP residual: mix the streams first (norm-preserving), then
+    take a LERP step per stream toward the normalized sublayer output. Requires ngpt=True.
+    Mixing must precede renormalization, since a convex combination of unit vectors is not
+    itself unit norm."""
+
+    ####################
+    # Block Attention Residuals
+    ####################
+    attn_res: bool = False
+    """Enable Block Attention Residuals (arXiv:2603.15031): replace the uniformly-weighted
+    residual accumulation with learned softmax attention over depth. Bounds hidden-state
+    magnitude, which otherwise grows as O(L) under PreNorm. Mutually exclusive with mhc.
+    Requires pipeline_model_parallel_size == 1 for now."""
+
+    attn_res_num_blocks: int = 8
+    """Number of blocks N the layers are partitioned into. Each block is summed to a single
+    representation, so memory and pipeline traffic are O(N*h) rather than O(L*h) - the same
+    payload shape as mHC with expansion rate N. N=num_layers recovers Full AttnRes; N=1
+    degenerates to a standard residual. The paper finds N~8 recovers most of the benefit."""
+
+    attn_res_query_init_std: float = 0.0
+    """Std of the normal used to initialize the learnable per-sublayer pseudo-query. 0 gives a
+    zero query, i.e. uniform attention over depth at init - exactly the averaging a standard
+    residual performs."""
+
+    attn_res_lerp: bool = False
+    """Compose Block AttnRes with the nGPT LERP residual: accumulate each block via a LERP step
+    toward the normalized sublayer output instead of a plain sum, keeping block summaries on
+    the unit sphere rather than growing with block size. Requires ngpt=True."""
+
+    # ---- Looped (weight-tied) depth ----
+    # A prelude/loop/coda stack: the middle block is built once and applied
+    # ``loop_iterations`` times, so effective depth exceeds parameter depth. The
+    # motivation is nGPT's LERP residual, which holds ||x|| constant with depth --
+    # a repeated block then sees inputs from the same distribution at every
+    # iteration, which is exactly what weight tying across depth requires.
+    #
+    # ``num_layers`` counts *unique* layers, so it must equal
+    # prelude + block + coda. Effective depth is prelude + block*iterations + coda.
+    loop_block_layers: int = 0
+    """Number of unique layers in the looped block. 0 disables looping entirely."""
+
+    loop_iterations: int = 1
+    """How many times the looped block is applied. 1 is equivalent to no looping."""
+
+    loop_prelude_layers: int = 0
+    """Unique layers applied once before the loop, to get off the token embedding."""
+
+    loop_coda_layers: int = 0
+    """Unique layers applied once after the loop, before the final norm and head."""
+
+    loop_group_size: int = 0
+    """Where the recurrence sits inside the block, at identical parameters and FLOPs.
+
+    0 (default) repeats the whole block -- outer recurrence. N>0 partitions the block
+    into consecutive groups of N and repeats each group in place, so N=1 applies each
+    layer ``loop_iterations`` times before moving on. Must divide loop_block_layers."""
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
@@ -1634,6 +1779,27 @@ class TransformerConfig(ModelParallelConfig):
             assert not self.output_z_loss_coeff, (
                 "liger_fused_linear_cross_entropy does not add the output z-loss"
             )
+        if self.loop_block_layers:
+            unique = self.loop_prelude_layers + self.loop_block_layers + self.loop_coda_layers
+            if unique != self.num_layers:
+                raise ValueError(
+                    "num_layers counts unique layers when looping, so it must equal "
+                    f"loop_prelude_layers + loop_block_layers + loop_coda_layers "
+                    f"({self.loop_prelude_layers} + {self.loop_block_layers} + "
+                    f"{self.loop_coda_layers} = {unique}), got num_layers={self.num_layers}."
+                )
+            if self.loop_iterations < 1:
+                raise ValueError(f"loop_iterations must be >= 1, got {self.loop_iterations}")
+            if self.loop_group_size and self.loop_block_layers % self.loop_group_size:
+                raise ValueError(
+                    f"loop_group_size ({self.loop_group_size}) must divide "
+                    f"loop_block_layers ({self.loop_block_layers}); otherwise the block "
+                    "cannot be partitioned into equal groups."
+                )
+            if self.pipeline_model_parallel_size > 1:
+                # The loop would have to be split across stages, and a tied layer
+                # living on one stage cannot be applied on another.
+                raise ValueError("Looped depth requires pipeline_model_parallel_size == 1.")
 
         # When fp32 residual connections are enabled, pipeline parallel communication must
         # use fp32 to match the dtype of the residual stream between pipeline stages.

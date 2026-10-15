@@ -6,6 +6,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import copy
+import logging
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
@@ -31,9 +32,17 @@ from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.multi_latent_attention import FusedMLASelfAttention
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+from megatron.core.transformer.transformer_block import build_loop_schedule
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import sharded_state_dict_default
-from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
+from megatron.core.utils import (
+    WrappedTensor,
+    deprecate_inference_params,
+    log_single_rank,
+    make_viewless_tensor,
+)
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -251,6 +260,67 @@ class HybridStack(MegatronModule):
                 eps=self.config.layernorm_epsilon,
             )
 
+        # Looped depth: the middle block is applied loop_iterations times. Shares
+        # build_loop_schedule with TransformerBlock so the two stacks cannot drift
+        # apart on what a given (prelude, block, iterations, group, coda) means.
+        self._loop_schedule = build_loop_schedule(self.config)
+        if self._loop_schedule is not None:
+            self._validate_loop_schedule()
+            # Logged unconditionally: a looped run that silently fell back to a plain
+            # stack is indistinguishable from a correct one in the loss curve, and
+            # whether the flags reach Megatron at all depends on plumbing outside
+            # this repo. This line is the positive confirmation that it is active.
+            looped_types = ''.join(self.layer_type_list[i] for i in self._loop_schedule)
+            log_single_rank(
+                logger,
+                logging.INFO,
+                f"Looped depth active: {len(self.layers)} unique layers applied as "
+                f"{len(self._loop_schedule)} (prelude {self.config.loop_prelude_layers}, "
+                f"block {self.config.loop_block_layers} x {self.config.loop_iterations}, "
+                f"group {self.config.loop_group_size or self.config.loop_block_layers}, "
+                f"coda {self.config.loop_coda_layers}); "
+                f"pattern='{''.join(self.layer_type_list)}' -> '{looped_types}'; "
+                f"schedule={self._loop_schedule}",
+            )
+
+    def _validate_loop_schedule(self) -> None:
+        """Reject loop configurations this stack cannot execute correctly.
+
+        Recompute and CUDA graphs both work under a loop schedule and are not
+        checked here -- recompute walks the schedule, and CudaGraphManager already
+        handles a module called several times per step, which is what gradient
+        accumulation does.
+
+        What is checked is specific to a hybrid stack. ``build_loop_schedule`` addresses
+        layers by index, and in a hybrid stack the index also selects a layer
+        *type*, so repeating a block splices its last layer type directly onto its
+        first. A block is not required to be homogeneous -- the natural hybrid
+        block is an alternating ``M-M-M-`` and repeating it is exactly the point --
+        but a block that begins and ends on the same type produces a doubled type
+        at every seam, which is nearly always an off-by-one in the boundaries
+        rather than an intent. That is a warning, not an error: it is a design
+        smell, and the caller may have meant it.
+        """
+        prelude = self.config.loop_prelude_layers
+        block = self.config.loop_block_layers
+        if len(self.layer_type_list) != len(self.layers):
+            raise ValueError(
+                f"Looped depth expects one layer type per built layer, got "
+                f"{len(self.layer_type_list)} types for {len(self.layers)} layers."
+            )
+        if self.config.loop_iterations > 1 and block > 1:
+            first, last = self.layer_type_list[prelude], self.layer_type_list[prelude + block - 1]
+            if first == last:
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    f"Looped block [{prelude}, {prelude + block}) of pattern "
+                    f"'{''.join(self.layer_type_list)}' both starts and ends on "
+                    f"'{first}', so every loop seam applies two '{first}' layers in a "
+                    "row. If that is not intended, shift the loop boundaries so the "
+                    "block covers whole repeats of the pattern period.",
+                )
+
     def _linear_layer_spec(self, submodules: HybridStackSubmodules) -> ModuleSpec:
         """The spec for `L` positions: the stack spec's, else the configured variant's."""
         if submodules.linear_layer is not None:
@@ -414,7 +484,15 @@ class HybridStack(MegatronModule):
                     use_inner_quantization_context=(use_inner_fp8_context or use_fp4_context),
                 )
             else:
-                for layer in self.layers:
+                if self._loop_schedule is None:
+                    layer_order = list(self.layers)
+                else:
+                    # Indexes parameters, not depth: a looped layer is the same
+                    # module applied at several positions, so layer.layer_number
+                    # repeats. Only the quantization context reads it, and that is
+                    # keyed per unique layer by design.
+                    layer_order = [self.layers[i] for i in self._loop_schedule]
+                for layer in layer_order:
                     # Layers have 1-indexed layer numbers attribute.
                     inner_quant_context = get_inner_quant_context(
                         self.config, layer.layer_number - 1

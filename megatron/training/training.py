@@ -66,6 +66,7 @@ from megatron.core.num_microbatches_calculator import (
 from megatron.core.optimizer import (OptimizerConfig, ParamKey,
                                      get_megatron_optimizer,
                                      get_mup_config_overrides,
+                                     get_ngpt_config_overrides,
                                      get_standard_config_overrides)
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer.layer_wise_optimizer import (
@@ -2551,6 +2552,14 @@ def setup_model_and_optimizer(
             )
             if mup_overrides:
                 config_overrides = {**(config_overrides or {}), **mup_overrides}
+
+        if getattr(args, "ngpt", False):
+            # nGPT scalers (LERP alphas / per-channel scalers) carry all the
+            # magnitude information once the weight matrices are normalized, so
+            # they get their own lr and weight-decay treatment.
+            ngpt_overrides = get_ngpt_config_overrides(config)
+            if ngpt_overrides:
+                config_overrides = {**(config_overrides or {}), **ngpt_overrides}
 
         optimizer = get_megatron_optimizer(
             config,

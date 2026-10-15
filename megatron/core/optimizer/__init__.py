@@ -4,6 +4,7 @@ import logging
 import warnings
 from collections import defaultdict
 from dataclasses import astuple
+from functools import wraps
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -189,6 +190,43 @@ def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, Par
         config_overrides[decoupled_param_key] = decoupled_lr_config
 
     return config_overrides
+
+
+def get_ngpt_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, ParamGroupOverride]:
+    """Get parameter-group overrides for nGPT scaler parameters.
+
+    On a normalized architecture the weight matrices carry only *direction* -- all
+    magnitude information lives in the scaler parameters (the LERP alphas and any
+    per-channel scalers, marked with the ``is_ngpt_scaler`` attribute). Those
+    typically want their own learning rate, and should not be decayed toward zero.
+
+    Scalers are 1-D, so they are already routed to Adam rather than to a
+    matrix-only optimizer such as Muon or Muown; this function only adjusts their
+    learning rate and weight decay.
+
+    Args:
+        config: Optimizer configuration carrying ``ngpt_scaler_lr_mult`` and
+            ``ngpt_scaler_wd_mult``.
+
+    Returns:
+        Overrides keyed by an ``is_ngpt_scaler`` :class:`ParamKey`, or an empty dict
+        when the defaults would leave behavior unchanged.
+    """
+    lr_mult = getattr(config, 'ngpt_scaler_lr_mult', 1.0)
+    wd_mult = getattr(config, 'ngpt_scaler_wd_mult', 0.0)
+
+    override: ParamGroupOverride = {'wd_mult': wd_mult}
+    if lr_mult != 1.0:
+        if config.lr is None:
+            raise ValueError("ngpt_scaler_lr_mult requires config.lr to be set")
+        override['max_lr'] = config.lr * lr_mult
+        if config.min_lr is not None:
+            override['min_lr'] = config.min_lr * lr_mult
+
+    log_single_rank(
+        logger, logging.INFO, f"[nGPT] scaler param group: lr_mult={lr_mult}, wd_mult={wd_mult}"
+    )
+    return {ParamKey(attr="is_ngpt_scaler"): override}
 
 
 def get_mup_config_overrides(
@@ -817,7 +855,12 @@ def _get_megatron_emerging_optimizer(
         eopt_name = bare_name
         use_layer_wise = True
 
-    if not HAVE_EMERGING_OPTIMIZERS:
+    # Optimizers implemented inside Megatron itself do not need the external
+    # package; only the ones whose classes come from it do. Muown lives in
+    # megatron.core.optimizer.muown and is self-contained (it carries its own
+    # Newton-Schulz), so gating it on the package would block it needlessly.
+    _SELF_CONTAINED_EOPTS = ("muown",)
+    if not HAVE_EMERGING_OPTIMIZERS and eopt_name not in _SELF_CONTAINED_EOPTS:
         raise ImportError(
             f"emerging-optimizers package is required for optimizer='{eopt_name}'. "
             "Install it with: pip install emerging-optimizers"
@@ -1049,6 +1092,62 @@ def _get_megatron_emerging_optimizer(
     return ChainedOptimizer(results)
 
 
+def _maybe_attach_weight_normalizer(
+    optimizer: MegatronOptimizer, config: OptimizerConfig, model_chunks: List[MegatronModule]
+) -> MegatronOptimizer:
+    """Attach the nGPT post-step weight normalizer to ``optimizer``, if enabled.
+
+    The normalizer re-projects weight matrices onto the unit hypersphere after
+    every optimizer step. It is installed by wrapping ``optimizer.step`` so it
+    applies uniformly to every optimizer flavor (Adam, distributed, chained and
+    emerging optimizers alike).
+
+    Args:
+        optimizer: The freshly constructed Megatron optimizer.
+        config: Optimizer config carrying the ``weight_normalizer_*`` fields.
+        model_chunks: Model chunks whose weights should be normalized.
+
+    Returns:
+        The same optimizer, with the normalization hook installed when enabled.
+    """
+    from .weight_normalizer import build_weight_normalizer
+
+    normalizer = build_weight_normalizer(config, model_chunks)
+    if normalizer is None:
+        return optimizer
+
+    unwrapped_step = optimizer.step
+
+    def _sync_normalized_weights_to_main_params() -> None:
+        """Push the normalization into the optimizer's master copies.
+
+        Mixed-precision and distributed optimizers keep fp32 master weights and
+        copy them *into* the model parameters during ``step``. Normalizing only
+        the model parameters afterwards would therefore be undone on the very
+        next step, when the un-normalized masters are copied over again. Copy the
+        normalized values back so the constraint actually persists.
+        """
+        for opt in getattr(optimizer, "chained_optimizers", [optimizer]):
+            copy_fn = getattr(opt, "_copy_model_params_to_main_params", None)
+            if copy_fn is not None:
+                copy_fn()
+
+    @wraps(unwrapped_step)
+    def step_with_weight_norm(*args: Any, **kwargs: Any) -> Any:
+        result = unwrapped_step(*args, **kwargs)
+        # Only renormalize when the step actually applied (skipped on grad-scaler
+        # overflow, where ``success`` is the first element of the returned tuple).
+        success = result[0] if isinstance(result, tuple) and len(result) > 0 else True
+        if success:
+            normalizer.normalize_weights()
+            _sync_normalized_weights_to_main_params()
+        return result
+
+    optimizer.step = step_with_weight_norm  # type: ignore[method-assign]
+    optimizer.weight_normalizer = normalizer  # type: ignore[attr-defined]
+    return optimizer
+
+
 def get_megatron_optimizer(
     config: OptimizerConfig,
     model_chunks: List[MegatronModule],
@@ -1100,11 +1199,15 @@ def get_megatron_optimizer(
     # TODO: the standard and emerging optimizer paths handle pg_collection differently;
     # unify them so both use a single pg_collection-based flow.
     if config.optimizer not in ('adam', 'sgd'):
-        return _get_megatron_emerging_optimizer(
-            config=config,
-            model_chunks=model_chunks,
-            config_overrides=config_overrides,
-            pg_collection=pg_collection,
+        return _maybe_attach_weight_normalizer(
+            _get_megatron_emerging_optimizer(
+                config=config,
+                model_chunks=model_chunks,
+                config_overrides=config_overrides,
+                pg_collection=pg_collection,
+            ),
+            config,
+            model_chunks,
         )
 
     log_single_rank(logger, logging.INFO, f'Setting up optimizer with config {config}')
@@ -1195,9 +1298,9 @@ def get_megatron_optimizer(
             model_chunk_offset += 1
 
         if len(optimizers) == 1:
-            return optimizers[0]
+            return _maybe_attach_weight_normalizer(optimizers[0], config, model_chunks)
 
-        return ChainedOptimizer(optimizers)
+        return _maybe_attach_weight_normalizer(ChainedOptimizer(optimizers), config, model_chunks)
 
     if dump_param_to_param_group_map is not None:
         param_to_param_group = {}
@@ -1285,4 +1388,4 @@ def get_megatron_optimizer(
             state_dict=param_to_param_group, checkpoint_id=dump_param_to_param_group_map
         )
 
-    return ChainedOptimizer(optimizers)
+    return _maybe_attach_weight_normalizer(ChainedOptimizer(optimizers), config, model_chunks)

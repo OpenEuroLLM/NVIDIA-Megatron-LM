@@ -2,6 +2,7 @@
 
 """Helpers for interacting with the experimental nvidia-resiliency-ext API."""
 
+import warnings
 from importlib import import_module
 from typing import Any, Callable, Dict
 
@@ -41,9 +42,18 @@ def has_nvrx_async_support() -> bool:
         getattr(state_dict_saver, "save_state_dict_async_finalize", None),
         getattr(state_dict_saver, "save_state_dict_async_plan", None),
     )
-    assert (
-        is_nvrx_min_version()
-    ), f"Minimum required nvidia-resiliency-ext package version is {NVRX_MIN_VERSION}."
+    if not is_nvrx_min_version():
+        # This is a capability predicate, so an insufficient version means "no
+        # support", not a fatal error. Asserting here aborts startup for *any*
+        # run on a container that ships an older nvidia-resiliency-ext, even when
+        # async checkpointing is never used (e.g. --save unset). Degrade
+        # gracefully instead; callers already handle the False case by falling
+        # back to Megatron's own async checkpoint path.
+        warnings.warn(
+            f"nvidia-resiliency-ext is older than the required {NVRX_MIN_VERSION}; "
+            "NVRx async checkpointing is disabled for this run."
+        )
+        return False
 
     return all(symbol is not None for symbol in required_symbols) and hasattr(
         filesystem_async, "_results_queue"

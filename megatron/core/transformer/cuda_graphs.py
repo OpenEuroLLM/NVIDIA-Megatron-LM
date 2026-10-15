@@ -184,6 +184,17 @@ except ImportError:
     pass
 
 
+def _loop_schedule_active(module) -> bool:
+    """True when the model applies one module at several depths (looped depth).
+
+    Read off the module's own config rather than the owning block, because the
+    runner only ever holds the layer. ``loop_block_layers`` is 0 for every
+    non-looped model, so this is False on the default path.
+    """
+    config = getattr(module, "config", None)
+    return bool(getattr(config, "loop_block_layers", 0))
+
+
 def is_graph_capturing():
     """Query if currently capturing."""
     return _IS_GRAPH_CAPTURING
@@ -1212,6 +1223,16 @@ class _CudaGraphRunner(torch.nn.Module):
                     metadata.input_use_count > 1
                     and metadata.input_use_count == buf_metadata.capture_reuse_count
                 )
+
+                if _loop_schedule_active(self.base_module):
+                    # Skipping the copy assumes the producer wrote straight into
+                    # this graph's input buffer, which holds only while each module
+                    # occupies one fixed position in the layer chain. A looped stack
+                    # applies one module at several depths, so at replay the input
+                    # legitimately arrives in a different allocation and the
+                    # skip-copy path trips its data_ptr assertion. Copy instead: one
+                    # hidden-state copy per graphed call, small next to a layer.
+                    can_skip_replay_copy = False
 
                 buf_metadata.capture_reuse_count -= 1
                 if buf_metadata.capture_reuse_count == 0:

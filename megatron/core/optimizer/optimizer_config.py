@@ -443,6 +443,72 @@ class OptimizerConfig:
     """Stack same-shape parameters and run the Muon update on the whole stack. Off by
     default to preserve the upstream per-parameter behavior."""
 
+    ###############################
+    # Muown (row-norm controlled Muon)
+    ###############################
+    muown_magnitude_lr_scale: float = 1.0
+    """Multiplier on the base lr for the row-magnitude (l-infinity sign) update."""
+
+    muown_momentum: float = 0.95
+    """Momentum coefficient for both the direction and magnitude components."""
+
+    muown_nesterov: bool = True
+    """Use Nesterov-style lookahead momentum in Muown."""
+
+    muown_num_ns_steps: int = 5
+    """Number of Newton-Schulz iterations used to orthogonalize the direction update."""
+
+    muown_scale_mode: str = "spectral"
+    """Scaling of the orthogonalized direction update: 'spectral' uses sqrt(max(out, in))
+    (Muon/Moonlight convention), 'unit' applies no extra scaling."""
+
+    muown_extra_scale_factor: float = 1.0
+    """Additional multiplier applied to the Muown direction update."""
+
+    muown_max_row_norm: Optional[float] = None
+    """Optional upper clamp on row magnitudes. None disables clamping."""
+
+    ###############################
+    # nGPT weight normalizer
+    ###############################
+    weight_normalizer: bool = False
+    """Renormalize weight matrices after every optimizer step (nGPT). This is what keeps the
+    matrices - and hence the hidden states - on the unit hypersphere when there is no
+    LayerNorm/RMSNorm in the trunk."""
+
+    weight_normalizer_out_norm_dim_0: bool = True
+    """Column-normalize output projections (linear_proj / linear_fc2), the strict nGPT
+    convention of normalizing along the embedding dimension. False row-normalizes them
+    instead. Note the True setting is also the tensor-parallel-local choice."""
+
+    weight_normalizer_bounded: bool = False
+    """Project onto the ball (shrink rows only when they exceed max_norm) rather than pinning
+    every row to the sphere."""
+
+    weight_normalizer_max_norm: float = 1.0
+    """Target row/column norm enforced by the weight normalizer."""
+
+    weight_normalizer_normalize_embeddings: bool = True
+    """Also normalize the token-embedding matrix."""
+
+    weight_normalizer_head_unconstrained: bool = True
+    """Exclude the LM head from normalization (qwen3-style row growth). The head is then
+    typically controlled by weight decay instead of by the sphere constraint."""
+
+    weight_normalizer_every_n_steps: int = 1
+    """Throttle: run the normalizer only every N optimizer steps."""
+
+    ngpt_scaler_lr_mult: float = 1.0
+    """Learning-rate multiplier for nGPT scaler parameters (the LERP alphas and any
+    per-channel scalers, i.e. parameters carrying ``is_ngpt_scaler``). On a normalized
+    architecture these magnitude parameters often want a different step size than the
+    direction-carrying weight matrices; 1.0 leaves them on the base LR."""
+
+    ngpt_scaler_wd_mult: float = 0.0
+    """Weight-decay multiplier for nGPT scaler parameters. Defaults to 0: decaying the
+    scalers toward zero would fight the geometry, since they are the only place magnitude
+    information lives once the weights are normalized."""
+
     #######################
     # Distributed optimizer
     #######################

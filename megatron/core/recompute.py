@@ -55,6 +55,18 @@ def checkpointed_forward(
     assert not is_dual_rope or len(rotary_pos_emb) == 2, "Dual RoPE input length is not equal to 2"
     rotary_pos_emb = rotary_pos_emb if is_dual_rope else (None, rotary_pos_emb)
 
+    # Execution order, as depth positions. Without looping this is just the layer
+    # order, so every index below means what it always did. With looping the same
+    # layer index appears at several positions, and recompute has to walk
+    # positions rather than layers -- chunking range(num_layers) would silently
+    # recompute the block once instead of once per iteration.
+    loop_schedule = getattr(self, "_loop_schedule", None)
+    order = (
+        list(range(self.num_layers_per_pipeline_rank))
+        if loop_schedule is None
+        else list(loop_schedule)
+    )
+
     def custom(start: int, end: int):
         def custom_forward(
             hidden_states,
@@ -71,10 +83,10 @@ def checkpointed_forward(
                 else rotary_pos_emb_global
             )
 
-            for index in range(start, end):
-                # Use self.layers[index] (not self._get_layer) so this
+            for position in range(start, end):
+                # Use self.layers[...] (not self._get_layer) so this
                 # function works for both TransformerBlock and HybridStack.
-                layer = self.layers[index]
+                layer = self.layers[order[position]]
 
                 # Get appropriate inner quantization context
                 if use_inner_quantization_context:
@@ -158,10 +170,8 @@ def checkpointed_forward(
         # Uniformly divide the total number of layers and checkpoint
         # the input activation of each divided chunk.
         layer_idx = 0
-        while layer_idx < self.num_layers_per_pipeline_rank:
-            chunk_end = min(
-                layer_idx + self.config.recompute_num_layers, self.num_layers_per_pipeline_rank
-            )
+        while layer_idx < len(order):
+            chunk_end = min(layer_idx + self.config.recompute_num_layers, len(order))
             chunk_runner(layer_idx, chunk_end, True)
             layer_idx += self.config.recompute_num_layers
     elif self.config.recompute_method == 'block':
@@ -171,7 +181,7 @@ def checkpointed_forward(
         # FP8/FP4 we skip checkpointing while hidden_states.requires_grad
         # is False (these slots get pushed past the recompute window).
         recompute_skip_num_layers = 0
-        for layer_idx in range(self.num_layers_per_pipeline_rank):
+        for layer_idx in range(len(order)):
             if (self.config.fp8 or self.config.fp4) and not hidden_states.requires_grad:
                 recompute_skip_num_layers += 1
             use_checkpoint = (

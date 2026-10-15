@@ -37,6 +37,7 @@ from megatron.core.utils import (
     WrappedTensor,
     deprecate_inference_params,
     get_pg_rank,
+    log_single_rank,
     make_viewless_tensor,
 )
 
@@ -195,6 +196,56 @@ def get_num_layers_to_build(
             assert num_layers_to_build >= 0, f"Not enough layers in the last virtual pipeline stage"
 
     return num_layers_to_build
+
+
+def build_loop_schedule(config) -> Optional[List[int]]:
+    """Return the order in which ``self.layers`` is applied, or None when not looping.
+
+    A looped stack is prelude / block x iterations / coda over *unique* layers, so
+    with 3 prelude, a 3-layer block run 4 times and 3 coda the 9 built layers are
+    applied in the order::
+
+        [0, 1, 2,  3, 4, 5,  3, 4, 5,  3, 4, 5,  3, 4, 5,  6, 7, 8]
+
+    giving an effective depth of 18. The block's weights are shared across
+    iterations, which is only well-posed if the residual keeps a stable magnitude
+    with depth -- the property nGPT's LERP residual provides and a plain additive
+    residual does not.
+
+    ``loop_group_size`` sets *where* the recurrence sits, at identical parameter
+    count and identical FLOPs -- only the application order changes. For a 6-layer
+    block run twice::
+
+        group 6 (default):  3 4 5 6 7 8 | 3 4 5 6 7 8    outer recurrence
+        group 3:            3 4 5 3 4 5 | 6 7 8 6 7 8
+        group 1:            3 3 | 4 4 | 5 5 | 6 6 | ...  each layer repeated
+
+    At group 1 a layer immediately consumes its own output, which is the hardest
+    case for magnitude stability; at group 6 it sees the rest of the block first.
+    So the LERP's advantage, if the invariance is what makes tying work, should be
+    largest at small group sizes.
+
+    Args:
+        config: A :class:`TransformerConfig` (or anything exposing the loop fields).
+
+    Returns:
+        The layer-index schedule, or None when ``loop_block_layers`` is 0.
+    """
+    block = getattr(config, "loop_block_layers", 0)
+    if not block:
+        return None
+    prelude = getattr(config, "loop_prelude_layers", 0)
+    coda = getattr(config, "loop_coda_layers", 0)
+    iterations = getattr(config, "loop_iterations", 1)
+    # 0 means "the whole block is one group", i.e. outer recurrence.
+    group = getattr(config, "loop_group_size", 0) or block
+
+    schedule = list(range(prelude))
+    for start in range(prelude, prelude + block, group):
+        for _ in range(iterations):
+            schedule.extend(range(start, start + group))
+    schedule.extend(range(prelude + block, prelude + block + coda))
+    return schedule
 
 
 @dataclass
@@ -368,6 +419,32 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         )
         if self.config.cuda_graph_impl == "local":
             annotate_first_last_layer(self.layers)
+
+        # Looped depth: the middle block is applied loop_iterations times. Stored as
+        # an explicit index list rather than nested loops in forward, so the whole
+        # schedule is inspectable and testable without running a forward.
+        self._loop_schedule = build_loop_schedule(self.config)
+        if self._loop_schedule is not None:
+            # Logged unconditionally: a looped run that silently fell back to a plain
+            # stack is indistinguishable from a correct one in the loss curve, and the
+            # flags reaching Megatron at all depends on plumbing outside this repo.
+            # This line is the positive confirmation that the loop is active.
+            log_single_rank(
+                logger,
+                logging.INFO,
+                f"Looped depth active: {len(self.layers)} unique layers applied as "
+                f"{len(self._loop_schedule)} (prelude {self.config.loop_prelude_layers}, "
+                f"block {self.config.loop_block_layers} x {self.config.loop_iterations}, "
+                f"group {self.config.loop_group_size or self.config.loop_block_layers}, "
+                f"coda {self.config.loop_coda_layers}); schedule={self._loop_schedule}",
+            )
+            # Recompute walks the loop schedule (see megatron/core/recompute.py), and
+            # CUDA graphs need no special handling: at PP=1 CudaGraphManager selects
+            # the first FWD_READY runner and a forward flips it to BWD_READY, so N
+            # calls to one module capture N runners and replay them in capture order.
+            # That is the same mechanism gradient accumulation already relies on --
+            # a looped layer at mbs<gbs/DP was always being called several times per
+            # step. Both paths are covered by tests; neither is guarded here.
 
         # @TODO: add back account_for_embedding_in_pipeline_split (see issue #293)
         # In pipeline parallelism, we want to add this LN only to the last stage of the pipeline
@@ -644,7 +721,16 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     # No intermediate_hidden_states requested: just hidden_states
                     hidden_states = checkpointed_result
             else:
-                for l_no, layer in enumerate(self.layers):
+                hidden_states, depth_state = self._depth_enter(hidden_states)
+                if self._loop_schedule is None:
+                    layer_order = list(enumerate(self.layers))
+                else:
+                    # l_no counts *positions*, not unique layers, so extract_layer_indices
+                    # keeps addressing depth rather than parameters.
+                    layer_order = [(i, self.layers[li]) for i, li in enumerate(self._loop_schedule)]
+                for l_no, layer in layer_order:
+                    if depth_state is not None:
+                        layer._depth_state = depth_state
                     # Get appropriate inner quantization context
                     if use_inner_quantization_context:
                         if self.config.fp8:
@@ -688,6 +774,10 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     if (l_no + layer_offset) in extract_layer_indices:
                         intermediate_hidden_states.append(hidden_states)
 
+        # Collapse the depth-wise residual state (mHC streams / AttnRes blocks)
+        # back to a single hidden state before the final norm.
+        hidden_states = self._depth_exit(hidden_states)
+
         # Final layer norm.
         if self.final_layernorm is not None:
             hidden_states = apply_module(self.final_layernorm)(cast(Tensor, hidden_states))
@@ -706,6 +796,138 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         if len(extract_layer_indices) > 0:
             return hidden_states, intermediate_hidden_states
 
+        return hidden_states
+
+    def _depth_enter(self, hidden_states: Tensor):
+        """Widen the residual stream for this forward pass, if a scheme is active.
+
+        mHC and Block AttnRes both replace the single residual stream with a
+        wider, depth-spanning state that every layer reads from and writes to,
+        but they carry it differently within a stage:
+
+        * **mHC** widens ``hidden_states`` itself to ``[s, b, n, h]``, so the
+          state travels through the layers as an ordinary argument and return
+          value -- which is what allows the layers to be CUDA-graph captured.
+        * **Block AttnRes** accumulates a growing list of block summaries, which
+          no single fixed-shape tensor expresses, so the block owns a
+          :class:`~megatron.core.transformer.depth_residual.DepthResidualState`
+          and stashes it on each layer.
+
+        Across a pipeline stage boundary both travel the same way: flattened to
+        ``[s, b, slots * h]`` by :func:`~megatron.core.transformer.depth_residual.pack_payload`,
+        a fixed width so the schedules can compute one tensor shape for the whole
+        pipeline. Deliberately 3-D -- the p2p layer exchanges shapes as a
+        3-element tensor under ``variable_seq_lengths``, so a rank-4 payload
+        would be silently truncated there.
+
+        Args:
+            hidden_states: ``[s, b, h]`` on the first stage, otherwise the
+                ``[s, b, slots * h]`` payload from the previous stage.
+
+        Returns:
+            ``(hidden_states, depth_state)``. ``hidden_states`` is widened for
+            mHC; ``depth_state`` is None unless Block AttnRes is active.
+        """
+        mhc = getattr(self.config, "mhc", False)
+        attn_res = getattr(self.config, "attn_res", False)
+        if not mhc and not attn_res:
+            return hidden_states, None
+        if mhc and attn_res:
+            raise ValueError("mhc and attn_res are mutually exclusive; enable at most one")
+
+        from megatron.core.transformer.depth_residual import depth_payload_slots, unpack_payload
+
+        slots = depth_payload_slots(self.config)
+
+        if mhc:
+            from megatron.core.transformer.mhc import expand_to_streams
+
+            if self.pre_process:
+                return expand_to_streams(hidden_states, slots), None
+            # Already widened by an earlier stage; restore the stream axis.
+            s, b, wide = hidden_states.shape
+            return hidden_states.reshape(s, b, slots, wide // slots), None
+
+        from megatron.core.transformer.attn_res import resolve_layers_per_block
+        from megatron.core.transformer.depth_residual import DepthResidualState
+
+        layers_per_block = resolve_layers_per_block(
+            self.config.num_layers, self.config.attn_res_num_blocks
+        )
+        if self.pre_process:
+            return hidden_states, DepthResidualState(
+                hidden_states, layers_per_block=layers_per_block
+            )
+
+        live, has_partial = self._depth_live_slots(layers_per_block)
+        sources = unpack_payload(hidden_states, slots, live)
+        state = DepthResidualState(sources[0], layers_per_block=layers_per_block)
+        # sources() appends the partial last when there is one, so pack_payload
+        # put it in the final live slot.
+        if has_partial:
+            state.blocks, state.partial = sources[:-1], sources[-1]
+        else:
+            state.blocks, state.partial = sources, None
+        return hidden_states, state
+
+    def _depth_live_slots(self, layers_per_block: int) -> tuple[int, bool]:
+        """Payload slices carrying real data at this stage's input boundary.
+
+        Derived from the layer offset rather than signalled, because the offset
+        is static: layer counts per stage do not vary at run time, so both sides
+        of the boundary compute the same answer. ``b_0`` is always present, one
+        more slice per block sealed so far, and one for the in-progress partial
+        sum when the boundary falls mid-block.
+
+        Returns:
+            ``(live_slices, has_partial)``.
+        """
+        done = get_transformer_layer_offset(self.config, vp_stage=self.vp_stage)
+        has_partial = bool(done % layers_per_block)
+        return 1 + done // layers_per_block + int(has_partial), has_partial
+
+    def _depth_exit(self, hidden_states: Tensor) -> Tensor:
+        """Reduce or repack the depth-wise state at the end of this stage.
+
+        On the last pipeline stage the state collapses to a single ``[s, b, h]``
+        hidden state for the final norm. Otherwise it is flattened to the
+        fixed-width payload the next stage expects.
+
+        Args:
+            hidden_states: The trunk output -- ``[s, b, n, h]`` streams under
+                mHC, otherwise ``[s, b, h]``.
+
+        Returns:
+            ``[s, b, h]`` on the last stage, else ``[s, b, slots * h]``.
+        """
+        from megatron.core.transformer.depth_residual import depth_payload_slots, pack_payload
+
+        mhc = getattr(self.config, "mhc", False)
+        if mhc and hidden_states.dim() == 4:
+            from megatron.core.transformer.mhc import collapse_streams
+
+            if self.post_process:
+                return collapse_streams(hidden_states)
+            s, b, n, h = hidden_states.shape
+            # reshape returns a view, and the pipeline schedule refuses to free a
+            # view of another tensor when it deallocates a stage output.
+            return make_viewless_tensor(
+                inp=hidden_states.reshape(s, b, n * h), requires_grad=True, keep_graph=True
+            )
+
+        depth_state = getattr(self.layers[0], "_depth_state", None) if len(self.layers) else None
+        if depth_state is None:
+            return hidden_states
+        if self.post_process:
+            hidden_states = depth_state.collapse()
+        else:
+            hidden_states = make_viewless_tensor(
+                inp=pack_payload(depth_state.sources(), depth_payload_slots(self.config)),
+                requires_grad=True,
+                keep_graph=True,
+            )
+        for layer in self.layers:
+            layer._depth_state = None
         return hidden_states
 
     def sharded_state_dict(

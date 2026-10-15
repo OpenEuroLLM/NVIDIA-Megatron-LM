@@ -20,6 +20,7 @@ from torch.optim.optimizer import ParamsT
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import get_pg_rank, get_pg_size, log_single_rank
 
+from .muown import Muown
 from .optimizer_config import ParamKey, ParamPredicate
 
 try:
@@ -1399,6 +1400,39 @@ def _angular_muown_config_to_kwargs(config, model_chunks, pg_collection) -> Dict
     return kwargs
 
 
+def _muown_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any]:
+    """Convert OptimizerConfig to Muown constructor kwargs.
+
+    Muown orthogonalizes only the *tangential* part of the update, so it reuses the
+    tensor-parallel Newton-Schulz from ``emerging_optimizers`` when that package is
+    available; otherwise :mod:`megatron.core.optimizer.muown` falls back to its own
+    single-process implementation.
+    """
+    kwargs = _kwargs_from_config(Muown, "muown", config)
+    kwargs.pop("orthogonalize_fn", None)
+
+    if HAVE_EMERGING_OPTIMIZERS and pg_collection is not None:
+
+        def _tp_orthogonalize(grad, steps=5, param=None, **_):
+            tp_group = (
+                pg_collection.expt_tp if getattr(param, 'expert_tp', False) else pg_collection.tp
+            )
+            partition_dim = getattr(param, "partition_dim", None)
+            if partition_dim == -1:
+                partition_dim = None
+            return newton_schulz_tp(
+                grad,
+                steps=steps,
+                coefficient_type=config.muon_coefficient_type,
+                tp_group=tp_group,
+                partition_dim=partition_dim,
+                tp_mode="duplicated",
+            )
+
+        kwargs["orthogonalize_fn"] = _tp_orthogonalize
+    return kwargs
+
+
 def _default_adam_based_eopt_config_to_kwargs(
     eopt_name, config, model_chunks, pg_collection
 ) -> Dict[str, Any]:
@@ -1449,6 +1483,18 @@ _EMERGING_OPTIMIZERS.update(
                 ): {'optimizer': 'adam'},
                 # Router/gate matrices are small and sensitive, so keep them on Adam.
                 ParamKey(name=('*router.weight', '*gate_weight')): {'optimizer': 'adam'},
+            },
+        ),
+        "muown": EmergingOptimizerEntry(
+            optimizer_cls=Muown,
+            init_state_fn=_eopt_init_state_fn,
+            config_to_kwargs=_muown_config_to_kwargs,
+            default_param_overrides={
+                ParamKey(
+                    predicate=ParamPredicate(
+                        name="nonlinear_or_embedding", fn=_is_nonlinear_or_embedding
+                    )
+                ): {'optimizer': 'adam'}
             },
         ),
     }
