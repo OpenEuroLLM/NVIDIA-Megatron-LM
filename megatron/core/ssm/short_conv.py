@@ -23,6 +23,12 @@ import torch.nn.functional as F
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm.gated_delta_net.common import (
+    _build_thd_cp_a2a_perm,
+    get_parameter_local_cp,
+    tensor_a2a_cp2hp,
+    tensor_a2a_hp2cp,
+)
 from megatron.core.ssm.utils import _split_tensor_factory
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer import TransformerConfig
@@ -54,9 +60,12 @@ class ShortConv(MegatronModule):
     ``[B | C | x]`` block, so the computation is local; ``sharded_state_dict`` splits the
     weight into the three streams so checkpoints reshard across TP sizes.
 
-    Context parallelism is not supported: the convolution at the start of a CP chunk needs
-    the last ``kernel_size - 1`` tokens of the previous one. Neither are packed sequences,
-    where it would mix tokens across document boundaries, nor Megatron inference.
+    Context parallelism follows the GDN/Mamba scheme: ``B * x`` is all-to-all'd from
+    sequence sharding to channel sharding, convolved over the whole sequence on this CP
+    rank's channels, and all-to-all'd back; ``C`` gates afterwards, locally.
+
+    Packed sequences (THD) restart the convolution at every document boundary. Megatron
+    inference is not supported.
     """
 
     def __init__(
@@ -75,14 +84,12 @@ class ShortConv(MegatronModule):
         self.layer_number = layer_number
         self.pg_collection = pg_collection
         self.tp_size = pg_collection.tp.size()
-        if pg_collection.cp.size() != 1:
-            raise NotImplementedError(
-                "ShortConv does not support context parallelism: the convolution at the start "
-                "of a context-parallel chunk needs the preceding tokens of the previous chunk."
-            )
-        assert config.hidden_size % self.tp_size == 0, (
+        self.cp_size = pg_collection.cp.size()
+        self.sp_size = self.tp_size if config.sequence_parallel else 1
+        assert config.hidden_size % (self.tp_size * self.cp_size) == 0, (
             f"hidden_size ({config.hidden_size}) must be divisible by "
-            f"tensor_model_parallel_size ({self.tp_size})."
+            f"tensor_model_parallel_size * context_parallel_size "
+            f"({self.tp_size} * {self.cp_size})."
         )
         self.hidden_size = config.hidden_size
         self.hidden_size_local_tp = config.hidden_size // self.tp_size
@@ -149,22 +156,84 @@ class ShortConv(MegatronModule):
         """[s, b, h] -> ([s, b, h], bias)."""
         if inference_context is not None:
             raise NotImplementedError("ShortConv does not support Megatron inference.")
-        if packed_seq_params is not None:
-            raise NotImplementedError(
-                "ShortConv does not support packed sequences: its convolution would mix "
-                "tokens across document boundaries."
-            )
-        bcx, _ = self.in_proj(hidden_states)  # [s, b, 3h/tp], sequence gathered under SP
+        thd = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
+        seq_len = hidden_states.shape[0] * self.sp_size * self.cp_size  # whole sequence
+        cp_group = self.pg_collection.cp
+
+        bcx, _ = self.in_proj(hidden_states)  # [s/cp, b, 3h/tp], sequence gathered under SP
         b, c, x = bcx.chunk(3, dim=-1)
-        bx = (b * x).permute(1, 2, 0)  # [b, h/tp, s]
-        conv = F.conv1d(
-            F.pad(bx, (self.kernel_size - 1, 0)),
-            self.conv1d.weight,
-            self.conv1d.bias,
-            groups=self.hidden_size_local_tp,
+        bx = b * x
+
+        cu_seqlens, thd_inv = None, None
+        if thd:
+            assert hidden_states.shape[1] == 1, "Packed sequences expect batch size 1"
+            cu_seqlens = self._resolve_cu_seqlens(packed_seq_params, seq_len)
+            bx = tensor_a2a_cp2hp(
+                bx, seq_dim=0, head_dim=-1, cp_group=cp_group, undo_attention_load_balancing=False
+            )
+            if self.cp_size > 1:
+                thd_idx, thd_inv = _build_thd_cp_a2a_perm(cu_seqlens, self.cp_size, seq_len)
+                bx = bx.index_select(0, thd_idx)
+        else:
+            bx = tensor_a2a_cp2hp(bx, seq_dim=0, head_dim=-1, cp_group=cp_group)
+        # bx: [s, b, h/(tp*cp)], the whole sequence on this CP rank's channels.
+
+        weight = get_parameter_local_cp(self.conv1d.weight, dim=0, cp_group=cp_group)
+        bias = (
+            get_parameter_local_cp(self.conv1d.bias, dim=0, cp_group=cp_group)
+            if self.conv_bias
+            else None
         )
-        y = c * conv.permute(2, 0, 1)  # [s, b, h/tp]
-        return self.out_proj(y)
+        conv = self._causal_conv(bx, weight, bias, cu_seqlens)
+
+        if thd:
+            if self.cp_size > 1:
+                conv = conv.index_select(0, thd_inv)
+            conv = tensor_a2a_hp2cp(
+                conv, seq_dim=0, head_dim=-1, cp_group=cp_group, redo_attention_load_balancing=False
+            )
+        else:
+            conv = tensor_a2a_hp2cp(conv, seq_dim=0, head_dim=-1, cp_group=cp_group)
+        return self.out_proj(c * conv)  # [s/cp, b, h/tp] in, [s/cp(/tp), b, h] out
+
+    def _causal_conv(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias: Optional[torch.Tensor],
+        cu_seqlens: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Depthwise causal convolution of ``x`` [s, b, ch]; restarts at document starts."""
+        k = self.kernel_size
+        if cu_seqlens is None:
+            out = F.conv1d(F.pad(x.permute(1, 2, 0), (k - 1, 0)), weight, bias, groups=x.shape[-1])
+            return out.permute(2, 0, 1)
+        # Packed: out[t] = sum_j w[k-1-j] * x[t-j], over the j that stay in t's document.
+        s = x.shape[0]
+        positions = torch.arange(s, device=x.device)
+        doc = torch.bucketize(positions, cu_seqlens[1:].to(positions.dtype), right=True)
+        pos_in_doc = positions - cu_seqlens[:-1].to(positions.dtype)[doc]
+        out = torch.zeros_like(x)
+        for j in range(k):
+            shifted = F.pad(x, (0, 0, 0, 0, j, 0))[:s]
+            keep = (pos_in_doc >= j).to(x.dtype).view(s, 1, 1)
+            out = out + shifted * keep * weight[:, 0, k - 1 - j]
+        return out if bias is None else out + bias
+
+    def _resolve_cu_seqlens(self, packed_seq_params: PackedSeqParams, seq_len: int):
+        """Document boundaries of the packed sequence, with alignment padding."""
+        cu = packed_seq_params.cu_seqlens_q_padded
+        if cu is None:
+            cu = packed_seq_params.cu_seqlens_q
+        if int(cu[-1].item()) != seq_len:
+            raise ValueError(
+                f"ShortConv: cu_seqlens[-1]={int(cu[-1])} != sequence length {seq_len}"
+            )
+        if ((cu[1:] - cu[:-1]) % self.cp_size != 0).any():
+            raise ValueError(
+                f"ShortConv: packed sequence lengths must be divisible by cp_size={self.cp_size}"
+            )
+        return cu
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None, tp_group=None):
         """Shard the conv by channel and split in_proj into its B/C/x streams."""

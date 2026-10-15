@@ -122,3 +122,115 @@ class TestShortConvFlops:
         h, k, tokens = 1024, 3, 2 * 4096
         per_layer = 3 * 2 * tokens * (h * 3 * h + k * h + h * h)  # fwd+bwd, FMA
         assert flops("C-C-*-") - flops("--*-") == 2 * per_layer
+
+
+def _short_conv(config, tp_group, cp_group):
+    spec = hybrid_stack_spec.submodules.short_conv_layer.submodules.self_attention
+    pg = ProcessGroupCollection(tp=tp_group, cp=cp_group)
+    return ShortConv(config, spec.submodules, layer_number=1, pg_collection=pg).cuda()
+
+
+def _thd(cu):
+    from megatron.core.packed_seq_params import PackedSeqParams
+
+    cu = torch.tensor(cu, dtype=torch.int32, device="cuda")
+    return PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu)
+
+
+@pytest.mark.internal
+class TestShortConvPacked:
+    """A packed batch convolves each document on its own."""
+
+    @pytest.fixture(scope="function", autouse=True)
+    def setup_method(self):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        model_parallel_cuda_manual_seed(123)
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=HIDDEN,
+            num_attention_heads=4,
+            normalization="RMSNorm",
+            add_bias_linear=False,
+            short_conv_kernel_size=KERNEL,
+            transformer_impl="transformer_engine",
+        )
+        self.conv = _short_conv(
+            config,
+            parallel_state.get_tensor_model_parallel_group(),
+            parallel_state.get_context_parallel_group(),
+        )
+        yield
+        Utils.destroy_model_parallel()
+
+    def test_documents_do_not_mix(self):
+        lengths = [5, 7, 4]
+        cu = [0, 5, 12, 16]
+        hidden = torch.randn(sum(lengths), 1, HIDDEN, device="cuda")
+        packed, _ = self.conv(hidden, packed_seq_params=_thd(cu))
+        separate = torch.cat([self.conv(hidden[a:b])[0] for a, b in zip(cu[:-1], cu[1:])], dim=0)
+        torch.testing.assert_close(packed, separate)
+
+
+def _cp_chunks(t: torch.Tensor, cp_size: int, rank: int) -> torch.Tensor:
+    """This rank's load-balanced sequence chunks (r and 2cp-1-r) of [s, ...]."""
+    chunks = t.chunk(2 * cp_size, dim=0)
+    return torch.cat([chunks[rank], chunks[2 * cp_size - 1 - rank]], dim=0)
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(Utils.world_size < 2, reason="needs 2 GPUs")
+class TestShortConvContextParallel:
+    """CP=2 computes exactly what CP=1 computes on the whole sequence."""
+
+    @pytest.fixture(scope="function", autouse=True)
+    def setup_method(self):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1, context_parallel_size=2
+        )
+        model_parallel_cuda_manual_seed(123)
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=HIDDEN,
+            num_attention_heads=4,
+            normalization="RMSNorm",
+            add_bias_linear=False,
+            short_conv_kernel_size=KERNEL,
+            context_parallel_size=2,
+            transformer_impl="transformer_engine",
+        )
+        tp = parallel_state.get_tensor_model_parallel_group()
+        self.cp_group = parallel_state.get_context_parallel_group()
+        rank = torch.distributed.get_rank()
+        # A CP=1 twin with identical weights, as the reference.
+        solo = [torch.distributed.new_group([r]) for r in range(torch.distributed.get_world_size())]
+        self.conv = _short_conv(config, tp, self.cp_group)
+        self.ref = _short_conv(config, tp, solo[rank])
+        self.ref.load_state_dict(self.conv.state_dict())
+        yield
+        Utils.destroy_model_parallel()
+
+    def test_matches_full_sequence(self):
+        cp, rank = self.cp_group.size(), self.cp_group.rank()
+        torch.manual_seed(0)  # same full input on every rank
+        hidden = torch.randn(32, 2, HIDDEN, device="cuda")
+        out, _ = self.conv(_cp_chunks(hidden, cp, rank))
+        ref, _ = self.ref(hidden)
+        torch.testing.assert_close(out, _cp_chunks(ref, cp, rank))
+
+    def test_packed_matches_full_sequence(self):
+        cp, rank = self.cp_group.size(), self.cp_group.rank()
+        cu = [0, 12, 32]  # each document divisible by 2 * cp
+        torch.manual_seed(0)
+        hidden = torch.randn(32, 1, HIDDEN, device="cuda")
+        # THD context parallelism load-balances every document on its own.
+        local = torch.cat(
+            [_cp_chunks(hidden[a:b], cp, rank) for a, b in zip(cu[:-1], cu[1:])], dim=0
+        )
+        out, _ = self.conv(local, packed_seq_params=_thd(cu))
+        ref, _ = self.ref(hidden, packed_seq_params=_thd(cu))
+        expected = torch.cat(
+            [_cp_chunks(ref[a:b], cp, rank) for a, b in zip(cu[:-1], cu[1:])], dim=0
+        )
+        torch.testing.assert_close(out, expected)

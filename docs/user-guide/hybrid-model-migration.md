@@ -356,9 +356,15 @@ model with an MLP after every mixer is `L-L-L-L-L-L-L-*-` repeated.
 
 `C` positions are gated short convolutions as in LFM2: `B`, `C` and `x`
 projections, a causal depthwise convolution of `B * x`, gated by `C`. They shard
-across tensor parallelism like the other mixers but support neither context
-parallelism nor packed sequences. An LFM2-style conv + attention model is, for
-example, `C-C-*-C-C-*-`.
+across tensor and context parallelism like the other mixers, and restart the
+convolution at every document boundary of a packed (THD) batch. An LFM2-style
+conv + attention model is, for example, `C-C-*-C-C-*-`.
+
+`L` mixers that are self-contained flash-linear-attention layers (`kda`,
+`signed_kda`, `panini`, `complex_kda`) have no parallel projections; under
+tensor parallelism every TP rank runs the whole layer, with gradients averaged
+across the TP group, which costs TP-times that layer's compute. They do not
+support context parallelism.
 
 ### Account for expanded layer indices
 
