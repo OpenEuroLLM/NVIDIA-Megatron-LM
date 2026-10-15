@@ -58,6 +58,7 @@ class HybridStackSubmodules:
     linear_layer: Optional[ModuleSpec] = None
     short_conv_layer: Union[ModuleSpec, type] = IdentityOp
     engram_layer: Union[ModuleSpec, type] = IdentityOp
+    pkm_layer: Union[ModuleSpec, type] = IdentityOp
     attention_layer: Union[ModuleSpec, type] = IdentityOp
     dsa_layer: Union[ModuleSpec, type] = IdentityOp
     mla_layer: Union[ModuleSpec, type] = IdentityOp
@@ -219,6 +220,13 @@ class HybridStack(MegatronModule):
                 elif layer_type == LayerSymbols.ENGRAM:
                     layer = build_module(
                         submodules.engram_layer,
+                        config=self.config,
+                        layer_number=layer_number,
+                        pg_collection=pg_collection,
+                    )
+                elif layer_type == LayerSymbols.PRODUCT_KEY_MEMORY:
+                    layer = build_module(
+                        submodules.pkm_layer,
                         config=self.config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,

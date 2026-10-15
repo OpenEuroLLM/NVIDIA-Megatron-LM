@@ -16,6 +16,7 @@ from megatron.core.models.gpt.moe_module_specs import (
 )
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
 from megatron.core.ssm.engram import EngramLayer
+from megatron.core.ssm.product_key_memory import ProductKeyMemoryLayer
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNetSubmodules
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
@@ -119,6 +120,7 @@ hybrid_stack_spec = ModuleSpec(
             ),
         ),
         engram_layer=ModuleSpec(module=EngramLayer),
+        pkm_layer=ModuleSpec(module=ProductKeyMemoryLayer),
         short_conv_layer=ModuleSpec(
             module=TransformerLayer,
             submodules=TransformerLayerSubmodules(

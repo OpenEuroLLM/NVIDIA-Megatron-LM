@@ -181,6 +181,12 @@ def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, Par
             max_lr=config.lr * config.engram_lr_mult,
             min_lr=(config.min_lr or 0.0) * config.engram_lr_mult,
         )
+        # Product-key memory value tables (megatron/core/ssm/product_key_memory.py).
+        config_overrides[ParamKey(attr="is_memory_table")] = ParamGroupOverride(
+            wd_mult=0.0,
+            max_lr=config.lr * config.pkm_lr_mult,
+            min_lr=(config.min_lr or 0.0) * config.pkm_lr_mult,
+        )
 
     if config.decoupled_lr is not None:
         decoupled_lr_config: ParamGroupOverride = {"max_lr": config.decoupled_lr}

@@ -43,22 +43,32 @@ class EngramTableOptimizer(MegatronOptimizer):
 
     def __init__(self, params: List[torch.nn.Parameter], config: OptimizerConfig):
         lr = config.lr if config.lr is not None else 0.0
-        mult = config.engram_lr_mult
-        group = dict(
-            params=params,
-            lr=lr * mult,
-            max_lr=lr * mult,
-            min_lr=(config.min_lr or 0.0) * mult,
-            wd_mult=0.0,
-            weight_decay=0.0,
-            is_engram_table=True,
-            is_expert_parallel=False,
-        )
+        # One group per LR multiplier: Engram tables (engram_lr_mult) and product-key
+        # memory values (pkm_lr_mult, set on the parameter) may share this optimizer.
+        by_mult = {}
+        for p in params:
+            kind = getattr(p, "sharded_table_kind", "engram")
+            mult = config.pkm_lr_mult if kind == "pkm" else config.engram_lr_mult
+            by_mult.setdefault(float(mult), []).append(p)
+        groups = [
+            dict(
+                params=group_params,
+                lr=lr * mult,
+                max_lr=lr * mult,
+                min_lr=(config.min_lr or 0.0) * mult,
+                wd_mult=0.0,
+                weight_decay=0.0,
+                is_engram_table=True,
+                is_expert_parallel=False,
+                sharded_table_lr_mult=mult,
+            )
+            for mult, group_params in sorted(by_mult.items())
+        ] or [dict(params=[], lr=0.0, max_lr=0.0, min_lr=0.0, wd_mult=0.0, weight_decay=0.0)]
         optimizer = torch.optim.Adam(
-            [group], betas=(config.adam_beta1, config.adam_beta2), eps=config.adam_eps
+            groups, betas=(config.adam_beta1, config.adam_beta2), eps=config.adam_eps
         )
         super().__init__(optimizer, config, init_state_fn=lambda opt, cfg=None: None)
-        self.params = params
+        self.params = [p for g in optimizer.param_groups for p in g["params"]]
         self.is_stub_optimizer = False
 
     # ---- gradients -------------------------------------------------------------
@@ -153,19 +163,23 @@ class EngramTableOptimizer(MegatronOptimizer):
             if 'step' in state:
                 steps.append(float(state['step']))
             param_state[f"{i}:{sharded.key}"] = entry
-        group = {k: v for k, v in self.optimizer.param_groups[0].items() if k != 'params'}
-        out = {'param_keyed': True, 'param_groups': {'0': group}, 'param_state': param_state}
+        groups = {
+            str(i): {k: v for k, v in g.items() if k != 'params'}
+            for i, g in enumerate(self.optimizer.param_groups)
+        }
+        out = {'param_keyed': True, 'param_groups': groups, 'param_state': param_state}
         if steps:
             out['common_step'] = max(steps)
         self._param_keys = list(param_state)
         return out
 
     def _load_param_keyed(self, state_dict):
-        saved = next(iter(state_dict['param_groups'].values()))
-        live = self.optimizer.param_groups[0]
-        for k, v in saved.items():
-            if k not in ('params', '_has_params'):
-                live[k] = v
+        saved = {g.get('sharded_table_lr_mult'): g for g in state_dict['param_groups'].values()}
+        for live in self.optimizer.param_groups:
+            match = saved.get(live.get('sharded_table_lr_mult'))
+            for k, v in (match or {}).items():
+                if k not in ('params', '_has_params'):
+                    live[k] = v
         step = state_dict.get('common_step', 0.0)
         for p, key in zip(self.params, self._param_keys):
             entry = state_dict['param_state'].get(key, {})

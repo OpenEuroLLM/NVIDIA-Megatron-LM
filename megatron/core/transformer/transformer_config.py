@@ -383,6 +383,29 @@ class TransformerConfig(ModelParallelConfig):
     engram_conv_kernel_size: int = 4
     """Kernel of Engram's depthwise causal conv (dilation = the largest n-gram order)."""
 
+    pkm_heads: int = 4
+    """Memory heads of a product-key memory (`P`) layer; their reads are summed."""
+
+    pkm_num_keys: int = 512
+    """Sub-keys per half; the memory has pkm_num_keys**2 value rows."""
+
+    pkm_key_dim: int = 256
+    """Query / product-key width (split into two halves of pkm_key_dim // 2)."""
+
+    pkm_topk: int = 32
+    """Candidates kept per half and rows read per head."""
+
+    pkm_value_dim: Optional[int] = None
+    """Width of a value row; None = hidden_size."""
+
+    pkm_gated: bool = True
+    """Memory+ (Berges et al. 2024): gate the read with SiLU(W_g h) before the output
+    projection."""
+
+    pkm_table_parallel: str = "tp"
+    """Values table distribution, as engram_table_parallel: "tp" (rows over TP, DDP
+    gradient) or "dp" (rows over the whole stage, sparse updates)."""
+
     engram_table_parallel: str = "tp"
     """How Engram tables are distributed. "tp": rows sharded over tensor parallelism,
     replicated over data parallelism (DDP reduces their dense gradient). "dp": rows

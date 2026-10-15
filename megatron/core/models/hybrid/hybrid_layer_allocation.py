@@ -24,6 +24,9 @@ class Symbols:
     SHORT_CONV = 'C'
     # Engram n-gram memory (hashed lookup into large tables), see megatron/core/ssm/engram.py.
     ENGRAM = 'N'
+    # Product-key memory (Lample et al. 2019 / Memory Layers at Scale), see
+    # megatron/core/ssm/product_key_memory.py.
+    PRODUCT_KEY_MEMORY = 'P'
     ATTENTION = "*"
     DS_ATTENTION = "D"
     MLA = "+"
@@ -31,7 +34,19 @@ class Symbols:
     MOE = 'E'
     PIPE = '|'
     MTP_SEPARATOR = "/"
-    VALID_LAYERS = {MAMBA, GDN, LINEAR, SHORT_CONV, ENGRAM, ATTENTION, DS_ATTENTION, MLA, MLP, MOE}
+    VALID_LAYERS = {
+        MAMBA,
+        GDN,
+        LINEAR,
+        SHORT_CONV,
+        ENGRAM,
+        PRODUCT_KEY_MEMORY,
+        ATTENTION,
+        DS_ATTENTION,
+        MLA,
+        MLP,
+        MOE,
+    }
 
     @classmethod
     def name_sorted_valid_layer_symbols(cls) -> list[str]:
@@ -182,10 +197,10 @@ def get_hybrid_layer_counts(pattern: str) -> Dict[str, int]:
 
     Examples:
         >>> get_hybrid_layer_counts("M*M*")
-        {'*': 2, 'D': 0, 'N': 0, 'G': 0, 'L': 0, 'M': 2, '+': 0, '-': 0, 'E': 0, 'C': 0}
+        {'*': 2, 'D': 0, 'N': 0, 'P': 0, 'G': 0, 'L': 0, 'M': 2, '+': 0, '-': 0, 'E': 0, 'C': 0}
 
         >>> get_hybrid_layer_counts("M-M-|M-M*-/MM/MM")
-        {'*': 1, 'D': 0, 'N': 0, 'G': 0, 'L': 0, 'M': 8, '+': 0, '-': 4, 'E': 0, 'C': 0}
+        {'*': 1, 'D': 0, 'N': 0, 'P': 0, 'G': 0, 'L': 0, 'M': 8, '+': 0, '-': 4, 'E': 0, 'C': 0}
     """
     parsed = parse_hybrid_pattern(pattern)
     counts = {symbol: 0 for symbol in Symbols.name_sorted_valid_layer_symbols()}

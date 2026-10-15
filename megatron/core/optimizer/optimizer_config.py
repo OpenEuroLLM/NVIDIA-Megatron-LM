@@ -187,6 +187,10 @@ class OptimizerConfig:
     megatron/core/ssm/engram.py); the tables also get no weight decay, as in the paper.
     Applies to max_lr and min_lr alike."""
 
+    pkm_lr_mult: float = 1.0
+    """Learning-rate multiplier of product-key memory value tables (parameters marked
+    `is_memory_table`, or the "dp"-sharded ones); they get no weight decay either."""
+
     embedding_wd_mult: float = 1.0
     """Multiplier applied to `weight_decay` for the word-embedding matrix (the 2-D parameter whose
     name contains `word_embeddings`). Default 1.0 = decay like every other weight (historical

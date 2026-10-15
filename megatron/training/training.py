@@ -780,11 +780,27 @@ def num_floating_point_operations(
             + kernel_size * hidden_size
         )
 
+    def pkm_layer_flops(total_tokens, hidden_size, heads, num_keys, key_dim, topk,
+                        value_dim, gated):
+        """Calculate FLOPs for a product-key memory (`P`) layer.
+
+        Query projection, the two half-key score matmuls (2 * num_keys keys of key_dim / 2
+        per head), the weighted sum of heads * topk value rows, the gate and the output
+        projection. The value table itself is a gather.
+        """
+        return 2 * total_tokens * (
+            hidden_size * heads * key_dim
+            + heads * num_keys * key_dim
+            + heads * topk * value_dim
+            + (hidden_size * value_dim if gated else 0)
+            + value_dim * hidden_size
+        )
+
     def hybrid_flops(total_tokens, seqlen_squared_sum, hidden_size,
                      num_attn_layers, num_mamba_layers, num_mlp_layers, num_moe_layers,
                      num_gdn_layers=0, num_linear_layers=0, num_short_conv_layers=0,
                      short_conv_kernel_size=3, num_engram_layers=0, engram_mem_dim=0,
-                     engram_conv_kernel_size=4,
+                     engram_conv_kernel_size=4, num_pkm_layers=0, pkm_args=None,
                      mamba_state_dim=128, mamba_head_dim=64,
                      mamba_num_groups=8, mamba_num_heads=128,
                      num_attn_heads=32, gqa=True,
@@ -817,6 +833,8 @@ def num_floating_point_operations(
                                                                short_conv_kernel_size) +
                 num_engram_layers * engram_layer_flops(total_tokens, hidden_size, engram_mem_dim,
                                                        engram_conv_kernel_size) +
+                (num_pkm_layers * pkm_layer_flops(total_tokens, hidden_size, **pkm_args)
+                 if num_pkm_layers else 0) +
                 # `L` layers: the same per-variant count the GPT path uses.
                 (num_linear_layers * 2 * total_tokens * linear_mixer_fmas_per_token()
                  if num_linear_layers else 0) +
@@ -1104,9 +1122,10 @@ def num_floating_point_operations(
         from megatron.core.models.hybrid.hybrid_layer_allocation import (
             Symbols, get_hybrid_layer_counts)
         (num_mamba_layers, num_gdn_layers, num_linear_layers, num_short_conv_layers,
-         num_engram_layers, num_attn_layers, num_mlp_layers, num_moe_layers) = itemgetter(
+         num_engram_layers, num_pkm_layers, num_attn_layers, num_mlp_layers,
+         num_moe_layers) = itemgetter(
             Symbols.MAMBA, Symbols.GDN, Symbols.LINEAR, Symbols.SHORT_CONV, Symbols.ENGRAM,
-            Symbols.ATTENTION, Symbols.MLP, Symbols.MOE
+            Symbols.PRODUCT_KEY_MEMORY, Symbols.ATTENTION, Symbols.MLP, Symbols.MOE
         )(get_hybrid_layer_counts(args.hybrid_layer_pattern))
 
         mtp_num_layers = args.mtp_num_layers
@@ -1130,6 +1149,15 @@ def num_floating_point_operations(
                 args.engram_embed_dim * len(args.engram_ngram_orders) * args.engram_num_heads
             ),
             engram_conv_kernel_size=args.engram_conv_kernel_size,
+            num_pkm_layers=num_pkm_layers,
+            pkm_args=dict(
+                heads=args.pkm_heads,
+                num_keys=args.pkm_num_keys,
+                key_dim=args.pkm_key_dim,
+                topk=args.pkm_topk,
+                value_dim=args.pkm_value_dim or args.hidden_size,
+                gated=args.pkm_gated,
+            ),
             mamba_state_dim=args.mamba_state_dim,
             mamba_head_dim=args.mamba_head_dim,
             mamba_num_groups=args.mamba_num_groups,
@@ -2568,7 +2596,10 @@ def setup_model_and_optimizer(
             use_gloo_process_groups=args.use_gloo_process_groups,
             dump_param_to_param_group_map=args.dump_param_to_param_group_map,
         )
-        if getattr(args, "engram_table_parallel", "tp") == "dp":
+        if "dp" in (
+            getattr(args, "engram_table_parallel", "tp"),
+            getattr(args, "pkm_table_parallel", "tp"),
+        ):
             # Engram tables sharded over the whole stage are not DDP parameters; their
             # optimizer joins the chain before the scheduler collects param groups.
             from megatron.core.optimizer.engram_optimizer import attach_engram_table_optimizer

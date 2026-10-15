@@ -374,6 +374,10 @@ class DynamicInferenceContext(BaseInferenceContext):
                 raise NotImplementedError("Short-conv (C) layers are not supported for inference.")
             if Symbols.ENGRAM in mamba_inference_state_config.layer_type_list:
                 raise NotImplementedError("Engram (N) layers are not supported for inference.")
+            if Symbols.PRODUCT_KEY_MEMORY in mamba_inference_state_config.layer_type_list:
+                raise NotImplementedError(
+                    "Product-key memory (P) layers are not supported for inference."
+                )
 
             self.num_attention_layers = len(attention_layer_map) + len(dsa_layer_map)
             self.num_mamba_layers = len(mamba_layer_map)
@@ -400,7 +404,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 model_config, vp_stage=None, pp_rank=pp_rank
             )
             self.num_mamba_layers = 0
-            (self.mamba_conv_states_shape, self.mamba_ssm_states_shape) = (None, None)
+            self.mamba_conv_states_shape, self.mamba_ssm_states_shape = (None, None)
             self.layer_map = {i: i for i in range(self.num_attention_layers)}
 
         if self.num_attention_layers == 0:
@@ -2970,7 +2974,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.total_request_count < self.max_requests and self.paused_request_count == 0
         )
 
-        (matched_block_ids, num_blocks_from_pool, _, _, _, effective_prefill_chunk_length) = (
+        matched_block_ids, num_blocks_from_pool, _, _, _, effective_prefill_chunk_length = (
             self._compute_prefix_match(req, req.remaining_prompt_length)
         )
 
