@@ -58,7 +58,9 @@ def routed_write_mix_reference(streams, f, idx, w, mix):
     """Out-of-place ``streams[t, idx_j] = sum_i mix[t, j, i] streams[t, idx_i] + w_j f``."""
     index = idx.long().unsqueeze(-1).expand(-1, -1, streams.shape[-1])
     rows = torch.gather(streams, 1, index).float()  # [T, k, C]
-    new = torch.einsum("tji,tic->tjc", mix.float(), rows)
+    # A broadcast sum, not einsum: a matmul runs in TF32 where it is enabled (NGC
+    # containers default to it), which would make the reference the inexact side.
+    new = (mix.float().unsqueeze(-1) * rows.unsqueeze(1)).sum(2)
     new = new + w.float().unsqueeze(-1) * f.float().unsqueeze(1)
     return streams.scatter(1, index, new.to(streams.dtype))
 

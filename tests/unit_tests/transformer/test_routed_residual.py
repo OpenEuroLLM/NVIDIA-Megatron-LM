@@ -26,18 +26,26 @@ def _stack(fused, x0, weights, routers, n, k, mixers=None):
     for layer, (w_f, w_r) in enumerate(zip(weights, routers)):
         stash = rr.GradStash()
         s0 = rr.stream_tap(s, 0, stash) if fused else s.select(-2, 0)
-        logits = s0.reshape(-1, c).float() @ w_r
-        idx, r = rr.route_streams(logits, k)
+        # The test's own dense maps run in float64: no TF32 (on by default in NGC
+        # containers), which would round the two paths' inputs differently.
+        logits = (s0.reshape(-1, c).double() @ w_r.double()).float()
+        # Select from the fixed input, so both paths take the same streams: selecting
+        # from the stream values would let a rounding difference flip a top-k choice
+        # and change the gradients discontinuously. The router still learns through
+        # the read / write weights, which are computed from the streams.
+        idx, _ = rr.route_streams(x0.reshape(-1, c).detach().float() @ w_r.detach(), k)
+        r = torch.softmax(torch.gather(logits, 1, idx.long()), dim=-1)
         w = 2 * torch.sigmoid(torch.gather(logits, 1, idx.long()))
         if fused:
             x = rr.routed_read(s, idx, r, stash)
         else:
             x = rr.routed_read_reference(s.reshape(-1, n, c), idx, r).view(x0.shape)
-        f = torch.tanh(x.float() @ w_f).to(s.dtype)
+        f = torch.tanh(x.double() @ w_f.double()).to(s.dtype)
         if mixers is not None:
             from megatron.core.transformer.mhc import sinkhorn_knopp
 
-            mix_logits = (s0.reshape(-1, c).float() @ mixers[layer]).view(-1, k, k)
+            mix_logits = (s0.reshape(-1, c).double() @ mixers[layer].double()).float()
+            mix_logits = mix_logits.view(-1, k, k)
             mix = sinkhorn_knopp(mix_logits + torch.eye(k, device=s.device), 6)
             if fused:
                 s = rr.routed_write_mix(s, f, idx, w, mix, stash)
@@ -251,7 +259,7 @@ def test_bf16_mixing_layer_against_fp32(k, c):
             x = rr.routed_read(base, idx, r, stash)
         else:
             x = rr.routed_read_reference(base, idx, r)
-        f = torch.tanh(x.float() @ wf).to(base.dtype)
+        f = torch.tanh(x.double() @ wf.double()).to(base.dtype)
         if fused:
             out = rr.routed_write_mix(base, f, idx, w, m, stash)
         else:
