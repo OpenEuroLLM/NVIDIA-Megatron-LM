@@ -383,6 +383,11 @@ class TransformerConfig(ModelParallelConfig):
     engram_conv_kernel_size: int = 4
     """Kernel of Engram's depthwise causal conv (dilation = the largest n-gram order)."""
 
+    exclusive_self_attention: bool = False
+    """Exclusive self attention (Zhai 2026, arXiv:2603.09078): orthogonalize every
+    attention output head against the token's own value vector (fused Triton kernel,
+    together with the output gate when attention_output_gate is set)."""
+
     canon_layers: str = ""
     """Canon layers (Allen-Zhu, Physics of LMs 4.1): any of "ABCD" -- A the token-mixer
     input, B the attention q/k/v, C the MLP input, D the MLP fc1 output (fused with

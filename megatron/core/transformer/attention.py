@@ -403,6 +403,11 @@ class Attention(MegatronModule, ABC):
             self.config.fine_grained_activation_offloading
             and "core_attn" in self.config.offload_modules
         )
+        if getattr(self.config, "exclusive_self_attention", False) and self.offload_core_attention:
+            raise ValueError(
+                "exclusive_self_attention reads the value tensor after core attention, which "
+                "core-attention offloading releases"
+            )
 
         self.offload_attn_proj = (
             self.config.fine_grained_activation_offloading
@@ -1362,6 +1367,7 @@ class Attention(MegatronModule, ABC):
             [
                 not self.config.test_mode,
                 self.config.fused_single_qkv_rope,
+                not getattr(self.config, "exclusive_self_attention", False),
                 inference_context is None,
                 packed_seq_params is None,
                 (
@@ -1395,12 +1401,15 @@ class Attention(MegatronModule, ABC):
         attn_mask_type = self.attn_mask_type
         block_table = None
         gate = None
+        own_value = None
         if split_qkv:
             if self.config.attention_output_gate:
                 query, key, value, gate = qkv_output
             else:
                 query, key, value = qkv_output
             mixed_qkv = qkv_split_arg_list = None
+            if getattr(self.config, "exclusive_self_attention", False):
+                own_value = value  # this step's tokens, before any KV-cache handling
         else:
             assert (
                 not self.config.attention_output_gate
@@ -1601,6 +1610,20 @@ class Attention(MegatronModule, ABC):
             # note that batch is a dummy dimension in the packed case
             core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
         nvtx_range_pop(suffix="core_attention")
+
+        if own_value is not None:
+            # Exclusive self attention, fused with the output gate (fused_xsa.py).
+            from megatron.core.fusions.fused_xsa import exclusive_self_attention
+
+            nvtx_range_push(suffix="xsa")
+            shape = core_attn_out.shape
+            hkv, dim = own_value.shape[-2], own_value.shape[-1]
+            o = core_attn_out.reshape(-1, shape[-1] // dim, dim)
+            v = own_value.reshape(-1, hkv, dim)
+            g = gate.reshape(o.shape) if gate is not None else None
+            core_attn_out = exclusive_self_attention(o, v, g).view(shape)
+            gate = None
+            nvtx_range_pop(suffix="xsa")
 
         # Output gate
         if gate is not None:
