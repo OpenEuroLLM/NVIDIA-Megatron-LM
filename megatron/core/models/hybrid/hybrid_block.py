@@ -731,9 +731,24 @@ class HybridStack(MegatronModule):
 
             sharded_state_dict.update(layer_sharded_state_dict)
 
-        # Add modules other than self.layers
+            # A layer's per-layer embedding (PLE) is keyed by the same global layer
+            # index, so pipeline layouts can change between save and load.
+            ple = (
+                self.per_layer_embeddings[local_layer_idx]
+                if self.per_layer_embeddings is not None
+                else None
+            )
+            if ple is not None:
+                ple_prefix = f'{prefix}per_layer_embeddings.{local_layer_idx}.'
+                ple_sd = ple.sharded_state_dict(ple_prefix, sharded_pp_offset, metadata)
+                replace_prefix_for_sharding(
+                    ple_sd, ple_prefix, f'{prefix}per_layer_embeddings.{global_layer_offset}.'
+                )
+                sharded_state_dict.update(ple_sd)
+
+        # Add modules other than self.layers (and the per-layer embeddings, above)
         for name, module in self.named_children():
-            if not module is self.layers:
+            if not module is self.layers and not module is self.per_layer_embeddings:
                 sharded_state_dict.update(
                     sharded_state_dict_default(
                         module,

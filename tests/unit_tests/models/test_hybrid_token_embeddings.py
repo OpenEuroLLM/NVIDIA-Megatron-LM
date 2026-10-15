@@ -133,3 +133,15 @@ def test_value_table_checkpoint_declares_the_head_axis():
 def test_ple_rejects_depth_schemes():
     with pytest.raises(NotImplementedError, match="per-layer embeddings"):
         _model(per_layer_embedding_dim=16, mhc=True, mhc_expansion_rate=2)
+
+
+def test_ple_table_checkpoint_declares_the_vocab_axis():
+    model = _model(per_layer_embedding_dim=16)
+    sd = model.decoder.sharded_state_dict(prefix="decoder.", sharded_offsets=())
+    keys = [k for k in sd if "per_layer_embeddings" in k and k.endswith("table.weight")]
+    # "*-*-": PLEs after the MLP layers 2 and 4, keyed by global layer offset 1 and 3
+    assert sorted(keys) == [
+        "decoder.per_layer_embeddings.1.table.weight", "decoder.per_layer_embeddings.3.table.weight"
+    ]
+    for k in keys:
+        assert sd[k].global_shape[0] == VOCAB, (k, sd[k].global_shape)

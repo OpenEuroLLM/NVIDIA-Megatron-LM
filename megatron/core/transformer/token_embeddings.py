@@ -23,16 +23,21 @@ from typing import Optional
 import torch
 from torch import nn
 
+from megatron.core.transformer.module import MegatronModule
+
 
 def _act(name: str):
     return {"gelu": nn.functional.gelu, "silu": nn.functional.silu}[name]
 
 
-class PerLayerEmbedding(nn.Module):
-    """PLE for one layer: ``h + Norm(W_up(act(W_gate h) * e[token]))``."""
+class PerLayerEmbedding(MegatronModule):
+    """PLE for one layer: ``h + Norm(W_up(act(W_gate h) * e[token]))``.
+
+    A MegatronModule so the checkpoint walk reaches the vocab-parallel table's own
+    sharded_state_dict (a plain nn.Module stores each TP rank's rows as the table)."""
 
     def __init__(self, config, vocab_size: int, tp_group) -> None:
-        super().__init__()
+        super().__init__(config)
         from megatron.core.tensor_parallel.layers import VocabParallelEmbedding
         from megatron.core.transformer.post_norm import build_post_norm
 
