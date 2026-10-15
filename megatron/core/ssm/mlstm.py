@@ -484,6 +484,13 @@ class MLSTM(MegatronModule):
             chunk_size=self.chunk_size,
         )
         nvtx_range_pop(suffix="mlstm_cell")
+        if getattr(self.config, "linear_xsa", False):
+            from megatron.core.fusions.fused_xsa import exclusive_self_attention_heads
+
+            # [B, H, T, D] -> per token and head
+            h = exclusive_self_attention_heads(
+                h.transpose(1, 2).contiguous(), v.transpose(1, 2).contiguous()
+            ).transpose(1, 2)
 
         # Per-head norm and elementwise output gate.
         nvtx_range_push(suffix="gated_norm")

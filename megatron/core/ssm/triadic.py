@@ -156,6 +156,19 @@ def _chunk_kda_wide(q, k, v, g, beta, sign, scale, allow_neg_eigval, cu_seqlens)
     state recurrence runs on the wide-key kernels (triadic_wide.py, registered as an
     FLA backend for K > 256, K-major state layout); FLA's other kernels tile the key
     dimension themselves."""
+    try:  # the ComplexKDA fork's chunk_kda takes K > 256 itself (feat/hybrid-kernels)
+        import fla.ops.common.chunk_delta_h_wide  # noqa: F401
+
+        o, _ = chunk_kda(
+            q=q, k=k, v=v, g=g, beta=beta, sign=sign, scale=scale,
+            use_qk_l2norm_in_kernel=False, use_gate_in_kernel=False,
+            use_beta_sigmoid_in_kernel=True, allow_neg_eigval=allow_neg_eigval,
+            safe_gate=False, state_v_first=False, cu_seqlens=cu_seqlens,
+        )
+        return o
+    except ImportError:
+        pass
+    # Older FLA: Megatron's copy of the wide-key kernels, as an FLA backend.
     from fla.ops.kda.chunk import ChunkKDAFunction
     from fla.ops.kda.implementation import resolve_implementation
 
@@ -198,8 +211,10 @@ class TriadicDeltaAttention(nn.Module):
         norm_eps: float = 1e-5,
         layer_idx: Optional[int] = None,
         kernel: str = "auto",
+        xsa: bool = False,
     ) -> None:
         super().__init__()
+        self.xsa = xsa
         if not HAVE_FLA:
             raise ImportError("the triadic variant needs flash-linear-attention (ComplexKDA)")
         if base not in BASES:
@@ -296,6 +311,10 @@ class TriadicDeltaAttention(nn.Module):
         else:
             o = triadic_chunk(q, k, v, q2, k2, g2, beta, g=g, sign=sign,
                               allow_neg_eigval=self.allow_neg_eigval)
+        if self.xsa:
+            from megatron.core.fusions.fused_xsa import exclusive_self_attention_heads
+
+            o = exclusive_self_attention_heads(o, v)
         gate = self.g_proj(x).view(b, t, self.h, self.d)
         o = self.o_norm(o, gate)
         return self.o_proj(o.reshape(b, t, self.h * self.d)), None, None

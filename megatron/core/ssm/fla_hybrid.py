@@ -88,6 +88,14 @@ def megatron_init_fla_layer(layer: torch.nn.Module, config: TransformerConfig) -
                     config.init_method(module.weight)
 
 
+def _with_xsa(config, kwargs):
+    """``kwargs`` plus ``xsa=True`` when linear_xsa is set (the ComplexKDA fork's option;
+    left out otherwise, so forks without it keep working)."""
+    if getattr(config, "linear_xsa", False):
+        kwargs = dict(kwargs, xsa=True)
+    return kwargs
+
+
 def _declared_kwargs(cls, kwargs):
     """``kwargs``, refusing any the constructor does not declare.
 
@@ -311,7 +319,7 @@ class KDA(_FLALayerWrapper):
         return _FLAKDA(
             **_declared_kwargs(
                 _FLAKDA,
-                dict(
+                _with_xsa(config, dict(
                     hidden_size=config.hidden_size,
                     expand_v=config.linear_fla_expand_v,
                     head_dim=head_dim,
@@ -328,7 +336,7 @@ class KDA(_FLALayerWrapper):
                     lower_bound=lower_bound,
                     layer_idx=layer_number,
                     norm_eps=config.layernorm_epsilon,
-                ),
+                )),
             )
         )
 
@@ -387,7 +395,7 @@ class SignedKDA(_FLALayerWrapper):
         if _FLASignedKDA.__name__ == "SignedKimiDeltaAttention":
             # Legacy only; False is the released layer's fixed behaviour.
             kwargs["tie_sign_across_group"] = False
-        return _FLASignedKDA(**_declared_kwargs(_FLASignedKDA, kwargs))
+        return _FLASignedKDA(**_declared_kwargs(_FLASignedKDA, _with_xsa(config, kwargs)))
 
 
 class PaniniDeltaAttention(_FLALayerWrapper):
@@ -465,4 +473,5 @@ class Triadic(_FLALayerWrapper):
             norm_eps=config.layernorm_epsilon,
             layer_idx=layer_number,
             kernel=config.linear_triadic_kernel,
+            xsa=getattr(config, "linear_xsa", False),
         )

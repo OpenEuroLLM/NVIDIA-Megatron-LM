@@ -465,6 +465,13 @@ class TransformerConfig(ModelParallelConfig):
     linear_fla_expand_v: float = 1.0
     """Value-dim expansion for the FLA hybrid layers (expand_v)."""
 
+    linear_xsa: bool = False
+    """Exclusive self attention for the linear mixers: project each head's recurrence output
+    off the token's own value before the output norm (fused_xsa.py) -- the self-copy a
+    token's own delta-rule write returns, about beta (q . k) v. Native GDN, mLSTM and the
+    triadic mixer apply it here; the FLA layers (kda, signed_kda, complex_kda) need the
+    ComplexKDA fork's xsa option."""
+
     linear_triadic_e: int = 2
     """Triadic linear attention (variant "triadic", megatron/core/ssm/triadic.py): E, the
     number of state slices per head (the second key's width); 1 is the base mixer."""

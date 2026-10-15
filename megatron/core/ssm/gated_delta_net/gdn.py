@@ -270,6 +270,10 @@ class GatedDeltaNet(_GDNBase):
             cu_seqlens=cu_seqlens_q,
         )
         nvtx_range_pop(suffix="gated_delta_rule")
+        if getattr(self.config, "linear_xsa", False):
+            from megatron.core.fusions.fused_xsa import exclusive_self_attention_heads
+
+            core_attn_out = exclusive_self_attention_heads(core_attn_out, value)
 
         if self.recompute_norm_out:
             self.norm_out_checkpoint = tensor_parallel.CheckpointWithoutOutput()

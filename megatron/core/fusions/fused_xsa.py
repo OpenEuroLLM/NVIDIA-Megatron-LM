@@ -143,3 +143,13 @@ def exclusive_self_attention(
     if HAVE_TRITON and o.is_cuda:
         return _XSA.apply(o, v, gate, eps)
     return xsa_reference(o, v, gate, eps)
+
+
+def exclusive_self_attention_heads(o: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """XSA over ``[..., H, D]`` outputs and ``[..., H_kv, D]`` own values (same leading
+    token dims), e.g. a linear mixer's recurrence output and its values."""
+    shape = o.shape
+    out = exclusive_self_attention(
+        o.reshape(-1, shape[-2], shape[-1]), v.reshape(-1, v.shape[-2], v.shape[-1])
+    )
+    return out.view(shape)

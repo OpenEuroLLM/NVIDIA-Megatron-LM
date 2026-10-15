@@ -182,7 +182,9 @@ class ComplexKDA(_MegatronSelfAttentionAdapter):
                 f"complex_kda: hidden_size {config.hidden_size} is not a whole "
                 f"number of heads of width {head_dim}"
             )
+        xsa = {"xsa": True} if getattr(config, "linear_xsa", False) else {}
         self.layer = ComplexKimiDeltaAttention(
+            **xsa,
             hidden_size=config.hidden_size,
             num_heads=num_heads,
             head_dim=head_dim,
