@@ -73,11 +73,13 @@ MOE = dict(
 
 
 def test_tracker_averages_per_layer_and_summarizes_shares():
-    arch_metrics.record("a", 1, 3, torch.tensor(6.0), 3)
-    arch_metrics.record("a", 1, 3, torch.tensor(2.0), 1)
-    arch_metrics.record("a", 3, 3, torch.tensor(1.0), 1)
-    arch_metrics.record_share("s", 2, 3, torch.tensor([[1.0, 0.0], [1.0, 0.0]]))
-    arch_metrics.record_union("u", 2, 3, 10, torch.tensor([1, 1, 4]))
+    # CUDA tensors, as at every call site: collect() all-reduces them (NCCL).
+    cuda = dict(device="cuda")
+    arch_metrics.record("a", 1, 3, torch.tensor(6.0, **cuda), 3)
+    arch_metrics.record("a", 1, 3, torch.tensor(2.0, **cuda), 1)
+    arch_metrics.record("a", 3, 3, torch.tensor(1.0, **cuda), 1)
+    arch_metrics.record_share("s", 2, 3, torch.tensor([[1.0, 0.0], [1.0, 0.0]], **cuda))
+    arch_metrics.record_union("u", 2, 3, 10, torch.tensor([1, 1, 4], **cuda))
     out = arch_metrics.collect()
     assert out["a/layer_1"] == pytest.approx(2.0) and out["a/layer_3"] == pytest.approx(1.0)
     assert out["a"] == pytest.approx(1.5)  # mean over the layers that recorded
