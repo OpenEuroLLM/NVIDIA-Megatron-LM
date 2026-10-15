@@ -845,8 +845,10 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             if self.pre_process:
                 return expand_to_streams(hidden_states, slots), None
             # Already widened by an earlier stage; restore the stream axis.
+            from megatron.core.transformer.routed_residual import own_streams
+
             s, b, wide = hidden_states.shape
-            return hidden_states.reshape(s, b, slots, wide // slots), None
+            return own_streams(hidden_states.reshape(s, b, slots, wide // slots), self.config), None
 
         from megatron.core.transformer.attn_res import resolve_layers_per_block
         from megatron.core.transformer.depth_residual import DepthResidualState

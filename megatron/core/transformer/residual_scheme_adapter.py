@@ -60,16 +60,9 @@ class ResidualSchemeAdapter(nn.Module):
                 eps=config.layernorm_epsilon,
             )
         if getattr(config, "mhc", False):
-            from megatron.core.transformer.mhc import MHCMixer
+            from megatron.core.transformer.routed_residual import build_stream_mixer
 
-            self.mhc_mixer = MHCMixer(
-                hidden_size=config.hidden_size,
-                expansion_rate=config.mhc_expansion_rate,
-                num_sinkhorn_iters=config.mhc_sinkhorn_iters,
-                alpha_init=config.mhc_alpha_init,
-                res_init=config.mhc_res_init,
-                eps=config.layernorm_epsilon,
-            )
+            self.mhc_mixer = build_stream_mixer(config)
         elif getattr(config, "attn_res", False):
             from megatron.core.transformer.attn_res import BlockAttnRes
 

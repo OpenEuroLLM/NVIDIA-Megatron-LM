@@ -519,20 +519,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         self.attnres_mlp = None
         self._depth_state = None
         if getattr(self.config, "mhc", False):
-            from megatron.core.transformer.mhc import MHCMixer
+            # Dense mHC, or routed residual streams with mhc_routed_topk.
+            from megatron.core.transformer.routed_residual import build_stream_mixer
 
-            def _make_mixer() -> "MHCMixer":
-                return MHCMixer(
-                    hidden_size=self.config.hidden_size,
-                    expansion_rate=self.config.mhc_expansion_rate,
-                    num_sinkhorn_iters=self.config.mhc_sinkhorn_iters,
-                    alpha_init=self.config.mhc_alpha_init,
-                    res_init=self.config.mhc_res_init,
-                    eps=self.config.layernorm_epsilon,
-                )
-
-            self.mhc_attn_mixer = _make_mixer() if has_attn else None
-            self.mhc_mlp_mixer = _make_mixer() if has_mlp else None
+            self.mhc_attn_mixer = build_stream_mixer(self.config) if has_attn else None
+            self.mhc_mlp_mixer = build_stream_mixer(self.config) if has_mlp else None
         elif getattr(self.config, "attn_res", False):
             from megatron.core.transformer.attn_res import BlockAttnRes
 

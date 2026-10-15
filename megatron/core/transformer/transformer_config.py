@@ -1769,6 +1769,13 @@ class TransformerConfig(ModelParallelConfig):
     Mixing must precede renormalization, since a convex combination of unit vectors is not
     itself unit norm."""
 
+    mhc_routed_topk: int = 0
+    """Routed residual streams (MoE-like residual sparsity, routed_residual.py): with k > 0
+    each sublayer reads and writes only stream 0 plus the top k-1 of the other
+    mhc_expansion_rate - 1 streams (chosen per token by a router on stream 0), with no stream
+    mixing, so it moves (2k+1) of the n streams instead of all of them. 0 is dense mHC.
+    Requires mhc=True; not combinable with mhc_lerp."""
+
     ####################
     # Block Attention Residuals
     ####################
@@ -1828,6 +1835,21 @@ class TransformerConfig(ModelParallelConfig):
         details.
         """
         super().__post_init__()
+
+        if self.mhc_routed_topk:
+            if not self.mhc:
+                raise ValueError("mhc_routed_topk requires mhc=True")
+            if not 1 <= self.mhc_routed_topk <= self.mhc_expansion_rate:
+                raise ValueError(
+                    f"mhc_routed_topk must be in [1, mhc_expansion_rate="
+                    f"{self.mhc_expansion_rate}], got {self.mhc_routed_topk}"
+                )
+            if self.mhc_lerp:
+                raise ValueError("mhc_routed_topk is not combinable with mhc_lerp")
+            if self.cuda_graph_impl != "none" or self.enable_cuda_graph:
+                # The per-step routing state (and the shared gradient buffer) lives in
+                # Python objects a captured graph would freeze.
+                raise ValueError("mhc_routed_topk does not support CUDA graphs yet")
 
         # The Liger fused LM-head + CE returns the loss before the logits exist,
         # so the logit softcap and the z-loss (both applied to the logits) would
