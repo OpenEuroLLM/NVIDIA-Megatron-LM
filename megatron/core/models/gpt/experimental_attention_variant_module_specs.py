@@ -9,7 +9,7 @@ from megatron.core.ssm.complex_kda import (
     ComplexKDAHybridAttention,
     ComplexKDASubmodules,
 )
-from megatron.core.ssm.fla_hybrid import KDA, PaniniDeltaAttention, SignedKDA, Triadic
+from megatron.core.ssm.fla_hybrid import KDA, PaniniDeltaAttention, PowerRetention, SignedKDA, Triadic
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNetSubmodules
 from megatron.core.ssm.mamba2_attention import Mamba2Attention
 from megatron.core.ssm.mamba_mixer import MambaMixerSubmodules
@@ -151,7 +151,8 @@ def get_fla_hybrid_module_spec(
     supplies its own norm before the mixer (fuse_input_layernorm False).
     """
     module = {
-        "kda": KDA, "signed_kda": SignedKDA, "panini": PaniniDeltaAttention, "triadic": Triadic
+        "kda": KDA, "signed_kda": SignedKDA, "panini": PaniniDeltaAttention, "triadic": Triadic,
+        "power": PowerRetention,
     }[
         config.experimental_attention_variant
     ]
@@ -245,7 +246,7 @@ def get_experimental_attention_variant_module_spec(
         return get_mamba_module_spec(config=config, backend=backend)
     elif config.experimental_attention_variant == "complex_kda":
         return get_complex_kda_module_spec(config=config, backend=backend)
-    elif config.experimental_attention_variant in ("kda", "signed_kda", "panini", "triadic"):
+    elif config.experimental_attention_variant in ("kda", "signed_kda", "panini", "triadic", "power"):
         return get_fla_hybrid_module_spec(config=config, backend=backend)
     elif config.experimental_attention_variant == "dsa":
         return get_dsa_module_spec_for_backend(config=config, backend=backend)
@@ -485,7 +486,8 @@ def get_transformer_block_with_experimental_attention_variant_spec(
 def is_linear_attention_variant(experimental_attention_variant: Optional[str]) -> bool:
     """Check if the experimental attention variant is a linear attention variant."""
     linear_attention_variants = [
-        "gated_delta_net", "mlstm", "mamba", "kda", "signed_kda", "panini", "complex_kda", "triadic"
+        "gated_delta_net", "mlstm", "mamba", "kda", "signed_kda", "panini", "complex_kda", "triadic",
+        "power",
     ]
     return experimental_attention_variant in linear_attention_variants
 

@@ -644,6 +644,20 @@ def num_floating_point_operations(
                     + args.hidden_size * v_dim
                 )
             )
+        elif args.experimental_attention_variant == "power":
+            # megatron/core/ssm/power_retention.py: q, k, v, gate and out projections plus
+            # the chunked power-retention core, whose state is binom(d+deg-1, deg) x (d+1)
+            # per head; the expanded-feature matmuls dominate (~4 per token and state entry).
+            from math import comb
+
+            head_dim = args.linear_key_head_dim
+            num_heads = args.linear_num_key_heads
+            dim = head_dim * num_heads
+            state = comb(head_dim + args.linear_power_deg - 1, args.linear_power_deg) * (head_dim + 1)
+            return (
+                args.hidden_size * (4 * dim + num_heads)
+                + num_heads * state * 4
+            )
         elif args.experimental_attention_variant == "triadic":
             # megatron/core/ssm/triadic.py: KDA's skeleton with a second key / query
             # (hidden x heads*E each, plus the slice-gate projection) and a delta rule

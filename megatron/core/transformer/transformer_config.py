@@ -294,7 +294,7 @@ class TransformerConfig(ModelParallelConfig):
     experimental_attention_variant: Optional[
         Literal[
             'gated_delta_net', 'mlstm', 'mamba', 'dsa', 'kda', 'signed_kda', 'panini', 'complex_kda',
-            'triadic',
+            'triadic', 'power',
         ]
     ] = None
     """Type of attention variant to use. Currently support gated_delta_net, mlstm,
@@ -471,6 +471,17 @@ class TransformerConfig(ModelParallelConfig):
     token's own delta-rule write returns, about beta (q . k) v. Native GDN, mLSTM and the
     triadic mixer apply it here; the FLA layers (kda, signed_kda, complex_kda) need the
     ComplexKDA fork's xsa option."""
+
+    linear_power_deg: int = 2
+    """Power retention (variant "power", megatron/core/ssm/power_retention.py): the even degree
+    of the (q . k)^deg similarity; the state per head is binom(d+deg-1, deg) x (d+1). The
+    public Triton kernels (the baseline) implement deg = 2."""
+
+    linear_power_chunk_size: int = 128
+    """Power retention: the chunk size of the chunked algorithm."""
+
+    linear_power_rope: bool = False
+    """Power retention: rotary embeddings on q / k (the reference model's choice); off = NoPE."""
 
     linear_triadic_e: int = 2
     """Triadic linear attention (variant "triadic", megatron/core/ssm/triadic.py): E, the

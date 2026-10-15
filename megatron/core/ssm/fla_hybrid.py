@@ -475,3 +475,31 @@ class Triadic(_FLALayerWrapper):
             kernel=config.linear_triadic_kernel,
             xsa=getattr(config, "linear_xsa", False),
         )
+
+
+class PowerRetention(_FLALayerWrapper):
+    """Power retention (power attention) as a Megatron mixer; see
+    megatron/core/ssm/power_retention.py. The public Triton kernels are the baseline."""
+
+    _NAME = "power"
+    _NEEDS = "retention (github.com/m-a-n-i-f-e-s-t/retention) and vidrial"
+
+    @staticmethod
+    def _fla_class():
+        from megatron.core.ssm.power_retention import HAVE_RETENTION, PowerRetentionAttention
+
+        return PowerRetentionAttention if HAVE_RETENTION else None
+
+    def _build(self, config, head_dim, num_heads, layer_number):
+        from megatron.core.ssm.power_retention import PowerRetentionAttention
+
+        return PowerRetentionAttention(
+            hidden_size=config.hidden_size,
+            head_dim=head_dim,
+            num_heads=num_heads,
+            deg=config.linear_power_deg,
+            chunk_size=config.linear_power_chunk_size,
+            rope=config.linear_power_rope,
+            xsa=getattr(config, "linear_xsa", False),
+            layer_idx=layer_number,
+        )
