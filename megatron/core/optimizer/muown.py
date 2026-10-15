@@ -165,6 +165,17 @@ class Muown(torch.optim.Optimizer):
         self._tp_shape = tp_shape_fn
         log_single_rank(logger, logging.INFO, "[Muown] initialized row-norm-controlled Muon")
 
+    @torch.no_grad()
+    def _init_group(self, group: dict, skip_non_grad_params: bool = True) -> None:
+        """Allocate the momentum buffers (checkpoint loading needs them before a step)."""
+        for p in group["params"]:
+            if skip_non_grad_params and p.grad is None:
+                continue
+            state = self.state[p]
+            if not state:
+                state["direction_momentum"] = torch.zeros_like(p, dtype=torch.float32)
+                state["magnitude_momentum"] = torch.zeros_like(p, dtype=torch.float32)
+
     def _orthogonalize(self, grad: torch.Tensor, param: torch.Tensor, steps: int) -> torch.Tensor:
         """Orthogonalize ``grad``, flattening any leading (expert) dimensions."""
         if grad.ndim == 2:

@@ -70,10 +70,15 @@ def _fwd_bwd(block: TransformerBlock, x: torch.Tensor):
 
     Captured backward graphs accumulate weight gradients straight into ``main_grad``
     (which DDP provides in training), eager backward into ``.grad``: give every
-    parameter a zeroed ``main_grad`` and read whichever of the two was filled.
+    parameter a ``main_grad`` (zeroed per call) and read whichever of the two was filled.
     """
     for p in block.parameters():
-        p.main_grad = torch.zeros_like(p, dtype=torch.float32)
+        # Allocated once and zeroed in place: a captured graph keeps writing into the
+        # buffer it saw at capture time.
+        if getattr(p, "main_grad", None) is None:
+            p.main_grad = torch.zeros_like(p, dtype=torch.float32)
+        else:
+            p.main_grad.zero_()
     out = block(hidden_states=x.clone().requires_grad_(True), attention_mask=None)
     block.zero_grad(set_to_none=True)
     out.square().mean().backward()

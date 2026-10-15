@@ -1282,8 +1282,18 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         saved = {_param_group_identifier(g): g for g in state_dict['param_groups'].values()}
         allow_new = getattr(self.config, 'allow_new_param_groups_on_load', False)
         groups = []
+        # Fallback key without is_expert_parallel: across the EP=1 / EP>1 change the
+        # same parameters move between dense and expert groups.
+        expert_idx = param_group_identifier_keys.index('is_expert_parallel')
+
+        def loose(ident):
+            return ident[:expert_idx] + ident[expert_idx + 1 :]
+
+        saved_loose = {loose(k): g for k, g in saved.items()}
         for live, cur in zip(self.optimizer.param_groups, current['param_groups']):
             match = saved.get(_param_group_identifier(cur))
+            if match is None:
+                match = saved_loose.get(loose(_param_group_identifier(cur)))
             if match is None and allow_new:
                 fallback = fallback_saved_param_group(cur, list(saved.values()))
                 if fallback is not None:
@@ -1305,8 +1315,14 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
             with torch.no_grad():
                 main_params[pid].copy_(entry['fp32_param'])
             optim_state = {k: v for k, v in entry.items() if k != 'fp32_param'}
-            if 'common_step' in state_dict:
-                optim_state['step'] = copy.deepcopy(state_dict['common_step'])
+            # Only optimizers that keep a per-param step get one back (TE FusedAdam keeps
+            # it in the param group and would choke on a scalar in the state).
+            current_step = current['state'].get(pid, {}).get('step')
+            if 'common_step' in state_dict and current_step is not None:
+                step = state_dict['common_step']
+                if torch.is_tensor(current_step) and not torch.is_tensor(step):
+                    step = torch.tensor(step, dtype=current_step.dtype, device=current_step.device)
+                optim_state['step'] = copy.deepcopy(step)
             if optim_state:
                 state[pid] = optim_state
         self.optimizer.load_state_dict({'state': state, 'param_groups': groups})
@@ -2288,15 +2304,17 @@ class ChainedOptimizer(MegatronOptimizer):
         """
 
         steps = []
+        # `param_groups`, not `optimizer.param_groups`: a chained optimizer can itself
+        # be a chain (e.g. LayerWiseDistributedOptimizer + EngramTableOptimizer).
         for optimizer in self.chained_optimizers:
-            for param_group in optimizer.optimizer.param_groups:
+            for param_group in optimizer.param_groups:
                 if len(param_group['params']) > 0 and 'step' in param_group:
                     steps.append(param_group['step'])
         steps = list(set(steps))
         assert len(steps) <= 1, f"steps: {steps}"
         step = steps[0] if len(steps) == 1 else None
         for optimizer in self.chained_optimizers:
-            for param_group in optimizer.optimizer.param_groups:
+            for param_group in optimizer.param_groups:
                 if len(param_group['params']) > 0 and 'step' in param_group:
                     param_group['step'] = step
 

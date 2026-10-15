@@ -51,20 +51,29 @@ def test_balanced_rows_and_owner():
 
 
 class TestEngramShardedSingle:
-    """One rank: the sharded path must equal the "tp" path on the same table."""
+    """One rank: the sharded path must equal the "tp" path on the same table.
+
+    Under torchrun with several ranks each runs this on its own one-rank groups."""
 
     @pytest.fixture(autouse=True)
     def setup(self):
         Utils.initialize_model_parallel(1, 1)
         model_parallel_cuda_manual_seed(123)
+        rank = torch.distributed.get_rank()
+        self.solo = [torch.distributed.new_group([r]) for r in range(Utils.world_size)][rank]
         yield
         Utils.destroy_model_parallel()
 
+    def _pg(self):
+        return ProcessGroupCollection(
+            tp=self.solo, cp=parallel_state.get_context_parallel_group(), tp_dp_cp=self.solo
+        )
+
     def test_matches_tp_mode_forward_and_grad(self):
         torch.manual_seed(0)
-        ref = EngramLayer(_config(), layer_number=1, pg_collection=_pg()).cuda()
+        ref = EngramLayer(_config(), layer_number=1, pg_collection=self._pg()).cuda()
         dp = EngramLayer(
-            _config(engram_table_parallel="dp"), layer_number=1, pg_collection=_pg()
+            _config(engram_table_parallel="dp"), layer_number=1, pg_collection=self._pg()
         ).cuda()
         assert not dp.table.requires_grad and dp.total_rows == sum(dp.sizes)
         with torch.no_grad():
@@ -88,7 +97,7 @@ class TestEngramShardedSingle:
     def test_optimizer_is_adam_at_the_engram_lr(self):
         torch.manual_seed(0)
         layer = EngramLayer(
-            _config(engram_table_parallel="dp"), layer_number=1, pg_collection=_pg()
+            _config(engram_table_parallel="dp"), layer_number=1, pg_collection=self._pg()
         ).cuda()
         config = OptimizerConfig(optimizer="adam", lr=1e-3, min_lr=1e-4, engram_lr_mult=5.0)
         opt = EngramTableOptimizer([layer.table], config)
@@ -134,7 +143,8 @@ def test_sharded_matches_whole_table(tp):
         shards = [torch.empty(n, layer.embed_dim, device="cuda") for n in sizes]
         torch.distributed.all_gather(shards, layer.table.data.contiguous(), group=group)
         full = torch.cat(shards)
-        solo = torch.distributed.new_group([rank])
+        # new_group must be called identically on every rank
+        solo = [torch.distributed.new_group([r]) for r in range(Utils.world_size)][rank]
         ref = EngramLayer(
             _config(engram_table_parallel="dp"),
             layer_number=1,
