@@ -102,6 +102,7 @@ class MLSTM(MegatronModule):
         fgate_bias_init_range: Tuple[float, float] = (3.0, 6.0),
         pg_collection: ProcessGroupCollection = None,
         name: str | None = None,
+        cp_comm_type: Optional[str] = None,
     ):
         """
         Args:
@@ -117,6 +118,8 @@ class MLSTM(MegatronModule):
                 the forget gate bias across heads.
             pg_collection: The required process groups to use for tensor model parallel.
             name (str | None): module instance name passed top-down from its parent module.
+            cp_comm_type: Passed by TransformerLayer under context parallelism and unused:
+                the mLSTM always exchanges heads for sequence (all-to-all), like GDN.
         """
 
         if not HAVE_MLSTM_KERNELS:
