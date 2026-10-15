@@ -352,7 +352,7 @@ class MoEMetricsTracker:
             if writer is not None:
                 writer.add_scalar(name, value, iteration)
             if wandb_writer is not None:
-                wandb_writer.log({name: value}, iteration)
+                wandb_writer.log({f"router-aggregates/{name}": value}, iteration)
 
     def _log_per_layer(
         self,
@@ -376,7 +376,7 @@ class MoEMetricsTracker:
                 if writer is not None:
                     writer.add_scalar(f"moe/{name}_layer_{i}", val, iteration)
                 if wandb_writer is not None:
-                    wandb_writer.log({f"moe/{name}_layer_{i}": val}, iteration)
+                    wandb_writer.log({f"router-layers/{name}_layer_{i}": val}, iteration)
 
     @staticmethod
     def _format(scalars: Dict[str, Union[float, torch.Tensor]]) -> str:

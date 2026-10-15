@@ -13,6 +13,11 @@ from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.moe.moe_health import (
+    expert_rms_statistics,
+    save_routed_expert_output_stats,
+    should_mask_routed_moe_layer,
+)
 from megatron.core.transformer.moe.moe_utils import (
     MoECudaGraphPartialCaptureSignal,
     MoECudaGraphTensorStore,
@@ -329,6 +334,11 @@ class MoELayer(BaseMoELayer):
             pg_collection=pg_collection,
             name=(name + ".experts") if name is not None else None,
         )
+        if config.moe_expert_viability_metrics:
+            initial_stats = expert_rms_statistics(self.experts, self.num_local_experts)
+            if initial_stats is not None:
+                initial_rms = torch.sqrt(initial_stats[0] / initial_stats[1])
+                self.register_buffer('_initial_expert_rms', initial_rms, persistent=True)
 
         # Initialize shared experts
         if self.use_shared_expert:
@@ -649,6 +659,8 @@ class MoELayer(BaseMoELayer):
 
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):
+            viability_input = hidden_states
+            routed_output = None
             try:
                 if "route" in self.fwd_execution_map:
                     shared_expert_output = self.shared_experts_compute(hidden_states)
@@ -677,6 +689,12 @@ class MoELayer(BaseMoELayer):
                 ), f"mlp_bias is not supported for {type(self.token_dispatcher)}"
                 output = self.combine(output)
 
+                # `output` is the routed path only at this point: shared experts are added in
+                # postprocess below.  This is consequently also the precise masking boundary.
+                routed_output = output
+                if should_mask_routed_moe_layer(self.layer_number):
+                    output = torch.zeros_like(output)
+
                 if intermediate_tensors is not None:
                     return output, mlp_bias
 
@@ -685,6 +703,18 @@ class MoELayer(BaseMoELayer):
                     output, shared_expert_output = intermediate_tensors
 
                 output = self.postprocess(output, shared_expert_output)
+
+                # Partial CUDA-graph execution can enter postprocess with an externally supplied
+                # intermediate, in which case this invocation did not observe the routed output.
+                if self.config.moe_expert_viability_metrics and routed_output is not None:
+                    save_routed_expert_output_stats(
+                        routed_output,
+                        viability_input,
+                        output,
+                        self.layer_number,
+                        self.config.num_layers,
+                        include_layer_output=self.use_shared_expert,
+                    )
 
                 if intermediate_tensors is not None:
                     return output

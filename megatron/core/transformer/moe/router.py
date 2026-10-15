@@ -9,6 +9,7 @@ from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
+from megatron.core.transformer.moe.moe_health import record_router_health_metrics
 from megatron.core.transformer.moe.moe_utils import (
     MoEAuxLossAutoScaler,
     ProcessGroupCollection,
@@ -784,6 +785,10 @@ class TopKRouter(Router):
                 router_replay=self.router_replay,
             )
 
+        # Keep the selected map separate from the final dispatch map. Capacity dropping can
+        # remove assignments, and logging both populations makes that loss visible.
+        selected_routing_map = routing_map
+
         # Apply token dropping to probs and routing_map.
         if self.config.moe_expert_capacity_factor is not None:
             probs, routing_map = apply_router_token_dropping(
@@ -828,6 +833,28 @@ class TopKRouter(Router):
 
         # Optionally apply expert bias
         self._apply_expert_bias(routing_map, padding_mask=padding_mask)
+
+        # Record metrics once for a real training forward. The grad-mode guard excludes eval
+        # and the no-grad pass of reentrant activation checkpointing.
+        if self.training and torch.is_grad_enabled():
+            num_layers = self.config.num_layers
+            if self.config.mtp_num_layers is not None:
+                num_layers += self.config.mtp_num_layers
+            if self.is_mtp_layer:
+                layer_number = self.layer_number + self.config.num_layers
+            else:
+                layer_number = self.layer_number
+            record_router_health_metrics(
+                logits,
+                selected_routing_map,
+                routing_map,
+                padding_mask,
+                self.score_function,
+                self.expert_bias,
+                layer_number,
+                num_layers,
+                reduce_group=self.tp_cp_group,
+            )
 
         return probs, routing_map
 
