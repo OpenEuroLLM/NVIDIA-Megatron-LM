@@ -86,14 +86,20 @@ stimer = StragglerDetector()
 
 @lru_cache(maxsize=None)
 def engram_on_this_rank(vp_stage=None) -> bool:
-    """Whether this pipeline stage (and virtual stage) holds an Engram (`N`) layer.
+    """Whether this pipeline stage (and virtual stage) needs the token ids: it holds an
+    Engram (`N`) layer, or the model uses per-layer / value embeddings.
 
-    Engram layers look up n-grams of the token ids, so such a stage needs the batch
-    like the first and last stages (and MTP stages) do.
+    These look up the token ids, so such a stage needs the batch like the first and
+    last stages (and MTP stages) do.
     """
     args = get_args()
     pattern = args.hybrid_layer_pattern or ''
-    if Symbols.ENGRAM not in pattern or args.pipeline_model_parallel_size == 1:
+    if args.pipeline_model_parallel_size == 1:
+        return False
+    if getattr(args, "per_layer_embedding_dim", 0) or getattr(args, "value_embedding", False):
+        # Per-layer / value embeddings look up the token ids on every stage too.
+        return True
+    if Symbols.ENGRAM not in pattern:
         return False
     layer_types, _ = select_pipeline_segment(
         parse_hybrid_pattern(pattern).main_pattern or '',

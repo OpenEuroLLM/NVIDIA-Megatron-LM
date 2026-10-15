@@ -1776,6 +1776,23 @@ class TransformerConfig(ModelParallelConfig):
     mixing, so it moves (2k+1) of the n streams instead of all of them. 0 is dense mHC.
     Requires mhc=True; not combinable with mhc_lerp."""
 
+    per_layer_embedding_dim: int = 0
+    """Per-layer embeddings (PLE, Gemma 3n / Gemma 4; token_embeddings.py): each chosen layer
+    of a HybridModel gets its own token table of this width, gated by the hidden state after
+    the layer and added as an extra residual update h += Norm(W_up(act(W_gate h) * e[token])).
+    0 disables."""
+
+    per_layer_embedding_layers: str = "mlp"
+    """Which HybridModel layers get a PLE: "mlp" (after every MLP / MoE layer, as Gemma
+    adds it after the feed-forward) or "all"."""
+
+    per_layer_embedding_activation: str = "gelu"
+    """Activation of the PLE gate (gelu as Gemma, or silu)."""
+
+    value_embedding: bool = False
+    """Value embeddings (modded-nanogpt; token_embeddings.py): every self-attention layer of
+    a HybridModel adds its own token table to its values, v <- l_v v + l_e ve[token]."""
+
     post_sublayer_norm: bool = False
     """Sandwich / peri-LN normalization: normalize every sublayer output (attention, MLP,
     MoE, Mamba, linear mixers, Engram, PKM) with a learnable gain before it enters the

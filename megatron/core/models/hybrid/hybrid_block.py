@@ -139,6 +139,8 @@ class HybridStack(MegatronModule):
         # Build layers from the pre-selected segment
         self.layers = nn.ModuleList()
         self._linear_spec = None  # built on the first `L` position, see _linear_layer_spec
+        self.per_layer_embeddings = None  # see attach_token_embeddings
+        self._input_ids = None
         for i, layer_type in enumerate(self.layer_type_list):
             layer_number = i + 1 + pp_layer_offset
             if self.config.fp8:
@@ -418,12 +420,14 @@ class HybridStack(MegatronModule):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        # Engram (`N`) layers look up hashed n-grams of the token ids. Handing them over
-        # here, rather than through each layer call, keeps activation recompute and the
-        # other layer types unaware of them.
+        # Engram (`N`) layers look up hashed n-grams of the token ids, value embeddings
+        # and per-layer embeddings plain token tables. Handing the ids over here, rather
+        # than through each layer call, keeps activation recompute and the other layer
+        # types unaware of them.
         for layer_type, layer in zip(self.layer_type_list, self.layers):
-            if layer_type == LayerSymbols.ENGRAM:
+            if layer_type == LayerSymbols.ENGRAM or getattr(layer, "uses_input_ids", False):
                 layer.set_input_ids(input_ids)
+        self._input_ids = input_ids
 
         if not self.pre_process:
             # See set_input_tensor()
@@ -484,6 +488,12 @@ class HybridStack(MegatronModule):
             depth_scheme = getattr(self.config, "mhc", False) or getattr(
                 self.config, "attn_res", False
             )
+            if (
+                getattr(self, "per_layer_embeddings", None) is not None
+                and self.config.recompute_granularity == 'full'
+                and self.training
+            ):
+                raise NotImplementedError("per-layer embeddings with full activation recompute")
             if depth_scheme and self.config.recompute_granularity == 'full' and self.training:
                 raise NotImplementedError(
                     "mHC / Block AttnRes do not support full activation recompute; use "
@@ -504,17 +514,18 @@ class HybridStack(MegatronModule):
                 )
             else:
                 if self._loop_schedule is None:
-                    layer_order = list(self.layers)
+                    order = list(range(len(self.layers)))
                 else:
                     # Indexes parameters, not depth: a looped layer is the same
                     # module applied at several positions, so layer.layer_number
                     # repeats. Only the quantization context reads it, and that is
                     # keyed per unique layer by design.
-                    layer_order = [self.layers[i] for i in self._loop_schedule]
+                    order = list(self._loop_schedule)
+                layer_order = [self.layers[i] for i in order]
                 # mHC widens hidden_states to [s, b, n, h] streams; Block AttnRes keeps
                 # its block summaries in a state stashed on every layer.
                 hidden_states, depth_state = self._depth_enter(hidden_states)
-                for layer in layer_order:
+                for layer_index, layer in zip(order, layer_order):
                     if depth_state is not None:
                         layer._depth_state = depth_state
                     # Layers have 1-indexed layer numbers attribute.
@@ -545,6 +556,7 @@ class HybridStack(MegatronModule):
                     # for cross-attention, and is not needed in our model.
                     if isinstance(hidden_states, tuple):
                         hidden_states = hidden_states[0]
+                    hidden_states = self._apply_per_layer_embedding(layer_index, hidden_states)
                 hidden_states = self._depth_exit(hidden_states, depth_state)
 
         # Final layer norm.
@@ -558,6 +570,42 @@ class HybridStack(MegatronModule):
         )
 
         return hidden_states
+
+    def attach_token_embeddings(self, vocab_size: int) -> None:
+        """Build the per-layer embeddings (PLE) of this stage's layers and the value
+        embeddings of its attention layers (token_embeddings.py)."""
+        from megatron.core.transformer.token_embeddings import PerLayerEmbedding
+
+        self.per_layer_embeddings = None
+        dim = getattr(self.config, "per_layer_embedding_dim", 0)
+        if dim:
+            if getattr(self.config, "mhc", False) or getattr(self.config, "attn_res", False) \
+                    or getattr(self.config, "ngpt", False):
+                raise NotImplementedError("per-layer embeddings with mHC / AttnRes / nGPT")
+            which = self.config.per_layer_embedding_layers
+            if which not in ("mlp", "all"):
+                raise ValueError(f"per_layer_embedding_layers must be mlp or all, got {which}")
+            mlp = (LayerSymbols.MLP, LayerSymbols.MOE)
+            self.per_layer_embeddings = nn.ModuleList(
+                [
+                    PerLayerEmbedding(self.config, vocab_size, self.tp_group)
+                    if which == "all" or t in mlp
+                    else None
+                    for t in self.layer_type_list
+                ]
+            )
+        if getattr(self.config, "value_embedding", False):
+            for layer in self.layers:
+                attention = getattr(layer, "self_attention", None)
+                if hasattr(attention, "attach_value_embedding"):
+                    attention.attach_value_embedding(vocab_size)
+                    layer.uses_input_ids = True
+
+    def _apply_per_layer_embedding(self, i: int, hidden_states: Tensor) -> Tensor:
+        ple = self.per_layer_embeddings[i] if self.per_layer_embeddings is not None else None
+        if ple is None:
+            return hidden_states
+        return ple(hidden_states, self._input_ids)
 
     def _depth_enter(self, hidden_states: Tensor):
         """Widen the residual for mHC or build the Block AttnRes state.

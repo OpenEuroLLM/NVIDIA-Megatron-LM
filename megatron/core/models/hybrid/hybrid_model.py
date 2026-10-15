@@ -287,6 +287,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             pg_collection=self.pg_collection,
             name="decoder",
         )
+        # Token-indexed tables need the vocabulary size, which the stack does not know.
+        self.decoder.attach_token_embeddings(self.vocab_size)
 
         # MTP block - uses mtp_block_spec from hybrid_stack_spec.submodules
         if self.mtp_process:

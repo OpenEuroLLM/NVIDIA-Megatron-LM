@@ -967,6 +967,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
     # outputs, which the manager already knows how to double-buffer -- and CUDA
     # graphs are worth +19-26% on every arm that can use them.
 
+    def set_input_ids(self, input_ids) -> None:
+        """Token ids of the micro-batch, for value embeddings (set by HybridStack)."""
+        set_ids = getattr(self.self_attention, "set_input_ids", None)
+        if set_ids is not None:
+            set_ids(input_ids)
+
     def _mhc_read(self, mixer, streams: Tensor) -> tuple[Tensor, tuple[Tensor, Tensor]]:
         """Read a ``C``-dim sublayer input out of the ``n`` mHC streams.
 

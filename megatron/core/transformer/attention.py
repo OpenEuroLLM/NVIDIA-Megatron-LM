@@ -1368,6 +1368,7 @@ class Attention(MegatronModule, ABC):
                 not self.config.test_mode,
                 self.config.fused_single_qkv_rope,
                 not getattr(self.config, "exclusive_self_attention", False),
+                getattr(self, "value_embedding", None) is None,
                 inference_context is None,
                 packed_seq_params is None,
                 (
@@ -1408,6 +1409,10 @@ class Attention(MegatronModule, ABC):
             else:
                 query, key, value = qkv_output
             mixed_qkv = qkv_split_arg_list = None
+            if getattr(self, "value_embedding", None) is not None:
+                if inference_context is not None:
+                    raise NotImplementedError("value embeddings are not supported for inference")
+                value = self.value_embedding(value, self._input_ids)
             if getattr(self.config, "exclusive_self_attention", False):
                 own_value = value  # this step's tokens, before any KV-cache handling
         else:
@@ -1649,6 +1654,24 @@ class Attention(MegatronModule, ABC):
         return output, bias
 
     @jit_fuser
+    def attach_value_embedding(self, vocab_size: int) -> None:
+        """Value embeddings (token_embeddings.py): a token table over this layer's local
+        key/value heads, added to the values after the q/k/v projection."""
+        from megatron.core.transformer.token_embeddings import ValueEmbedding
+
+        self.value_embedding = ValueEmbedding(
+            self.config,
+            vocab_size,
+            self.num_query_groups_per_partition,
+            self.hidden_size_per_attention_head,
+        )
+        self.value_embedding.tp_group = self.pg_collection.tp
+        self._input_ids = None
+
+    def set_input_ids(self, input_ids) -> None:
+        """Token ids [b, s] of the current micro-batch (set through the layer)."""
+        self._input_ids = input_ids
+
     @torch.no_grad()
     def _record_arch_metrics(self, core_attn_out, own_value, gate):
         """Output-gate openness (mean, and the fraction of nearly closed entries: the

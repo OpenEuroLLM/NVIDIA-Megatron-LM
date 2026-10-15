@@ -813,7 +813,7 @@ def num_floating_point_operations(
                      gdn_num_qk_heads=16, gdn_num_v_heads=32,
                      gdn_conv_kernel_dim=4,
                      vocab_size=256000, mtp_num_layers=0,
-                     num_swa_layers=0, swa_window=None):
+                     num_swa_layers=0, swa_window=None, num_ple_layers=0, ple_dim=0):
         """Calculate total FLOPs for the hybrid model."""
         # Sliding-window layers: the projections as attention, the score / value part
         # over at most `swa_window` keys per query.
@@ -848,7 +848,9 @@ def num_floating_point_operations(
                 # `L` layers: the same per-variant count the GPT path uses.
                 (num_linear_layers * 2 * total_tokens * linear_mixer_fmas_per_token()
                  if num_linear_layers else 0) +
-                (2 * total_tokens * hidden_size * vocab_size * (1 + mtp_num_layers))  # logits computation
+                (2 * total_tokens * hidden_size * vocab_size * (1 + mtp_num_layers)) +  # logits
+                # Per-layer embeddings: gate and output projections (hidden x dim each).
+                num_ple_layers * 2 * total_tokens * 2 * hidden_size * ple_dim
         )
         return flops_fwd * 3
 
@@ -1163,6 +1165,13 @@ def num_floating_point_operations(
             num_pkm_layers=num_pkm_layers,
             num_swa_layers=num_swa_layers,
             swa_window=(args.window_size[0] + 1) if args.window_size else None,
+            ple_dim=getattr(args, "per_layer_embedding_dim", 0),
+            num_ple_layers=(
+                (num_mlp_layers + num_moe_layers
+                 if getattr(args, "per_layer_embedding_layers", "mlp") == "mlp"
+                 else len(args.hybrid_layer_pattern.split('/')[0].replace('|', '')))
+                if getattr(args, "per_layer_embedding_dim", 0) else 0
+            ),
             pkm_args=dict(
                 heads=args.pkm_heads,
                 num_keys=args.pkm_num_keys,
