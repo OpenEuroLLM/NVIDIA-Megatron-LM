@@ -67,6 +67,30 @@ class TestMHCMixer:
         assert torch.allclose(h_pre, torch.full_like(h_pre, 1.0 / N), atol=1e-4)
         assert torch.allclose(h_post, torch.ones_like(h_post), atol=1e-4)
 
+    def test_fused_coeffs_and_read_match_the_separate_path(self):
+        """coeffs_and_read == forward + read, values and gradients."""
+        torch.manual_seed(0)
+        mixer = MHCMixer(C, expansion_rate=N, res_init="uniform")
+        with torch.no_grad():
+            mixer.phi.normal_(0.0, 0.05)
+        base = expand_to_streams(torch.randn(S, B, C), N) + 0.1 * torch.randn(S, B, N, C)
+        results = []
+        for fused in (False, True):
+            mixer.zero_grad()
+            streams = base.clone().requires_grad_(True)
+            if fused:
+                out = mixer.coeffs_and_read(streams)
+                if out is None:
+                    pytest.skip("Inductor unavailable")
+                x, h_pre, h_post, h_res = out
+            else:
+                h_pre, h_post, h_res = mixer(streams)
+                x = mixer.read(streams, h_pre)
+            (x.square().sum() + h_post.sum() + (h_res * h_res).sum()).backward()
+            results.append([x, h_post, h_res, streams.grad, mixer.phi.grad])
+        for a, b in zip(*results):
+            torch.testing.assert_close(a, b, rtol=1e-4, atol=1e-5)
+
     def test_identity_init_keeps_streams_independent(self):
         mixer = MHCMixer(C, expansion_rate=N, res_init="identity")
         _, _, h_res = mixer(expand_to_streams(torch.randn(S, B, C), N))

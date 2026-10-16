@@ -989,8 +989,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             them back as ordinary values (rather than caching them on the module)
             keeps the layer capturable.
         """
-        h_pre, h_post, h_res = mixer(streams)
         from megatron.core.transformer import arch_metrics
+
+        fused = getattr(mixer, "coeffs_and_read", None)
+        if fused is not None and not arch_metrics.active():
+            out = fused(streams)
+            if out is not None:
+                layer_input, _, h_post, h_res = out
+                return layer_input, (h_post, h_res)
+        h_pre, h_post, h_res = mixer(streams)
 
         if arch_metrics.active():
             mixer.record_metrics(streams, (h_pre, h_post, h_res))

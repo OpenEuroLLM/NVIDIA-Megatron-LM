@@ -117,6 +117,22 @@ def _mhc_coeffs(flat, phi, b_pre, b_post, b_res, a_pre, a_post, a_res, n, eps, i
 _mhc_coeffs_compiled = None
 
 
+def _mhc_coeffs_read(streams, phi, b_pre, b_post, b_res, a_pre, a_post, a_res, n, eps, iters):
+    """:func:`_mhc_coeffs` and :func:`_mhc_read` as one graph: the stream state feeds both,
+    so compiled together its two gradients are summed inside one backward kernel instead of
+    being materialized separately and added by autograd (a full pass over the widest tensor
+    per sublayer), and the forward reads it in one go."""
+    s_, b_, _, c = streams.shape
+    h_pre, h_post, h_res = _mhc_coeffs(
+        streams.reshape(s_, b_, n * c), phi, b_pre, b_post, b_res, a_pre, a_post, a_res, n, eps,
+        iters,
+    )
+    return _mhc_read(streams, h_pre.to(streams.dtype)), h_pre, h_post, h_res
+
+
+_mhc_coeffs_read_compiled = None
+
+
 def _mhc_write(streams, sublayer_out, h_post, h_res):
     """Fused mHC stream update: ``H_res @ x + H_post^T f(x)`` in one pass.
 
@@ -569,6 +585,35 @@ class MHCMixer(nn.Module):
         arch_metrics.record_mean(
             f"{p}/res_diag", layer, num_layers, torch.diagonal(h_res, dim1=-2, dim2=-1)
         )
+
+    def coeffs_and_read(self, streams: torch.Tensor):
+        """``(layer_input, h_pre, h_post, h_res)``: :meth:`forward` and :meth:`read` fused
+        (see :func:`_mhc_coeffs_read`); None when Inductor is unavailable."""
+        global _mhc_coeffs_read_compiled
+        if _mhc_coeffs_read_compiled is None:
+            try:
+                _mhc_coeffs_read_compiled = torch.compile(_mhc_coeffs_read, dynamic=False)
+            except Exception:  # pragma: no cover
+                _mhc_coeffs_read_compiled = False
+        if _mhc_coeffs_read_compiled is False:
+            return None
+        try:
+            return _mhc_coeffs_read_compiled(
+                streams,
+                self.phi,
+                self.b_pre,
+                self.b_post,
+                self.b_res,
+                self.alpha_pre,
+                self.alpha_post,
+                self.alpha_res,
+                streams.shape[-2],
+                self.eps,
+                self.num_sinkhorn_iters,
+            )
+        except Exception:  # pragma: no cover - Inductor unavailable
+            _mhc_coeffs_read_compiled = False
+            return None
 
     def read(self, streams: torch.Tensor, h_pre: torch.Tensor) -> torch.Tensor:
         """Aggregate the ``n`` streams into a single ``C``-dim layer input."""
