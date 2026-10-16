@@ -78,6 +78,22 @@ def _lerp_analytic(x, a, alpha, eps):
 _lerp_analytic_compiled = _maybe_compile(_lerp_analytic)
 
 
+def _post_norm_lerp(hidden, x, alpha, correct, eps, post_layer_norm, analytic):
+    """The whole residual update of the ``approx`` / ``analytic`` modes, fused: the sublayer
+    output's L2 normalization (``post_layer_norm``) and the LERP. Eager, each step is a full
+    ``[s, b, h]`` pass forward and backward (~10 per sublayer); compiled it is a reduction
+    and a pointwise kernel each way."""
+    a = hidden
+    if post_layer_norm:
+        a = hidden / torch.linalg.vector_norm(hidden, dim=-1, keepdim=True).clamp(min=eps)
+    if analytic:
+        return _lerp_analytic(x, a, alpha, eps)
+    return (x + alpha * (a - x)) * correct
+
+
+_post_norm_lerp_compiled = _maybe_compile(_post_norm_lerp)
+
+
 ALPHA_ACTIVATIONS = ("abs", "half_sigmoid", "half_tanh_sq", "tanh_smooth_bound")
 
 
@@ -309,6 +325,19 @@ class NGPTResidual(nn.Module):
         if tag is not None and arch_metrics.active():
             arch_metrics.record_mean(f"ngpt_{tag[0]}/lerp_rate", tag[1], tag[2], alpha32)
 
+        x = residual
+        mode = self.lerp_normalization
+        if mode in ("approx", "analytic"):
+            correct = None
+            if mode == "approx":
+                correct = torch.rsqrt(
+                    torch.clamp(1.0 - 2.0 * alpha32 * (1.0 - alpha32), min=self.eps)
+                ).to(input_dtype)
+            out = _post_norm_lerp_compiled(
+                hidden_states, x, alpha, correct, self.eps, self.post_layer_norm, mode == "analytic"
+            )
+            return out.to(input_dtype)
+
         if self.post_layer_norm:
             # vector_norm saves only its input and output, so no [s, b, h]
             # temporary is retained (unlike x.float().pow(2).mean(...)).
@@ -316,9 +345,6 @@ class NGPTResidual(nn.Module):
             a = hidden_states / inv
         else:
             a = hidden_states
-
-        x = residual
-        mode = self.lerp_normalization
 
         if mode == "analytic":
             # Exact factor for unit-norm x and a; full-rank Jacobian.
