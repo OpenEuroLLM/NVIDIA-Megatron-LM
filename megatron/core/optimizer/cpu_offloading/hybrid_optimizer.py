@@ -223,15 +223,26 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
 
         self._register_param_copy_back_gpu_hook()
 
+    # Parameters per CPU sub-optimizer are gathered until they hold this many elements:
+    # one optimizer per parameter (the original scheme) costs a Python step, a pinned
+    # copy and an event sync per parameter, which dominates for many small parameters
+    # (e.g. one per grouped-GEMM expert); a few million elements per bucket keep the
+    # D2H copy of the next bucket overlapping the CPU step of the current one.
+    CPU_BUCKET_NUMEL = 1 << 22
+
     @staticmethod
-    def build_cpu_optimizer_list(cpu_optimizer_cls, cpu_param_groups):
-        """Build several cpu optimizers to enable overlap. Currently we naively
-        assign each parameter to an individual optimizer.
+    def build_cpu_optimizer_list(cpu_optimizer_cls, cpu_param_groups, bucket_numel=None):
+        """Build several cpu optimizers to enable overlap: consecutive parameters of a
+        group share an optimizer until it holds ``bucket_numel`` elements.
 
         Args:
             cpu_optimizer_cls (Type[torch.optim.Optimizer]): A torch optimizer class
             cpu_param_groups (List[Dict[str, Any]]): The CPU parameter groups
+            bucket_numel (int, optional): Elements per optimizer; 1 gives one optimizer
+                per parameter. Defaults to ``CPU_BUCKET_NUMEL``.
         """
+        if bucket_numel is None:
+            bucket_numel = HybridDeviceOptimizer.CPU_BUCKET_NUMEL
         cpu_optimizers = []
 
         if len(cpu_param_groups) == 0:
@@ -242,10 +253,15 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             params = group_defaults.pop("params")
             if isinstance(params, torch.Tensor):
                 params = [params]
-            for param in params:
-                _cpu_param_group = group_defaults.copy()
-                _cpu_param_group["params"] = [param]
-                cpu_optimizers.append(cpu_optimizer_cls([_cpu_param_group]))
+            bucket, numel = [], 0
+            for i, param in enumerate(params):
+                bucket.append(param)
+                numel += param.numel()
+                if numel >= bucket_numel or i == len(params) - 1:
+                    _cpu_param_group = group_defaults.copy()
+                    _cpu_param_group["params"] = bucket
+                    cpu_optimizers.append(cpu_optimizer_cls([_cpu_param_group]))
+                    bucket, numel = [], 0
         return cpu_optimizers
 
     def _get_sub_optimizer_param_groups(self, offload_fraction: float):

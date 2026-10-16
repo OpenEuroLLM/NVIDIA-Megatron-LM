@@ -253,3 +253,32 @@ def test_overlap_cpu_optimizer_d2h_h2d_sync_correctness(
         assert torch.allclose(
             v, ref_params[k], atol=1e-03
         ), f"Weight {k} value mismatch, max error: {(v - ref_params[k]).abs().max()}"
+
+
+@pytest.mark.parametrize("bucket_numel", [1, 1000, 1 << 30])
+def test_cpu_optimizer_buckets(bucket_numel):
+    """Consecutive CPU parameters share a sub-optimizer up to bucket_numel elements; the
+    step is the same as with one optimizer per parameter."""
+
+    def run(numel):
+        setup_seed(0)
+        params = [nn.Parameter(torch.randn(s)) for s in [(600,), (30, 20), (500,), (7, 3)]]
+        group = {"params": params, "lr": 1e-2, "weight_decay": 0.1}
+        opts = HybridDeviceOptimizer.build_cpu_optimizer_list(
+            torch.optim.AdamW, [group], bucket_numel=numel
+        )
+        for step in range(3):
+            setup_seed(10 + step)
+            for p in params:
+                p.grad = torch.randn_like(p)
+            for opt in opts:
+                opt.step()
+        return params, opts
+
+    ref, ref_opts = run(1)
+    got, opts = run(bucket_numel)
+    assert len(ref_opts) == 4
+    assert len(opts) == {1: 4, 1000: 2, 1 << 30: 1}[bucket_numel]
+    assert [p for o in opts for g in o.param_groups for p in g["params"]] == got
+    for a, b in zip(got, ref):
+        torch.testing.assert_close(a, b, rtol=0, atol=0)
