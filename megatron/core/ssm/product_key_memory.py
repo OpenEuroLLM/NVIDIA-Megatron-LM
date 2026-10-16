@@ -37,6 +37,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from megatron.core.fusions.fused_weighted_bag import weighted_bag
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.tp_replicated import (
     gather_replicated_input,
@@ -92,16 +93,6 @@ def product_key_topk(
     scores, flat = combined.topk(topk, dim=-1)
     rows = i1.gather(-1, flat // topk) * n_keys + i2.gather(-1, flat % topk)
     return scores, rows
-
-
-def _weighted_bag(vals: torch.Tensor, index: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
-    """``sum_j weights[t, j] * vals[index[t, j]]`` -> ``[T, dim]`` fp32, by embedding_bag over
-    the (unique) rows ``vals``: the expanded ``[T, heads * topk, dim]`` rows -- GBs per layer
-    -- are never materialized. fp32 because embedding_bag has no bf16 backward for the
-    per-sample weights; only the unique rows are upcast."""
-    return F.embedding_bag(
-        index, vals.float(), per_sample_weights=weights.reshape(index.shape).float(), mode="sum"
-    )
 
 
 class ProductKeyMemoryLayer(MegatronModule):
@@ -259,7 +250,9 @@ class ProductKeyMemoryLayer(MegatronModule):
                 rows = rows.chunk(tp)[self.tp_group.rank()]
                 weights = scatter_to_sequence_parallel_region(weights, group=self.tp_group)
             vals, inverse = sharded_lookup_unique(self, rows.reshape(-1), dtype)
-            out = _weighted_bag(vals, inverse.view(rows.shape[0], -1), weights).to(dtype)
+            # weighted sum over the unique rows; the expanded [T, heads * topk, dim] rows
+            # (GBs per layer) are never materialized (fused_weighted_bag.py)
+            out = weighted_bag(vals, inverse.view(rows.shape[0], -1), weights, out_dtype=dtype)
             if tp > 1:
                 out = gather_from_sequence_parallel_region(
                     out, tensor_parallel_output_grad=False, group=self.tp_group
@@ -270,10 +263,11 @@ class ProductKeyMemoryLayer(MegatronModule):
         local = rows - self.row_start
         outside = (local < 0) | (local >= self.values.shape[0])
         uniq, inverse = torch.unique(local.masked_fill(outside, 0), return_inverse=True)
-        out = _weighted_bag(
+        out = weighted_bag(
             self.values.index_select(0, uniq),
             inverse.view(rows.shape[0], -1),
             weights.masked_fill(outside, 0.0),
+            out_dtype=dtype,
         )
         if tp > 1:
             out = reduce_from_tensor_model_parallel_region(out, group=self.tp_group)
