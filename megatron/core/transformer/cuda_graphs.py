@@ -125,9 +125,21 @@ def _apply_cudagraph_buffer_metadata(tensor, *, is_output=False):
     return metadata
 
 
+def _is_traced_tensor(tensor) -> bool:
+    """A fake or functional tensor of a torch.compile / AOT-autograd trace."""
+    from torch._subclasses.fake_tensor import FakeTensor
+
+    return isinstance(tensor, FakeTensor) or torch._is_functional_tensor(tensor)
+
+
 def _tag_cudagraph_buffer_saved_for_backward(tensor):
     """Tag a CUDA graph input or output observed in a Python 'save_for_backward' call."""
     if not torch.is_tensor(tensor):
+        return
+    # torch.compile traces autograd Functions with fake / functional tensors (e.g. a
+    # compiled helper inside a captured layer): no graph buffers there, and their
+    # ``_base`` cannot be inspected.
+    if torch.compiler.is_compiling() or _is_traced_tensor(tensor):
         return
 
     # Views of the same graph buffer share one metadata object. If this tensor has not reached a
