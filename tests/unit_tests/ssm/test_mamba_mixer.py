@@ -106,10 +106,11 @@ class TestMambaMixer:
             results.append((out.detach(), x.grad.clone(), grads))
         (out, dx, grads), (ref_out, ref_dx, ref_grads) = results
         torch.testing.assert_close(out, ref_out)
-        torch.testing.assert_close(dx, ref_dx)
+        # the batch-first weight gradients reduce over the tokens in another order
+        torch.testing.assert_close(dx, ref_dx, rtol=1e-4, atol=1e-4)
         assert len(grads) == len(ref_grads)
         for g, r in zip(grads, ref_grads):
-            torch.testing.assert_close(g, r)
+            torch.testing.assert_close(g, r, rtol=1e-4, atol=1e-4)
 
     def test_variable_batch_size_inference(self):
         mixer = self.get_mixer()
