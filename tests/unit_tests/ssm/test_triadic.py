@@ -133,6 +133,55 @@ def test_cute_kernel_matches_reference(e):
     assert all(x.grad is not None and torch.isfinite(x.grad).all() for x in [qb, kb, vb] + leaves)
 
 
+@pytest.mark.parametrize("e", [1, 2, 4, 8])
+@pytest.mark.parametrize("base", ["kda", "ckda"])
+def test_cute_kda_matches_reference(e, base):
+    """cute-triadic-gdn's Triadic KDA / Complex KDA (sm90) against the third-order recurrence:
+    forward and the gradient of every input."""
+    chunk_kda_joint = triadic._cute_kda()
+    if chunk_kda_joint is None:
+        pytest.skip("needs cute-triadic-gdn with the KDA kernels on an sm90 GPU")
+    gen = torch.Generator(device="cuda").manual_seed(5)
+    b, t, h, d = 1, 128, 2, 128
+    q, k, v, q2, k2, g2, g, sign, bl = _inputs(b, t, h, d, e, base == "ckda", gen)
+    beta = torch.sigmoid(bl) * (2.0 if base == "ckda" else 1.0)
+    leaves = {"q": q, "k": k, "v": v, "q2": q2, "k2": k2, "g2": g2, "g": g, "beta": beta}
+    dy = torch.randn(b, t, h, d, device="cuda", generator=gen)
+    results = []
+    for path in ("cute", "reference"):
+        xs = {n: x.detach().clone().requires_grad_() for n, x in leaves.items()}
+        if path == "cute":
+            q_, k_, v_ = (xs[n].bfloat16() for n in "qkv")
+            out = chunk_kda_joint(q_, k_, v_, xs["k2"], xs["q2"], xs["g2"], xs["g"], xs["beta"],
+                                  sign=sign, scale=d**-0.5).float()
+        else:
+            out = triadic.triadic_reference(xs["q"], xs["k"], xs["v"], xs["q2"], xs["k2"],
+                                            xs["g2"], xs["beta"], g=xs["g"], sign=sign)
+        out.backward(dy)
+        results.append((out.detach(), {n: x.grad for n, x in xs.items()}))
+    (o_c, g_c), (o_r, g_r) = results
+    assert (o_c - o_r).norm() / o_r.norm() < 2e-2
+    for name in leaves:
+        a, r = g_c[name].float(), g_r[name].float()
+        err = (a - r).norm() / r.norm().clamp(min=1e-6)
+        assert err < 5e-2, (name, float(err))
+
+
+@pytest.mark.parametrize("base", ["kda", "ckda"])
+def test_layer_takes_the_cute_kda_kernels(base):
+    if triadic._cute_kda() is None:
+        pytest.skip("needs cute-triadic-gdn with the KDA kernels on an sm90 GPU")
+    torch.manual_seed(0)
+    layer = triadic.TriadicDeltaAttention(hidden_size=256, head_dim=128, num_heads=2, e=4,
+                                          base=base, kernel="cute").cuda().to(torch.bfloat16)
+    assert layer.cute is not None
+    x = torch.randn(2, 128, 256, device="cuda", dtype=torch.bfloat16)
+    o_cute = layer(x)[0].float()
+    layer.cute = None                                          # the KDA-expansion path
+    o_kda = layer(x)[0].float()
+    assert (o_cute - o_kda).norm() / o_kda.norm() < 3e-2
+
+
 @pytest.mark.parametrize("e,d", [(2, 64), (4, 128), (8, 64)])
 @pytest.mark.parametrize("base", ["gdn", "kda", "ckda"])
 def test_gradients_match_the_reference(e, d, base):

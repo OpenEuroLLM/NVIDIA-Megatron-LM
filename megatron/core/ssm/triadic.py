@@ -27,9 +27,12 @@ Two backends (``linear_triadic_kernel``):
 * "kda": the existing KDA chunk kernel on the expanded ``kappa`` / ``q2 (x) q`` -- exact,
   every base, any GPU the kernel runs on, but the keys are ``E`` times wider in memory
   and FLA's ``chunk_kda`` takes ``E * D <= 256``.
-* "cute": the CuTe DSL kernels of cute-triadic-gdn (Hopper / Blackwell), which never
-  form ``kappa``: Triadic GDN only (no channel gate), ``D = 128``, ``E`` in
-  {1, 2, 4, 8, 12, 16}. "auto" takes them when they apply and are installed.
+* "cute": the CuTe DSL kernels of cute-triadic-gdn (submodules/cute-triadic-gdn), which
+  never form ``kappa``, ``D = 128``. Triadic GDN on Hopper / Blackwell with ``E`` in
+  {1, 2, 4, 8, 12, 16}; Triadic KDA / Complex KDA on Hopper with ``E`` in {1, 2, 4, 8}
+  (the channel gate is factored out of the recurrence: Triton kernels form the
+  channel-decayed operands, the CuTe kernels run the GDN pipeline on them).
+  "auto" takes them when they apply and are installed.
 :func:`triadic_reference` is the naive recurrence over the third-order state the
 expansion is tested against.
 """
@@ -53,6 +56,7 @@ except ImportError:  # pragma: no cover
 BASES = ("gdn", "kda", "ckda")
 KERNELS = ("auto", "kda", "cute")
 CUTE_E = (1, 2, 4, 8, 12, 16)
+CUTE_KDA_E = (1, 2, 4, 8)
 
 
 def _cute_gdn():
@@ -66,8 +70,22 @@ def _cute_gdn():
     return gdn_joint_call
 
 
+def _cute_kda():
+    """cute_triadic_gdn's Triadic KDA / Complex KDA (chunk_kda_joint), or None when not
+    installed / not Hopper (the KDA kernels are sm90 only)."""
+    try:
+        from cute_triadic_gdn.ops.kda_joint import chunk_kda_joint
+    except Exception:  # pragma: no cover - not installed
+        return None
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9:
+        return None
+    return chunk_kda_joint
+
+
 def cute_applies(base: str, head_dim: int, e: int) -> bool:
-    return base == "gdn" and head_dim == 128 and e in CUTE_E
+    if head_dim != 128:
+        return False
+    return e in (CUTE_E if base == "gdn" else CUTE_KDA_E)
 
 
 def _l2norm(x: torch.Tensor) -> torch.Tensor:
@@ -223,12 +241,12 @@ class TriadicDeltaAttention(nn.Module):
             raise ValueError(f"triadic kernel must be one of {KERNELS}, got {kernel!r}")
         self.cute = None
         if kernel != "kda" and cute_applies(base, head_dim, e):
-            self.cute = _cute_gdn()
+            self.cute = _cute_gdn() if base == "gdn" else _cute_kda()
         if kernel == "cute" and self.cute is None:
             raise ValueError(
-                "linear_triadic_kernel=cute needs cute-triadic-gdn on an sm90+ GPU and "
-                f"base=gdn, head_dim=128, E in {CUTE_E} (got base={base}, head_dim={head_dim}, "
-                f"E={e})"
+                "linear_triadic_kernel=cute needs cute-triadic-gdn and head_dim=128: base=gdn "
+                f"on sm90+ with E in {CUTE_E}, or base=kda/ckda on sm90 with E in {CUTE_KDA_E} "
+                f"(got base={base}, head_dim={head_dim}, E={e})"
             )
         self.h, self.d, self.e, self.base = num_heads, head_dim, e, base
         self.gate = "softplus" if base == "kda" else gate
@@ -303,11 +321,18 @@ class TriadicDeltaAttention(nn.Module):
             k2 = q2 = torch.ones(b, t, self.h, 1, device=x.device, dtype=torch.float32)
         g2, g, sign = self._gates(x)
         beta = self.b_proj(x).float()
-        if self.cute is not None and t % 64 == 0:
+        if self.cute is not None and t % 64 == 0 and self.base == "gdn":
             # Triadic GDN without forming kappa (beta in (0, 1): sigmoid here).
             o = self.cute(q.to(torch.bfloat16), k.to(torch.bfloat16), v.to(torch.bfloat16),
                           k2.contiguous(), q2.contiguous(), g2.contiguous(),
                           torch.sigmoid(beta), scale=self.d**-0.5)
+        elif self.cute is not None and t % 64 == 0:
+            # Triadic KDA / Complex KDA without forming kappa: the final write strength
+            # (x2 with negative eigenvalues, as the KDA kernel's allow_neg_eigval).
+            beta = torch.sigmoid(beta) * (2.0 if self.allow_neg_eigval else 1.0)
+            o = self.cute(q.to(torch.bfloat16), k.to(torch.bfloat16), v.to(torch.bfloat16),
+                          k2.contiguous(), q2.contiguous(), g2.contiguous(), g.float().contiguous(),
+                          beta, sign=sign, scale=self.d**-0.5)
         else:
             o = triadic_chunk(q, k, v, q2, k2, g2, beta, g=g, sign=sign,
                               allow_neg_eigval=self.allow_neg_eigval)
