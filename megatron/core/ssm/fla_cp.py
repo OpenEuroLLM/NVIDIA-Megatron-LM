@@ -26,11 +26,6 @@ def _gather(x: torch.Tensor, group) -> torch.Tensor:
     return torch.stack(dist_fn.all_gather(x.contiguous(), group=group))
 
 
-def _megatron_order(cp: int) -> list[int]:
-    """The chunk ids (of 2 cp) in the order ranks hold them: r, 2 cp - 1 - r per rank."""
-    return [c for r in range(cp) for c in (r, 2 * cp - 1 - r)]
-
-
 def full_sequence(x: torch.Tensor, group, differentiable: bool = True) -> torch.Tensor:
     """``[s / cp, b, ...]`` (Megatron's CP layout) -> ``[s, b, ...]`` in token order, on every
     rank. ``differentiable=False`` for tensors without gradient (e.g. token ids)."""
@@ -42,10 +37,11 @@ def full_sequence(x: torch.Tensor, group, differentiable: bool = True) -> torch.
         dist.all_gather(bufs, x.contiguous(), group=group)
         parts = torch.stack(bufs)
     half = x.shape[0] // 2
-    chunks = parts.view(cp, 2, half, *x.shape[1:]).flatten(0, 1)  # in _megatron_order
-    inverse = torch.empty(2 * cp, dtype=torch.long)
-    inverse[torch.tensor(_megatron_order(cp))] = torch.arange(2 * cp)
-    return chunks[inverse.to(chunks.device)].flatten(0, 1)
+    chunks = parts.view(cp, 2, half, *x.shape[1:])  # [rank, slot]: chunks (r, 2cp-1-r)
+    # chunk c sits at rank c, slot 0 (first half) or at rank 2cp-1-c, slot 1 (second half);
+    # static slices, no index tensor: no host-to-device copy (CUDA-graph capturable)
+    return torch.cat([chunks[c, 0] for c in range(cp)]
+                     + [chunks[2 * cp - 1 - c, 1] for c in range(cp, 2 * cp)])
 
 
 def local_sequence(full: torch.Tensor, group) -> torch.Tensor:
