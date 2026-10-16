@@ -127,8 +127,9 @@ class PowerRetentionAttention(nn.Module):
             raise ValueError(f"the power-retention Triton baseline supports deg=2, got {deg}")
         self.h, self.d, self.deg, self.chunk_size = num_heads, head_dim, deg, chunk_size
         self.switch_over_seq_len = switch_over_seq_len
-        if attention_impl not in ("flex", "retention"):
-            raise ValueError(f"power attention_impl must be flex or retention, got {attention_impl!r}")
+        if attention_impl not in ("triton", "flex", "retention"):
+            raise ValueError(
+                f"power attention_impl must be triton, flex or retention, got {attention_impl!r}")
         self.attention_impl = attention_impl
         self.rope, self.gating, self.xsa = rope, gating, xsa
         dim = num_heads * head_dim
@@ -160,7 +161,11 @@ class PowerRetentionAttention(nn.Module):
         # the quadratic (attention) form up to switch_over_seq_len tokens: faster than any
         # chunk size there (and the only form for t <= chunk_size)
         chunk = self.chunk_size if t > max(self.chunk_size, self.switch_over_seq_len) else None
-        if chunk is None and self.attention_impl == "flex":
+        if chunk is None and self.attention_impl == "triton" and self.deg == 2:
+            from megatron.core.fusions.fused_power_attention import power_attention
+
+            o = power_attention(q, k, v, log_g, scale=self.d**-0.5)
+        elif chunk is None and self.attention_impl == "flex":
             o = power_attention_flex(q, k, v, log_g, deg=self.deg, scale=self.d**-0.5)
         else:
             o = power_retention(

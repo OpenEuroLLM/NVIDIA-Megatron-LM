@@ -129,3 +129,28 @@ def test_hybrid_model_with_power_layers_trains():
 def test_layer_rejects_unsupported_degrees():
     with pytest.raises(ValueError, match="deg=2"):
         power.PowerRetentionAttention(hidden_size=64, head_dim=16, num_heads=4, deg=4)
+
+
+@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("gated", [False, True])
+def test_triton_power_attention_matches_the_quadratic_definition(d, gated):
+    from megatron.core.fusions.fused_power_attention import power_attention
+
+    torch.manual_seed(0)
+    b, t, h = 2, 320, 2
+    q = torch.randn(b, t, h, d, device="cuda") * 0.5
+    k = torch.randn(b, t, h, d, device="cuda") * 0.5
+    v = torch.randn(b, t, h, d, device="cuda")
+    log_g = F.logsigmoid(3.0 + torch.randn(b, t, h, device="cuda")) if gated else None
+    ref_leaves = [x.double().requires_grad_() for x in (q, k, v)]
+    ref_g = log_g.double().requires_grad_() if gated else None
+    ref = naive_power_attention(*ref_leaves, ref_g, 2, d**-0.5)
+    leaves = [x.bfloat16().requires_grad_() for x in (q, k, v)]
+    g_leaf = log_g.clone().requires_grad_() if gated else None
+    out = power_attention(*leaves, g_leaf, scale=d**-0.5)
+    assert (out.double() - ref).norm() / ref.norm() < 1e-2
+    do = torch.randn_like(ref)
+    got = torch.autograd.grad(out.float(), leaves + ([g_leaf] if gated else []), do.float())
+    want = torch.autograd.grad(ref, ref_leaves + ([ref_g] if gated else []), do)
+    for a, r in zip(got, want):
+        assert (a.double() - r).norm() / r.norm() < 5e-2
