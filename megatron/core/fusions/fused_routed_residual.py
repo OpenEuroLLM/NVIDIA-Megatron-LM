@@ -501,10 +501,13 @@ def routed_read(
 
 
 def _writable(streams: torch.Tensor) -> torch.Tensor:
-    """``streams`` itself, or a copy when it is a view: the write updates it in place, which
-    autograd refuses on views made inside custom Functions -- e.g. a layer's input under
-    Megatron's CUDA-graph recording (_CudagraphRecordNode returns it as such a view)."""
-    return streams.clone() if streams._is_view() else streams
+    """``streams`` itself, or a copy when autograd refuses an in-place write on it: a view
+    made inside a custom Function or a leaf that requires grad -- both what a layer's input
+    is under Megatron's CUDA graphs (_CudagraphRecordNode's output while recording, the
+    static input buffer while capturing)."""
+    if streams._is_view() or (streams.is_leaf and streams.requires_grad):
+        return streams.clone()
+    return streams
 
 
 def routed_write(
