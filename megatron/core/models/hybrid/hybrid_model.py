@@ -359,7 +359,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         config = self.config
 
         def reject(what):
-            raise ValueError(f"overlap_moe_expert_parallel_comm with HybridModel does not support {what}.")
+            raise ValueError(
+                f"overlap_moe_expert_parallel_comm with HybridModel does not support {what}."
+            )
 
         if config.cuda_graph_impl != "none":
             reject("CUDA graphs yet; set cuda_graph_impl='none'")

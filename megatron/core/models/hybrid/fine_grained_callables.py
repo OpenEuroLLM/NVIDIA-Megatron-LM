@@ -151,7 +151,11 @@ def _inner_quant_context(layer):
 def _flex_backends(config):
     flex = config.moe_token_dispatcher_type == "flex"
     backend = config.moe_flex_dispatcher_backend
-    return flex and backend == "deepep", flex and backend == "hybridep", flex and backend == "ncclep"
+    return (
+        flex and backend == "deepep",
+        flex and backend == "hybridep",
+        flex and backend == "ncclep",
+    )
 
 
 def _maybe_final_norm(node: ScheduleNode, hidden_states: Tensor) -> Tensor:
