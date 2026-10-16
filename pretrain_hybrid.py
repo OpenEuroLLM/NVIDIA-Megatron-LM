@@ -308,12 +308,14 @@ def loss_func(
     return loss, num_tokens, report
 
 
-def forward_step(data_iterator, model: HybridModel):
+def forward_step(data_iterator, model: HybridModel, return_schedule_plan: bool = False):
     """Forward training step.
 
     Args:
         data_iterator : Input data iterator
         model (HybridModel): The Hybrid Model
+        return_schedule_plan (bool): Return the EP-overlap (combined 1F1B) schedule plan
+            instead of the output tensor (overlap_moe_expert_parallel_comm).
     """
     timers = get_timers()
 
@@ -363,6 +365,19 @@ def forward_step(data_iterator, model: HybridModel):
     timers('batch-generator').stop()
 
     with stimer:
+        if return_schedule_plan:
+            assert get_args().overlap_moe_expert_parallel_comm, (
+                "overlap_moe_expert_parallel_comm must be enabled to return the schedule plan"
+            )
+            schedule_plan = model.build_schedule_plan(
+                tokens,
+                position_ids,
+                attention_mask,
+                labels=labels,
+                packed_seq_params=packed_seq_params,
+                loss_mask=loss_mask,
+            )
+            return schedule_plan, partial(loss_func, loss_mask, model=model)
         output_tensor = model(
             tokens,
             position_ids,

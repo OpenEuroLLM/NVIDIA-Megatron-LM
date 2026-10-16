@@ -338,6 +338,194 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 quant_config = get_quant_config_or_none(name, self.config.quant_recipe)
                 module.finish_init(quant_config)
 
+        if self.config.overlap_moe_expert_parallel_comm:
+            self._validate_ep_overlap_support()
+
+    def _validate_ep_overlap_support(self) -> None:
+        """Reject what the EP-overlap schedule plan (``build_schedule_plan``) cannot run.
+
+        The plan calls the layers of each group directly instead of ``HybridStack.forward``
+        (see ``hybrid/fine_grained_callables.py``), so everything that forward adds around
+        the plain layer loop is unsupported here.
+        """
+        from megatron.core.enums import Fp8Recipe
+        from megatron.core.models.hybrid.fine_grained_callables import (
+            TERMINAL_SYMBOLS,
+            supported_pre_layer,
+        )
+        from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+        from megatron.core.transformer.moe.moe_layer import MoELayer
+
+        config = self.config
+
+        def reject(what):
+            raise ValueError(
+                f"overlap_moe_expert_parallel_comm with HybridModel does not support {what}."
+            )
+
+        if config.cuda_graph_impl != "none":
+            reject("CUDA graphs yet; set cuda_graph_impl='none'")
+        for flag in ("mhc", "attn_res", "ngpt"):
+            if getattr(config, flag, False):
+                reject(f"the {flag} residual scheme")
+        if self.mtp_process or config.mtp_num_layers:
+            reject("multi-token prediction")
+        if config.fp8 and config.fp8_recipe == Fp8Recipe.delayed:
+            reject("the delayed FP8 recipe")
+        if getattr(config, "moe_expert_viability_metrics", False):
+            reject("moe_expert_viability_metrics")
+        decoder = self.decoder
+        if getattr(decoder, "_loop_schedule", None) is not None:
+            reject("looped depth")
+        if getattr(decoder, "per_layer_embeddings", None) is not None:
+            reject("per-layer embeddings")
+        for symbol, layer in zip(decoder.layer_type_list, decoder.layers):
+            if getattr(layer, "uses_input_ids", False):
+                reject(f"layers that read the token ids ('{symbol}': value embeddings)")
+            if symbol == Symbols.MOE:
+                if not isinstance(getattr(layer, "mlp", None), MoELayer):
+                    reject(f"an `E` layer without a MoELayer ({type(layer).__name__})")
+                if layer.recompute_pre_mlp_layernorm:
+                    reject("recomputing the pre-MLP layernorm of MoE layers")
+            elif symbol not in TERMINAL_SYMBOLS and not supported_pre_layer(layer):
+                reject(f"layer type '{symbol}' ({type(layer).__name__})")
+
+    def _preprocess(
+        self,
+        input_ids: Tensor,
+        position_ids: Tensor,
+        decoder_input: Tensor = None,
+        inference_context: BaseInferenceContext = None,
+        packed_seq_params: PackedSeqParams = None,
+        padding_mask: Optional[Tensor] = None,
+    ):
+        """Embedding and rotary embedding of ``forward`` (training path), for the EP-overlap
+        schedule's ``PreProcessNode``. Returns its 6-tuple ``(decoder_input, rotary_pos_emb,
+        rotary_pos_cos, rotary_pos_sin, sequence_len_offset, padding_mask)``; HybridModel
+        computes no cos / sin and no sequence_len_offset in training."""
+        if decoder_input is not None:
+            pass
+        elif self.pre_process:
+            decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
+            if self.config.sequence_parallel and not self.embedding.scatter_to_sequence_parallel:
+                decoder_input = tensor_parallel.scatter_to_sequence_parallel_region(
+                    decoder_input, group=self.pg_collection.tp
+                )
+        else:
+            decoder_input = None
+
+        rotary_pos_emb = None
+        if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
+            rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
+                inference_context, self.decoder, decoder_input, self.config, packed_seq_params
+            )
+            rotary_pos_emb = self.rotary_pos_emb(
+                rotary_seq_len,
+                packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == 'thd',
+            )
+        elif self.position_embedding_type == 'yarn':
+            rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
+                inference_context, self.decoder, decoder_input, self.config, packed_seq_params
+            )
+            rotary_pos_emb, _ = self.rotary_pos_emb(
+                rotary_seq_len,
+                packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == 'thd',
+            )
+        return decoder_input, rotary_pos_emb, None, None, None, padding_mask
+
+    def _postprocess(
+        self,
+        hidden_states,
+        input_ids,
+        position_ids,
+        labels,
+        rotary_pos_emb=None,
+        rotary_pos_cos=None,
+        rotary_pos_sin=None,
+        mtp_in_postprocess=None,
+        loss_mask=None,
+        decoder_input=None,
+        attention_mask=None,
+        padding_mask=None,
+        inference_params=None,
+        packed_seq_params=None,
+        sequence_len_offset=None,
+        runtime_gather_output=None,
+        extra_block_kwargs=None,
+        inference_context=None,
+        output_processor=None,
+        output_processor_context=None,
+    ):
+        """Output layer and loss of ``forward`` (training path, no MTP), for the EP-overlap
+        schedule's ``PostProcessNode``."""
+        if output_processor is not None:
+            raise NotImplementedError("HybridModel's EP overlap takes no output_processor")
+        if not self.post_process:
+            return hidden_states
+        output_weight = None
+        if self.share_embeddings_and_output_weights:
+            output_weight = self.shared_embedding_or_output_weight()
+        if self.config.liger_fused_linear_cross_entropy and labels is not None:
+            if self.config.mup_output_mult != 1.0:
+                hidden_states = hidden_states * self.config.mup_output_mult
+            weight = output_weight if output_weight is not None else self.output_layer.weight
+            assert weight is not None
+            return liger_fused_linear_cross_entropy(
+                hidden_states,
+                weight,
+                labels,
+                loss_mask,
+                self.config.liger_fused_linear_cross_entropy_chunk_size,
+            )
+        logits, _ = self.output_layer(
+            hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+        )
+        logits = self._scale_logits(logits)
+        if labels is None:
+            return logits.transpose(0, 1).contiguous()
+        return self.compute_language_model_loss(labels, logits)
+
+    def build_schedule_plan(
+        self,
+        input_ids: Tensor,
+        position_ids: Tensor,
+        attention_mask: Tensor,
+        decoder_input: Tensor = None,
+        labels: Tensor = None,
+        inference_context: BaseInferenceContext = None,
+        packed_seq_params: PackedSeqParams = None,
+        extra_block_kwargs: dict = None,
+        runtime_gather_output: Optional[bool] = None,
+        inference_params: Optional[BaseInferenceContext] = None,
+        loss_mask: Optional[Tensor] = None,
+        padding_mask: Optional[Tensor] = None,
+    ):
+        """The combined-1F1B (EP all-to-all overlap) schedule plan of this model chunk,
+        as ``GPTModel.build_schedule_plan``; one schedule layer per HybridStack layer group
+        (``hybrid/model_chunk_schedule_plan.py``)."""
+        if self.config.fine_grained_activation_offloading:
+            self.preprocess_for_fine_grained_offloading()
+        if self.config.moe_paged_stash:
+            self.preprocess_for_paged_stash()
+
+        from megatron.core.models.hybrid.model_chunk_schedule_plan import (
+            HybridModelChunkSchedulePlan,
+        )
+
+        return HybridModelChunkSchedulePlan(
+            self,
+            input_ids,
+            position_ids,
+            attention_mask,
+            decoder_input,
+            labels,
+            packed_seq_params,
+            extra_block_kwargs,
+            runtime_gather_output,
+            loss_mask,
+            padding_mask,
+        )
+
     def _set_sliding_window_layers(self, main_pattern: str) -> None:
         """`W` layers are sliding-window attention, `*` layers global: express that as
         the per-layer window_attn_skip_freq list (1 = windowed) that every attention
