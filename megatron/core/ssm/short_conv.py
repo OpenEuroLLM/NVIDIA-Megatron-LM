@@ -161,6 +161,11 @@ class ShortConv(MegatronModule):
         cp_group = self.pg_collection.cp
 
         bcx, _ = self.in_proj(hidden_states)  # [s/cp, b, 3h/tp], sequence gathered under SP
+        if getattr(self.config, "fused_short_conv", False) and not thd and self.cp_size == 1:
+            from megatron.core.fusions.fused_short_conv import fused_short_conv
+
+            bias = self.conv1d.bias if self.conv_bias else None
+            return self.out_proj(fused_short_conv(bcx, self.conv1d.weight, bias))
         b, c, x = bcx.chunk(3, dim=-1)
         bx = b * x
 

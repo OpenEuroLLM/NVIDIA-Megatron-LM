@@ -912,6 +912,11 @@ class TransformerConfig(ModelParallelConfig):
     fused_single_qkv_rope: bool = False
     """If set, avoid splitting QKV before ROPE forward and avoid concatenating ROPE dgrads."""
 
+    fused_short_conv: bool = False
+    """ShortConv (`C` layers): the gated depthwise causal convolution C * conv(B * x) as one
+    Triton kernel each way (megatron/core/fusions/fused_short_conv.py); unpacked
+    sequences without context parallelism (others keep the unfused path)."""
+
     swiglu_triton: bool = False
     """Bias-free SwiGLU through two Triton kernels (megatron/core/fusions/fused_swiglu_triton.py)
     instead of the torch.compile'd swiglu (only with bias_swiglu_fusion and no bias)."""
