@@ -100,55 +100,56 @@ if HAVE_TRITON:
         tl.store(y_ptr + (t * B + b) * C + c, acc.to(y_ptr.dtype.element_ty), mask=mask)
 
     @triton.jit
-    def _canon_conv_bwd(
-        g_ptr, x_ptr, p_ptr, w_ptr, dx_ptr, dp_ptr, dw_ptr, S, B, C,
-        K: tl.constexpr, KP: tl.constexpr, HAS_PREFIX: tl.constexpr, BLOCK_R: tl.constexpr,
-        BLOCK_C: tl.constexpr, R_ITERS: tl.constexpr,
+    def _canon_conv_bwd_dx(
+        g_ptr, w_ptr, dx_ptr, dp_ptr, S, B, C,
+        K: tl.constexpr, HAS_PREFIX: tl.constexpr, BLOCK_R: tl.constexpr, BLOCK_C: tl.constexpr,
     ):
-        """Over the extended rows t in [-(K-1), S): dx (t >= 0), dprefix (t < 0), and this
-        program's partial dw over its R_ITERS row tiles (dw_ptr[pid_r, c, j], summed by the
-        caller -- an atomic per tile serializes the ~S*B/BLOCK_R tiles on every column)."""
-        pid_r = tl.program_id(0)
+        """dx (t >= 0) and dprefix (t < 0) over the extended rows t in [-(K-1), S)."""
+        rows = (tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)).to(tl.int64)  # extended
+        cols = tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)
+        t = (rows // B)[:, None] - (K - 1)
+        b = (rows % B)[:, None]
+        c = cols[None, :]
+        mask = (rows[:, None] < (S + K - 1) * B) & (c < C)
+        acc = tl.load(g_ptr + (t * B + b) * C + c, mask=mask & (t >= 0), other=0.0).to(
+            tl.float32
+        )  # the residual
+        for j in tl.static_range(K):
+            w = tl.load(w_ptr + cols * K + j, mask=cols < C, other=0.0).to(tl.float32)
+            tj = t + j
+            g = tl.load(g_ptr + (tj * B + b) * C + c, mask=mask & (tj >= 0) & (tj < S), other=0.0)
+            acc += w[None, :] * g.to(tl.float32)
+        tl.store(dx_ptr + (t * B + b) * C + c, acc.to(dx_ptr.dtype.element_ty), mask=mask & (t >= 0))
+        if HAS_PREFIX:
+            pt = t + (K - 1)
+            tl.store(
+                dp_ptr + (pt * B + b) * C + c, acc.to(dp_ptr.dtype.element_ty), mask=mask & (t < 0)
+            )
+
+    @triton.jit
+    def _canon_conv_bwd_dw(
+        g_ptr, x_ptr, p_ptr, dw_ptr, S, B, C, ROWS_PER,
+        K: tl.constexpr, KP: tl.constexpr, HAS_PREFIX: tl.constexpr, BLOCK_R: tl.constexpr,
+        BLOCK_C: tl.constexpr,
+    ):
+        """This program's partial dw[c, j] = sum g[t] * x[t - j] over ROWS_PER rows, kept in
+        registers across the row loop (one store per program, summed by the caller)."""
+        pid = tl.program_id(0)
         cols = tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)
         c = cols[None, :]
         jj = tl.arange(0, KP)
-        dw_acc = tl.zeros((KP, BLOCK_C), tl.float32)
-        for it in tl.static_range(R_ITERS):
-            rows = ((pid_r * R_ITERS + it) * BLOCK_R + tl.arange(0, BLOCK_R)).to(tl.int64)
-            t = (rows // B)[:, None] - (K - 1)
+        acc = tl.zeros((KP, BLOCK_C), tl.float32)
+        r0 = pid * ROWS_PER
+        for r in tl.range(r0, r0 + ROWS_PER, BLOCK_R):
+            rows = (r + tl.arange(0, BLOCK_R)).to(tl.int64)
+            t = (rows // B)[:, None]
             b = (rows % B)[:, None]
-            mask = (rows[:, None] < (S + K - 1) * B) & (c < C)
-            g_t = tl.load(g_ptr + (t * B + b) * C + c, mask=mask & (t >= 0), other=0.0).to(
-                tl.float32
-            )
-            acc = g_t  # the residual
+            mask = (rows[:, None] < S * B) & (c < C)
+            g = tl.load(g_ptr + (t * B + b) * C + c, mask=mask, other=0.0).to(tl.float32)
             for j in tl.static_range(K):
-                w = tl.load(w_ptr + cols * K + j, mask=cols < C, other=0.0).to(tl.float32)
-                tj = t + j
-                g = tl.load(
-                    g_ptr + (tj * B + b) * C + c, mask=mask & (tj >= 0) & (tj < S), other=0.0
-                )
-                acc += w[None, :] * g.to(tl.float32)
-            tl.store(
-                dx_ptr + (t * B + b) * C + c, acc.to(dx_ptr.dtype.element_ty), mask=mask & (t >= 0)
-            )
-            if HAS_PREFIX:
-                pt = t + (K - 1)
-                tl.store(
-                    dp_ptr + (pt * B + b) * C + c,
-                    acc.to(dp_ptr.dtype.element_ty),
-                    mask=mask & (t < 0),
-                )
-            # dw[c, j] = sum_{t, b} g[t] * x[t - j]   (rows t >= 0 only)
-            for j in tl.static_range(K):
-                xv = _load_ext(x_ptr, p_ptr, t - j, b, c, B, C, mask & (t >= 0), K, HAS_PREFIX)
-                part = tl.sum(g_t * xv, axis=0)
-                dw_acc += tl.where(jj[:, None] == j, part[None, :], 0.0)
-        tl.store(
-            dw_ptr + (pid_r * C + c) * K + jj[:, None],
-            dw_acc,
-            mask=(jj[:, None] < K) & (c < C),
-        )
+                xv = _load_ext(x_ptr, p_ptr, t - j, b, c, B, C, mask, K, HAS_PREFIX)
+                acc += tl.where(jj[:, None] == j, tl.sum(g * xv, axis=0)[None, :], 0.0)
+        tl.store(dw_ptr + (pid * C + c) * K + jj[:, None], acc, mask=(jj[:, None] < K) & (c < C))
 
     @triton.jit
     def _canon_swiglu_fwd(
@@ -209,7 +210,11 @@ def _grid(rows: int, cols: int):
     return (triton.cdiv(rows, _BLOCK_R), triton.cdiv(cols, _BLOCK_C))
 
 
-_BWD_R_ITERS = 8  # row tiles per backward program (one dw partial each)
+# Backward tiles (tuned on the speed suite's shapes): dx as a mirrored conv; dw as a
+# reduction over _DW_SPLIT row ranges. One kernel doing both (dw by a per-tile atomic, or
+# per-tile partials) ran 1.4-2x slower.
+_DX_BLOCK_R, _DX_BLOCK_C = 64, 128
+_DW_SPLIT, _DW_BLOCK_R, _DW_BLOCK_C = 128, 64, 64
 
 
 def _conv_bwd(grad, x, prefix, weight):
@@ -218,13 +223,20 @@ def _conv_bwd(grad, x, prefix, weight):
     grad = grad.contiguous()
     dx = torch.empty_like(x)
     dprefix = torch.empty_like(prefix) if prefix is not None else None
-    n_r = triton.cdiv(triton.cdiv((s + k - 1) * b, _BLOCK_R), _BWD_R_ITERS)
-    dw_part = torch.empty((n_r, c, k), dtype=torch.float32, device=x.device)
-    _canon_conv_bwd[(n_r, triton.cdiv(c, _BLOCK_C))](
-        grad, x, prefix if prefix is not None else x, weight, dx,
-        dprefix if dprefix is not None else dx, dw_part, s, b, c,
+    _canon_conv_bwd_dx[
+        (triton.cdiv((s + k - 1) * b, _DX_BLOCK_R), triton.cdiv(c, _DX_BLOCK_C))
+    ](
+        grad, weight, dx, dprefix if dprefix is not None else dx, s, b, c,
+        K=k, HAS_PREFIX=prefix is not None, BLOCK_R=_DX_BLOCK_R, BLOCK_C=_DX_BLOCK_C,
+    )
+    rows = s * b
+    per = triton.cdiv(triton.cdiv(rows, _DW_SPLIT), _DW_BLOCK_R) * _DW_BLOCK_R
+    n = triton.cdiv(rows, per)
+    dw_part = torch.empty((n, c, k), dtype=torch.float32, device=x.device)
+    _canon_conv_bwd_dw[(n, triton.cdiv(c, _DW_BLOCK_C))](
+        grad, x, prefix if prefix is not None else x, dw_part, s, b, c, per,
         K=k, KP=triton.next_power_of_2(k), HAS_PREFIX=prefix is not None,
-        BLOCK_R=_BLOCK_R, BLOCK_C=_BLOCK_C, R_ITERS=_BWD_R_ITERS,
+        BLOCK_R=_DW_BLOCK_R, BLOCK_C=_DW_BLOCK_C,
     )
     return dx, dprefix, dw_part.sum(0).to(weight.dtype)
 
