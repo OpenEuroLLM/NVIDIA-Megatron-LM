@@ -103,3 +103,46 @@ def sharded_lookup(layer, rows: torch.Tensor, dtype: torch.dtype) -> torch.Tenso
     """``[n]`` global row ids -> ``[n, embed_dim]`` rows in ``dtype`` (see module doc)."""
     anchor = torch.zeros((), device=rows.device, requires_grad=torch.is_grad_enabled())
     return _ShardedRowLookup.apply(anchor, layer, rows, dtype)
+
+
+class _ShardedUniqueRows(torch.autograd.Function):
+    """:class:`_ShardedRowLookup` for already-unique (sorted) rows, without the expansion
+    to every request: ``[u]`` rows -> ``[u, embed_dim]``. The caller combines them (e.g.
+    by ``embedding_bag`` over the inverse index), so neither the expanded rows nor their
+    gradient are ever materialized."""
+
+    @staticmethod
+    def forward(ctx, anchor, layer, uniq, dtype):
+        group, size = layer.shard_group, layer.shard_size
+        ctx.layer = layer
+        if size == 1:
+            ctx.requested, ctx.single = uniq, True
+            return layer.table.index_select(0, uniq - layer.row_start).to(dtype)
+        owners = row_owner(uniq, layer.total_rows, size)  # sorted, so are owners
+        send = torch.bincount(owners, minlength=size)
+        recv = torch.empty_like(send)
+        dist.all_to_all_single(recv, send, group=group)
+        send_splits, recv_splits = send.tolist(), recv.tolist()
+        requested = _exchange(group, uniq, recv_splits, send_splits)  # rows I own
+        values = layer.table.index_select(0, requested - layer.row_start).to(dtype)
+        ctx.requested, ctx.single, ctx.splits = requested, False, (send_splits, recv_splits)
+        return _exchange(group, values, send_splits, recv_splits)  # rows I asked for
+
+    @staticmethod
+    def backward(ctx, grad):
+        layer = ctx.layer
+        if ctx.single:
+            owned = grad
+        else:
+            send_splits, recv_splits = ctx.splits
+            owned = _exchange(layer.shard_group, grad.contiguous(), recv_splits, send_splits)
+        layer.table_grad.index_add_(0, ctx.requested - layer.row_start, owned.float())
+        return grad.new_zeros(()), None, None, None
+
+
+def sharded_lookup_unique(layer, rows: torch.Tensor, dtype: torch.dtype):
+    """``[n]`` global row ids -> ``(values [u, embed_dim] in dtype, inverse [n])`` with
+    ``values[inverse]`` the rows of :func:`sharded_lookup`."""
+    uniq, inverse = torch.unique(rows, return_inverse=True)
+    anchor = torch.zeros((), device=rows.device, requires_grad=torch.is_grad_enabled())
+    return _ShardedUniqueRows.apply(anchor, layer, uniq, dtype), inverse

@@ -241,15 +241,23 @@ class ProductKeyMemoryLayer(MegatronModule):
         """
         tp = self.tp_group.size()
         if self.sharded:
-            from megatron.core.ssm.engram_sharded import sharded_lookup
+            from megatron.core.ssm.engram_sharded import sharded_lookup_unique
 
             if tp > 1:  # each TP rank reads its token slice; weight grads are all-gathered
                 if rows.shape[0] % tp:
                     raise ValueError("pkm_table_parallel='dp' needs tokens divisible by TP")
                 rows = rows.chunk(tp)[self.tp_group.rank()]
                 weights = scatter_to_sequence_parallel_region(weights, group=self.tp_group)
-            vals = sharded_lookup(self, rows.reshape(-1), dtype).view(*rows.shape, self.value_dim)
-            out = (vals * weights.unsqueeze(-1).to(dtype)).sum(dim=(1, 2))
+            # Weighted sum over the unique rows by embedding_bag: the expanded
+            # [T, heads, topk, value_dim] rows (GBs per layer) are never materialized.
+            vals, inverse = sharded_lookup_unique(self, rows.reshape(-1), dtype)
+            t = rows.shape[0]
+            out = F.embedding_bag(
+                inverse.view(t, -1),
+                vals,
+                per_sample_weights=weights.reshape(t, -1).to(vals.dtype),
+                mode="sum",
+            )
             if tp > 1:
                 out = gather_from_sequence_parallel_region(
                     out, tensor_parallel_output_grad=False, group=self.tp_group
@@ -259,10 +267,13 @@ class ProductKeyMemoryLayer(MegatronModule):
             weights = copy_to_tensor_model_parallel_region(weights, group=self.tp_group)
         local = rows - self.row_start
         outside = (local < 0) | (local >= self.values.shape[0])
-        vals = F.embedding(local.masked_fill(outside, 0).reshape(-1), self.values)
-        vals = vals.view(*rows.shape, self.value_dim)
-        w = weights.masked_fill(outside, 0.0).unsqueeze(-1).to(vals.dtype)
-        out = (vals * w).sum(dim=(1, 2))
+        t = rows.shape[0]
+        out = F.embedding_bag(  # weighted sum without the expanded rows (see above)
+            local.masked_fill(outside, 0).reshape(t, -1),
+            self.values,
+            per_sample_weights=weights.masked_fill(outside, 0.0).reshape(t, -1).to(self.values.dtype),
+            mode="sum",
+        )
         if tp > 1:
             out = reduce_from_tensor_model_parallel_region(out, group=self.tp_group)
         return out.to(dtype)
