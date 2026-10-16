@@ -145,7 +145,11 @@ class RoutedStreamMixer(nn.Module):
             rows = idx.long().unsqueeze(-1).expand(-1, -1, self.n)
             res = torch.gather(res, 1, rows)  # [T, k, n]
             res = torch.gather(res, 2, idx.long().unsqueeze(1).expand(-1, self.k, -1))
-            static = self.b_res.float()[idx.long().unsqueeze(-1), idx.long().unsqueeze(1)]
+            # b_res[idx_i, idx_j] as a one-hot product: exact, and its backward is a small
+            # reduction -- advanced indexing's accumulating backward serializes on the n * n
+            # entries (~70 ms a step at T = 32k).
+            onehot = torch.nn.functional.one_hot(idx.long(), self.n).float()  # [T, k, n]
+            static = onehot @ self.b_res.float() @ onehot.mT
             mix = sinkhorn_knopp(self.alpha_res.float() * res + static, self.sinkhorn_iters)
         return (idx, r, stash), (idx, w, mix, stash), None
 
