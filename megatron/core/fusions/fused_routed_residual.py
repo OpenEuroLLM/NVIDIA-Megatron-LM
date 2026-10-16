@@ -500,12 +500,21 @@ def routed_read(
     return x.view(streams.shape[:-2] + (c,))
 
 
+def _writable(streams: torch.Tensor) -> torch.Tensor:
+    """``streams`` itself, or a copy when it is a view: the write updates it in place, which
+    autograd refuses on views made inside custom Functions -- e.g. a layer's input under
+    Megatron's CUDA-graph recording (_CudagraphRecordNode returns it as such a view)."""
+    return streams.clone() if streams._is_view() else streams
+
+
 def routed_write(
     streams: torch.Tensor, f: torch.Tensor, idx: torch.Tensor, w: torch.Tensor, stash: GradStash
 ) -> torch.Tensor:
     """``streams[t, idx[t, j]] += w[t, j] * f[t]`` -- in place when the kernel runs."""
     if _fused(streams):
-        return _RoutedWrite.apply(streams, f, idx.int().contiguous(), w.float().contiguous(), stash)
+        return _RoutedWrite.apply(
+            _writable(streams), f, idx.int().contiguous(), w.float().contiguous(), stash
+        )
     n, c = streams.shape[-2:]
     out = routed_write_reference(streams.reshape(-1, n, c), f.reshape(-1, c), idx, w)
     return out.view(streams.shape)
@@ -523,7 +532,7 @@ def routed_write_mix(
     place when the kernel runs (after the sublayer's :func:`routed_read`)."""
     if _fused(streams):
         return _RoutedWriteMix.apply(
-            streams, f, idx.int().contiguous(), w.float().contiguous(),
+            _writable(streams), f, idx.int().contiguous(), w.float().contiguous(),
             mix.float().contiguous(), stash,
         )
     n, c = streams.shape[-2:]
