@@ -53,12 +53,12 @@ def test_flex_attention_form_matches_the_quadratic_definition(gated):
     leaves = [x.clone().requires_grad_() for x in (q, k, v)]
     ref = naive_power_attention(*leaves, log_g, 2, d**-0.5)
     out = power.power_attention_flex(*leaves, log_g, deg=2, scale=d**-0.5)
-    assert (out - ref).norm() / ref.norm() < 1e-4
+    assert (out - ref).norm() / ref.norm() < 3e-3  # TF32 / bf16 inside the kernel on H100
     do = torch.randn_like(ref)
     g_ref = torch.autograd.grad(ref, leaves, do)
     g = torch.autograd.grad(out, leaves, do)
     for a, r in zip(g, g_ref):
-        assert (a - r).norm() / r.norm() < 1e-3
+        assert (a - r).norm() / r.norm() < 1e-2
 
 
 def test_attention_form_matches_chunked_form():

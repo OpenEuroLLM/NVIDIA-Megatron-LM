@@ -108,7 +108,7 @@ class PowerRetentionAttention(nn.Module):
         deg: int = 2,
         chunk_size: int = 128,
         switch_over_seq_len: int = 0,
-        attention_impl: str = "flex",
+        attention_impl: str = "retention",
         rope: bool = False,
         gating: bool = True,
         xsa: bool = False,
