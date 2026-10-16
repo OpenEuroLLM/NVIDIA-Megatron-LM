@@ -71,26 +71,43 @@ def test_fused_stack_matches_reference(n, k, c, dtype, mix):
     gen = torch.Generator(device="cuda").manual_seed(0)
     layers = 3
     weights = [torch.randn(c, c, device="cuda", generator=gen) / c**0.5 for _ in range(layers)]
-    routers = [torch.randn(c, n, device="cuda", generator=gen) for _ in range(layers)]
+    # O(1) router logits: unscaled ones (O(sqrt(c))) saturate the softmax / sigmoid,
+    # leaving near-zero, cancellation-dominated router gradients.
+    routers = [torch.randn(c, n, device="cuda", generator=gen) / c**0.5 for _ in range(layers)]
     mixers = [torch.randn(c, k * k, device="cuda", generator=gen) / c**0.5 for _ in range(layers)]
     x0 = torch.randn(5, 3, c, device="cuda", generator=gen).to(dtype)
     dy = torch.randn(5, 3, c, device="cuda", generator=gen).to(dtype)
-    results = []
-    for fused in (True, False):
-        x = x0.clone().requires_grad_()
+
+    def run(fused, dt):
+        x = x0.to(dt).clone().requires_grad_()
         params = [p.clone().requires_grad_() for p in weights + routers + mixers]
         y = _stack(
             fused, x, params[:layers], params[layers : 2 * layers], n, k,
             mixers=params[2 * layers :] if mix else None,
         )
-        y.backward(dy)
-        results.append([y.detach(), x.grad] + [p.grad for p in params if p.grad is not None])
-    for a, b in zip(*results):
-        # Compared in norm: large reductions (C = 2304) reorder sums, and bf16 gradient
-        # buffers round at every layer.
-        # (Single-layer bf16 kernel accuracy against fp32 is pinned separately.)
-        tol = 1e-4 if dtype == torch.float32 else 1e-1
-        assert (a.float() - b.float()).norm() <= tol * b.float().norm() + 1e-4
+        y.backward(dy.to(dt))
+        return [y.detach().float(), x.grad.float()] + [
+            p.grad.float() for p in params if p.grad is not None
+        ]
+
+    fused, ref = run(True, dtype), run(False, dtype)
+    if dtype == torch.float32:
+        for a, b in zip(fused, ref):
+            # In norm: large reductions (C = 2304) reorder sums.
+            assert (a - b).norm() <= 1e-4 * b.norm() + 1e-4
+        return
+    # bf16: a 3-layer bf16 chain can itself be far from fp32 in both paths (on H100,
+    # n = 8, k = 4, C = 2304 drifted by O(1) in both), so measure the fused kernels
+    # against an fp32 ground truth on the same bf16-rounded inputs and routing, and
+    # require them to be no worse than the out-of-place bf16 definition.
+    truth = run(False, torch.float32)
+    for a, r, t in zip(fused, ref, truth):
+        # In norm, with an absolute floor: some gradients vanish in exact arithmetic
+        # (the first mixer sees n identical streams), leaving only rounding in both.
+        err_fused, err_ref = (a - t).norm(), (r - t).norm()
+        assert err_fused <= 1.5 * err_ref + 2e-2 * t.norm() + 1e-4, (
+            float(err_fused), float(err_ref), float(t.norm())
+        )
 
 
 def test_write_is_in_place_and_touches_only_the_routed_streams():
