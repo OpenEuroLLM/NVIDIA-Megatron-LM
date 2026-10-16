@@ -2,6 +2,7 @@
 
 import logging
 import math
+import os
 import warnings
 from dataclasses import dataclass, field
 from typing import Callable, List, Literal, Optional, Tuple, Union
@@ -1970,9 +1971,12 @@ class TransformerConfig(ModelParallelConfig):
                 "mhc_routed_mix / _balance_rate / _reversible need mhc_routed_topk > 0"
             )
         if self.mhc_routed_topk:
-            if self.cuda_graph_impl != "none" or self.enable_cuda_graph:
+            if (self.cuda_graph_impl != "none" or self.enable_cuda_graph) and not os.environ.get(
+                "MEGATRON_ROUTED_CUDA_GRAPHS"
+            ):
                 # The per-step routing state (and the shared gradient buffer) lives in
-                # Python objects a captured graph would freeze.
+                # Python objects a captured graph freezes into static buffers: allowed only
+                # on request (MEGATRON_ROUTED_CUDA_GRAPHS=1) until verified against eager.
                 raise ValueError("mhc_routed_topk does not support CUDA graphs yet")
 
         # The Liger fused LM-head + CE returns the loss before the logits exist,
