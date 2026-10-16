@@ -367,6 +367,16 @@ class MLP(MegatronModule):
                     else:
                         assert self.config.add_bias_linear is True
                         intermediate_parallel = bias_gelu_impl(intermediate_parallel, bias_parallel)
+                elif (
+                    self.activation_func == F.silu
+                    and self.config.gated_linear_unit
+                    and getattr(self.config, "swiglu_triton", False)
+                    and bias_parallel is None
+                    and not self.config.activation_func_fp8_input_store
+                ):
+                    from megatron.core.fusions.fused_swiglu_triton import swiglu_triton
+
+                    intermediate_parallel = swiglu_triton(intermediate_parallel)
                 elif self.activation_func == F.silu and self.config.gated_linear_unit:
                     intermediate_parallel = bias_swiglu_impl(
                         intermediate_parallel,

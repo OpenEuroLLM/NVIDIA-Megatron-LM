@@ -912,6 +912,10 @@ class TransformerConfig(ModelParallelConfig):
     fused_single_qkv_rope: bool = False
     """If set, avoid splitting QKV before ROPE forward and avoid concatenating ROPE dgrads."""
 
+    swiglu_triton: bool = False
+    """Bias-free SwiGLU through two Triton kernels (megatron/core/fusions/fused_swiglu_triton.py)
+    instead of the torch.compile'd swiglu (only with bias_swiglu_fusion and no bias)."""
+
     fused_qk_norm_rope: bool = False
     """Self-attention with qk_layernorm (RMSNorm) and RoPE: one Triton kernel from the fused
     QKV projection to normed, rotated q / k and v, and one back
