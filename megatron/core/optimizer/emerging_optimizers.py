@@ -1432,6 +1432,35 @@ def _muown_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, An
         def _tp_group(param):
             return pg_collection.expt_tp if getattr(param, 'expert_tp', False) else pg_collection.tp
 
+        if HAVE_EMERGING_OPTIMIZERS and config.muon_coefficient_type in _COEFFICIENT_SETS:
+
+            def _batched_orthogonalize(stack, steps=5, param=None, **_):
+                partition_dim = getattr(param, "partition_dim", None)
+                if partition_dim == -1:
+                    partition_dim = None
+                return _batched_newton_schulz(
+                    stack,
+                    steps=steps,
+                    coefficient_type=config.muon_coefficient_type,
+                    tp_group=_tp_group(param),
+                    partition_dim=partition_dim,
+                    tp_mode="duplicated",
+                )
+
+            def _bucket_key(param):
+                # Stacked parameters share one all_gather / row all-reduce, so they
+                # must agree on shape, dtype, process group and sharded dim.
+                return (
+                    tuple(param.shape),
+                    param.dtype,
+                    bool(getattr(param, "expert_tp", False)),
+                    getattr(param, "partition_dim", None),
+                    bool(getattr(param, "tensor_model_parallel", False)),
+                )
+
+            kwargs["batched_orthogonalize_fn"] = _batched_orthogonalize
+            kwargs["bucket_key_fn"] = _bucket_key
+
         def _row_sum(partial, param):
             # Column-sharded weights (RowParallelLinear: linear_proj / linear_fc2 / MoE
             # down-proj) hold a column slice of every row.

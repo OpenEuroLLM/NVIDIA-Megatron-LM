@@ -20,8 +20,15 @@ class TestNewtonSchulz:
         assert sv.min() > 0.5 and sv.max() < 1.5
 
     def test_rejects_non_matrix(self):
-        with pytest.raises(ValueError, match="expects a 2-D matrix"):
-            newton_schulz(torch.randn(4, 4, 4))
+        with pytest.raises(ValueError, match="expects a matrix"):
+            newton_schulz(torch.randn(4))
+
+    def test_stack_is_orthogonalized_matrix_by_matrix(self):
+        torch.manual_seed(0)
+        stack = torch.randn(3, 32, 16)
+        got = newton_schulz(stack)
+        for i in range(3):
+            torch.testing.assert_close(got[i], newton_schulz(stack[i]), rtol=0, atol=1e-2)
 
 
 class TestMuown:
@@ -115,6 +122,51 @@ class TestMuown:
             Muown([param], scale_mode="bogus")
 
 
+class TestMuownStackedStep:
+    """Same-shape parameters (e.g. grouped-GEMM experts) are updated as one stack."""
+
+    @staticmethod
+    def _run(bucket_key_fn, steps=3, device="cpu"):
+        torch.manual_seed(0)
+        shapes = [(48, 16)] * 6 + [(16, 48)] * 3 + [(2, 24, 16)] * 2 + [(32, 32)]
+        params = [torch.nn.Parameter(torch.randn(*s, device=device)) for s in shapes]
+        opt = Muown(params, lr=1e-2, weight_decay=0.1, bucket_key_fn=bucket_key_fn)
+        for step in range(steps):
+            torch.manual_seed(100 + step)
+            for p in params:
+                p.grad = torch.randn_like(p)
+            opt.step()
+        return params, opt
+
+    @pytest.mark.parametrize(
+        "device",
+        [
+            "cpu",
+            pytest.param(
+                "cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+            ),
+        ],
+    )
+    def test_matches_the_per_parameter_step(self, device):
+        ref, ref_opt = self._run(lambda p: None, device=device)
+        got, opt = self._run(None, device=device)
+        for a, b in zip(got, ref):
+            torch.testing.assert_close(a, b, rtol=1e-4, atol=1e-5)
+        for p_got, p_ref in zip(got, ref):
+            for key in ("direction_momentum", "magnitude_momentum"):
+                assert opt.state[p_got][key].shape == p_got.shape
+                torch.testing.assert_close(
+                    opt.state[p_got][key], ref_opt.state[p_ref][key], rtol=1e-4, atol=1e-5
+                )
+
+    def test_small_stack_limit_splits_buckets(self, monkeypatch):
+        monkeypatch.setattr(Muown, "_STACK_NUMEL", 48 * 16 * 2)
+        ref, _ = self._run(lambda p: None)
+        got, _ = self._run(None)
+        for a, b in zip(got, ref):
+            torch.testing.assert_close(a, b, rtol=1e-4, atol=1e-5)
+
+
 class TestClassifyParam:
     @pytest.mark.parametrize(
         "name,expected",
@@ -192,7 +244,8 @@ class TestMuownCpuOffload:
     @staticmethod
     def _params(seed=0):
         torch.manual_seed(seed)
-        shapes = [(64, 32), (32, 96), (4, 48, 16), (128, 128)]  # incl. a grouped (expert) one
+        # incl. grouped (expert) tensors and same-shape runs (updated as one stack)
+        shapes = [(64, 32), (64, 32), (32, 96), (4, 48, 16), (4, 48, 16), (128, 128), (64, 32)]
         return [torch.nn.Parameter(torch.randn(*s, device="cuda")) for s in shapes]
 
     def _run(self, offload, steps=4, opt_state=None):
@@ -232,6 +285,7 @@ class TestMuownCpuOffload:
             torch.testing.assert_close(a, b, rtol=0, atol=0)
         assert all(not buf.is_cuda for st in opt.state.values() for buf in st.values())
         # the checkpoint keeps the parameter-shaped buffers, nothing else
-        for (pid, st), p in zip(opt.state_dict()["state"].items(), self._params()):
+        params = self._params()
+        for pid, st in opt.state_dict()["state"].items():
             assert set(st) == {"direction_momentum", "magnitude_momentum"}
-            assert st["magnitude_momentum"].shape == p.shape
+            assert st["magnitude_momentum"].shape == params[pid].shape
