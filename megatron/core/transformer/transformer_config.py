@@ -1622,6 +1622,10 @@ class TransformerConfig(ModelParallelConfig):
     mamba_head_dim: int = 64
     """The dimensionality of the heads in the Mamba layers."""
 
+    mamba_chunk_size: Optional[int] = None
+    """Chunk size of the Mamba2 SSD kernel (None: the mixer's default, 128). The chunk splits
+    the work between the quadratic intra-chunk part and the inter-chunk state recurrence."""
+
     mamba_num_groups: int = 8
     """The number of groups used in Mamba layers."""
 

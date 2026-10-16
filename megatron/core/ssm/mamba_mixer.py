@@ -217,7 +217,8 @@ class MambaMixer(MegatronModule):
         self.D_has_hdim = D_has_hdim
         self.rmsnorm = rmsnorm
         self.norm_before_gate = norm_before_gate
-        self.chunk_size = chunk_size
+        # config.mamba_chunk_size (when set) overrides the spec's chunk size
+        self.chunk_size = getattr(config, "mamba_chunk_size", None) or chunk_size
         self.layer_number = layer_number
         self.pp_layer_offset = pp_layer_offset
         self.cached_batch_size = None
