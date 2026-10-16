@@ -477,8 +477,9 @@ class TransformerConfig(ModelParallelConfig):
     of the (q . k)^deg similarity; the state per head is binom(d+deg-1, deg) x (d+1). The
     public Triton kernels (the baseline) implement deg = 2."""
 
-    linear_power_chunk_size: int = 128
-    """Power retention: the chunk size of the chunked algorithm."""
+    linear_power_chunk_size: int = 256
+    """Power retention: the chunk size of the chunked algorithm (256: 15% faster than 128 on
+    H100 at head dim 64, the speed suite's chunk sweep)."""
 
     linear_power_rope: bool = False
     """Power retention: rotary embeddings on q / k (the reference model's choice); off = NoPE."""
