@@ -496,6 +496,22 @@ class MambaMixer(MegatronModule):
                     out, out_bias = self._decode(hidden_states, conv_state, ssm_state)
                     return out, out_bias
 
+        if (
+            not in_inference_mode
+            and self.use_mem_eff_path
+            and packed_seq_params is None
+            and self.cp.cp_size == 1
+            and not self.config.sequence_parallel
+        ):
+            # The kernel works batch-first. Transposing the d_model-wide input and output
+            # instead of the (2 d_inner + 2 G N + H)-wide projection and the d_inner-wide
+            # kernel output moves several times fewer bytes (fwd and bwd); in_proj /
+            # out_proj act per token, so their layout is free without sequence parallelism.
+            zxBCdt, _ = self.in_proj(hidden_states.transpose(0, 1).contiguous())
+            y = self._ssm_training(zxBCdt, batch_first=True)
+            out, out_bias = self.out_proj(y)
+            return out.transpose(0, 1).contiguous(), out_bias
+
         zxBCdt, _ = self.in_proj(hidden_states)
 
         zxBCdt = self.cp.pre_conv_ssm(zxBCdt, packed_seq_params)
@@ -726,18 +742,23 @@ class MambaMixer(MegatronModule):
         return out, out_bias
 
     def _ssm_training(
-        self, zxBCdt: torch.Tensor, packed_seq_params: Optional[PackedSeqParams] = None
+        self,
+        zxBCdt: torch.Tensor,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        batch_first: bool = False,
     ) -> torch.Tensor:
         """
         Performs SSM computation for training step.
 
         Uses the memory-efficient kernel `mamba_split_conv1d_scan_combined` which reduces the size
         of forward activations stored for backprop and therefore reduces memory pressure during
-        training.
+        training. With ``batch_first`` (no context parallelism) ``zxBCdt`` and the result are
+        ``[b, l, d]`` instead of ``[l, b, d]``.
         """
 
         # transpose: l b pd --> b l pd
-        zxBCdt = rearrange(zxBCdt, "l b d -> b l d").contiguous()
+        if not batch_first:
+            zxBCdt = rearrange(zxBCdt, "l b d -> b l d").contiguous()
 
         # (nheads_local_tpcp)
         A = -torch.exp(self.cp.get_A_log().float())
@@ -773,8 +794,9 @@ class MambaMixer(MegatronModule):
             **state_dtype_kwarg,
         )
 
-        y = rearrange(y, "b l d -> l b d").contiguous()
-        y = self.cp.post_conv_ssm(y, packed_seq_params)
+        if not batch_first:
+            y = rearrange(y, "b l d -> l b d").contiguous()
+            y = self.cp.post_conv_ssm(y, packed_seq_params)
 
         if self.rmsnorm:
             y = self.norm(y)

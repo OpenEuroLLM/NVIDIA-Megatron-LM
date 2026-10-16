@@ -82,6 +82,35 @@ class TestMambaMixer:
         assert output.shape[2] == mixer.config.hidden_size
         assert output.dtype == torch.float32
 
+    def test_batch_first_training_matches_sequence_first(self):
+        """The training forward runs in_proj / out_proj batch-first (cheaper transposes);
+        output and gradients equal the sequence-first path."""
+        mixer = self.get_mixer(1, 1, True)
+        torch.manual_seed(0)
+        x = torch.randn(64, 2, mixer.config.hidden_size, device="cuda", requires_grad=True)
+        grad_out = torch.randn(64, 2, mixer.config.hidden_size, device="cuda")
+
+        def reference(h):
+            zxBCdt, _ = mixer.in_proj(h)
+            out, _ = mixer.out_proj(mixer._ssm_training(zxBCdt))
+            return out
+
+        results = []
+        for fn in (mixer, reference):
+            mixer.zero_grad()
+            x.grad = None
+            out = fn(x)
+            out = out[0] if isinstance(out, tuple) else out
+            out.backward(grad_out)
+            grads = [p.grad.clone() for p in mixer.parameters() if p.grad is not None]
+            results.append((out.detach(), x.grad.clone(), grads))
+        (out, dx, grads), (ref_out, ref_dx, ref_grads) = results
+        torch.testing.assert_close(out, ref_out)
+        torch.testing.assert_close(dx, ref_dx)
+        assert len(grads) == len(ref_grads)
+        for g, r in zip(grads, ref_grads):
+            torch.testing.assert_close(g, r)
+
     def test_variable_batch_size_inference(self):
         mixer = self.get_mixer()
 
