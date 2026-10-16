@@ -42,6 +42,25 @@ def test_kernel_matches_the_quadratic_definition(t, deg, gated):
     assert (out - ref).norm() / ref.norm() < 3e-2
 
 
+@pytest.mark.parametrize("gated", [False, True])
+def test_flex_attention_form_matches_the_quadratic_definition(gated):
+    torch.manual_seed(0)
+    b, t, h, d = 2, 384, 2, 32
+    q = torch.randn(b, t, h, d, device="cuda") * 0.5
+    k = torch.randn(b, t, h, d, device="cuda") * 0.5
+    v = torch.randn(b, t, h, d, device="cuda")
+    log_g = F.logsigmoid(3.0 + torch.randn(b, t, h, device="cuda")) if gated else None
+    leaves = [x.clone().requires_grad_() for x in (q, k, v)]
+    ref = naive_power_attention(*leaves, log_g, 2, d**-0.5)
+    out = power.power_attention_flex(*leaves, log_g, deg=2, scale=d**-0.5)
+    assert (out - ref).norm() / ref.norm() < 1e-4
+    do = torch.randn_like(ref)
+    g_ref = torch.autograd.grad(ref, leaves, do)
+    g = torch.autograd.grad(out, leaves, do)
+    for a, r in zip(g, g_ref):
+        assert (a - r).norm() / r.norm() < 1e-3
+
+
 def test_attention_form_matches_chunked_form():
     """switch_over_seq_len: the quadratic form below it, the chunked one above -- same layer."""
     torch.manual_seed(0)

@@ -487,6 +487,10 @@ class TransformerConfig(ModelParallelConfig):
     ones the chunked recurrence. At 4096 tokens the attention form is 1.7x (head dim 64) to
     7x (128) faster than the best chunk size on H100 (bench_power.py); 0: always chunked."""
 
+    linear_power_attention_impl: str = "flex"
+    """Power retention's quadratic form: "flex" (FlexAttention with the deg-th power and the
+    gate as a score_mod: no [T, T] weights) or "retention" (the package's Triton kernel)."""
+
     linear_power_rope: bool = False
     """Power retention: rotary embeddings on q / k (the reference model's choice); off = NoPE."""
 

@@ -33,6 +33,57 @@ except ImportError:  # pragma: no cover
 
 GATE_INIT = 6.906768  # logsigmoid(6.906768) = log(0.999)
 
+_FLEX = {}
+
+
+def _flex_attention():
+    """torch.compile'd flex_attention (compiled once per process)."""
+    if "fn" not in _FLEX:
+        from torch.nn.attention.flex_attention import flex_attention
+
+        _FLEX["fn"] = torch.compile(flex_attention, dynamic=False)
+    return _FLEX["fn"]
+
+
+def _causal_block_mask(t: int, device):
+    key = (t, str(device))
+    if key not in _FLEX:
+        from torch.nn.attention.flex_attention import create_block_mask
+
+        _FLEX[key] = create_block_mask(
+            lambda b, h, q, kv: q >= kv, B=None, H=None, Q_LEN=t, KV_LEN=t, device=device
+        )
+    return _FLEX[key]
+
+
+def power_attention_flex(q, k, v, log_g=None, deg: int = 2, scale: Optional[float] = None):
+    """The quadratic form of power retention on FlexAttention ([B, T, H, D] in and out).
+
+    Its weights ``(scale q_t . k_s)^deg exp(L_t - L_s)`` (L = cumsum log g) normalised over s
+    are a softmax over ``deg log|scale q_t . k_s| + L_t - L_s`` -- the retention package's
+    attention form (retention/_attention/reference.py: the same 1e-7 inside the log) as a
+    score_mod, so the flash-attention-style kernel never forms the [T, T] weights."""
+    b, t, h, d = q.shape
+    scale = d**-0.5 if scale is None else scale
+    Lq = Lk = None
+    if log_g is not None:
+        L = log_g.float().cumsum(1).transpose(1, 2)  # [B, H, T]
+        # one tensor per indexing: flex's score_mod backward takes each captured tensor
+        # indexed once (autograd sums the two gradients)
+        Lq, Lk = L.contiguous(), L.clone()
+
+    def score_mod(score, bi, hi, qi, ki):
+        s = deg * torch.log(torch.abs(score) + 1e-7)
+        if Lq is not None:
+            s = s + (Lq[bi, hi, qi] - Lk[bi, hi, ki])
+        return s
+
+    o = _flex_attention()(
+        q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), score_mod=score_mod,
+        block_mask=_causal_block_mask(t, q.device), scale=scale,
+    )
+    return o.transpose(1, 2)
+
 
 def _rope(x: torch.Tensor, base: float = 10000.0) -> torch.Tensor:
     """Rotary embedding over the head dim of ``x`` [B, T, H, D] (positions 0..T-1)."""
@@ -57,6 +108,7 @@ class PowerRetentionAttention(nn.Module):
         deg: int = 2,
         chunk_size: int = 128,
         switch_over_seq_len: int = 0,
+        attention_impl: str = "flex",
         rope: bool = False,
         gating: bool = True,
         xsa: bool = False,
@@ -75,6 +127,9 @@ class PowerRetentionAttention(nn.Module):
             raise ValueError(f"the power-retention Triton baseline supports deg=2, got {deg}")
         self.h, self.d, self.deg, self.chunk_size = num_heads, head_dim, deg, chunk_size
         self.switch_over_seq_len = switch_over_seq_len
+        if attention_impl not in ("flex", "retention"):
+            raise ValueError(f"power attention_impl must be flex or retention, got {attention_impl!r}")
+        self.attention_impl = attention_impl
         self.rope, self.gating, self.xsa = rope, gating, xsa
         dim = num_heads * head_dim
         self.q_proj = nn.Linear(hidden_size, dim, bias=False)
@@ -105,10 +160,13 @@ class PowerRetentionAttention(nn.Module):
         # the quadratic (attention) form up to switch_over_seq_len tokens: faster than any
         # chunk size there (and the only form for t <= chunk_size)
         chunk = self.chunk_size if t > max(self.chunk_size, self.switch_over_seq_len) else None
-        o = power_retention(
-            q.contiguous(), k.contiguous(), v.contiguous(), log_g,
-            deg=self.deg, scale=self.d**-0.5, chunk_size=chunk,
-        )
+        if chunk is None and self.attention_impl == "flex":
+            o = power_attention_flex(q, k, v, log_g, deg=self.deg, scale=self.d**-0.5)
+        else:
+            o = power_retention(
+                q.contiguous(), k.contiguous(), v.contiguous(), log_g,
+                deg=self.deg, scale=self.d**-0.5, chunk_size=chunk,
+            )
         if self.xsa:
             from megatron.core.fusions.fused_xsa import exclusive_self_attention_heads
 
