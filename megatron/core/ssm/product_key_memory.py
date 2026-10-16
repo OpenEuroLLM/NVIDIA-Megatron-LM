@@ -94,6 +94,16 @@ def product_key_topk(
     return scores, rows
 
 
+def _weighted_bag(vals: torch.Tensor, index: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    """``sum_j weights[t, j] * vals[index[t, j]]`` -> ``[T, dim]`` fp32, by embedding_bag over
+    the (unique) rows ``vals``: the expanded ``[T, heads * topk, dim]`` rows -- GBs per layer
+    -- are never materialized. fp32 because embedding_bag has no bf16 backward for the
+    per-sample weights; only the unique rows are upcast."""
+    return F.embedding_bag(
+        index, vals.float(), per_sample_weights=weights.reshape(index.shape).float(), mode="sum"
+    )
+
+
 class ProductKeyMemoryLayer(MegatronModule):
     """``h + PKM(h)``; see the module docstring."""
 
@@ -248,16 +258,8 @@ class ProductKeyMemoryLayer(MegatronModule):
                     raise ValueError("pkm_table_parallel='dp' needs tokens divisible by TP")
                 rows = rows.chunk(tp)[self.tp_group.rank()]
                 weights = scatter_to_sequence_parallel_region(weights, group=self.tp_group)
-            # Weighted sum over the unique rows by embedding_bag: the expanded
-            # [T, heads, topk, value_dim] rows (GBs per layer) are never materialized.
             vals, inverse = sharded_lookup_unique(self, rows.reshape(-1), dtype)
-            t = rows.shape[0]
-            out = F.embedding_bag(
-                inverse.view(t, -1),
-                vals,
-                per_sample_weights=weights.reshape(t, -1).to(vals.dtype),
-                mode="sum",
-            )
+            out = _weighted_bag(vals, inverse.view(rows.shape[0], -1), weights).to(dtype)
             if tp > 1:
                 out = gather_from_sequence_parallel_region(
                     out, tensor_parallel_output_grad=False, group=self.tp_group
@@ -267,12 +269,11 @@ class ProductKeyMemoryLayer(MegatronModule):
             weights = copy_to_tensor_model_parallel_region(weights, group=self.tp_group)
         local = rows - self.row_start
         outside = (local < 0) | (local >= self.values.shape[0])
-        t = rows.shape[0]
-        out = F.embedding_bag(  # weighted sum without the expanded rows (see above)
-            local.masked_fill(outside, 0).reshape(t, -1),
-            self.values,
-            per_sample_weights=weights.masked_fill(outside, 0.0).reshape(t, -1).to(self.values.dtype),
-            mode="sum",
+        uniq, inverse = torch.unique(local.masked_fill(outside, 0), return_inverse=True)
+        out = _weighted_bag(
+            self.values.index_select(0, uniq),
+            inverse.view(rows.shape[0], -1),
+            weights.masked_fill(outside, 0.0),
         )
         if tp > 1:
             out = reduce_from_tensor_model_parallel_region(out, group=self.tp_group)
