@@ -912,6 +912,12 @@ class TransformerConfig(ModelParallelConfig):
     fused_single_qkv_rope: bool = False
     """If set, avoid splitting QKV before ROPE forward and avoid concatenating ROPE dgrads."""
 
+    fused_qk_norm_rope: bool = False
+    """Self-attention with qk_layernorm (RMSNorm) and RoPE: one Triton kernel from the fused
+    QKV projection to normed, rotated q / k and v, and one back
+    (megatron/core/fusions/fused_qk_norm_rope.py) instead of split + two norms + two RoPEs
+    (+ concat in the backward). Raises if a layer does not qualify (training only)."""
+
     fused_residual_rmsnorm: bool = False
     """If True, fuses residual connection and RMSNorm backward pass when TE is used."""
 

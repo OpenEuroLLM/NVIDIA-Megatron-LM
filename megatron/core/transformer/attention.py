@@ -742,6 +742,45 @@ class Attention(MegatronModule, ABC):
                 )
         return query, key, value, rotary_pos_emb, attn_mask_type, block_table
 
+    def _fused_qk_norm_rope_applies(self, inference_context, packed_seq_params, rotary_pos_emb):
+        """Whether config.fused_qk_norm_rope runs this call (see fused_qk_norm_rope.py)."""
+        if not getattr(self.config, "fused_qk_norm_rope", False) or inference_context is not None:
+            return False
+        reasons = {
+            "self attention": self.attention_type == "self",
+            "no packed sequences": packed_seq_params is None,
+            "RoPE": rotary_pos_emb is not None,
+            "qk_layernorm with RMSNorm": self.config.qk_layernorm
+            and self.config.normalization == "RMSNorm"
+            and hasattr(self.q_layernorm, "weight")
+            and hasattr(self.k_layernorm, "weight"),
+            "no attention_output_gate": not self.config.attention_output_gate,
+            "no nGPT s_qk": getattr(self, "ngpt_sq", None) is None,
+            "context parallel 1": self.pg_collection.cp.size() == 1,
+            "non-interleaved RoPE": not self.config.rotary_interleaved,
+            "no YaRN mscale": self._yarn_concentration_factor in (None, 1.0),
+            "num_query_groups >= TP": self.config.num_query_groups >= self.world_size,
+            "no Canon B": getattr(self, "canon_b", None) is None,
+        }
+        missing = [name for name, ok in reasons.items() if not ok]
+        if missing:
+            raise ValueError(f"fused_qk_norm_rope needs: {', '.join(missing)}")
+        return True
+
+    def _fused_qk_norm_rope(self, mixed, pos_emb):
+        from megatron.core.fusions.fused_qk_norm_rope import fused_qk_norm_rope
+
+        hq = self.num_attention_heads_per_partition // self.num_query_groups_per_partition
+        weights = []
+        for norm in (self.q_layernorm, self.k_layernorm):
+            w = norm.weight
+            if getattr(norm, "zero_centered_gamma", False) or self.config.layernorm_zero_centered_gamma:
+                w = w + 1
+            weights.append(w)
+        return fused_qk_norm_rope(
+            mixed, weights[0], weights[1], pos_emb, hq, self.config.layernorm_epsilon
+        )
+
     @abstractmethod
     def get_query_key_value_tensors(
         self,
@@ -1389,14 +1428,24 @@ class Attention(MegatronModule, ABC):
                 self.config.fused_single_qkv_rope and split_qkv
             ), "fused_single_qkv_rope requested but not available/supported for the config."
 
+        fuse_qk_norm_rope = self._fused_qk_norm_rope_applies(
+            inference_context, packed_seq_params, rotary_pos_emb
+        )
         qkv_linear_manager = off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear")
         with qkv_linear_manager as hidden_states:
-            qkv_output = self.get_query_key_value_tensors(
-                hidden_states,
-                key_value_states,
-                split_qkv=split_qkv,
-                output_gate=self.config.attention_output_gate,
-            )
+            if fuse_qk_norm_rope:
+                mixed, _ = self.get_query_key_value_tensors(
+                    hidden_states, key_value_states, split_qkv=False
+                )
+                qkv_output = self._fused_qk_norm_rope(mixed, rotary_pos_emb[0])
+                rotary_pos_emb = None  # applied
+            else:
+                qkv_output = self.get_query_key_value_tensors(
+                    hidden_states,
+                    key_value_states,
+                    split_qkv=split_qkv,
+                    output_gate=self.config.attention_output_gate,
+                )
         # `qkv_output` may be a tuple; commit supports tuple/list and will keep structure.
         qkv_output = qkv_linear_manager.group_offload(qkv_output, forced_released_tensors=[])
         attn_mask_type = self.attn_mask_type
