@@ -101,12 +101,11 @@ class _MegatronSelfAttentionAdapter(MegatronModule):
                 "Complex KDA needs flash-linear-attention; install `fla` or "
                 "choose another experimental_attention_variant"
             )
-        if config.context_parallel_size != 1:
-            raise NotImplementedError(
-                "experimental_attention_variant='complex_kda' does not support context "
-                f"parallelism (got context_parallel_size={config.context_parallel_size})."
-            )
         self.tp_group = pg_collection.tp if pg_collection is not None else None
+        # Context parallelism (fla_cp.py): the Complex KDA layer runs its piece of the token
+        # stream with FLA's CP kernels; other layers the whole gathered sequence.
+        cp = pg_collection.cp if pg_collection is not None else None
+        self.cp_group = cp if cp is not None and cp.size() > 1 else None
         self.layer = None  # set by the subclass
 
     def _replicate(self):
@@ -145,6 +144,9 @@ class _MegatronSelfAttentionAdapter(MegatronModule):
                 "ignoring it would run the sequences into each other"
             )
         hidden_states = gather_replicated_input(hidden_states, self.config, self.tp_group)
+        if self.cp_group is not None:
+            y = self._forward_cp(hidden_states)
+            return scatter_replicated_output(y, self.config, self.tp_group), None
         # (s, b, h) -> (b, s, h)
         x = hidden_states.transpose(0, 1).contiguous()
         out = self.layer(x)
@@ -153,6 +155,22 @@ class _MegatronSelfAttentionAdapter(MegatronModule):
         # folded into the projections here, so there is none to return.
         y = y.transpose(0, 1).contiguous()
         return scatter_replicated_output(y, self.config, self.tp_group), None
+
+    def _forward_cp(self, hidden_states):
+        """[s / cp, b, h] in Megatron's CP layout -> the same, through the layer."""
+        from megatron.core.ssm import fla_cp
+
+        group, batch = self.cp_group, hidden_states.shape[1]
+        if isinstance(self.layer, ComplexKimiDeltaAttention):
+            x = fla_cp.to_stream(hidden_states, group)
+            ctx = fla_cp.cp_context(group, batch, hidden_states.shape[0] * group.size(),
+                                    self.layer.conv_size, x.device)
+            out = self.layer(x, cp_context=ctx)
+            return fla_cp.from_stream(out[0] if isinstance(out, tuple) else out, group, batch)
+        x = fla_cp.full_sequence(hidden_states, group).transpose(0, 1).contiguous()
+        out = self.layer(x)
+        out = out[0] if isinstance(out, tuple) else out
+        return fla_cp.local_sequence(out.transpose(0, 1).contiguous(), group)
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Replicated tensors: the layer is a full copy on every TP rank."""

@@ -154,8 +154,10 @@ class EngramLayer(MegatronModule):
     ):
         super().__init__(config)
         assert pg_collection is not None, "pg_collection must be provided for EngramLayer"
-        if pg_collection.cp.size() != 1:
-            raise NotImplementedError("Engram does not support context parallelism.")
+        # Context parallelism: the n-gram hash and the causal conv need the history across
+        # the (load-balanced) CP chunks, so Engram runs on the gathered sequence and keeps
+        # this rank's chunks (fla_cp.py; its compute is not split over CP).
+        self.cp_group = pg_collection.cp if pg_collection.cp.size() > 1 else None
         self.config = config
         self.layer_number = layer_number
         self.tp_group = pg_collection.tp
@@ -365,7 +367,15 @@ class EngramLayer(MegatronModule):
         if self.residual_scheme is not None:
             hidden_states, ctx = self.residual_scheme.read(hidden_states, self._depth_state)
         h = gather_replicated_input(hidden_states, self.config, self.tp_group)  # [s, b, h]
-        e = self._memory(self._input_ids).to(h.dtype)
+        input_ids = self._input_ids
+        if self.cp_group is not None:
+            from megatron.core.ssm import fla_cp
+
+            h = fla_cp.full_sequence(h, self.cp_group)
+            input_ids = fla_cp.full_sequence(
+                input_ids.transpose(0, 1), self.cp_group, differentiable=False
+            ).transpose(0, 1)
+        e = self._memory(input_ids).to(h.dtype)
         k = self.key_proj(e)
         v = self.value_proj(e)
         gate = (self.hidden_norm(h).float() * self.key_norm(k).float()).sum(-1, keepdim=True)
@@ -381,6 +391,8 @@ class EngramLayer(MegatronModule):
         pad = (self.kernel_size - 1) * self.dilation
         conv = self.conv1d(F.pad(v.permute(1, 2, 0), (pad, 0))).permute(2, 0, 1)
         y = F.silu(conv) + v
+        if self.cp_group is not None:
+            y = fla_cp.local_sequence(y, self.cp_group)
         y = scatter_replicated_output(y, self.config, self.tp_group)
         if self.residual_scheme is not None:
             return self.residual_scheme.write(y, ctx, self._depth_state, self.layer_number)

@@ -163,6 +163,8 @@ class _FLALayerWrapper(MegatronModule):
     """Common plumbing for a self-contained FLA layer used as a Megatron mixer."""
 
     _NAME = "fla"
+    # The layer takes FLA's context-parallel context (cp_context) through its kwargs.
+    _FLA_CP = False
     # Where the layer comes from, for the error when it is missing.
     _NEEDS = "fla.layers.*"
 
@@ -191,11 +193,10 @@ class _FLALayerWrapper(MegatronModule):
 
         self.tp_group = pg_collection.tp if pg_collection is not None else None
         cp = pg_collection.cp.size() if pg_collection is not None else 1
-        if cp != 1:
-            raise NotImplementedError(
-                f"{self._NAME} does not support context parallelism (got cp={cp}): the "
-                "FLA layer runs its recurrence over the sequence it is given."
-            )
+        # Context parallelism (fla_cp.py): layers with FLA's CP kernels (_FLA_CP) run their
+        # contiguous piece of the token stream and pass the recurrent state across ranks; the
+        # others run the whole gathered sequence on every rank (correct, not split).
+        self.cp_group = pg_collection.cp if cp > 1 else None
 
         head_dim = config.linear_key_head_dim
         num_heads = config.linear_num_key_heads
@@ -287,6 +288,9 @@ class _FLALayerWrapper(MegatronModule):
         if packed_seq_params is not None:
             raise NotImplementedError(f"{self._NAME} does not support packed sequences yet.")
         hidden_states = gather_replicated_input(hidden_states, self.config, self.tp_group)
+        if self.cp_group is not None:
+            out = self._forward_cp(hidden_states)
+            return scatter_replicated_output(out, self.config, self.tp_group), None
         # Megatron is sequence-first, FLA is batch-first.
         x = hidden_states.transpose(0, 1).contiguous()
         # attention_mask is Megatron's causal mask; these layers are causal by
@@ -294,6 +298,22 @@ class _FLALayerWrapper(MegatronModule):
         out, _, _ = self._fla_forward(hidden_states=x, attention_mask=None, use_cache=False)
         out = out.transpose(0, 1).contiguous()
         return scatter_replicated_output(out, self.config, self.tp_group), None
+
+    def _forward_cp(self, hidden_states: Tensor) -> Tensor:
+        """[s / cp, b, h] in Megatron's CP layout -> the same, through the layer."""
+        from megatron.core.ssm import fla_cp
+
+        group, batch = self.cp_group, hidden_states.shape[1]
+        if self._FLA_CP:
+            x = fla_cp.to_stream(hidden_states, group)
+            ctx = fla_cp.cp_context(group, batch, hidden_states.shape[0] * group.size(),
+                                    self.config.linear_conv_kernel_dim, x.device)
+            out, _, _ = self._fla_forward(hidden_states=x, attention_mask=None, use_cache=False,
+                                          cp_context=ctx)
+            return fla_cp.from_stream(out, group, batch)
+        x = fla_cp.full_sequence(hidden_states, group).transpose(0, 1).contiguous()
+        out, _, _ = self._fla_forward(hidden_states=x, attention_mask=None, use_cache=False)
+        return fla_cp.local_sequence(out.transpose(0, 1).contiguous(), group)
 
 
 class KDA(_FLALayerWrapper):
@@ -309,6 +329,7 @@ class KDA(_FLALayerWrapper):
 
     _NAME = "kda"
     _NEEDS = "fla.layers.kda"
+    _FLA_CP = True
 
     @staticmethod
     def _fla_class():
@@ -358,6 +379,7 @@ class SignedKDA(_FLALayerWrapper):
     """
 
     _NAME = "signed_kda"
+    _FLA_CP = True
     _NEEDS = "fla.layers.complex_kda_layer (or legacy fla.layers.signed_kda_layer)"
 
     @staticmethod

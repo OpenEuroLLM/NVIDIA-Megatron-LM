@@ -761,7 +761,6 @@ class Attention(MegatronModule, ABC):
             and hasattr(self.q_layernorm, "weight")
             and hasattr(self.k_layernorm, "weight"),
             "no nGPT s_qk": getattr(self, "ngpt_sq", None) is None,
-            "context parallel 1": self.pg_collection.cp.size() == 1,
             "non-interleaved RoPE": not self.config.rotary_interleaved,
             "no YaRN mscale": self._yarn_concentration_factor in (None, 1.0),
             "num_query_groups >= TP": self.config.num_query_groups >= self.world_size,
