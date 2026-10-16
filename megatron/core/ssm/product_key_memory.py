@@ -87,6 +87,14 @@ def product_key_topk(
     q1, q2 = q.chunk(2, dim=-1)
     s1 = torch.einsum("thd,hnd->thn", q1.float(), keys1.float())
     s2 = torch.einsum("thd,hnd->thn", q2.float(), keys2.float())
+    from megatron.core.fusions.fused_product_key_topk import (
+        fused_product_key_topk,
+        fused_product_key_topk_applies,
+    )
+
+    if fused_product_key_topk_applies(s1, topk):
+        # the three top-k selections and the gathers in one Triton kernel each way
+        return fused_product_key_topk(s1, s2, topk)
     v1, i1 = s1.topk(topk, dim=-1)
     v2, i2 = s2.topk(topk, dim=-1)
     combined = (v1.unsqueeze(-1) + v2.unsqueeze(-2)).flatten(-2)  # [T, H, k*k]
