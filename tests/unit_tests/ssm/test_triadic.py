@@ -214,3 +214,28 @@ def test_gradients_match_the_reference(e, d, base):
         a, r = grads[0][name].float(), grads[1][name].float()
         err = (a - r).norm() / r.norm().clamp(min=1e-6)
         assert err < 5e-2, (name, float(err))
+
+
+@pytest.mark.parametrize("base,e", [("gdn", 1), ("gdn", 2), ("kda", 2), ("ckda", 4)])
+def test_fused_inputs_match_the_module_path(base, e):
+    """One GEMM for all projections + two conv launches == the module-by-module path."""
+    torch.manual_seed(0)
+    layer = triadic.TriadicDeltaAttention(hidden_size=128, head_dim=64, num_heads=2, e=e,
+                                          base=base, kernel="kda").cuda()
+    x = torch.randn(2, 64, 128, device="cuda")
+    results = []
+    for fused in (True, False):
+        layer.fuse_inputs = fused
+        layer.zero_grad()
+        xx = x.clone().requires_grad_()
+        out = layer(xx)[0]
+        out.square().mean().backward()
+        results.append((out.detach(), xx.grad,
+                        {n: p.grad.clone() for n, p in layer.named_parameters() if p.grad is not None}))
+    (o1, gx1, g1), (o2, gx2, g2) = results
+    # (NGC containers may run fp32 GEMMs as TF32: one GEMM vs. several rounds differently)
+    torch.testing.assert_close(o1, o2, rtol=1e-2, atol=1e-3)
+    torch.testing.assert_close(gx1, gx2, rtol=1e-2, atol=1e-3)
+    assert g1.keys() == g2.keys()
+    for n in g1:
+        assert (g1[n] - g2[n]).norm() <= 2e-2 * g2[n].norm() + 1e-5, n

@@ -44,6 +44,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from megatron.core.jit import jit_fuser
+
 try:
     from fla.layers.complex_kda_layer import compute_gate, init_dt_bias
     from fla.modules import FusedRMSNormGated, ShortConvolution
@@ -90,6 +92,33 @@ def cute_applies(base: str, head_dim: int, e: int) -> bool:
 
 def _l2norm(x: torch.Tensor) -> torch.Tensor:
     return F.normalize(x.float(), dim=-1, eps=1e-6)
+
+
+@jit_fuser
+def _qkv_prep(qkv: torch.Tensor, h: int, d: int):
+    """q, k unit-normalised (fp32 math, input dtype out) and v, from the conv'd [b, t, 3hd]."""
+    b, t, _ = qkv.shape
+    q, k, v = qkv.view(b, t, 3, h, d).unbind(2)
+    q = F.normalize(q.float(), dim=-1, eps=1e-6).to(qkv.dtype)
+    k = F.normalize(k.float(), dim=-1, eps=1e-6).to(qkv.dtype)
+    return q, k, v
+
+
+@jit_fuser
+def _second_key_prep(kq2: torch.Tensor, h: int, e: int):
+    """k2, q2 = l2norm(softplus(.)) over E, fp32."""
+    b, t, _ = kq2.shape
+    k2, q2 = kq2.float().view(b, t, 2, h, e).unbind(2)
+    return (F.normalize(F.softplus(k2), dim=-1, eps=1e-6),
+            F.normalize(F.softplus(q2), dim=-1, eps=1e-6))
+
+
+@jit_fuser
+def _slice_decay(a2: torch.Tensor, dt2_bias: torch.Tensor, a2_log: torch.Tensor, h: int, e: int):
+    """g2 = -exp(A2) softplus(W x + dt2) per (head, slice), fp32."""
+    b, t, _ = a2.shape
+    g2 = -a2_log.float().exp() * F.softplus(a2.float() + dt2_bias.float())
+    return g2.view(b, t, h, e)
 
 
 def expand_triadic(q, k, q2, k2, g2, g=None, sign=None):
@@ -288,6 +317,46 @@ class TriadicDeltaAttention(nn.Module):
         )
         self.o_norm = FusedRMSNormGated(head_dim, activation="sigmoid", eps=norm_eps)
         self.o_proj = nn.Linear(key_dim, hidden_size, bias=False)
+        # one GEMM for all input projections and two short-conv launches instead of
+        # nine + five (same parameters; False: the module-by-module path, for tests)
+        self.fuse_inputs = True
+
+    def _fused_inputs(self, x):
+        """All input projections as one GEMM (weights concatenated at run time, so the
+        parameters and checkpoints are those of the separate modules), the q/k/v and
+        k2/q2 short convolutions as one launch each, the elementwise prep compiled."""
+        from fla.modules.conv.causal_conv1d import causal_conv1d
+
+        b, t, _ = x.shape
+        kd, he = self.h * self.d, self.h * self.e
+        mods = [self.q_proj, self.k_proj, self.v_proj]
+        if self.e > 1:
+            mods += [self.k2_proj, self.q2_proj]
+        mods += [self.a2_proj, self.b_proj, self.g_proj[0]]
+        if self.base != "gdn":
+            mods.append(self.f_proj[0])
+        y = F.linear(x, torch.cat([m.weight for m in mods], dim=0))
+        sizes = [3 * kd] + ([2 * he] if self.e > 1 else []) + [he, self.h, self.d]
+        sizes += [self.d] if self.base != "gdn" else []
+        parts = list(torch.split(y, sizes, dim=-1))
+        qkv = parts.pop(0)
+        w = torch.cat([c.weight for c in (self.q_conv1d, self.k_conv1d, self.v_conv1d)], 0)
+        qkv, _ = causal_conv1d(qkv.contiguous(), weight=w.squeeze(1), activation="silu")
+        q, k, v = _qkv_prep(qkv, self.h, self.d)
+        k2 = q2 = None
+        if self.e > 1:
+            kq2 = parts.pop(0)
+            w2 = torch.cat([self.k2_conv1d.weight, self.q2_conv1d.weight], 0)
+            kq2, _ = causal_conv1d(kq2.contiguous(), weight=w2.squeeze(1), activation=None)
+            k2, q2 = _second_key_prep(kq2, self.h, self.e)
+        a2, beta, gate_low = parts[0], parts[1], parts[2]
+        g2 = _slice_decay(a2, self.dt2_bias, self.A2_log, self.h, self.e)
+        g = sign = None
+        if self.base != "gdn":
+            z = self.f_proj[1](parts[3]).view(b, t, self.h, self.d)
+            sign, g = compute_gate(self.gate, z, self.A_log, self.dt_bias.view(self.h, self.d),
+                                   self.lower_bound)
+        return q, k, v, k2, q2, g2, g, sign, beta.float(), gate_low
 
     def _gates(self, x):
         b, t, _ = x.shape
@@ -306,21 +375,25 @@ class TriadicDeltaAttention(nn.Module):
             raise NotImplementedError("the triadic variant takes no padding mask")
         x = hidden_states
         b, t, _ = x.shape
-        q, _ = self.q_conv1d(self.q_proj(x))
-        k, _ = self.k_conv1d(self.k_proj(x))
-        v, _ = self.v_conv1d(self.v_proj(x))
-        q = _l2norm(q.view(b, t, self.h, self.d))
-        k = _l2norm(k.view(b, t, self.h, self.d))
-        v = v.view(b, t, self.h, self.d)
-        if self.e > 1:
-            k2, _ = self.k2_conv1d(self.k2_proj(x))
-            q2, _ = self.q2_conv1d(self.q2_proj(x))
-            k2 = _l2norm(F.softplus(k2.float()).view(b, t, self.h, self.e))
-            q2 = _l2norm(F.softplus(q2.float()).view(b, t, self.h, self.e))
+        if self.fuse_inputs:
+            q, k, v, k2, q2, g2, g, sign, beta, gate_low = self._fused_inputs(x)
         else:
+            q, _ = self.q_conv1d(self.q_proj(x))
+            k, _ = self.k_conv1d(self.k_proj(x))
+            v, _ = self.v_conv1d(self.v_proj(x))
+            q = _l2norm(q.view(b, t, self.h, self.d))
+            k = _l2norm(k.view(b, t, self.h, self.d))
+            v = v.view(b, t, self.h, self.d)
+            if self.e > 1:
+                k2, _ = self.k2_conv1d(self.k2_proj(x))
+                q2, _ = self.q2_conv1d(self.q2_proj(x))
+                k2 = _l2norm(F.softplus(k2.float()).view(b, t, self.h, self.e))
+                q2 = _l2norm(F.softplus(q2.float()).view(b, t, self.h, self.e))
+            g2, g, sign = self._gates(x)
+            beta = self.b_proj(x).float()
+            gate_low = self.g_proj[0](x)
+        if self.e == 1:
             k2 = q2 = torch.ones(b, t, self.h, 1, device=x.device, dtype=torch.float32)
-        g2, g, sign = self._gates(x)
-        beta = self.b_proj(x).float()
         if self.cute is not None and t % 64 == 0 and self.base == "gdn":
             # Triadic GDN without forming kappa (beta in (0, 1): sigmoid here).
             o = self.cute(q.to(torch.bfloat16), k.to(torch.bfloat16), v.to(torch.bfloat16),
@@ -340,6 +413,6 @@ class TriadicDeltaAttention(nn.Module):
             from megatron.core.fusions.fused_xsa import exclusive_self_attention_heads
 
             o = exclusive_self_attention_heads(o, v)
-        gate = self.g_proj(x).view(b, t, self.h, self.d)
+        gate = self.g_proj[1](gate_low).view(b, t, self.h, self.d)
         o = self.o_norm(o, gate)
         return self.o_proj(o.reshape(b, t, self.h * self.d)), None, None
