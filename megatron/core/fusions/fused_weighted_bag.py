@@ -139,8 +139,10 @@ def weighted_bag(
     """``out[t] = sum_j weights[t, j] * table[index[t, j]]``, ``[T, D]`` in ``out_dtype``.
 
     ``table`` ``[U, D]`` (any float dtype), ``index`` ``[T, J]`` (int, rows of ``table``),
-    ``weights`` ``[T, J]``. Torch fallback (fp32 embedding_bag) off CUDA / without Triton.
+    ``weights`` ``[T, J]`` (or any shape of ``T * J`` elements). Torch fallback (fp32
+    embedding_bag) off CUDA / without Triton.
     """
+    weights = weights.reshape(index.shape)  # e.g. [T, heads, topk] for [T, heads * topk]
     if not (HAVE_TRITON and table.is_cuda):
         return weighted_bag_reference(table, index, weights).to(out_dtype)
     return _WeightedBag.apply(table, index, weights, out_dtype)

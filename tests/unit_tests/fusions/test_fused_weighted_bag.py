@@ -50,3 +50,11 @@ def test_backward_is_deterministic():
         weighted_bag(tab, index, weights).sum().backward()
         grads.append(tab.grad)
     assert torch.equal(grads[0], grads[1])
+
+
+def test_weights_in_another_shape():
+    """PKM passes [T, heads, topk] weights for a [T, heads * topk] index."""
+    table, index, weights = _case(16, 8, 20, 64, torch.float32)
+    w = weights.view(16, 2, 4).clone().requires_grad_(True)
+    weighted_bag(table, index, w).sum().backward()
+    assert w.grad.shape == (16, 2, 4)
