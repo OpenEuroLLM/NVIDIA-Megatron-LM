@@ -8,6 +8,7 @@ from unittest import mock
 import pytest
 import torch
 
+from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import load, save
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.utils import unwrap_model
@@ -52,22 +53,34 @@ class TestCpuOffloadResume:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.parametrize("sharding_type", ["dp_reshardable", "fully_reshardable"])
     @pytest.mark.parametrize("offload_fraction", [1.0, 0.5])
     @pytest.mark.parametrize("precision_aware", [True, False])
-    def test_resume_matches_uninterrupted(self, tmp_path_dist_ckpt, offload_fraction, precision_aware):
+    def test_resume_matches_uninterrupted(
+        self, tmp_path_dist_ckpt, offload_fraction, precision_aware, sharding_type
+    ):
         Utils.initialize_model_parallel(1, 1)
+        # as megatron.training.checkpointing._build_sharded_state_dict_metadata
+        md = {
+            "distrib_optim_sharding_type": sharding_type,
+            "singleton_local_shards": False,
+            "chained_optim_avoid_prefix": True,
+            "dp_cp_group": parallel_state.get_data_parallel_group(with_context_parallel=True),
+        }
         with TempNamedDir(tmp_path_dist_ckpt / 'cpu_offload_resume', sync=True) as ckpt_dir:
             model_a, opt_a = _setup(1, offload_fraction, precision_aware)
             _train(model_a, opt_a, range(3))
-            model_sd = unwrap_model(model_a[0]).sharded_state_dict()
-            save({"model": model_sd, "optimizer": opt_a.sharded_state_dict(model_sd)}, ckpt_dir)
+            model_sd = unwrap_model(model_a[0]).sharded_state_dict(metadata=md)
+            save({"model": model_sd, "optimizer": opt_a.sharded_state_dict(model_sd, metadata=md)},
+                 ckpt_dir)
             _train(model_a, opt_a, range(3, 6))
             ref = _params(model_a)
 
             model_b, opt_b = _setup(7, offload_fraction, precision_aware)  # other init
-            model_sd = unwrap_model(model_b[0]).sharded_state_dict()
+            model_sd = unwrap_model(model_b[0]).sharded_state_dict(metadata=md)
             loaded = load(
-                {"model": model_sd, "optimizer": opt_b.sharded_state_dict(model_sd, is_loading=True)},
+                {"model": model_sd,
+                 "optimizer": opt_b.sharded_state_dict(model_sd, is_loading=True, metadata=md)},
                 ckpt_dir,
             )
             unwrap_model(model_b[0]).load_state_dict(loaded["model"])
