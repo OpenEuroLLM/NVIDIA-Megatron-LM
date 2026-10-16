@@ -88,14 +88,18 @@ class PowerRetentionAttention(nn.Module):
         b, t, _ = x.shape
         # all input projections as one GEMM (weights concatenated at run time)
         mods = [self.q_proj, self.k_proj, self.v_proj] + ([self.g_proj] if self.gating else [])
-        y = F.linear(x, torch.cat([m.weight for m in mods], dim=0))
+        weights = [m.weight for m in mods]
+        pad = -sum(w.shape[0] for w in weights) % 64  # odd widths run on a slow sm80 GEMM
+        if pad:
+            weights.append(weights[0].new_zeros(pad, weights[0].shape[1]))
+        y = F.linear(x, torch.cat(weights, dim=0))
         dim = self.h * self.d
         q, k, v = (y[..., i * dim : (i + 1) * dim].view(b, t, self.h, self.d) for i in range(3))
         if self.rope:
             q, k = _rope(q), _rope(k)
         log_g = None
         if self.gating:
-            log_g = F.logsigmoid(GATE_INIT + y[..., 3 * dim :].float()).contiguous()
+            log_g = F.logsigmoid(GATE_INIT + y[..., 3 * dim : 3 * dim + self.h].float()).contiguous()
         chunk = self.chunk_size if t > self.chunk_size else None
         o = power_retention(
             q.contiguous(), k.contiguous(), v.contiguous(), log_g,
