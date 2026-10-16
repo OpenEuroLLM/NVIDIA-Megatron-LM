@@ -56,13 +56,54 @@ def qk_norm_rope_reference(mixed, q_weight, k_weight, freqs, hq, eps):
 if HAVE_TRITON:
 
     @triton.jit
-    def _rope_partner(cols, ROT: tl.constexpr, HALF: tl.constexpr):
-        # rotate_half partner channel and sign: out[c] = y[c] cos + sign * y[p] sin
-        partner = tl.where(cols < HALF, cols + HALF, cols - HALF)
-        sign = tl.where(cols < HALF, -1.0, 1.0)
-        rotated = cols < ROT
-        return tl.where(rotated, partner, cols), sign, rotated
+    def _load_parts(
+        ptr,
+        rows2,
+        m2,
+        HALF: tl.constexpr,
+        ROT: tl.constexpr,
+        REST: tl.constexpr,
+        REST_P: tl.constexpr,
+    ):
+        """The rotary halves [0, HALF), [HALF, ROT) and the tail [ROT, ROT + REST) of rows."""
+        lo = tl.load(ptr + rows2 + tl.arange(0, HALF)[None, :], mask=m2, other=0.0).to(
+            tl.float32
+        )
+        hi = tl.load(
+            ptr + rows2 + HALF + tl.arange(0, HALF)[None, :], mask=m2, other=0.0
+        ).to(tl.float32)
+        rc = tl.arange(0, REST_P)
+        rest = tl.load(
+            ptr + rows2 + ROT + rc[None, :], mask=m2 & (rc < REST)[None, :], other=0.0
+        ).to(tl.float32)
+        return lo, hi, rest
 
+    @triton.jit
+    def _store_parts(
+        ptr,
+        rows2,
+        m2,
+        lo,
+        hi,
+        rest,
+        HALF: tl.constexpr,
+        ROT: tl.constexpr,
+        REST: tl.constexpr,
+        REST_P: tl.constexpr,
+    ):
+        ty = ptr.dtype.element_ty
+        tl.store(ptr + rows2 + tl.arange(0, HALF)[None, :], lo.to(ty), mask=m2)
+        tl.store(ptr + rows2 + HALF + tl.arange(0, HALF)[None, :], hi.to(ty), mask=m2)
+        rc = tl.arange(0, REST_P)
+        tl.store(
+            ptr + rows2 + ROT + rc[None, :], rest.to(ty), mask=m2 & (rc < REST)[None, :]
+        )
+
+    _CONFIGS = [
+        triton.Config({"TB": tb}, num_warps=w) for tb in (16, 32, 64) for w in (2, 4, 8)
+    ]
+
+    @triton.autotune(configs=_CONFIGS, key=["T", "NG", "HQ", "D", "ROT"])
     @triton.jit
     def _fwd_kernel(
         mixed,
@@ -80,57 +121,69 @@ if HAVE_TRITON:
         HQ: tl.constexpr,
         D: tl.constexpr,
         ROT: tl.constexpr,
+        REST_P: tl.constexpr,
         TB: tl.constexpr,
     ):
+        HALF: tl.constexpr = ROT // 2
+        REST: tl.constexpr = D - ROT
         pid_t = tl.program_id(0)
         g = tl.program_id(1)
         rows = pid_t * TB + tl.arange(0, TB)  # token index t = s * B + b
         rmask = rows < T
-        cols = tl.arange(0, D)
-        HALF: tl.constexpr = ROT // 2
-        partner, sign, rotated = _rope_partner(cols, ROT, HALF)
         m2 = rmask[:, None]
-        s_idx = rows // B
-        fcols = tl.where(rotated, cols, 0)
+        hc = tl.arange(0, HALF)
         ang = tl.load(
-            freqs + s_idx[:, None] * ROT + fcols[None, :],
-            mask=m2 & rotated[None, :],
-            other=0.0,
+            freqs + (rows // B)[:, None] * HALF + hc[None, :], mask=m2, other=0.0
         )
         cos = tl.cos(ang)
         sin = tl.sin(ang)
-        base = (rows[:, None] * NG + g) * ((HQ + 2) * D)
+        rc = tl.arange(0, REST_P)
+        base = ((rows * NG + g) * ((HQ + 2) * D))[:, None]
         for j in tl.static_range(HQ + 2):
-            x = tl.load(mixed + base + j * D + cols[None, :], mask=m2, other=0.0).to(
-                tl.float32
-            )
+            lo, hi, rest = _load_parts(mixed + j * D, base, m2, HALF, ROT, REST, REST_P)
             if j == HQ + 1:  # value: plain copy
-                tl.store(
-                    v_out + (rows[:, None] * NG + g) * D + cols[None, :],
-                    x.to(v_out.dtype.element_ty),
-                    mask=m2,
+                _store_parts(
+                    v_out,
+                    ((rows * NG + g) * D)[:, None],
+                    m2,
+                    lo,
+                    hi,
+                    rest,
+                    HALF,
+                    ROT,
+                    REST,
+                    REST_P,
                 )
             else:
                 w_ptr = qw if j < HQ else kw
-                w = tl.load(w_ptr + cols).to(tl.float32)
-                wp = tl.load(w_ptr + partner).to(tl.float32)
-                xp = tl.load(
-                    mixed + base + j * D + partner[None, :], mask=m2, other=0.0
-                ).to(tl.float32)
-                rstd = 1.0 / tl.sqrt(tl.sum(x * x, axis=1) / D + eps)
-                y = x * rstd[:, None] * w[None, :]
-                yp = xp * rstd[:, None] * wp[None, :]
-                out = tl.where(rotated[None, :], y * cos + sign[None, :] * yp * sin, y)
+                wlo = tl.load(w_ptr + hc).to(tl.float32)
+                whi = tl.load(w_ptr + HALF + hc).to(tl.float32)
+                wr = tl.load(w_ptr + ROT + rc, mask=rc < REST, other=0.0).to(tl.float32)
+                ss = (
+                    tl.sum(lo * lo, axis=1)
+                    + tl.sum(hi * hi, axis=1)
+                    + tl.sum(rest * rest, axis=1)
+                )
+                rstd = 1.0 / tl.sqrt(ss / D + eps)
+                ylo = lo * rstd[:, None] * wlo[None, :]
+                yhi = hi * rstd[:, None] * whi[None, :]
+                yr = rest * rstd[:, None] * wr[None, :]
+                olo = ylo * cos - yhi * sin
+                ohi = yhi * cos + ylo * sin
                 if j < HQ:
-                    dst = (
-                        q_out + ((rows[:, None] * NG + g) * HQ + j) * D + cols[None, :]
-                    )
-                    tl.store(dst, out.to(q_out.dtype.element_ty), mask=m2)
+                    dst = (((rows * NG + g) * HQ + j) * D)[:, None]
+                    _store_parts(q_out, dst, m2, olo, ohi, yr, HALF, ROT, REST, REST_P)
                 else:
-                    dst = k_out + (rows[:, None] * NG + g) * D + cols[None, :]
-                    tl.store(dst, out.to(k_out.dtype.element_ty), mask=m2)
+                    dst = ((rows * NG + g) * D)[:, None]
+                    _store_parts(k_out, dst, m2, olo, ohi, yr, HALF, ROT, REST, REST_P)
                 tl.store(rstd_out + (rows * NG + g) * (HQ + 1) + j, rstd, mask=rmask)
 
+    # the backward's per-block weight partials are sized for the smallest TB and zeroed
+    @triton.autotune(
+        configs=_CONFIGS,
+        key=["T", "NG", "HQ", "D", "ROT"],
+        reset_to_zero=["dqw_part", "dkw_part"],
+    )
     @triton.jit
     def _bwd_kernel(
         mixed,
@@ -150,87 +203,106 @@ if HAVE_TRITON:
         HQ: tl.constexpr,
         D: tl.constexpr,
         ROT: tl.constexpr,
+        REST_P: tl.constexpr,
         TB: tl.constexpr,
     ):
+        HALF: tl.constexpr = ROT // 2
+        REST: tl.constexpr = D - ROT
         pid_t = tl.program_id(0)
         g = tl.program_id(1)
         rows = pid_t * TB + tl.arange(0, TB)
         rmask = rows < T
-        cols = tl.arange(0, D)
-        HALF: tl.constexpr = ROT // 2
-        partner, sign, rotated = _rope_partner(cols, ROT, HALF)
         m2 = rmask[:, None]
-        s_idx = rows // B
-        fcols = tl.where(rotated, cols, 0)
-        pcols = tl.where(rotated, partner, 0)
+        hc = tl.arange(0, HALF)
+        rc = tl.arange(0, REST_P)
         ang = tl.load(
-            freqs + s_idx[:, None] * ROT + fcols[None, :],
-            mask=m2 & rotated[None, :],
-            other=0.0,
-        )
-        ang_p = tl.load(
-            freqs + s_idx[:, None] * ROT + pcols[None, :],
-            mask=m2 & rotated[None, :],
-            other=0.0,
+            freqs + (rows // B)[:, None] * HALF + hc[None, :], mask=m2, other=0.0
         )
         cos = tl.cos(ang)
-        sin_p = tl.sin(ang_p)
-        # d/dy of (y cos + sign_c y[p(c)] sin_c): g[c] = do[c] cos[c] - sign[c] do[p(c)] sin[p(c)]
-        base = (rows[:, None] * NG + g) * ((HQ + 2) * D)
-        dqw_acc = tl.zeros([D], dtype=tl.float32)
-        dkw_acc = tl.zeros([D], dtype=tl.float32)
+        sin = tl.sin(ang)
+        base = ((rows * NG + g) * ((HQ + 2) * D))[:, None]
+        wq_lo = tl.zeros([HALF], dtype=tl.float32)
+        wq_hi = tl.zeros([HALF], dtype=tl.float32)
+        wq_r = tl.zeros([REST_P], dtype=tl.float32)
+        wk_lo = tl.zeros([HALF], dtype=tl.float32)
+        wk_hi = tl.zeros([HALF], dtype=tl.float32)
+        wk_r = tl.zeros([REST_P], dtype=tl.float32)
         for j in tl.static_range(HQ + 2):
             if j == HQ + 1:
-                gv = tl.load(
-                    dv + (rows[:, None] * NG + g) * D + cols[None, :],
-                    mask=m2,
-                    other=0.0,
+                glo, ghi, gr = _load_parts(
+                    dv, ((rows * NG + g) * D)[:, None], m2, HALF, ROT, REST, REST_P
                 )
-                tl.store(
-                    dmixed + base + j * D + cols[None, :],
-                    gv.to(dmixed.dtype.element_ty),
-                    mask=m2,
+                _store_parts(
+                    dmixed + j * D, base, m2, glo, ghi, gr, HALF, ROT, REST, REST_P
                 )
             else:
                 if j < HQ:
-                    gptr = dq + ((rows[:, None] * NG + g) * HQ + j) * D
-                    w = tl.load(qw + cols).to(tl.float32)
+                    src = dq
+                    off = (((rows * NG + g) * HQ + j) * D)[:, None]
+                    w_ptr = qw
                 else:
-                    gptr = dk + (rows[:, None] * NG + g) * D
-                    w = tl.load(kw + cols).to(tl.float32)
-                do = tl.load(gptr + cols[None, :], mask=m2, other=0.0).to(tl.float32)
-                do_p = tl.load(gptr + partner[None, :], mask=m2, other=0.0).to(
-                    tl.float32
+                    src = dk
+                    off = ((rows * NG + g) * D)[:, None]
+                    w_ptr = kw
+                dlo, dhi, dr = _load_parts(src, off, m2, HALF, ROT, REST, REST_P)
+                # transpose of the rotation [[c, -s], [s, c]]
+                glo = dlo * cos + dhi * sin
+                ghi = dhi * cos - dlo * sin
+                lo, hi, rest = _load_parts(
+                    mixed + j * D, base, m2, HALF, ROT, REST, REST_P
                 )
-                gy = tl.where(
-                    rotated[None, :], do * cos - sign[None, :] * do_p * sin_p, do
-                )
-                x = tl.load(
-                    mixed + base + j * D + cols[None, :], mask=m2, other=0.0
-                ).to(tl.float32)
                 rstd = tl.load(
                     rstd_in + (rows * NG + g) * (HQ + 1) + j, mask=rmask, other=0.0
                 )
-                xhat = x * rstd[:, None]
+                r2 = rstd[:, None]
+                xlo, xhi, xr = lo * r2, hi * r2, rest * r2
                 if j < HQ:
-                    dqw_acc += tl.sum(gy * xhat, axis=0)
+                    wq_lo += tl.sum(glo * xlo, axis=0)
+                    wq_hi += tl.sum(ghi * xhi, axis=0)
+                    wq_r += tl.sum(dr * xr, axis=0)
                 else:
-                    dkw_acc += tl.sum(gy * xhat, axis=0)
-                gx = gy * w[None, :]
-                dx = rstd[:, None] * (
-                    gx - xhat * (tl.sum(gx * xhat, axis=1) / D)[:, None]
+                    wk_lo += tl.sum(glo * xlo, axis=0)
+                    wk_hi += tl.sum(ghi * xhi, axis=0)
+                    wk_r += tl.sum(dr * xr, axis=0)
+                wlo = tl.load(w_ptr + hc).to(tl.float32)
+                whi = tl.load(w_ptr + HALF + hc).to(tl.float32)
+                wr = tl.load(w_ptr + ROT + rc, mask=rc < REST, other=0.0).to(tl.float32)
+                gxlo = glo * wlo[None, :]
+                gxhi = ghi * whi[None, :]
+                gxr = dr * wr[None, :]
+                dot = (
+                    tl.sum(gxlo * xlo, axis=1)
+                    + tl.sum(gxhi * xhi, axis=1)
+                    + tl.sum(gxr * xr, axis=1)
+                ) / D
+                d2 = dot[:, None]
+                _store_parts(
+                    dmixed + j * D,
+                    base,
+                    m2,
+                    r2 * (gxlo - xlo * d2),
+                    r2 * (gxhi - xhi * d2),
+                    r2 * (gxr - xr * d2),
+                    HALF,
+                    ROT,
+                    REST,
+                    REST_P,
                 )
-                tl.store(
-                    dmixed + base + j * D + cols[None, :],
-                    dx.to(dmixed.dtype.element_ty),
-                    mask=m2,
-                )
-        part = pid_t * NG + g
-        tl.store(dqw_part + part * D + cols, dqw_acc)
-        tl.store(dkw_part + part * D + cols, dkw_acc)
+        part = (pid_t * NG + g) * D
+        tl.store(dqw_part + part + hc, wq_lo)
+        tl.store(dqw_part + part + HALF + hc, wq_hi)
+        tl.store(dqw_part + part + ROT + rc, wq_r, mask=rc < REST)
+        tl.store(dkw_part + part + hc, wk_lo)
+        tl.store(dkw_part + part + HALF + hc, wk_hi)
+        tl.store(dkw_part + part + ROT + rc, wk_r, mask=rc < REST)
 
 
-_TB = 32
+_MIN_TB = 16  # smallest autotuned token block
+
+
+def _rest_p(d, rot):
+    """Width of the non-rotary tail block (a power of two >= 1; masked to d - rot)."""
+    return max(1, triton.next_power_of_2(d - rot)) if d > rot else 1
 
 
 class _FusedQKNormRope(torch.autograd.Function):
@@ -243,14 +315,17 @@ class _FusedQKNormRope(torch.autograd.Function):
         assert width == (hq + 2) * d and d & (d - 1) == 0, (
             "head dim must be a power of two"
         )
-        assert rot % 2 == 0 and rot <= d
-        freqs = freqs.reshape(s, rot).float().contiguous()
+        assert rot % 2 == 0 and rot <= d and (rot // 2) & (rot // 2 - 1) == 0, (
+            "rot/2: power of 2"
+        )
+        # Megatron's angles are cat(theta, theta): the kernels read the first half
+        freqs = freqs.reshape(s, rot)[:, : rot // 2].float().contiguous()
         t = s * b
         q = mixed.new_empty(s, b, ng * hq, d)
         k = mixed.new_empty(s, b, ng, d)
         v = mixed.new_empty(s, b, ng, d)
         rstd = torch.empty(t, ng, hq + 1, device=mixed.device, dtype=torch.float32)
-        grid = (triton.cdiv(t, _TB), ng)
+        grid = lambda meta: (triton.cdiv(t, meta["TB"]), ng)  # noqa: E731
         _fwd_kernel[grid](
             mixed,
             q,
@@ -267,10 +342,10 @@ class _FusedQKNormRope(torch.autograd.Function):
             HQ=hq,
             D=d,
             ROT=rot,
-            TB=_TB,
+            REST_P=_rest_p(d, rot),
         )
         ctx.save_for_backward(mixed, q_weight, k_weight, freqs, rstd)
-        ctx.hq = hq
+        ctx.hq, ctx.rot = hq, rot
         return q, k, v
 
     @staticmethod
@@ -279,13 +354,14 @@ class _FusedQKNormRope(torch.autograd.Function):
         s, b, ng, width = mixed.shape
         hq = ctx.hq
         d = width // (hq + 2)
-        rot = freqs.shape[-1]
+        rot = ctx.rot
         t = s * b
         dmixed = torch.empty_like(mixed)
-        n_tb = triton.cdiv(t, _TB)
-        dqw_part = torch.empty(n_tb * ng, d, device=mixed.device, dtype=torch.float32)
-        dkw_part = torch.empty_like(dqw_part)
-        _bwd_kernel[(n_tb, ng)](
+        n_tb = triton.cdiv(t, _MIN_TB)
+        dqw_part = torch.zeros(n_tb * ng, d, device=mixed.device, dtype=torch.float32)
+        dkw_part = torch.zeros_like(dqw_part)
+        grid = lambda meta: (triton.cdiv(t, meta["TB"]), ng)  # noqa: E731
+        _bwd_kernel[grid](
             mixed,
             dq.contiguous(),
             dk.contiguous(),
@@ -303,7 +379,7 @@ class _FusedQKNormRope(torch.autograd.Function):
             HQ=hq,
             D=d,
             ROT=rot,
-            TB=_TB,
+            REST_P=_rest_p(d, rot),
         )
         dqw = dqw_part.sum(0).to(q_weight.dtype)
         dkw = dkw_part.sum(0).to(k_weight.dtype)
