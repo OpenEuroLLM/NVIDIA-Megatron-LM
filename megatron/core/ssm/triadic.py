@@ -335,10 +335,16 @@ class TriadicDeltaAttention(nn.Module):
         mods += [self.a2_proj, self.b_proj, self.g_proj[0]]
         if self.base != "gdn":
             mods.append(self.f_proj[0])
-        y = F.linear(x, torch.cat([m.weight for m in mods], dim=0))
         sizes = [3 * kd] + ([2 * he] if self.e > 1 else []) + [he, self.h, self.d]
         sizes += [self.d] if self.base != "gdn" else []
-        parts = list(torch.split(y, sizes, dim=-1))
+        # Zero rows up to a multiple of 64 output features: the odd total (e.g. 2638) puts
+        # the GEMM on a slow sm80 CUTLASS kernel instead of the Hopper ones.
+        pad = -sum(sizes) % 64
+        weights = [m.weight for m in mods]
+        if pad:
+            weights.append(weights[0].new_zeros(pad, weights[0].shape[1]))
+        y = F.linear(x, torch.cat(weights, dim=0))
+        parts = list(torch.split(y, sizes + ([pad] if pad else []), dim=-1))[: len(sizes)]
         qkv = parts.pop(0)
         w = torch.cat([c.weight for c in (self.q_conv1d, self.k_conv1d, self.v_conv1d)], 0)
         qkv, _ = causal_conv1d(qkv.contiguous(), weight=w.squeeze(1), activation="silu")
