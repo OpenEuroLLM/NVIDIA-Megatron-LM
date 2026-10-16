@@ -15,9 +15,10 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _inputs(s, b, ng, hq, d, rot, dtype, seed=0):
+def _inputs(s, b, ng, hq, d, rot, dtype, seed=0, gate=False):
     g = torch.Generator(device="cuda").manual_seed(seed)
-    mixed = torch.randn(s, b, ng, (hq + 2) * d, device="cuda", generator=g).to(dtype)
+    heads = hq * (2 if gate else 1) + 2
+    mixed = torch.randn(s, b, ng, heads * d, device="cuda", generator=g).to(dtype)
     qw = (1 + 0.1 * torch.randn(d, device="cuda", generator=g)).to(dtype)
     kw = (1 + 0.1 * torch.randn(d, device="cuda", generator=g)).to(dtype)
     pos = torch.arange(s, device="cuda", dtype=torch.float32)
@@ -27,26 +28,30 @@ def _inputs(s, b, ng, hq, d, rot, dtype, seed=0):
     return mixed, qw, kw, freqs
 
 
+@pytest.mark.parametrize("gate", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize(
     "s,b,ng,hq,d,rot",
     [(37, 2, 3, 1, 64, 64), (64, 3, 2, 4, 64, 64), (50, 1, 4, 2, 128, 64), (33, 2, 1, 3, 64, 32)],
 )
-def test_matches_unfused_forward_and_backward(s, b, ng, hq, d, rot, dtype):
-    mixed, qw, kw, freqs = _inputs(s, b, ng, hq, d, rot, dtype)
+def test_matches_unfused_forward_and_backward(s, b, ng, hq, d, rot, dtype, gate):
+    mixed, qw, kw, freqs = _inputs(s, b, ng, hq, d, rot, dtype, gate=gate)
     eps = 1e-6
     outs, grads = [], []
     for fn in (fused_qk_norm_rope, qk_norm_rope_reference):
         m = mixed.clone().requires_grad_()
         w1, w2 = qw.clone().requires_grad_(), kw.clone().requires_grad_()
-        q, k, v = fn(m, w1, w2, freqs, hq, eps)
+        outputs = fn(m, w1, w2, freqs, hq, eps, gate=gate)
+        q, k, v = outputs[:3]
         assert q.shape == (s, b, ng * hq, d) and k.shape == v.shape == (s, b, ng, d)
+        if gate:
+            assert outputs[3].shape == q.shape
         g = torch.Generator(device="cuda").manual_seed(1)
-        dq, dk, dv = (torch.randn(t.shape, device="cuda", generator=g).to(dtype) for t in (q, k, v))
-        (q.float() * dq.float()).sum().add_((k.float() * dk.float()).sum()).add_(
-            (v.float() * dv.float()).sum()
-        ).backward()
-        outs.append((q, k, v))
+        loss = 0
+        for t in outputs:
+            loss = loss + (t.float() * torch.randn(t.shape, device="cuda", generator=g)).sum()
+        loss.backward()
+        outs.append(outputs)
         grads.append((m.grad, w1.grad, w2.grad))
     tol = dict(rtol=1e-5, atol=1e-5) if dtype == torch.float32 else dict(rtol=2e-2, atol=2e-2)
     for a, r in zip(outs[0], outs[1]):

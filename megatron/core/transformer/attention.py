@@ -136,6 +136,12 @@ except ImportError:
     HAVE_FUSED_QKV_ROPE = False
 
 
+@jit_fuser
+def _sigmoid_output_gate(x: Tensor, gate: Tensor) -> Tensor:
+    """x * sigmoid(gate) in fp32, one fused kernel each way (torch.compile)."""
+    return (x * torch.sigmoid(gate.float())).to(x.dtype)
+
+
 class LinearQkvInterface(Protocol):
     """Interface for linear_qkv modules."""
 
@@ -754,7 +760,6 @@ class Attention(MegatronModule, ABC):
             and self.config.normalization == "RMSNorm"
             and hasattr(self.q_layernorm, "weight")
             and hasattr(self.k_layernorm, "weight"),
-            "no attention_output_gate": not self.config.attention_output_gate,
             "no nGPT s_qk": getattr(self, "ngpt_sq", None) is None,
             "context parallel 1": self.pg_collection.cp.size() == 1,
             "non-interleaved RoPE": not self.config.rotary_interleaved,
@@ -767,6 +772,18 @@ class Attention(MegatronModule, ABC):
             raise ValueError(f"fused_qk_norm_rope needs: {', '.join(missing)}")
         return True
 
+    def _mixed_qkv_for_fusion(self, hidden_states):
+        """The QKV projection as [sq, b, ng, (np/ng [+ np/ng gate] + 2) * hn] (the layout of
+        get_query_key_value_tensors before its split)."""
+        mixed, _ = apply_module(self.linear_qkv)(hidden_states)
+        hq = self.num_attention_heads_per_partition // self.num_query_groups_per_partition
+        heads = hq * (2 if self.config.attention_output_gate else 1) + 2
+        return mixed.view(
+            *mixed.shape[:-1],
+            self.num_query_groups_per_partition,
+            heads * self.hidden_size_per_attention_head,
+        )
+
     def _fused_qk_norm_rope(self, mixed, pos_emb):
         from megatron.core.fusions.fused_qk_norm_rope import fused_qk_norm_rope
 
@@ -778,7 +795,8 @@ class Attention(MegatronModule, ABC):
                 w = w + 1
             weights.append(w)
         return fused_qk_norm_rope(
-            mixed, weights[0], weights[1], pos_emb, hq, self.config.layernorm_epsilon
+            mixed, weights[0], weights[1], pos_emb, hq, self.config.layernorm_epsilon,
+            gate=self.config.attention_output_gate,
         )
 
     @abstractmethod
@@ -1434,10 +1452,9 @@ class Attention(MegatronModule, ABC):
         qkv_linear_manager = off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear")
         with qkv_linear_manager as hidden_states:
             if fuse_qk_norm_rope:
-                mixed, _ = self.get_query_key_value_tensors(
-                    hidden_states, key_value_states, split_qkv=False
+                qkv_output = self._fused_qk_norm_rope(
+                    self._mixed_qkv_for_fusion(hidden_states), rotary_pos_emb[0]
                 )
-                qkv_output = self._fused_qk_norm_rope(mixed, rotary_pos_emb[0])
                 rotary_pos_emb = None  # applied
             else:
                 qkv_output = self.get_query_key_value_tensors(
@@ -1741,12 +1758,7 @@ class Attention(MegatronModule, ABC):
             arch_metrics.record_mean("xsa/self_cos", layer, n, cos.abs())
 
     def _apply_output_gate(self, x, gate):
-        x_dtype = x.dtype
-        gate = gate.contiguous()
-        gate = gate.view(*x.shape)
-        x = x * torch.sigmoid(gate.float())
-        x = x.to(x_dtype)
-        return x
+        return _sigmoid_output_gate(x, gate.reshape(x.shape))
 
     def set_for_recompute_input_layernorm(self):
         """Set the attention layer for recompute input_layernorm. Only needed for fp8."""

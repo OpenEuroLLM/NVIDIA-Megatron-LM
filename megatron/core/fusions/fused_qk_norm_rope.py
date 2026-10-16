@@ -29,13 +29,14 @@ except ImportError:  # pragma: no cover
     HAVE_TRITON = False
 
 
-def qk_norm_rope_reference(mixed, q_weight, k_weight, freqs, hq, eps):
-    """Unfused torch semantics (fp32 math): returns q, k, v as the fused op."""
+def qk_norm_rope_reference(mixed, q_weight, k_weight, freqs, hq, eps, gate=False):
+    """Unfused torch semantics (fp32 math): returns q, k, v (, gate) as the fused op."""
     s, b, ng, width = mixed.shape
-    d = width // (hq + 2)
+    heads = hq * (2 if gate else 1) + 2
+    d = width // heads
     rot = freqs.shape[-1]
-    x = mixed.view(s, b, ng, hq + 2, d).float()
-    q, k, v = x[..., :hq, :], x[..., hq, :], x[..., hq + 1, :]
+    x = mixed.view(s, b, ng, heads, d).float()
+    q, k, v = x[..., :hq, :], x[..., heads - 2, :], x[..., heads - 1, :]
 
     def norm(t, w):
         return t * torch.rsqrt(t.pow(2).mean(-1, keepdim=True) + eps) * w.float()
@@ -50,7 +51,10 @@ def qk_norm_rope_reference(mixed, q_weight, k_weight, freqs, hq, eps):
 
     qo = rope(norm(q, q_weight)).reshape(s, b, ng * hq, d)
     ko = rope(norm(k, k_weight))
-    return qo.to(mixed.dtype), ko.to(mixed.dtype), v.to(mixed.dtype).contiguous()
+    out = (qo.to(mixed.dtype), ko.to(mixed.dtype), v.to(mixed.dtype).contiguous())
+    if gate:
+        out += (x[..., hq : 2 * hq, :].reshape(s, b, ng * hq, d).to(mixed.dtype),)
+    return out
 
 
 if HAVE_TRITON:
@@ -110,6 +114,7 @@ if HAVE_TRITON:
         q_out,
         k_out,
         v_out,
+        g_out,
         qw,
         kw,
         freqs,
@@ -119,6 +124,7 @@ if HAVE_TRITON:
         eps,
         NG: tl.constexpr,
         HQ: tl.constexpr,
+        GATE: tl.constexpr,
         D: tl.constexpr,
         ROT: tl.constexpr,
         REST_P: tl.constexpr,
@@ -138,9 +144,16 @@ if HAVE_TRITON:
         cos = tl.cos(ang)
         sin = tl.sin(ang)
         rc = tl.arange(0, REST_P)
-        base = ((rows * NG + g) * ((HQ + 2) * D))[:, None]
+        base = ((rows * NG + g) * ((HQ * (1 + GATE) + 2) * D))[:, None]
         for j in tl.static_range(HQ + 2):
-            lo, hi, rest = _load_parts(mixed + j * D, base, m2, HALF, ROT, REST, REST_P)
+            # per group: q heads, [gate heads,] k, v
+            if j < HQ:
+                xptr = mixed + j * D
+            elif j == HQ:
+                xptr = mixed + HQ * (1 + GATE) * D
+            else:
+                xptr = mixed + (HQ * (1 + GATE) + 1) * D
+            lo, hi, rest = _load_parts(xptr, base, m2, HALF, ROT, REST, REST_P)
             if j == HQ + 1:  # value: plain copy
                 _store_parts(
                     v_out,
@@ -177,6 +190,13 @@ if HAVE_TRITON:
                     dst = ((rows * NG + g) * D)[:, None]
                     _store_parts(k_out, dst, m2, olo, ohi, yr, HALF, ROT, REST, REST_P)
                 tl.store(rstd_out + (rows * NG + g) * (HQ + 1) + j, rstd, mask=rmask)
+        if GATE:  # output-gate heads: plain copy
+            for j in tl.static_range(HQ):
+                lo, hi, rest = _load_parts(
+                    mixed + (HQ + j) * D, base, m2, HALF, ROT, REST, REST_P
+                )
+                dst = (((rows * NG + g) * HQ + j) * D)[:, None]
+                _store_parts(g_out, dst, m2, lo, hi, rest, HALF, ROT, REST, REST_P)
 
     # the backward's per-block weight partials are sized for the smallest TB and zeroed
     @triton.autotune(
@@ -190,6 +210,7 @@ if HAVE_TRITON:
         dq,
         dk,
         dv,
+        dg,
         dmixed,
         qw,
         kw,
@@ -201,6 +222,7 @@ if HAVE_TRITON:
         B,
         NG: tl.constexpr,
         HQ: tl.constexpr,
+        GATE: tl.constexpr,
         D: tl.constexpr,
         ROT: tl.constexpr,
         REST_P: tl.constexpr,
@@ -220,7 +242,7 @@ if HAVE_TRITON:
         )
         cos = tl.cos(ang)
         sin = tl.sin(ang)
-        base = ((rows * NG + g) * ((HQ + 2) * D))[:, None]
+        base = ((rows * NG + g) * ((HQ * (1 + GATE) + 2) * D))[:, None]
         wq_lo = tl.zeros([HALF], dtype=tl.float32)
         wq_hi = tl.zeros([HALF], dtype=tl.float32)
         wq_r = tl.zeros([REST_P], dtype=tl.float32)
@@ -233,23 +255,34 @@ if HAVE_TRITON:
                     dv, ((rows * NG + g) * D)[:, None], m2, HALF, ROT, REST, REST_P
                 )
                 _store_parts(
-                    dmixed + j * D, base, m2, glo, ghi, gr, HALF, ROT, REST, REST_P
+                    dmixed + (HQ * (1 + GATE) + 1) * D,
+                    base,
+                    m2,
+                    glo,
+                    ghi,
+                    gr,
+                    HALF,
+                    ROT,
+                    REST,
+                    REST_P,
                 )
             else:
                 if j < HQ:
                     src = dq
                     off = (((rows * NG + g) * HQ + j) * D)[:, None]
                     w_ptr = qw
+                    xoff = j * D
                 else:
                     src = dk
                     off = ((rows * NG + g) * D)[:, None]
                     w_ptr = kw
+                    xoff = HQ * (1 + GATE) * D
                 dlo, dhi, dr = _load_parts(src, off, m2, HALF, ROT, REST, REST_P)
                 # transpose of the rotation [[c, -s], [s, c]]
                 glo = dlo * cos + dhi * sin
                 ghi = dhi * cos - dlo * sin
                 lo, hi, rest = _load_parts(
-                    mixed + j * D, base, m2, HALF, ROT, REST, REST_P
+                    mixed + xoff, base, m2, HALF, ROT, REST, REST_P
                 )
                 rstd = tl.load(
                     rstd_in + (rows * NG + g) * (HQ + 1) + j, mask=rmask, other=0.0
@@ -277,12 +310,28 @@ if HAVE_TRITON:
                 ) / D
                 d2 = dot[:, None]
                 _store_parts(
-                    dmixed + j * D,
+                    dmixed + xoff,
                     base,
                     m2,
                     r2 * (gxlo - xlo * d2),
                     r2 * (gxhi - xhi * d2),
                     r2 * (gxr - xr * d2),
+                    HALF,
+                    ROT,
+                    REST,
+                    REST_P,
+                )
+        if GATE:  # output-gate heads: plain copy of their gradient
+            for j in tl.static_range(HQ):
+                src = (((rows * NG + g) * HQ + j) * D)[:, None]
+                glo, ghi, gr = _load_parts(dg, src, m2, HALF, ROT, REST, REST_P)
+                _store_parts(
+                    dmixed + (HQ + j) * D,
+                    base,
+                    m2,
+                    glo,
+                    ghi,
+                    gr,
                     HALF,
                     ROT,
                     REST,
@@ -307,12 +356,13 @@ def _rest_p(d, rot):
 
 class _FusedQKNormRope(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, mixed, q_weight, k_weight, freqs, hq, eps):
+    def forward(ctx, mixed, q_weight, k_weight, freqs, hq, eps, gate):
         mixed = mixed.contiguous()
         s, b, ng, width = mixed.shape
-        d = width // (hq + 2)
+        heads = hq * (2 if gate else 1) + 2
+        d = width // heads
         rot = freqs.shape[-1]
-        assert width == (hq + 2) * d and d & (d - 1) == 0, (
+        assert width == heads * d and d & (d - 1) == 0, (
             "head dim must be a power of two"
         )
         assert rot % 2 == 0 and rot <= d and (rot // 2) & (rot // 2 - 1) == 0, (
@@ -324,6 +374,7 @@ class _FusedQKNormRope(torch.autograd.Function):
         q = mixed.new_empty(s, b, ng * hq, d)
         k = mixed.new_empty(s, b, ng, d)
         v = mixed.new_empty(s, b, ng, d)
+        g = mixed.new_empty(s, b, ng * hq, d) if gate else v  # (unused without a gate)
         rstd = torch.empty(t, ng, hq + 1, device=mixed.device, dtype=torch.float32)
         grid = lambda meta: (triton.cdiv(t, meta["TB"]), ng)  # noqa: E731
         _fwd_kernel[grid](
@@ -331,6 +382,7 @@ class _FusedQKNormRope(torch.autograd.Function):
             q,
             k,
             v,
+            g,
             q_weight,
             k_weight,
             freqs,
@@ -340,32 +392,34 @@ class _FusedQKNormRope(torch.autograd.Function):
             eps,
             NG=ng,
             HQ=hq,
+            GATE=int(gate),
             D=d,
             ROT=rot,
             REST_P=_rest_p(d, rot),
         )
         ctx.save_for_backward(mixed, q_weight, k_weight, freqs, rstd)
-        ctx.hq, ctx.rot = hq, rot
-        return q, k, v
+        ctx.hq, ctx.rot, ctx.gate, ctx.d = hq, rot, gate, d
+        return (q, k, v, g) if gate else (q, k, v)
 
     @staticmethod
-    def backward(ctx, dq, dk, dv):
+    def backward(ctx, dq, dk, dv, dg=None):
         mixed, q_weight, k_weight, freqs, rstd = ctx.saved_tensors
-        s, b, ng, width = mixed.shape
-        hq = ctx.hq
-        d = width // (hq + 2)
-        rot = ctx.rot
+        s, b, ng, _ = mixed.shape
+        hq, rot, d = ctx.hq, ctx.rot, ctx.d
         t = s * b
         dmixed = torch.empty_like(mixed)
         n_tb = triton.cdiv(t, _MIN_TB)
         dqw_part = torch.zeros(n_tb * ng, d, device=mixed.device, dtype=torch.float32)
         dkw_part = torch.zeros_like(dqw_part)
+        dv = dv.contiguous()
+        dg = dg.contiguous() if ctx.gate else dv
         grid = lambda meta: (triton.cdiv(t, meta["TB"]), ng)  # noqa: E731
         _bwd_kernel[grid](
             mixed,
             dq.contiguous(),
             dk.contiguous(),
-            dv.contiguous(),
+            dv,
+            dg,
             dmixed,
             q_weight,
             k_weight,
@@ -377,16 +431,20 @@ class _FusedQKNormRope(torch.autograd.Function):
             b,
             NG=ng,
             HQ=hq,
+            GATE=int(ctx.gate),
             D=d,
             ROT=rot,
             REST_P=_rest_p(d, rot),
         )
         dqw = dqw_part.sum(0).to(q_weight.dtype)
         dkw = dkw_part.sum(0).to(k_weight.dtype)
-        return dmixed, dqw, dkw, None, None, None
+        return dmixed, dqw, dkw, None, None, None, None
 
 
-def fused_qk_norm_rope(mixed, q_weight, k_weight, freqs, hq: int, eps: float):
-    """q, k, v from the QKV projection ``mixed`` [s, b, ng, (hq + 2) * d]: q / k RMSNormed
-    (weights [d]) and rotated with ``freqs`` [s, ..., rot]; see the module docstring."""
-    return _FusedQKNormRope.apply(mixed, q_weight, k_weight, freqs, hq, eps)
+def fused_qk_norm_rope(
+    mixed, q_weight, k_weight, freqs, hq: int, eps: float, gate: bool = False
+):
+    """q, k, v (and the output gate with ``gate``) from the QKV projection ``mixed``
+    [s, b, ng, (hq [+ hq] + 2) * d]: q / k RMSNormed (weights [d]) and rotated with
+    ``freqs`` [s, ..., rot]; see the module docstring."""
+    return _FusedQKNormRope.apply(mixed, q_weight, k_weight, freqs, hq, eps, gate)

@@ -22,7 +22,7 @@ def setup():
     Utils.destroy_model_parallel()
 
 
-def _model(fused, groups=2, rotary_percent=1.0, zero_centered=False):
+def _model(fused, groups=2, rotary_percent=1.0, zero_centered=False, gate=False):
     torch.manual_seed(0)
     model_parallel_cuda_manual_seed(0)
     config = TransformerConfig(
@@ -31,7 +31,7 @@ def _model(fused, groups=2, rotary_percent=1.0, zero_centered=False):
         gated_linear_unit=True, activation_func=torch.nn.functional.silu, qk_layernorm=True,
         layernorm_zero_centered_gamma=zero_centered, attention_backend=AttnBackend.unfused,
         hidden_dropout=0.0, attention_dropout=0.0, is_hybrid_model=True, bf16=True,
-        params_dtype=torch.bfloat16, fused_qk_norm_rope=fused,
+        params_dtype=torch.bfloat16, fused_qk_norm_rope=fused, attention_output_gate=gate,
     )
     return HybridModel(
         config=config, hybrid_stack_spec=hybrid_stack_spec, vocab_size=128,
@@ -40,13 +40,16 @@ def _model(fused, groups=2, rotary_percent=1.0, zero_centered=False):
     ).cuda().to(torch.bfloat16)
 
 
-@pytest.mark.parametrize("groups,rotary_percent,zero_centered", [(2, 1.0, False), (4, 0.5, True), (1, 1.0, False)])
-def test_fused_matches_unfused(groups, rotary_percent, zero_centered):
+@pytest.mark.parametrize(
+    "groups,rotary_percent,zero_centered,gate",
+    [(2, 1.0, False, False), (4, 0.5, True, False), (1, 1.0, False, False), (2, 1.0, False, True)],
+)
+def test_fused_matches_unfused(groups, rotary_percent, zero_centered, gate):
     tokens = torch.randint(0, 128, (2, 64), device="cuda")
     pos = torch.arange(64, device="cuda").unsqueeze(0).expand(2, -1)
     results = []
     for fused in (False, True):
-        model = _model(fused, groups, rotary_percent, zero_centered)
+        model = _model(fused, groups, rotary_percent, zero_centered, gate)
         with torch.no_grad():  # a non-trivial norm weight
             for name, p in model.named_parameters():
                 if "layernorm" in name and p.dim() == 1:
