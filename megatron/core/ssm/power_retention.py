@@ -56,6 +56,7 @@ class PowerRetentionAttention(nn.Module):
         num_heads: int,
         deg: int = 2,
         chunk_size: int = 128,
+        switch_over_seq_len: int = 0,
         rope: bool = False,
         gating: bool = True,
         xsa: bool = False,
@@ -73,6 +74,7 @@ class PowerRetentionAttention(nn.Module):
             # (higher degrees: the package's vidrial CUDA kernels, or our own later).
             raise ValueError(f"the power-retention Triton baseline supports deg=2, got {deg}")
         self.h, self.d, self.deg, self.chunk_size = num_heads, head_dim, deg, chunk_size
+        self.switch_over_seq_len = switch_over_seq_len
         self.rope, self.gating, self.xsa = rope, gating, xsa
         dim = num_heads * head_dim
         self.q_proj = nn.Linear(hidden_size, dim, bias=False)
@@ -100,7 +102,9 @@ class PowerRetentionAttention(nn.Module):
         log_g = None
         if self.gating:
             log_g = F.logsigmoid(GATE_INIT + y[..., 3 * dim : 3 * dim + self.h].float()).contiguous()
-        chunk = self.chunk_size if t > self.chunk_size else None
+        # the quadratic (attention) form up to switch_over_seq_len tokens: faster than any
+        # chunk size there (and the only form for t <= chunk_size)
+        chunk = self.chunk_size if t > max(self.chunk_size, self.switch_over_seq_len) else None
         o = power_retention(
             q.contiguous(), k.contiguous(), v.contiguous(), log_g,
             deg=self.deg, scale=self.d**-0.5, chunk_size=chunk,

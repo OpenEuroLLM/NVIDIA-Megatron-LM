@@ -521,6 +521,7 @@ class PowerRetention(_FLALayerWrapper):
             num_heads=num_heads,
             deg=config.linear_power_deg,
             chunk_size=config.linear_power_chunk_size,
+            switch_over_seq_len=config.linear_power_switch_over_seq_len,
             rope=config.linear_power_rope,
             xsa=getattr(config, "linear_xsa", False),
             layer_idx=layer_number,

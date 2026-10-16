@@ -42,6 +42,24 @@ def test_kernel_matches_the_quadratic_definition(t, deg, gated):
     assert (out - ref).norm() / ref.norm() < 3e-2
 
 
+def test_attention_form_matches_chunked_form():
+    """switch_over_seq_len: the quadratic form below it, the chunked one above -- same layer."""
+    torch.manual_seed(0)
+    layer = power.PowerRetentionAttention(hidden_size=128, head_dim=32, num_heads=4,
+                                          chunk_size=128).cuda().to(torch.bfloat16)
+    x = torch.randn(2, 512, 128, device="cuda", dtype=torch.bfloat16)
+    outs, grads = [], []
+    for switch in (0, 4096):
+        layer.switch_over_seq_len = switch
+        xi = x.clone().requires_grad_(True)
+        o, _, _ = layer(xi)
+        o.float().pow(2).mean().backward()
+        outs.append(o.float())
+        grads.append(xi.grad.float())
+    assert (outs[0] - outs[1]).norm() / outs[1].norm() < 3e-2
+    assert (grads[0] - grads[1]).norm() / grads[1].norm() < 5e-2
+
+
 @pytest.mark.parametrize("rope,xsa", [(False, False), (True, False), (False, True)])
 def test_layer_trains(rope, xsa):
     torch.manual_seed(0)
