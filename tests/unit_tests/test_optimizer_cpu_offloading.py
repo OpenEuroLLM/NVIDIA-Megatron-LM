@@ -282,3 +282,47 @@ def test_cpu_optimizer_buckets(bucket_numel):
     assert [p for o in opts for g in o.param_groups for p in g["params"]] == got
     for a, b in zip(got, ref):
         torch.testing.assert_close(a, b, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("offload_fraction", [1.0, 0.5])
+@pytest.mark.parametrize("param_update_in_fp32", [False, True])
+def test_state_dict_resume_matches_uninterrupted(offload_fraction, param_update_in_fp32):
+    """Steps after save -> fresh optimizer -> load_state_dict equal the uninterrupted steps."""
+    import copy
+
+    dtype = torch.bfloat16 if param_update_in_fp32 else torch.float32
+
+    def make(params_from=None):
+        setup_seed(0)
+        net = Net().cuda().to(dtype)
+        if params_from is not None:
+            net.load_state_dict(params_from)
+        hdo = HybridDeviceOptimizer(
+            list(net.parameters()), offload_fraction=offload_fraction, lr=1e-2,
+            cpu_optimizer_cls=Adam, gpu_optimizer_cls=GPUAdam,
+            param_update_in_fp32=param_update_in_fp32,
+        )
+        return net, hdo
+
+    def step(net, hdo, i):
+        setup_seed(100 + i)
+        hdo.zero_grad()
+        net(torch.randn(2, 3, 32, 32, device="cuda", dtype=dtype)).float().sum().backward()
+        hdo.step()
+
+    net, hdo = make()
+    for i in range(3):
+        step(net, hdo, i)
+    torch.cuda.synchronize()
+    saved_params = copy.deepcopy(net.state_dict())
+    saved_opt = copy.deepcopy(hdo.state_dict())
+    for i in range(3, 6):
+        step(net, hdo, i)
+
+    net2, hdo2 = make(saved_params)
+    hdo2.load_state_dict(saved_opt)
+    for i in range(3, 6):
+        step(net2, hdo2, i)
+    torch.cuda.synchronize()
+    for (k, a), b in zip(net.state_dict().items(), net2.state_dict().values()):
+        torch.testing.assert_close(a, b, rtol=0, atol=0, msg=lambda m, k=k: f"{k}: {m}")

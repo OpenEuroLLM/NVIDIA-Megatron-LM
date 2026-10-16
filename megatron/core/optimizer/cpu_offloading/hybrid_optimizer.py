@@ -80,7 +80,8 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         self._init_sub_optimizers()
         self._register_load_state_dict_hooks()
 
-    def _set_sub_optimizer_grads(self):
+    def _set_gpu_fp32_grads(self):
+        """fp32 grads of the GPU part (on the current stream: the GPU optimizer steps there)."""
         if self.param_update_in_fp32:
             for param in self.param_to_fp32_param:
                 if param in self.gpu_params_map_cpu_copy:
@@ -95,6 +96,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 else:
                     fp32_param.requires_grad = False
 
+    def _set_sub_optimizer_grads(self):
         # Sync the grads from GPU to CPU.
         for optimizer in self.cpu_optimizers:
             for param in _param_generator(optimizer):
@@ -162,6 +164,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         self._d2h_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self._d2h_stream):
             self._set_sub_optimizer_grads()
+        self._set_gpu_fp32_grads()
 
         # Step the sub-optimizers.
         if self.gpu_optimizer:
@@ -286,12 +289,21 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             for param in group["params"]:
                 orig_param = param
                 cpu_copy = False
+                fp32_copy = self.param_update_in_fp32 and param.dtype != torch.float32
                 if offload_params_numel < offload_threshold and param.is_cuda:
-                    param = param.detach().clone().cpu().pin_memory()
+                    # straight to the (pinned) dtype the CPU optimizer updates: an fp32
+                    # master cloned from a pinned bf16 copy would be pageable, and every
+                    # D2H / H2D copy of it synchronous
+                    cpu = torch.empty(
+                        param.shape, dtype=torch.float32 if fp32_copy else param.dtype,
+                        device="cpu", pin_memory=self.pin_cpu_params,
+                    )
+                    param = cpu.copy_(param.detach())
                     offload_params_numel += param.numel()
                     cpu_copy = True
-                if self.param_update_in_fp32 and param.dtype != torch.float32:
-                    param = param.detach().clone().float()
+                if fp32_copy:
+                    if param.dtype != torch.float32:
+                        param = param.detach().clone().float()
                     param_to_fp32_param[orig_param] = param
 
                 if cpu_copy:
@@ -335,6 +347,16 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 if self.param_update_in_fp32:
                     new_state[orig_param]["master_param"] = param
         self.state = new_state
+        # TE FusedAdam counts its step in the param group, not in the state: carry it in
+        # the HDO groups (saved with them; _sync_hdo_param_groups_to_sub_optimizers hands
+        # it back), or a reloaded GPU part restarts its bias correction at step 1.
+        if self.gpu_optimizer is not None:
+            group_of = {
+                self.param_to_inner_param[p]: g for g in self.param_groups for p in g["params"]
+            }
+            for group in self.gpu_optimizer.param_groups:
+                if "step" in group and group["params"]:
+                    group_of[group["params"][0]]["step"] = group["step"]
 
     def _sync_hdo_state_to_sub_optimizers(self):
         for optimizer in self.sub_optimizers:
