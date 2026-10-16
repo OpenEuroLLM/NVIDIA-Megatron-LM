@@ -912,6 +912,10 @@ class TransformerConfig(ModelParallelConfig):
     fused_single_qkv_rope: bool = False
     """If set, avoid splitting QKV before ROPE forward and avoid concatenating ROPE dgrads."""
 
+    gdn_fused_out_norm: bool = False
+    """Gated DeltaNet (G layers): the output RMSNorm and its silu gate as FLA's fused
+    rms_norm_gated (one Triton kernel each way) instead of TE norm + eager gating."""
+
     fused_short_conv: bool = False
     """ShortConv (`C` layers): the gated depthwise causal convolution C * conv(B * x) as one
     Triton kernel each way (megatron/core/fusions/fused_short_conv.py); unpacked

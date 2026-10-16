@@ -368,6 +368,23 @@ class _GDNBase(MegatronModule):
 
     @jit_fuser
     def _apply_gated_norm(self, x, gate):
+        if getattr(self.config, "gdn_fused_out_norm", False):
+            # RMSNorm(x) * w * silu(gate) as one Triton kernel each way (FLA)
+            from fla.modules.fused_norm_gate import rms_norm_gated
+
+            assert self.config.normalization == "RMSNorm", "gdn_fused_out_norm needs RMSNorm"
+            assert self.activation in ("silu", "swish"), "gdn_fused_out_norm needs a silu gate"
+            w = self.out_norm.weight
+            if self.config.layernorm_zero_centered_gamma:
+                w = w + 1
+            return rms_norm_gated(
+                x.reshape(-1, x.shape[-1]),
+                gate.reshape(-1, gate.shape[-1]),
+                w,
+                None,
+                activation="swish",
+                eps=self.config.layernorm_epsilon,
+            )
         # Output Norm
         x_dtype = x.dtype
         x = x.reshape(-1, x.shape[-1])
