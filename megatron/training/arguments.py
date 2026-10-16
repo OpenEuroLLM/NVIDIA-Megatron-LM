@@ -3203,6 +3203,9 @@ def _add_training_args(parser):
                        help='Additional multiplier on the Muown direction update.')
     group.add_argument('--muown-max-row-norm', type=float, default=None,
                        help='Optional upper clamp on Muown row magnitudes.')
+    group.add_argument('--muown-cpu-offload', action='store_true',
+                       help='Keep the Muown momentum in pinned host memory, streamed through '
+                            'the optimizer step (transfers overlapped with Newton-Schulz).')
 
     # nGPT weight normalizer (arXiv:2410.01131)
     group.add_argument('--weight-normalizer', action='store_true',

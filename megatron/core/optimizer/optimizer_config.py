@@ -472,6 +472,11 @@ class OptimizerConfig:
     muown_max_row_norm: Optional[float] = None
     """Optional upper clamp on row magnitudes. None disables clamping."""
 
+    muown_cpu_offload: bool = False
+    """Keep Muown's momentum buffers in pinned host memory and stream them through the
+    step (prefetch / write-back overlapped with the Newton-Schulz matmuls): frees 8 bytes
+    per matrix parameter of GPU memory. Checkpoints are unchanged."""
+
     ###############################
     # nGPT weight normalizer
     ###############################

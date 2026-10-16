@@ -122,6 +122,13 @@ class Muown(torch.optim.Optimizer):
             the TP group. None (single process) uses the local sums.
         tp_shape_fn: ``param -> (rows, cols)`` of the unsharded matrix, for the
             spectral scale. None uses the local shape.
+        cpu_offload: Keep the momentum buffers in pinned host memory instead of on the
+            GPU (8 bytes per matrix parameter). The step streams them: while one
+            parameter is orthogonalized, the next one's state is copied in on a side
+            stream and the previous one's copied back, so the transfers hide behind
+            the Newton-Schulz matmuls. The state keeps its shapes (checkpoints are
+            unchanged); state a checkpoint load put on the GPU moves back on the next
+            step.
     """
 
     def __init__(
@@ -140,6 +147,7 @@ class Muown(torch.optim.Optimizer):
         orthogonalize_fn: Callable[..., torch.Tensor] | None = None,
         row_sum_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
         tp_shape_fn: Callable[[torch.Tensor], tuple] | None = None,
+        cpu_offload: bool = False,
     ) -> None:
         if num_ns_steps < 1:
             raise ValueError(f"num_ns_steps must be at least 1, got {num_ns_steps}")
@@ -163,6 +171,11 @@ class Muown(torch.optim.Optimizer):
         )
         self._row_sum = row_sum_fn or (lambda t, _p: t)
         self._tp_shape = tp_shape_fn
+        self.cpu_offload = cpu_offload
+        self._copy_stream = None
+        # Contiguous pinned rows for the used magnitude column, per parameter. Kept out
+        # of self.state so checkpoints only ever see parameter-shaped state.
+        self._mag_staging: dict = {}
         log_single_rank(logger, logging.INFO, "[Muown] initialized row-norm-controlled Muon")
 
     @torch.no_grad()
@@ -173,8 +186,15 @@ class Muown(torch.optim.Optimizer):
                 continue
             state = self.state[p]
             if not state:
-                state["direction_momentum"] = torch.zeros_like(p, dtype=torch.float32)
-                state["magnitude_momentum"] = torch.zeros_like(p, dtype=torch.float32)
+                state["direction_momentum"] = self._zeros(p)
+                state["magnitude_momentum"] = self._zeros(p)
+
+    def _zeros(self, p: torch.Tensor) -> torch.Tensor:
+        """A zero fp32 state tensor of ``p``'s shape: on ``p``'s device, or pinned host
+        memory under cpu_offload."""
+        if self.cpu_offload:
+            return torch.zeros(p.shape, dtype=torch.float32, pin_memory=True)
+        return torch.zeros_like(p, dtype=torch.float32)
 
     def _orthogonalize(self, grad: torch.Tensor, param: torch.Tensor, steps: int) -> torch.Tensor:
         """Orthogonalize ``grad``, flattening any leading (expert) dimensions."""
@@ -194,16 +214,8 @@ class Muown(torch.optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
+        work = []
         for group in self.param_groups:
-            lr = group["lr"]
-            mag_lr = lr * group["magnitude_lr_scale"]
-            momentum = group["momentum"]
-            nesterov = group["nesterov"]
-            wd = group["weight_decay"]
-            steps = group["num_ns_steps"]
-            eps = group["eps"]
-            max_row_norm = group["max_row_norm"]
-
             for p in group["params"]:
                 if p.grad is None:
                     continue
@@ -212,61 +224,136 @@ class Muown(torch.optim.Optimizer):
                         f"Muown received a {p.ndim}-D parameter of shape {tuple(p.shape)}; "
                         "route non-matrix parameters to Adam via parameter groups."
                     )
-
-                grad = p.grad.float()
-                w = p.data.float()
-
-                # --- decompose W into row magnitude m and unit-row direction D ---
-                # Row reductions go through _row_sum: partial under column sharding.
-                m = self._row_sum(w.square().sum(dim=-1, keepdim=True), p).sqrt().clamp(min=eps)
-                d = w / m
-
-                # Radial component moves the magnitude; the remainder rotates D.
-                radial = self._row_sum((grad * d).sum(dim=-1, keepdim=True), p)
-                tangential = grad - radial * d
-
+                work.append((group, p))
+        if self.cpu_offload and work:
+            self._step_offloaded(work)
+        else:
+            for group, p in work:
                 state = self.state[p]
                 if len(state) == 0:
-                    state["direction_momentum"] = torch.zeros_like(tangential)
                     # Allocated at the *parameter* shape, not the natural [out, 1]
                     # of a per-row magnitude. Megatron's optimizer-state handling
                     # (checkpoint save, distributed optimizer sharding) requires
                     # every state tensor to match the parameter shape; a [out, 1]
                     # buffer makes every save fail with "Optimizer shape ... does
                     # not match model shape". Only column 0 is used.
+                    state["direction_momentum"] = torch.zeros_like(p, dtype=torch.float32)
                     state["magnitude_momentum"] = torch.zeros_like(p, dtype=torch.float32)
-
-                dir_buf = state["direction_momentum"]
-                mag_buf = state["magnitude_momentum"][..., :1]
-                dir_buf.mul_(momentum).add_(tangential, alpha=1.0 - momentum)
-                mag_buf.mul_(momentum).add_(radial, alpha=1.0 - momentum)
-
-                if nesterov:
-                    dir_update = tangential.mul(1.0 - momentum).add_(dir_buf, alpha=momentum)
-                    mag_update = radial.mul(1.0 - momentum).add_(mag_buf, alpha=momentum)
-                else:
-                    dir_update = dir_buf
-                    mag_update = mag_buf
-
-                # --- direction: Muon (orthogonalized) step, then renormalize ---
-                ortho = self._orthogonalize(dir_update, p, steps)
-                if group["scale_mode"] == "spectral":
-                    rows, cols = self._tp_shape(p) if self._tp_shape else ortho.shape[-2:]
-                    scale = max(rows, cols) ** 0.5
-                else:
-                    scale = 1.0
-                scale *= group["extra_scale_factor"]
-                d = d - lr * scale * ortho
-                d = d / self._row_sum(d.square().sum(dim=-1, keepdim=True), p).sqrt().clamp(min=eps)
-
-                # --- magnitude: l-infinity steepest descent == sign step ---
-                m = m - mag_lr * torch.sign(mag_update)
-                if wd != 0.0:
-                    m = m - mag_lr * wd * m
-                m = m.clamp(min=eps)
-                if max_row_norm is not None:
-                    m = m.clamp(max=max_row_norm)
-
-                p.data.copy_((m * d).to(p.dtype))
-
+                self._update(
+                    group, p, state["direction_momentum"], state["magnitude_momentum"][..., :1]
+                )
         return loss
+
+    def _host_state(self, p: torch.Tensor) -> tuple:
+        """``p``'s momentum buffers in pinned host memory (allocated, or moved there
+        after a checkpoint load placed them on the GPU), plus a contiguous pinned
+        staging row for the used magnitude column."""
+        state = self.state[p]
+        for key in ("direction_momentum", "magnitude_momentum"):
+            buf = state.get(key)
+            if buf is None:
+                state[key] = self._zeros(p)
+            elif buf.is_cuda or not buf.is_pinned():
+                state[key] = buf.detach().to("cpu", torch.float32).pin_memory()
+        mag = state["magnitude_momentum"]
+        staging = self._mag_staging.get(p)
+        if staging is None:
+            staging = torch.empty(mag[..., :1].shape, dtype=torch.float32, pin_memory=True)
+            self._mag_staging[p] = staging
+        return state["direction_momentum"], mag, staging
+
+    def _step_offloaded(self, work: list) -> None:
+        """The step over ``work`` with the state streamed from / to host memory:
+        prefetch of parameter i + 1 and write-back of parameter i - 1 run on a side
+        stream while parameter i is updated on the current stream."""
+        compute = torch.cuda.current_stream()
+        if self._copy_stream is None:
+            self._copy_stream = torch.cuda.Stream()
+        copy = self._copy_stream
+
+        def fetch(p):
+            d_host, m_host, staging = self._host_state(p)
+            staging.copy_(m_host[..., :1])
+            with torch.cuda.stream(copy):
+                d = d_host.to(p.device, non_blocking=True)
+                m = staging.to(p.device, non_blocking=True)
+            ready = copy.record_event()
+            return d, m, ready
+
+        pending = []  # (param, its magnitude staging row) to fold back after the sync
+        nxt = fetch(work[0][1])
+        for i, (group, p) in enumerate(work):
+            d, m, ready = nxt
+            if i + 1 < len(work):
+                nxt = fetch(work[i + 1][1])
+            compute.wait_event(ready)
+            self._update(group, p, d, m)
+            updated = compute.record_event()
+            d_host, _, staging = self._host_state(p)
+            with torch.cuda.stream(copy):
+                copy.wait_event(updated)
+                d_host.copy_(d, non_blocking=True)
+                staging.copy_(m, non_blocking=True)
+            # allocated on the copy stream, used on the compute stream
+            d.record_stream(compute)
+            m.record_stream(compute)
+            pending.append((p, staging))
+        copy.synchronize()
+        for p, staging in pending:
+            self.state[p]["magnitude_momentum"][..., :1].copy_(staging)
+
+    def _update(self, group: dict, p: torch.Tensor, dir_buf: torch.Tensor, mag_buf: torch.Tensor):
+        """One parameter's Muown update with its direction momentum ``dir_buf`` and its
+        magnitude momentum column ``mag_buf`` (both updated in place)."""
+        lr = group["lr"]
+        mag_lr = lr * group["magnitude_lr_scale"]
+        momentum = group["momentum"]
+        nesterov = group["nesterov"]
+        wd = group["weight_decay"]
+        steps = group["num_ns_steps"]
+        eps = group["eps"]
+        max_row_norm = group["max_row_norm"]
+
+        grad = p.grad.float()
+        w = p.data.float()
+
+        # --- decompose W into row magnitude m and unit-row direction D ---
+        # Row reductions go through _row_sum: partial under column sharding.
+        m = self._row_sum(w.square().sum(dim=-1, keepdim=True), p).sqrt().clamp(min=eps)
+        d = w / m
+
+        # Radial component moves the magnitude; the remainder rotates D.
+        radial = self._row_sum((grad * d).sum(dim=-1, keepdim=True), p)
+        tangential = grad - radial * d
+
+        dir_buf.mul_(momentum).add_(tangential, alpha=1.0 - momentum)
+        mag_buf.mul_(momentum).add_(radial, alpha=1.0 - momentum)
+
+        if nesterov:
+            dir_update = tangential.mul(1.0 - momentum).add_(dir_buf, alpha=momentum)
+            mag_update = radial.mul(1.0 - momentum).add_(mag_buf, alpha=momentum)
+        else:
+            dir_update = dir_buf
+            mag_update = mag_buf
+
+        # --- direction: Muon (orthogonalized) step, then renormalize ---
+        ortho = self._orthogonalize(dir_update, p, steps)
+        if group["scale_mode"] == "spectral":
+            rows, cols = self._tp_shape(p) if self._tp_shape else ortho.shape[-2:]
+            scale = max(rows, cols) ** 0.5
+        else:
+            scale = 1.0
+        scale *= group["extra_scale_factor"]
+        d = d - lr * scale * ortho
+        d = d / self._row_sum(d.square().sum(dim=-1, keepdim=True), p).sqrt().clamp(min=eps)
+
+        # --- magnitude: l-infinity steepest descent == sign step ---
+        m = m - mag_lr * torch.sign(mag_update)
+        if wd != 0.0:
+            m = m - mag_lr * wd * m
+        m = m.clamp(min=eps)
+        if max_row_norm is not None:
+            m = m.clamp(max=max_row_norm)
+
+        p.data.copy_((m * d).to(p.dtype))
+

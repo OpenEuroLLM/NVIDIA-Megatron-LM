@@ -183,3 +183,55 @@ class TestNormalizeWeight:
         param = torch.nn.Parameter(torch.randn(8, 4, dtype=torch.bfloat16))
         normalize_weight_(param, 1)
         assert param.dtype == torch.bfloat16
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+class TestMuownCpuOffload:
+    """cpu_offload streams the momentum through pinned host memory; the step is the same."""
+
+    @staticmethod
+    def _params(seed=0):
+        torch.manual_seed(seed)
+        shapes = [(64, 32), (32, 96), (4, 48, 16), (128, 128)]  # incl. a grouped (expert) one
+        return [torch.nn.Parameter(torch.randn(*s, device="cuda")) for s in shapes]
+
+    def _run(self, offload, steps=4, opt_state=None):
+        params = self._params()
+        opt = Muown(params, lr=1e-2, weight_decay=0.1, cpu_offload=offload)
+        if opt_state is not None:
+            # a copy: torch keeps the loaded tensors themselves when they are already on
+            # the parameter's device, and the step updates them in place
+            import copy
+
+            opt.load_state_dict(copy.deepcopy(opt_state))
+        for step in range(steps):
+            torch.manual_seed(100 + step)
+            for p in params:
+                p.grad = torch.randn_like(p)
+            opt.step()
+        return params, opt
+
+    def test_matches_the_on_device_step(self):
+        ref, _ = self._run(offload=False)
+        got, opt = self._run(offload=True)
+        for a, b in zip(got, ref):
+            torch.testing.assert_close(a, b, rtol=0, atol=0)
+        for state in opt.state.values():
+            for buf in state.values():
+                assert not buf.is_cuda and buf.is_pinned()
+
+    def test_state_loaded_onto_the_gpu_moves_back_and_round_trips(self):
+        _, ref_opt = self._run(offload=False, steps=2)
+        saved = ref_opt.state_dict()
+        # torch's load_state_dict casts state to the parameter's device (the GPU here)
+        _, opt = self._run(offload=True, steps=0, opt_state=saved)
+        assert any(buf.is_cuda for st in opt.state.values() for buf in st.values())
+        ref, _ = self._run(offload=False, steps=3, opt_state=saved)
+        got, opt = self._run(offload=True, steps=3, opt_state=saved)
+        for a, b in zip(got, ref):
+            torch.testing.assert_close(a, b, rtol=0, atol=0)
+        assert all(not buf.is_cuda for st in opt.state.values() for buf in st.values())
+        # the checkpoint keeps the parameter-shaped buffers, nothing else
+        for (pid, st), p in zip(opt.state_dict()["state"].items(), self._params()):
+            assert set(st) == {"direction_momentum", "magnitude_momentum"}
+            assert st["magnitude_momentum"].shape == p.shape
