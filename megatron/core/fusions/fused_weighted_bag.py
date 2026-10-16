@@ -38,6 +38,18 @@ def weighted_bag_reference(table: torch.Tensor, index: torch.Tensor, weights: to
 
 if HAVE_TRITON:
 
+    # Tiles: few warps over wide column blocks (an average row is read ~8 times, so a
+    # program's work is small); tuned on the PKM shapes (T 16k, J 128, D 768).
+    _FWD_CONFIGS = [
+        triton.Config({"BJ": bj, "BD": bd}, num_warps=w)
+        for bj, bd, w in [(16, 256, 2), (16, 512, 2), (32, 512, 8), (16, 128, 4)]
+    ]
+    _BWD_V_CONFIGS = [
+        triton.Config({"BP": bp, "BD": bd}, num_warps=w)
+        for bp, bd, w in [(16, 256, 2), (8, 512, 2), (4, 512, 2), (16, 512, 4), (16, 128, 2)]
+    ]
+
+    @triton.autotune(configs=_FWD_CONFIGS, key=["J", "D"])
     @triton.jit
     def _bag_fwd(idx_ptr, w_ptr, v_ptr, out_ptr, J, D, BJ: tl.constexpr, BD: tl.constexpr):
         t = tl.program_id(0).to(tl.int64)
@@ -70,6 +82,7 @@ if HAVE_TRITON:
             ).to(tl.float32)
             tl.store(dw_ptr + t * J + jj, tl.sum(rows * g[None, :], axis=1), mask=jm)
 
+    @triton.autotune(configs=_BWD_V_CONFIGS, key=["J", "D"])
     @triton.jit
     def _bag_bwd_v(
         order_ptr, offsets_ptr, w_ptr, g_ptr, dv_ptr, J, D, BP: tl.constexpr, BD: tl.constexpr
@@ -93,7 +106,7 @@ if HAVE_TRITON:
         tl.store(dv_ptr + u * D + d, acc.to(dv_ptr.dtype.element_ty), mask=dm)
 
 
-_BJ, _BD, _BP = 16, 128, 16
+_BJ = 16  # rows per step of the weight-gradient kernel
 
 
 class _WeightedBag(torch.autograd.Function):
@@ -103,7 +116,7 @@ class _WeightedBag(torch.autograd.Function):
         t, j = index.shape
         d = table.shape[1]
         out = torch.empty((t, d), dtype=out_dtype, device=table.device)
-        _bag_fwd[(t, triton.cdiv(d, _BD))](index, weights, table, out, j, d, BJ=_BJ, BD=_BD)
+        _bag_fwd[lambda meta: (t, triton.cdiv(d, meta["BD"]))](index, weights, table, out, j, d)
         ctx.save_for_backward(table, index, weights)
         return out
 
@@ -117,7 +130,7 @@ class _WeightedBag(torch.autograd.Function):
         if ctx.needs_input_grad[2]:
             dw = torch.empty((t, j), dtype=torch.float32, device=table.device)
             _bag_bwd_w[(t,)](
-                index, table, grad, dw, j, d, BJ=_BJ, BD=triton.next_power_of_2(d), num_warps=8
+                index, table, grad, dw, j, d, BJ=_BJ, BD=triton.next_power_of_2(d), num_warps=2
             )
             dw = dw.to(weights.dtype)
         dv = None
@@ -127,8 +140,8 @@ class _WeightedBag(torch.autograd.Function):
             offsets = torch.zeros(u + 1, dtype=torch.int64, device=table.device)
             offsets[1:] = torch.cumsum(torch.bincount(flat, minlength=u), 0)
             dv = torch.empty_like(table)
-            _bag_bwd_v[(u, triton.cdiv(d, _BD))](
-                order, offsets, weights, grad, dv, j, d, BP=_BP, BD=_BD
+            _bag_bwd_v[lambda meta: (u, triton.cdiv(d, meta["BD"]))](
+                order, offsets, weights, grad, dv, j, d
             )
         return dv, None, dw, None
 
