@@ -487,11 +487,11 @@ class TransformerConfig(ModelParallelConfig):
     ones the chunked recurrence. At 4096 tokens the attention form is 1.7x (head dim 64) to
     7x (128) faster than the best chunk size on H100 (bench_power.py); 0: always chunked."""
 
-    linear_power_attention_impl: str = "retention"
+    linear_power_attention_impl: str = "triton"
     """Power retention's quadratic form: "triton" (megatron/core/fusions/fused_power_attention.py:
-    a flash-style kernel without softmax rescaling, deg 2), "retention" (the package's Triton
-    kernel) or "flex" (FlexAttention with the deg-th power and the gate as a score_mod; 1.5-1.7x
-    slower than retention's kernel on H100 at head dim 64-256, bench_power.py)."""
+    a flash-style kernel without softmax rescaling, deg 2; on H100 1.1-1.3x faster than
+    retention's kernel at head dim 64-256, bench_power.py), "retention" (the package's Triton
+    kernel) or "flex" (FlexAttention with the deg-th power and the gate as a score_mod)."""
 
     linear_power_rope: bool = False
     """Power retention: rotary embeddings on q / k (the reference model's choice); off = NoPE."""
