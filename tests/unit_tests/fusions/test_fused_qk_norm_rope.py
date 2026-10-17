@@ -59,3 +59,51 @@ def test_matches_unfused_forward_and_backward(s, b, ng, hq, d, rot, dtype, gate)
     for a, r in zip(grads[0], grads[1]):
         # weight grads sum over all tokens: compare in norm
         torch.testing.assert_close(a.float(), r.float(), rtol=tol["rtol"] * 5, atol=tol["atol"] * 20)
+
+
+def _fwd_bwd(fn, mixed, qw, kw, freqs, hq, eps, gate, weight_map=lambda w: w):
+    m = mixed.clone().requires_grad_()
+    w1, w2 = qw.clone().requires_grad_(), kw.clone().requires_grad_()
+    outputs = fn(m, weight_map(w1), weight_map(w2), freqs, hq, eps, gate=gate)
+    g = torch.Generator(device="cuda").manual_seed(1)
+    loss = 0
+    for t in outputs:
+        loss = loss + (t.float() * torch.randn(t.shape, device="cuda", generator=g)).sum()
+    loss.backward()
+    return outputs, (m.grad, w1.grad, w2.grad)
+
+
+@pytest.mark.parametrize("gate", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("s,b,ng,hq,d", [(37, 2, 3, 1, 64), (50, 1, 4, 2, 128)])
+def test_nope_norm_only(s, b, ng, hq, d, dtype, gate):
+    """freqs=None (NoPE): q / k RMSNorm only, value / gate copied -- as the unfused path."""
+    mixed, qw, kw, _ = _inputs(s, b, ng, hq, d, 64, dtype, gate=gate)
+    eps = 1e-6
+    fused = _fwd_bwd(fused_qk_norm_rope, mixed, qw, kw, None, hq, eps, gate)
+    ref = _fwd_bwd(qk_norm_rope_reference, mixed, qw, kw, None, hq, eps, gate)
+    tol = dict(rtol=1e-5, atol=1e-5) if dtype == torch.float32 else dict(rtol=2e-2, atol=2e-2)
+    for a, r in zip(fused[0], ref[0]):
+        torch.testing.assert_close(a.float(), r.float(), **tol)
+    for a, r in zip(fused[1], ref[1]):
+        torch.testing.assert_close(a.float(), r.float(), rtol=tol["rtol"] * 5, atol=tol["atol"] * 20)
+    # and it is exactly a plain RMSNorm of the head (no rotation)
+    heads = hq * (2 if gate else 1) + 2
+    x = mixed.view(s, b, ng, heads, d).float()
+    k = x[..., heads - 2, :]
+    k_ref = k * torch.rsqrt(k.pow(2).mean(-1, keepdim=True) + eps) * kw.float()
+    torch.testing.assert_close(fused[0][1].float(), k_ref, **tol)
+
+
+def test_zero_centered_gamma_weights():
+    """Zero-centred gamma: the attention layer passes (1 + w); gradients reach w unchanged."""
+    s, b, ng, hq, d, rot = 33, 2, 2, 2, 64, 64
+    mixed, qw, kw, freqs = _inputs(s, b, ng, hq, d, rot, torch.float32)
+    qw, kw = qw - 1, kw - 1  # stored zero-centred
+    eps = 1e-6
+    fused = _fwd_bwd(fused_qk_norm_rope, mixed, qw, kw, freqs, hq, eps, False, lambda w: w + 1)
+    ref = _fwd_bwd(qk_norm_rope_reference, mixed, qw, kw, freqs, hq, eps, False, lambda w: w + 1)
+    for a, r in zip(fused[0], ref[0]):
+        torch.testing.assert_close(a, r, rtol=1e-5, atol=1e-5)
+    for a, r in zip(fused[1], ref[1]):
+        torch.testing.assert_close(a, r, rtol=5e-5, atol=2e-4)

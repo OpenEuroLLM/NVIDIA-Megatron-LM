@@ -755,14 +755,15 @@ class Attention(MegatronModule, ABC):
         reasons = {
             "self attention": self.attention_type == "self",
             "no packed sequences": packed_seq_params is None,
-            "RoPE": rotary_pos_emb is not None,
             "qk_layernorm with RMSNorm": self.config.qk_layernorm
             and self.config.normalization == "RMSNorm"
             and hasattr(self.q_layernorm, "weight")
             and hasattr(self.k_layernorm, "weight"),
             "no nGPT s_qk": getattr(self, "ngpt_sq", None) is None,
-            "non-interleaved RoPE": not self.config.rotary_interleaved,
-            "no YaRN mscale": self._yarn_concentration_factor in (None, 1.0),
+            # RoPE layout / scaling only matter with RoPE: a NoPE layer only norms q / k
+            "non-interleaved RoPE": rotary_pos_emb is None or not self.config.rotary_interleaved,
+            "no YaRN mscale": rotary_pos_emb is None
+            or self._yarn_concentration_factor in (None, 1.0),
             "num_query_groups >= TP": self.config.num_query_groups >= self.world_size,
             "no Canon B": getattr(self, "canon_b", None) is None,
         }
@@ -1451,8 +1452,10 @@ class Attention(MegatronModule, ABC):
         qkv_linear_manager = off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear")
         with qkv_linear_manager as hidden_states:
             if fuse_qk_norm_rope:
+                # NoPE (rotary_pos_emb None): the fused kernel only norms q / k
                 qkv_output = self._fused_qk_norm_rope(
-                    self._mixed_qkv_for_fusion(hidden_states), rotary_pos_emb[0]
+                    self._mixed_qkv_for_fusion(hidden_states),
+                    rotary_pos_emb[0] if rotary_pos_emb is not None else None,
                 )
                 rotary_pos_emb = None  # applied
             else:

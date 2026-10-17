@@ -939,8 +939,8 @@ class TransformerConfig(ModelParallelConfig):
     instead of the torch.compile'd swiglu (only with bias_swiglu_fusion and no bias)."""
 
     fused_qk_norm_rope: bool = False
-    """Self-attention with qk_layernorm (RMSNorm) and RoPE: one Triton kernel from the fused
-    QKV projection to normed, rotated q / k and v, and one back
+    """Self-attention with qk_layernorm (RMSNorm), with RoPE or NoPE: one Triton kernel from
+    the fused QKV projection to normed (and, with RoPE, rotated) q / k and v, and one back
     (megatron/core/fusions/fused_qk_norm_rope.py) instead of split + two norms + two RoPEs
     (+ concat in the backward). Raises if a layer does not qualify (training only)."""
 

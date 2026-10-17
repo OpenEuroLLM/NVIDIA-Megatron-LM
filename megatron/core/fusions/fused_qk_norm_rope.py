@@ -15,7 +15,8 @@ Layout (Megatron's, per query group): ``mixed`` [s, b, ng, (hq + 2) * d] holds h
 heads, one key head and one value head of size d; outputs q [s, b, ng * hq, d],
 k [s, b, ng, d], v [s, b, ng, d]. RoPE is Megatron's non-interleaved rotate-half on the
 first ``rot`` channels (rotary_percent), angles ``freqs`` [s, rot] (the q/k rotary
-embedding tensor without its two singleton dims), mscale 1.
+embedding tensor without its two singleton dims), mscale 1. ``freqs=None`` is NoPE: q / k are
+only normed (the kernels then rotate the first two channels by angle 0, the identity).
 """
 
 import torch
@@ -34,7 +35,7 @@ def qk_norm_rope_reference(mixed, q_weight, k_weight, freqs, hq, eps, gate=False
     s, b, ng, width = mixed.shape
     heads = hq * (2 if gate else 1) + 2
     d = width // heads
-    rot = freqs.shape[-1]
+    rot = freqs.shape[-1] if freqs is not None else 0
     x = mixed.view(s, b, ng, heads, d).float()
     q, k, v = x[..., :hq, :], x[..., heads - 2, :], x[..., heads - 1, :]
 
@@ -42,6 +43,8 @@ def qk_norm_rope_reference(mixed, q_weight, k_weight, freqs, hq, eps, gate=False
         return t * torch.rsqrt(t.pow(2).mean(-1, keepdim=True) + eps) * w.float()
 
     def rope(t):
+        if freqs is None:  # NoPE: q / k norm only
+            return t
         f = freqs.float().view(s, 1, *([1] * (t.dim() - 3)), rot)
         cos, sin = f.cos(), f.sin()
         r, rest = t[..., :rot], t[..., rot:]
@@ -446,5 +449,9 @@ def fused_qk_norm_rope(
 ):
     """q, k, v (and the output gate with ``gate``) from the QKV projection ``mixed``
     [s, b, ng, (hq [+ hq] + 2) * d]: q / k RMSNormed (weights [d]) and rotated with
-    ``freqs`` [s, ..., rot]; see the module docstring."""
+    ``freqs`` [s, ..., rot], or only normed with ``freqs=None`` (NoPE); see the module
+    docstring."""
+    if freqs is None:
+        # a rotation by angle 0 is the identity: the smallest rotary block (2 channels)
+        freqs = torch.zeros(mixed.shape[0], 2, device=mixed.device, dtype=torch.float32)
     return _FusedQKNormRope.apply(mixed, q_weight, k_weight, freqs, hq, eps, gate)

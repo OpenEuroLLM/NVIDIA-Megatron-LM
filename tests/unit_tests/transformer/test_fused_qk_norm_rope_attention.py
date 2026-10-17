@@ -22,7 +22,10 @@ def setup():
     Utils.destroy_model_parallel()
 
 
-def _model(fused, groups=2, rotary_percent=1.0, zero_centered=False, gate=False):
+def _model(
+    fused, groups=2, rotary_percent=1.0, zero_centered=False, gate=False, pos_emb="rope",
+    interleaved=False,
+):
     torch.manual_seed(0)
     model_parallel_cuda_manual_seed(0)
     config = TransformerConfig(
@@ -32,24 +35,33 @@ def _model(fused, groups=2, rotary_percent=1.0, zero_centered=False, gate=False)
         layernorm_zero_centered_gamma=zero_centered, attention_backend=AttnBackend.unfused,
         hidden_dropout=0.0, attention_dropout=0.0, is_hybrid_model=True, bf16=True,
         params_dtype=torch.bfloat16, fused_qk_norm_rope=fused, attention_output_gate=gate,
+        rotary_interleaved=interleaved,
     )
     return HybridModel(
         config=config, hybrid_stack_spec=hybrid_stack_spec, vocab_size=128,
-        max_sequence_length=64, hybrid_layer_pattern="*-*-", position_embedding_type="rope",
+        max_sequence_length=64, hybrid_layer_pattern="*-*-", position_embedding_type=pos_emb,
         rotary_percent=rotary_percent, share_embeddings_and_output_weights=False,
     ).cuda().to(torch.bfloat16)
 
 
 @pytest.mark.parametrize(
-    "groups,rotary_percent,zero_centered,gate",
-    [(2, 1.0, False, False), (4, 0.5, True, False), (1, 1.0, False, False), (2, 1.0, False, True)],
+    "groups,rotary_percent,zero_centered,gate,pos_emb,interleaved",
+    [
+        (2, 1.0, False, False, "rope", False),
+        (4, 0.5, True, False, "rope", False),
+        (1, 1.0, False, False, "rope", False),
+        (2, 1.0, False, True, "rope", False),
+        # NoPE: q / k norm only; RoPE-only requirements (layout, mscale) do not apply
+        (2, 1.0, False, False, "none", False),
+        (4, 1.0, True, True, "none", True),
+    ],
 )
-def test_fused_matches_unfused(groups, rotary_percent, zero_centered, gate):
+def test_fused_matches_unfused(groups, rotary_percent, zero_centered, gate, pos_emb, interleaved):
     tokens = torch.randint(0, 128, (2, 64), device="cuda")
     pos = torch.arange(64, device="cuda").unsqueeze(0).expand(2, -1)
     results = []
     for fused in (False, True):
-        model = _model(fused, groups, rotary_percent, zero_centered, gate)
+        model = _model(fused, groups, rotary_percent, zero_centered, gate, pos_emb, interleaved)
         with torch.no_grad():  # a non-trivial norm weight
             for name, p in model.named_parameters():
                 if "layernorm" in name and p.dim() == 1:
