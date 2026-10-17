@@ -26,6 +26,10 @@ SCHEMES = {
         mhc=True, mhc_expansion_rate=2, mhc_sinkhorn_iters=4, mhc_lerp=True, ngpt=True
     ),
     "mhc_routed": dict(mhc=True, mhc_expansion_rate=4, mhc_routed_topk=2),
+    "mhc_routed_keys_lerp": dict(
+        mhc=True, mhc_expansion_rate=4, mhc_routed_topk=2, mhc_routed_key_dim=8,
+        mhc_lerp=True, ngpt=True, ngpt_lerp_normalization="analytic",
+    ),
     "attn_res": dict(attn_res=True, attn_res_num_blocks=3),
     "ngpt": dict(ngpt=True),
 }

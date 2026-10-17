@@ -409,3 +409,237 @@ class TestReversibleRoutedResidual:
             from megatron.core.transformer.routed_residual import RoutedStreamMixer
 
             RoutedStreamMixer(64, 4, 2, mix=True, reversible=True)
+
+
+# ----------------------------------------------------------------- LERP write (nGPT)
+
+
+def _unit(x):
+    return x / x.norm(dim=-1, keepdim=True)
+
+
+def _lerp_layer(fused, reversible, s_in, a0, idx, r0, w0, al0, mode, dy):
+    """One routed read + LERP write on ``s_in`` [T, n, C]; returns the output and the
+    gradients of (streams, a, r, w, alpha)."""
+    s = s_in.clone().requires_grad_()
+    base = s * 1.0  # non-leaf, so the fused write may update it in place
+    a, r, w, al = (v.clone().requires_grad_() for v in (a0, r0, w0, al0))
+    stash = rr.GradStash()
+    if not fused:
+        x = rr.routed_read_reference(base, idx, r)
+        out = rr.routed_write_lerp_reference(base, a, idx, w, al, mode, 1e-6)
+    else:
+        read = rr.routed_read_reversible if reversible else rr.routed_read
+        x = read(base, idx, r, stash)
+        out = rr.routed_write_lerp(base, a, idx, w, al, mode, 1e-6, stash, reversible=reversible)
+    written = out.detach().clone()  # a reversible backward restores the buffer in place
+    # the read feeds the loss too, so its backward runs after the write's
+    ((out.double() * dy).sum() + (x.double() * dy[:, 0]).sum()).backward()
+    return [written] + [v.grad for v in (s, a, r, w, al)], base
+
+
+@pytest.mark.parametrize("mode", rr.LERP_WRITE_MODES)
+@pytest.mark.parametrize("n,k", [(2, 1), (4, 2), (8, 3)])
+@pytest.mark.parametrize("c", [64, 200, 2304])
+@pytest.mark.parametrize("reversible", [False, True])
+def test_lerp_write_matches_reference(mode, n, k, c, reversible):
+    """The fused LERP write (and its reversible form) against the float64 out-of-place
+    definition: output and every gradient, on unit-norm streams."""
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    t = 37
+    s0 = _unit(torch.randn(t, n, c, device="cuda", generator=gen, dtype=torch.float64))
+    a0 = _unit(torch.randn(t, c, device="cuda", generator=gen, dtype=torch.float64))
+    idx = torch.stack(
+        [torch.randperm(n, generator=torch.Generator().manual_seed(i))[:k] for i in range(t)]
+    ).int().cuda()
+    r0 = torch.softmax(torch.randn(t, k, device="cuda", generator=gen, dtype=torch.float64), -1)
+    w0 = 2 * torch.sigmoid(torch.randn(t, k, device="cuda", generator=gen, dtype=torch.float64))
+    al0 = 0.05 + 0.2 * torch.rand(c, device="cuda", generator=gen, dtype=torch.float64)
+    dy = torch.randn(t, n, c, device="cuda", generator=gen, dtype=torch.float64)
+
+    ref, _ = _lerp_layer(False, False, s0, a0, idx, r0, w0, al0, mode, dy)
+    fused, base = _lerp_layer(
+        True, reversible, s0.float(), a0.float(), idx, r0.float(), w0.float(), al0.float(),
+        mode, dy,
+    )
+    names = ["out", "d_streams", "d_a", "d_r", "d_w", "d_alpha"]
+    for name, x, y in zip(names, fused, ref):
+        err = (x.double() - y).norm() / y.norm().clamp(min=1e-12)
+        assert err < 1e-5, (name, float(err))
+    # direct lands exactly on the sphere (approx / analytic only for a scalar step)
+    if mode == "direct":
+        torch.testing.assert_close(
+            fused[0].norm(dim=-1), torch.ones(t, n, device="cuda"), rtol=1e-5, atol=1e-5
+        )
+    if reversible:  # the backward restored the streams it wrote
+        torch.testing.assert_close(base.detach().double(), s0, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("mode", rr.LERP_WRITE_MODES)
+def test_lerp_write_bf16_against_fp32(mode):
+    """bf16 streams, in place: within 1% of the fp32 definition on the same inputs."""
+    gen = torch.Generator(device="cuda").manual_seed(1)
+    t, n, k, c = 40, 6, 3, 2304
+    s0 = _unit(torch.randn(t, n, c, device="cuda", generator=gen)).bfloat16()
+    a0 = _unit(torch.randn(t, c, device="cuda", generator=gen)).bfloat16()
+    idx = torch.stack(
+        [torch.randperm(n, generator=torch.Generator().manual_seed(i))[:k] for i in range(t)]
+    ).int().cuda()
+    r0 = torch.softmax(torch.randn(t, k, device="cuda", generator=gen), -1)
+    w0 = 2 * torch.sigmoid(torch.randn(t, k, device="cuda", generator=gen))
+    al0 = 0.05 + 0.2 * torch.rand(c, device="cuda", generator=gen)
+    dy = torch.randn(t, n, c, device="cuda", generator=gen, dtype=torch.float64)
+    fused, _ = _lerp_layer(True, False, s0, a0, idx, r0, w0, al0, mode, dy)
+    truth, _ = _lerp_layer(False, False, s0.float(), a0.float(), idx, r0, w0, al0, mode, dy)
+    for x, y in zip(fused, truth):
+        assert (x.float() - y.float()).norm() <= 1e-2 * y.float().norm()
+
+
+@pytest.mark.parametrize("mode", rr.LERP_WRITE_MODES)
+def test_lerp_write_with_every_stream_is_the_ngpt_residual(mode):
+    """k = n and write weight 1: every stream takes exactly NGPTResidual's step."""
+    from megatron.core.transformer.ngpt import NGPTResidual
+
+    torch.manual_seed(0)
+    n, c = 4, 64
+    mixer = RoutedStreamMixer(c, n, n).cuda()
+    with torch.no_grad():
+        mixer.alpha_post.zero_()  # w = 2 sigmoid(0) = 1 for every row
+    lerp = NGPTResidual(c, alpha_init_value=0.1, lerp_normalization=mode).cuda()
+    with torch.no_grad():
+        lerp.alpha.mul_(1.0 + 0.5 * torch.rand(c, device="cuda"))  # per-channel steps
+    s = _unit(torch.randn(6, 2, n, c, device="cuda"))
+    f = torch.randn(6, 2, c, device="cuda")
+    expected = torch.stack([lerp(f, s[:, :, i]) for i in range(n)], dim=2)
+    pre, post, res = mixer(s * 1.0)
+    streams = s.clone()
+    mixer.read(streams, pre)
+    out = mixer.write(streams, f, post, res, lerp=lerp)
+    torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
+
+
+class TestRoutedLerpAndKeys:
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+        yield
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize(
+        "kw",
+        [
+            dict(mhc_routed_key_dim=8),
+            dict(mhc_lerp=True, ngpt=True, ngpt_lerp_normalization="analytic"),
+            dict(mhc_lerp=True, ngpt=True, ngpt_lerp_normalization="direct",
+                 mhc_routed_key_dim=8),
+        ],
+        ids=["keys", "lerp", "keys_lerp"],
+    )
+    def test_fused_model_matches_out_of_place(self, monkeypatch, kw):
+        torch.manual_seed(0)
+        model = _hybrid_model("*-P-C-*-", **kw)
+        if "mhc_routed_key_dim" in kw:
+            with torch.no_grad():  # a live content score, so its path is checked too
+                for m in model.modules():
+                    if isinstance(m, RoutedStreamMixer):
+                        m.key_gain.fill_(0.5)
+        ids = torch.randint(0, 128, (2, 16), device="cuda")
+        grads = []
+        for fused in (True, False):
+            if not fused:
+                monkeypatch.setattr(rr, "_fused", lambda streams: False)
+            model.zero_grad(set_to_none=True)
+            logits = model(ids, position_ids=None, attention_mask=None)
+            logits.float().logsumexp(-1).mean().backward()
+            grads.append({n: p.grad.clone() for n, p in model.named_parameters()})
+        assert set(grads[0]) == set(grads[1])
+        for name in grads[0]:
+            torch.testing.assert_close(
+                grads[0][name], grads[1][name], rtol=1e-4, atol=1e-5, msg=name
+            )
+        if "mhc_routed_key_dim" in kw:
+            keys = [n for n in grads[0] if n.endswith("w_key")]
+            assert keys and all(grads[0][n].abs().sum() > 0 for n in keys)
+
+    @pytest.mark.parametrize("mode", rr.LERP_WRITE_MODES)
+    def test_reversible_lerp_matches_the_stored_backward(self, mode):
+        def run(reversible):
+            torch.manual_seed(0)
+            model_parallel_cuda_manual_seed(0)
+            model = _hybrid_model(
+                "*-P-C-*-", mhc_lerp=True, ngpt=True, ngpt_lerp_normalization=mode,
+                mhc_routed_key_dim=8, mhc_routed_reversible=reversible,
+            ).float()
+            with torch.no_grad():
+                for m in model.modules():
+                    if isinstance(m, RoutedStreamMixer):
+                        m.key_gain.fill_(0.5)
+            ids = torch.randint(0, 128, (2, 16), device="cuda",
+                                generator=torch.Generator("cuda").manual_seed(3))
+            logits = model(ids, position_ids=None, attention_mask=None)
+            logits.float().logsumexp(-1).mean().backward()
+            return logits.detach(), {n: p.grad.clone() for n, p in model.named_parameters()}
+
+        out_a, ga = run(False)
+        out_b, gb = run(True)
+        torch.testing.assert_close(out_a, out_b)
+        for name in ga:
+            torch.testing.assert_close(gb[name], ga[name], rtol=1e-4, atol=1e-4, msg=name)
+
+    def test_zero_key_gain_is_the_positional_router(self):
+        """At init (gain 0) the content router routes, reads and writes exactly as the
+        positional one with the same weights, and the gain still gets a gradient."""
+        torch.manual_seed(0)
+        plain = RoutedStreamMixer(64, 4, 2).cuda()
+        keyed = RoutedStreamMixer(64, 4, 2, key_dim=8).cuda()
+        with torch.no_grad():
+            keyed.phi[:, : plain.phi.shape[1]].copy_(plain.phi)
+        s = torch.randn(8, 2, 4, 64, device="cuda")
+        (i0, r0, _), (_, w0, _, _), _ = plain(s.clone())
+        streams = s.clone()
+        (i1, r1, st), (_, w1, _, _), _ = keyed(streams)
+        assert torch.equal(i0, i1)
+        torch.testing.assert_close(r1, r0, rtol=0, atol=0)
+        torch.testing.assert_close(w1, w0, rtol=0, atol=0)
+        keyed.read(streams, (i1, r1, st)).sum().backward()
+        assert keyed.key_gain.grad is not None and keyed.key_gain.grad.abs() > 0
+
+    def test_lerp_trains(self):
+        model = _hybrid_model(
+            "*-C-*-", mhc_lerp=True, ngpt=True, ngpt_lerp_normalization="analytic",
+            mhc_routed_key_dim=8,
+        )
+        opt = torch.optim.Adam(model.parameters(), lr=3e-3)
+        ids = torch.randint(0, 128, (4, 16), device="cuda")
+        losses = []
+        for _ in range(8):
+            logits = model(ids[:, :-1], position_ids=None, attention_mask=None)
+            loss = torch.nn.functional.cross_entropy(
+                logits.float().reshape(-1, 128), ids[:, 1:].reshape(-1)
+            )
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            losses.append(loss.item())
+        assert losses[-1] < losses[0]
+        mixer = model.decoder.layers[0].mhc_attn_mixer
+        assert mixer.key_gain.grad is not None
+        assert model.decoder.layers[0].ngpt_attn_residual.alpha.grad is not None
+
+    def test_config_validation(self):
+        base = dict(num_layers=2, hidden_size=64, num_attention_heads=4)
+        with pytest.raises(ValueError, match="_key_dim need mhc_routed_topk"):
+            TransformerConfig(**base, mhc=True, mhc_routed_key_dim=8)
+        with pytest.raises(ValueError, match="mhc_routed_key_dim must be in"):
+            TransformerConfig(**base, mhc=True, mhc_routed_topk=2, mhc_routed_key_dim=65)
+        with pytest.raises(ValueError, match="does not support mhc_routed_mix"):
+            TransformerConfig(
+                **base, mhc=True, mhc_routed_topk=2, mhc_routed_mix=True, mhc_lerp=True,
+                ngpt=True,
+            )
+        with pytest.raises(ValueError, match="supports ngpt_lerp_normalization"):
+            TransformerConfig(
+                **base, mhc=True, mhc_routed_topk=2, mhc_lerp=True, ngpt=True,
+                ngpt_lerp_normalization_ffn="direct_ste",
+            )

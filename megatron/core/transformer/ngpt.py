@@ -297,6 +297,19 @@ class NGPTResidual(nn.Module):
             return 0.5 * torch.tanh(raw).pow(2)
         return torch.tanh(math.atanh(0.95) * raw.pow(2))
 
+    def effective_alpha(self) -> torch.Tensor:
+        """The effective per-channel step ``alpha`` ``[h]`` in fp32 (recorded as a metric).
+
+        Also used by the routed-residual LERP write, which applies the step itself.
+        """
+        alpha32 = self._alpha_activation_fn(self.alpha.float() * self.alpha_scaler)
+        from megatron.core.transformer import arch_metrics
+
+        tag = arch_metrics.tag_of(self)
+        if tag is not None and arch_metrics.active():
+            arch_metrics.record_mean(f"ngpt_{tag[0]}/lerp_rate", tag[1], tag[2], alpha32)
+        return alpha32
+
     def forward(self, hidden_states: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
         """Apply the LERP residual update.
 
@@ -317,13 +330,8 @@ class NGPTResidual(nn.Module):
         # Reductions still accumulate in fp32, which is where the precision
         # actually matters; alpha is a small [h] vector so it stays fp32 and is
         # cast once.
-        alpha32 = self._alpha_activation_fn(self.alpha.float() * self.alpha_scaler)
+        alpha32 = self.effective_alpha()
         alpha = alpha32.to(input_dtype)
-        from megatron.core.transformer import arch_metrics
-
-        tag = arch_metrics.tag_of(self)
-        if tag is not None and arch_metrics.active():
-            arch_metrics.record_mean(f"ngpt_{tag[0]}/lerp_rate", tag[1], tag[2], alpha32)
 
         x = residual
         mode = self.lerp_normalization

@@ -1854,7 +1854,9 @@ class TransformerConfig(ModelParallelConfig):
     each sublayer reads and writes only stream 0 plus the top k-1 of the other
     mhc_expansion_rate - 1 streams (chosen per token by a router on stream 0), with no stream
     mixing, so it moves (2k+1) of the n streams instead of all of them. 0 is dense mHC.
-    Requires mhc=True; not combinable with mhc_lerp."""
+    Requires mhc=True. With mhc_lerp (and ngpt) the write is an nGPT LERP step of each
+    selected stream, its step alpha scaled by the router's write weight (lerp normalization
+    approx, analytic or direct; not with mhc_routed_mix)."""
 
     per_layer_embedding_dim: int = 0
     """Per-layer embeddings (PLE, Gemma 3n / Gemma 4; token_embeddings.py): each chosen layer
@@ -1890,6 +1892,13 @@ class TransformerConfig(ModelParallelConfig):
     and router saw, instead of saving the gathered rows and the router input. Exact up to
     the stream dtype's rounding, which reaches only the router gradients. Not with
     mhc_routed_mix."""
+
+    mhc_routed_key_dim: int = 0
+    """Routed residual streams: content-based routing. The router also reads the first
+    mhc_routed_key_dim channels of every stream (a tag) and adds the score
+    g <q(s_0), W_k tag_j> / sqrt(d) to the routing logits, with the gain g initialized to 0
+    (so it starts as the positional router). Costs n * mhc_routed_key_dim more elements read
+    per token and sublayer. 0 disables."""
 
     mhc_routed_balance_rate: float = 0.0
     """Routed residual streams: update rate of the aux-loss-free selection bias that
@@ -1975,11 +1984,35 @@ class TransformerConfig(ModelParallelConfig):
                     f"mhc_routed_topk must be in [1, mhc_expansion_rate="
                     f"{self.mhc_expansion_rate}], got {self.mhc_routed_topk}"
                 )
+            if not 0 <= self.mhc_routed_key_dim <= self.hidden_size:
+                raise ValueError(
+                    f"mhc_routed_key_dim must be in [0, hidden_size={self.hidden_size}], "
+                    f"got {self.mhc_routed_key_dim}"
+                )
             if self.mhc_lerp:
-                raise ValueError("mhc_routed_topk is not combinable with mhc_lerp")
-        elif self.mhc_routed_mix or self.mhc_routed_balance_rate or self.mhc_routed_reversible:
+                if self.mhc_routed_mix:
+                    raise ValueError(
+                        "mhc_lerp with mhc_routed_topk does not support mhc_routed_mix yet"
+                    )
+                from megatron.core.fusions.fused_routed_residual import LERP_WRITE_MODES
+
+                modes = {
+                    self.ngpt_lerp_normalization_attn or self.ngpt_lerp_normalization,
+                    self.ngpt_lerp_normalization_ffn or self.ngpt_lerp_normalization,
+                }
+                if not modes <= set(LERP_WRITE_MODES):
+                    raise ValueError(
+                        f"mhc_lerp with mhc_routed_topk supports ngpt_lerp_normalization in "
+                        f"{LERP_WRITE_MODES}, got {sorted(modes)}"
+                    )
+        elif (
+            self.mhc_routed_mix
+            or self.mhc_routed_balance_rate
+            or self.mhc_routed_reversible
+            or self.mhc_routed_key_dim
+        ):
             raise ValueError(
-                "mhc_routed_mix / _balance_rate / _reversible need mhc_routed_topk > 0"
+                "mhc_routed_mix / _balance_rate / _reversible / _key_dim need mhc_routed_topk > 0"
             )
         if self.mhc_routed_topk:
             if (self.cuda_graph_impl != "none" or self.enable_cuda_graph) and not os.environ.get(

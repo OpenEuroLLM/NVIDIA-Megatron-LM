@@ -41,6 +41,20 @@ projection) read the restored values, the residual path's do not. One stream sta
 per pipeline stage stays alive until the backward. Mixing is not invertible in
 general and does not combine with it.
 
+LERP write (nGPT). On the unit sphere the write is an nGPT LERP step of each routed
+stream toward the normalized sublayer output ``a``, its step the per-channel nGPT
+rate ``alpha`` scaled by the row's write weight (``beta = w_j alpha``)::
+
+    streams[t, idx_j] <- m * (s + beta * (a - s)),   s = streams[t, idx_j]
+
+with ``m`` the renormalization of :class:`~megatron.core.transformer.ngpt.NGPTResidual`
+(``approx``: from ``beta``; ``analytic``: from ``beta`` and ``cos = <s, a>``;
+``direct``: ``1 / |s + beta (a - s)|``). Still ``2k C`` elements moved; ``analytic``
+and ``direct`` take a second pass over the routed rows for their row reduction. Per
+row the forward keeps one scalar (``cos`` or ``m``), which with ``beta`` and ``a``
+makes the step invertible -- ``s = (s' / m - beta a) / (1 - beta)`` -- so the LERP
+write also has a reversible form.
+
 ``*_reference`` are the out-of-place torch definitions the kernels are tested
 against.
 """
@@ -81,6 +95,32 @@ def routed_write_reference(streams, f, idx, w):
     full = torch.zeros(streams.shape, dtype=torch.float32, device=streams.device)
     full = full.scatter_add(1, idx.long().unsqueeze(-1).expand_as(upd), upd)
     return (streams.float() + full).to(streams.dtype)
+
+
+LERP_WRITE_MODES = ("approx", "analytic", "direct")
+
+
+def routed_write_lerp_reference(streams, a, idx, w, alpha, mode, eps):
+    """Out-of-place LERP write: ``streams[t, idx_j] = m (s + beta (a - s))``,
+    ``beta = w[t, j] alpha`` (see the module docstring); ``a`` [T, C], ``alpha`` [C]."""
+    index = idx.long().unsqueeze(-1).expand(-1, -1, streams.shape[-1])
+    dt = torch.float64 if streams.dtype == torch.float64 else torch.float32
+    rows = torch.gather(streams, 1, index).to(dt)  # [T, k, C]
+    beta = w.to(dt).unsqueeze(-1) * alpha.to(dt)
+    a = a.to(dt).unsqueeze(1)
+    h = rows + beta * (a - rows)
+    if mode == "approx":
+        out = h * torch.rsqrt(torch.clamp(1.0 - 2.0 * beta * (1.0 - beta), min=eps))
+    elif mode == "analytic":
+        cos = (rows * a).sum(-1, keepdim=True)
+        one_minus = 1.0 - beta
+        denom = one_minus * one_minus + 2.0 * beta * one_minus * cos + beta * beta
+        out = h * torch.rsqrt(torch.clamp(denom, min=eps))
+    elif mode == "direct":
+        out = h / torch.linalg.vector_norm(h, dim=-1, keepdim=True).clamp(min=eps)
+    else:
+        raise ValueError(f"routed LERP write: mode must be one of {LERP_WRITE_MODES}, got {mode!r}")
+    return streams.scatter(1, index, out.to(streams.dtype))
 
 
 if HAVE_TRITON:
@@ -221,6 +261,169 @@ if HAVE_TRITON:
             tl.store(g_ptr + goffs, ds.to(g_ptr.dtype.element_ty), mask=rm)
         tl.store(dw_ptr + t * K + j, dw, mask=jm)
         tl.store(dm_ptr + t * K * K + j[:, None] * K + j[None, :], dm, mask=mm)
+
+
+if HAVE_TRITON:
+    # LERP write. MODE 0 approx, 1 analytic, 2 direct (LERP_WRITE_MODES). One program
+    # per token; all math in fp32. ``stat`` [T, k] is the per-row scalar the forward
+    # keeps: cos = <s, a> (analytic) or m = 1 / max(|h|, eps) (direct).
+
+    @triton.jit
+    def _lerp_scale(beta, stat, eps, MODE: tl.constexpr):
+        """The renormalization ``m`` [KP, BLOCK] of the step ``h = s + beta (a - s)``."""
+        if MODE == 0:
+            m = 1.0 / tl.sqrt(tl.maximum(1.0 - 2.0 * beta * (1.0 - beta), eps))
+        elif MODE == 1:
+            one_minus = 1.0 - beta
+            denom = one_minus * one_minus + 2.0 * beta * one_minus * stat[:, None] + beta * beta
+            m = 1.0 / tl.sqrt(tl.maximum(denom, eps))
+        else:
+            m = stat[:, None] + tl.zeros_like(beta)
+        return m
+
+    @triton.jit
+    def _lerp_fwd(
+        s_ptr, a_ptr, idx_ptr, w_ptr, al_ptr, stat_ptr, N, C, eps,
+        K: tl.constexpr, KP: tl.constexpr, MODE: tl.constexpr, BLOCK: tl.constexpr,
+    ):
+        t = tl.program_id(0).to(tl.int64)
+        j = tl.arange(0, KP)
+        jm = j < K
+        idx = tl.load(idx_ptr + t * K + j, mask=jm, other=0).to(tl.int64)
+        w = tl.load(w_ptr + t * K + j, mask=jm, other=0.0).to(tl.float32)
+        row = (t * N + idx) * C
+        stat = tl.zeros([KP], dtype=tl.float32)
+        if MODE != 0:
+            # The row reduction, over the pre-write rows (nothing is stored yet).
+            acc = tl.zeros([KP], dtype=tl.float32)
+            for c0 in range(0, C, BLOCK):
+                c = c0 + tl.arange(0, BLOCK)
+                cm = c < C
+                rm = jm[:, None] & cm[None, :]
+                s = tl.load(s_ptr + row[:, None] + c[None, :], mask=rm, other=0.0).to(tl.float32)
+                a = tl.load(a_ptr + t * C + c, mask=cm, other=0.0).to(tl.float32)
+                if MODE == 1:
+                    acc += tl.sum(s * a[None, :], axis=1)
+                else:
+                    al = tl.load(al_ptr + c, mask=cm, other=0.0)
+                    beta = w[:, None] * al[None, :]
+                    h = s + beta * (a[None, :] - s)
+                    acc += tl.sum(h * h, axis=1)
+            if MODE == 1:
+                stat = acc
+            else:
+                stat = 1.0 / tl.maximum(tl.sqrt(acc), eps)
+            tl.store(stat_ptr + t * K + j, stat, mask=jm)
+        for c0 in range(0, C, BLOCK):
+            c = c0 + tl.arange(0, BLOCK)
+            cm = c < C
+            rm = jm[:, None] & cm[None, :]
+            offs = row[:, None] + c[None, :]
+            s = tl.load(s_ptr + offs, mask=rm, other=0.0).to(tl.float32)
+            a = tl.load(a_ptr + t * C + c, mask=cm, other=0.0).to(tl.float32)
+            al = tl.load(al_ptr + c, mask=cm, other=0.0)
+            beta = w[:, None] * al[None, :]
+            m = _lerp_scale(beta, stat, eps, MODE)
+            out = (s + beta * (a[None, :] - s)) * m
+            tl.store(s_ptr + offs, out.to(s_ptr.dtype.element_ty), mask=rm)
+
+    @triton.jit
+    def _lerp_pre(src_ptr, srow, rrow, c, rm, a, beta, stat, eps,
+                  MODE: tl.constexpr, REV: tl.constexpr):
+        """The pre-write rows [KP, BLOCK]: the read's saved rows, or (REV) the inverted
+        step of the post-write streams, ``s = (s' / m - beta a) / (1 - beta)``."""
+        if REV:
+            out = tl.load(src_ptr + srow[:, None] + c[None, :], mask=rm, other=0.0)
+            m = _lerp_scale(beta, stat, eps, MODE)
+            s = (out.to(tl.float32) / m - beta * a[None, :]) / (1.0 - beta)
+        else:
+            s = tl.load(src_ptr + rrow[:, None] + c[None, :], mask=rm, other=0.0)
+            s = s.to(tl.float32)
+        return s
+
+    @triton.jit
+    def _lerp_bwd(
+        g_ptr, src_ptr, a_ptr, idx_ptr, w_ptr, al_ptr, stat_ptr, da_ptr, dw_ptr, dal_ptr,
+        N, C, eps,
+        K: tl.constexpr, KP: tl.constexpr, MODE: tl.constexpr, REV: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        # g [T, N, C] is the stream gradient, turned into the pre-write rows' gradient
+        # in place. src: the read's rows [T, K, C], or (REV) the streams [T, N, C],
+        # restored in place.
+        t = tl.program_id(0).to(tl.int64)
+        j = tl.arange(0, KP)
+        jm = j < K
+        idx = tl.load(idx_ptr + t * K + j, mask=jm, other=0).to(tl.int64)
+        w = tl.load(w_ptr + t * K + j, mask=jm, other=0.0).to(tl.float32)
+        srow = (t * N + idx) * C
+        rrow = (t * K + j) * C
+        stat = tl.zeros([KP], dtype=tl.float32)
+        if MODE != 0:
+            # 1 on the padding rows: their direct-mode m divides in the inverted step.
+            stat = tl.load(stat_ptr + t * K + j, mask=jm, other=1.0)
+        # Pass 1, the row reduction: analytic dL/dcos = sum -g h m^3 beta (1 - beta);
+        # direct <g, out>.
+        red = tl.zeros([KP], dtype=tl.float32)
+        if MODE != 0:
+            for c0 in range(0, C, BLOCK):
+                c = c0 + tl.arange(0, BLOCK)
+                cm = c < C
+                rm = jm[:, None] & cm[None, :]
+                g = tl.load(g_ptr + srow[:, None] + c[None, :], mask=rm, other=0.0).to(tl.float32)
+                a = tl.load(a_ptr + t * C + c, mask=cm, other=0.0).to(tl.float32)
+                al = tl.load(al_ptr + c, mask=cm, other=0.0)
+                beta = w[:, None] * al[None, :]
+                s = _lerp_pre(src_ptr, srow, rrow, c, rm, a, beta, stat, eps, MODE, REV)
+                m = _lerp_scale(beta, stat, eps, MODE)
+                h = s + beta * (a[None, :] - s)
+                if MODE == 1:
+                    red += tl.sum(-g * h * m * m * m * beta * (1.0 - beta), axis=1)
+                else:
+                    red += tl.sum(g * h * m, axis=1)
+        dw = tl.zeros([KP], dtype=tl.float32)
+        for c0 in range(0, C, BLOCK):
+            c = c0 + tl.arange(0, BLOCK)
+            cm = c < C
+            rm = jm[:, None] & cm[None, :]
+            goffs = srow[:, None] + c[None, :]
+            g = tl.load(g_ptr + goffs, mask=rm, other=0.0).to(tl.float32)
+            a = tl.load(a_ptr + t * C + c, mask=cm, other=0.0).to(tl.float32)
+            al = tl.load(al_ptr + c, mask=cm, other=0.0)
+            beta = w[:, None] * al[None, :]
+            s = _lerp_pre(src_ptr, srow, rrow, c, rm, a, beta, stat, eps, MODE, REV)
+            if REV:
+                tl.store(src_ptr + goffs, s.to(src_ptr.dtype.element_ty), mask=rm)
+            m = _lerp_scale(beta, stat, eps, MODE)
+            h = s + beta * (a[None, :] - s)
+            if MODE == 0:
+                dh = g * m
+                dbeta = dh * (a[None, :] - s) + g * h * m * m * m * (1.0 - 2.0 * beta)
+                ds = dh * (1.0 - beta)
+                dar = dh * beta
+            elif MODE == 1:
+                dh = g * m
+                u = -0.5 * g * h * m * m * m  # dL/d denom
+                dbeta = dh * (a[None, :] - s) + u * 2.0 * (2.0 * beta - 1.0) * (
+                    1.0 - stat[:, None]
+                )
+                ds = dh * (1.0 - beta) + red[:, None] * a[None, :]
+                dar = dh * beta + red[:, None] * s
+            else:
+                dh = m * (g - h * m * red[:, None])
+                dbeta = dh * (a[None, :] - s)
+                ds = dh * (1.0 - beta)
+                dar = dh * beta
+            dw += tl.sum(dbeta * al[None, :], axis=1)
+            tl.store(da_ptr + t * C + c, tl.sum(dar, axis=0), mask=cm)
+            tl.store(dal_ptr + t * C + c, tl.sum(dbeta * w[:, None], axis=0), mask=cm)
+            tl.store(g_ptr + goffs, ds.to(g_ptr.dtype.element_ty), mask=rm)
+        tl.store(dw_ptr + t * K + j, dw, mask=jm)
+
+
+def _lerp_block(c: int, kp: int) -> int:
+    # A dozen [KP, BLOCK] fp32 temporaries: keep a tile around 2k elements.
+    return max(16, min(triton.next_power_of_2(c), 2048 // kp))
 
 
 def _mix_block(c: int, kp: int) -> int:
@@ -366,36 +569,122 @@ class _RoutedWriteMix(torch.autograd.Function):
         return g, df, None, dw.to(w.dtype), dm.to(mix.dtype), None
 
 
-class _RouterCoeffsReversible(torch.autograd.Function):
-    """``coeff_fn(stream main, phi)`` without keeping the stream: the backward
-    recomputes it from the restored state."""
+_LERP_MODE_IDS = {mode: i for i, mode in enumerate(LERP_WRITE_MODES)}
+
+
+class _RoutedWriteLerp(torch.autograd.Function):
+    """The LERP write in place; ``reversible``: its backward also inverts it in place."""
 
     @staticmethod
-    def forward(ctx, streams, phi, main, coeff_fn, stash):
+    def forward(ctx, streams, a, idx, w, alpha, mode, eps, stash, reversible):
+        t, n, c = _dims(streams)
+        k = idx.shape[-1]
+        kp = triton.next_power_of_2(k)
+        a = a.contiguous()
+        stat = torch.ones(t, k, dtype=torch.float32, device=streams.device)
+        _lerp_fwd[(t,)](
+            streams, a, idx, w, alpha, stat, n, c, eps,
+            K=k, KP=kp, MODE=mode, BLOCK=_lerp_block(c, kp),
+        )
+        ctx.mark_dirty(streams)
+        ctx.save_for_backward(a, idx, w, alpha, stat)
+        ctx.n, ctx.mode, ctx.eps, ctx.stash, ctx.reversible = n, mode, eps, stash, reversible
+        ctx.streams = streams.detach() if reversible else None
+        return streams
+
+    @staticmethod
+    def backward(ctx, g):
+        a, idx, w, alpha, stat = ctx.saved_tensors
+        if ctx.reversible:
+            src = ctx.streams
+        else:
+            src = ctx.stash.rows
+            if src is None:
+                raise RuntimeError("a LERP routed write needs the routed read of its sublayer")
+        c = a.shape[-1]
+        t, k = idx.shape
+        kp = triton.next_power_of_2(k)
+        g = _own(g)
+        da = torch.empty(a.shape, dtype=torch.float32, device=a.device)
+        dw = torch.empty(t, k, dtype=torch.float32, device=a.device)
+        dal = torch.empty(t, c, dtype=torch.float32, device=a.device)
+        _lerp_bwd[(t,)](
+            g, src, a, idx, w, alpha, stat, da, dw, dal, ctx.n, c, ctx.eps,
+            K=k, KP=kp, MODE=ctx.mode, REV=ctx.reversible, BLOCK=_lerp_block(c, kp),
+        )
+        ctx.streams = None
+        ctx.stash.grad = g
+        return g, da.to(a.dtype), None, dw, dal.sum(0), None, None, None, None
+
+
+class _StreamTapTags(torch.autograd.Function):
+    """:class:`_StreamTap` plus the first ``tag_dim`` channels of every stream, ``[..., n,
+    tag_dim]`` (the content router's keys), in one node: its backward is the sublayer's
+    last for both."""
+
+    @staticmethod
+    def forward(ctx, streams, main, tag_dim, stash):
+        ctx.main, ctx.tag_dim, ctx.stash, ctx.shape = main, tag_dim, stash, streams.shape
+        return streams.select(-2, main).clone(), streams[..., :tag_dim].clone()
+
+    @staticmethod
+    def backward(ctx, ds0, dtags):
+        grad = ctx.stash.grad
+        if grad is not None:
+            grad, ctx.stash.grad = grad, None
+            ctx.stash.rows = None
+            own = False
+        else:
+            grad, own = ds0.new_zeros(ctx.shape), True
+        grad.select(-2, ctx.main).add_(ds0)
+        grad[..., : ctx.tag_dim].add_(dtags)
+        return (grad if own else None), None, None, None
+
+
+class _RouterCoeffsReversible(torch.autograd.Function):
+    """``coeff_fn(stream main, tags, *params)`` without keeping the stream: the backward
+    recomputes it from the restored state. ``tags`` are the first ``tag_dim`` channels
+    of every stream (None when 0)."""
+
+    @staticmethod
+    def forward(ctx, streams, main, tag_dim, coeff_fn, stash, *params):
         with torch.no_grad():
-            out = coeff_fn(streams.select(-2, main), phi)
-        ctx.streams, ctx.main, ctx.coeff_fn, ctx.stash = streams, main, coeff_fn, stash
-        ctx.save_for_backward(phi)
+            tags = streams[..., :tag_dim] if tag_dim else None
+            out = coeff_fn(streams.select(-2, main), tags, *params)
+        ctx.streams, ctx.main, ctx.tag_dim = streams, main, tag_dim
+        ctx.coeff_fn, ctx.stash = coeff_fn, stash
+        ctx.save_for_backward(*params)
         return out
 
     @staticmethod
     def backward(ctx, dout):
-        (phi,) = ctx.saved_tensors
-        streams = ctx.streams
+        params = ctx.saved_tensors
+        streams, tag_dim = ctx.streams, ctx.tag_dim
         with torch.enable_grad():
             s0 = streams.select(-2, ctx.main).detach().clone().requires_grad_()
-            p = phi.detach().requires_grad_()
-            ds0, dphi = torch.autograd.grad(ctx.coeff_fn(s0, p), (s0, p), dout)
+            inputs = [s0]
+            tags = None
+            if tag_dim:
+                tags = streams[..., :tag_dim].detach().clone().requires_grad_()
+                inputs.append(tags)
+            ps = [p.detach().requires_grad_() for p in params]
+            grads = torch.autograd.grad(
+                ctx.coeff_fn(s0, tags, *ps), inputs + ps, dout, allow_unused=True
+            )
         ctx.streams = None
+        ds0, dtags = grads[0], (grads[1] if tag_dim else None)
+        dparams = tuple(grads[len(inputs) :])
         stash = ctx.stash
         if stash.grad is not None:
             # This is the sublayer's last backward: release the buffer.
             grad, stash.grad = stash.grad, None
-            grad.select(-2, ctx.main).add_(ds0.to(grad.dtype))
-            return None, dphi, None, None, None
-        ds = ds0.new_zeros(streams.shape)
-        ds.select(-2, ctx.main).copy_(ds0)
-        return ds, dphi, None, None, None
+            own = False
+        else:
+            grad, own = ds0.new_zeros(streams.shape), True
+        grad.select(-2, ctx.main).add_(ds0.to(grad.dtype))
+        if dtags is not None:
+            grad[..., :tag_dim].add_(dtags.to(grad.dtype))
+        return ((grad if own else None), None, None, None, None) + dparams
 
 
 class _RoutedReadReversible(torch.autograd.Function):
@@ -462,10 +751,11 @@ class _RoutedWriteReversible(torch.autograd.Function):
         return g, df, None, dw.to(w.dtype), None
 
 
-def router_coeffs_reversible(streams, phi, coeff_fn, stash, main: int = 0):
-    """``coeff_fn(streams[..., main, :], phi)``, recomputed in the backward from the
-    restored streams (reversible routed residual)."""
-    return _RouterCoeffsReversible.apply(streams, phi, main, coeff_fn, stash)
+def router_coeffs_reversible(streams, params, coeff_fn, stash, main: int = 0, tag_dim: int = 0):
+    """``coeff_fn(streams[..., main, :], tags, *params)``, recomputed in the backward from
+    the restored streams (reversible routed residual); ``tags`` is
+    ``streams[..., :tag_dim]``, or None when ``tag_dim`` is 0."""
+    return _RouterCoeffsReversible.apply(streams, main, tag_dim, coeff_fn, stash, *params)
 
 
 def routed_read_reversible(streams, idx, r, stash):
@@ -487,6 +777,16 @@ def stream_tap(streams: torch.Tensor, main: int, stash: GradStash) -> torch.Tens
     if _fused(streams):
         return _StreamTap.apply(streams, main, stash)
     return streams.select(-2, main)
+
+
+def stream_tap_tags(
+    streams: torch.Tensor, main: int, tag_dim: int, stash: GradStash
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Copies of stream ``main`` ``[..., C]`` and of the first ``tag_dim`` channels of every
+    stream ``[..., n, tag_dim]``."""
+    if _fused(streams):
+        return _StreamTapTags.apply(streams, main, tag_dim, stash)
+    return streams.select(-2, main), streams[..., :tag_dim]
 
 
 def routed_read(
@@ -541,6 +841,36 @@ def routed_write_mix(
     n, c = streams.shape[-2:]
     out = routed_write_mix_reference(
         streams.reshape(-1, n, c), f.reshape(-1, c), idx, w, mix
+    )
+    return out.view(streams.shape)
+
+
+def routed_write_lerp(
+    streams: torch.Tensor,
+    a: torch.Tensor,
+    idx: torch.Tensor,
+    w: torch.Tensor,
+    alpha: torch.Tensor,
+    mode: str,
+    eps: float,
+    stash: GradStash,
+    reversible: bool = False,
+) -> torch.Tensor:
+    """The LERP write ``streams[t, idx_j] = m (s + w[t, j] alpha (a[t] - s))`` (module
+    docstring) -- in place when the kernel runs (after the sublayer's :func:`routed_read`,
+    or its :func:`routed_read_reversible` with ``reversible``). ``a`` ``[..., C]`` is the
+    (normalized) sublayer output, ``alpha`` ``[C]`` the nGPT step."""
+    if mode not in LERP_WRITE_MODES:
+        raise ValueError(f"routed LERP write: mode must be one of {LERP_WRITE_MODES}, got {mode!r}")
+    if _fused(streams):
+        return _RoutedWriteLerp.apply(
+            streams if reversible else _writable(streams), a, idx.int().contiguous(),
+            w.float().contiguous(), alpha.float().contiguous(), _LERP_MODE_IDS[mode], eps,
+            stash, reversible,
+        )
+    n, c = streams.shape[-2:]
+    out = routed_write_lerp_reference(
+        streams.reshape(-1, n, c), a.reshape(-1, c), idx, w, alpha, mode, eps
     )
     return out.view(streams.shape)
 

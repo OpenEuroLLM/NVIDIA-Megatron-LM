@@ -25,6 +25,25 @@ with ``M`` a per-token ``[k, k]`` doubly stochastic matrix (Sinkhorn) from
 The backward needs the pre-write rows, which the read keeps anyway: mixing adds
 only the ``[k, k]`` matrices to the activation memory.
 
+Content keys (``mhc_routed_key_dim = d``). The router above sees only stream 0, so it
+picks streams by position, not by what they hold. With ``d > 0`` it also reads the
+first ``d`` channels of every stream (a tag, ``n d`` elements: a few percent of the
+``(2k + 1) C``) and adds an attention-like content score to the routing logits::
+
+    z_j += g <q, k_j> / sqrt(d),   q = phi_q rms(s_0),   k_j = W_k rms(s_j[:d])
+
+``q`` comes from the same projection as the logits (``d`` more columns of ``phi``);
+the gain ``g`` starts at 0, so at init the router is the positional one above and
+the score is learned in. The model chooses what the tag channels carry.
+
+LERP write (``mhc_lerp`` with ``ngpt``). The write becomes an nGPT LERP step of each
+selected stream toward the normalized sublayer output, its step ``alpha`` (the
+sublayer's NGPTResidual) scaled per row by the write weight,
+``s_j <- Norm(s_j + w_j alpha (a - s_j))`` (fused_routed_residual.py): with
+``post_layer_norm`` the output's own scale is normalized away, so the write weight acts
+on the step. Every stream stays on the sphere, so the read weights mix vectors of
+equal norm, and a stream that is rarely picked keeps its content longer.
+
 Balancing (``mhc_routed_balance_rate``). Like the aux-loss-free MoE router
 (DeepSeek-V3), a per-stream bias added to the routing logits for the selection
 only (not the read weights) moves after every step toward the under-picked
@@ -44,14 +63,17 @@ from torch import nn
 
 from megatron.core.fusions.fused_routed_residual import (
     GradStash,
+    LERP_WRITE_MODES,
     route_streams,
     routed_read,
     routed_write,
     routed_read_reversible,
+    routed_write_lerp,
     routed_write_mix,
     routed_write_reversible,
     router_coeffs_reversible,
     stream_tap,
+    stream_tap_tags,
 )
 
 
@@ -70,17 +92,24 @@ class RoutedStreamMixer(nn.Module):
         identity_bias: float = 5.0,
         balance: bool = False,
         reversible: bool = False,
+        key_dim: int = 0,
     ) -> None:
         super().__init__()
         if reversible and mix:
             raise ValueError("mhc_routed_reversible does not combine with mhc_routed_mix")
+        if not 0 <= key_dim <= hidden_size:
+            raise ValueError(f"mhc_routed_key_dim must be in [0, {hidden_size}], got {key_dim}")
         self.reversible = reversible
         if not 1 <= topk <= expansion_rate:
             raise ValueError(f"mhc_routed_topk must be in [1, {expansion_rate}], got {topk}")
         self.hidden_size, self.n, self.k, self.eps = hidden_size, expansion_rate, topk, eps
         self.mix, self.sinkhorn_iters, self.identity_bias = mix and topk > 1, sinkhorn_iters, identity_bias
         n = expansion_rate
-        self.phi = nn.Parameter(torch.empty(hidden_size, 2 * n + (n * n if self.mix else 0)))
+        self.key_dim = key_dim
+        # Columns of phi: routing logits [n], write gates [n], mixing [n * n] (mix), query
+        # [key_dim].
+        self._q0 = 2 * n + (n * n if self.mix else 0)
+        self.phi = nn.Parameter(torch.empty(hidden_size, self._q0 + key_dim))
         self.b_route = nn.Parameter(torch.zeros(n))
         self.b_post = nn.Parameter(torch.zeros(n))
         self.alpha_post = nn.Parameter(torch.full((1,), alpha_init))
@@ -89,6 +118,11 @@ class RoutedStreamMixer(nn.Module):
             self.b_res = nn.Parameter(torch.zeros(n, n))
             self.alpha_res = nn.Parameter(torch.full((1,), alpha_init))
             scalers += [self.b_res, self.alpha_res]
+        if key_dim:
+            self.w_key = nn.Parameter(torch.empty(key_dim, key_dim))
+            self.key_gain = nn.Parameter(torch.zeros(1))
+            self.w_key.use_adam_with_emerging_optimizers = True
+            scalers.append(self.key_gain)
         # A router (as an MoE router): Adam, also under the Muon-family optimizers.
         self.phi.use_adam_with_emerging_optimizers = True
         for p in scalers:
@@ -107,6 +141,11 @@ class RoutedStreamMixer(nn.Module):
         with torch.no_grad():
             self.phi.zero_()
             self.phi[:, : self.n].normal_(0.0, self.hidden_size**-0.5)
+            if self.key_dim:
+                # q and k ~ N(0, 1) per entry, so the score <q, k> / sqrt(d) is ~ N(0, 1).
+                self.phi[:, self._q0 :].normal_(0.0, self.hidden_size**-0.5)
+                self.w_key.normal_(0.0, self.key_dim**-0.5)
+                self.key_gain.zero_()
             self.b_route.zero_()
             self.b_post.zero_()
             if self.mix:
@@ -122,10 +161,16 @@ class RoutedStreamMixer(nn.Module):
     def forward(self, streams: torch.Tensor):
         """``streams`` ``[s, b, n, C]`` -> ``(pre, post, None)`` routing state."""
         stash = GradStash()
+        params = (self.phi, self.w_key, self.key_gain) if self.key_dim else (self.phi,)
         if self._reversible_now(streams):
-            coeffs = router_coeffs_reversible(streams, self.phi, self._coeffs, stash)
+            coeffs = router_coeffs_reversible(
+                streams, params, self._router, stash, tag_dim=self.key_dim
+            )
+        elif self.key_dim:
+            s0, tags = stream_tap_tags(streams, 0, self.key_dim, stash)
+            coeffs = self._router(s0, tags, *params)
         else:
-            coeffs = self._coeffs(stream_tap(streams, 0, stash), self.phi)
+            coeffs = self._router(stream_tap(streams, 0, stash), None, *params)
         z, post = coeffs[:, : self.n], coeffs[:, self.n : 2 * self.n]
         select_bias = self.route_bias if self.balance else None
         idx, r = route_streams(z + self.b_route.float(), self.k, select_bias=select_bias)
@@ -174,6 +219,8 @@ class RoutedStreamMixer(nn.Module):
             arch_metrics.record_share(f"{p}/pick_share", layer, num_layers, onehot)
         arch_metrics.record_mean(f"{p}/main_read", layer, num_layers, r[:, 0])
         arch_metrics.record_mean(f"{p}/write", layer, num_layers, w)
+        if self.key_dim:
+            arch_metrics.record_mean(f"{p}/key_gain", layer, num_layers, self.key_gain)
         if mix is not None:
             arch_metrics.record_mean(
                 f"{p}/mix_diag", layer, num_layers, torch.diagonal(mix, dim1=-2, dim2=-1)
@@ -185,6 +232,22 @@ class RoutedStreamMixer(nn.Module):
         rms = torch.linalg.vector_norm(s0, dim=-1, keepdim=True).float()
         rms = (rms / self.hidden_size**0.5).clamp(min=self.eps)
         return torch.matmul(s0, phi.to(s0.dtype)).float() / rms
+
+    def _router(self, s0, tags, phi, w_key=None, key_gain=None) -> torch.Tensor:
+        """All coefficients ``[T, 2n (+ n * n)]`` fp32: :meth:`_coeffs`, with the content
+        score added to the routing logits when ``tags`` (``[..., n, key_dim]``) are given."""
+        coeffs = self._coeffs(s0, phi)
+        if tags is None:
+            return coeffs
+        d = self.key_dim
+        q = coeffs[:, self._q0 :]  # [T, d], from the normalized s_0
+        tags = tags.reshape(-1, self.n, d)
+        rms = torch.linalg.vector_norm(tags, dim=-1, keepdim=True).float()
+        rms = (rms / d**0.5).clamp(min=self.eps)
+        keys = torch.matmul(tags, w_key.to(tags.dtype)).float() / rms  # [T, n, d]
+        score = (keys * q.unsqueeze(1)).sum(-1) * d**-0.5
+        z = coeffs[:, : self.n] + key_gain.float() * score
+        return torch.cat([z, coeffs[:, self.n : self._q0]], dim=1)
 
     def _reversible_now(self, streams: torch.Tensor) -> bool:
         from megatron.core.fusions.fused_routed_residual import _fused
@@ -198,15 +261,34 @@ class RoutedStreamMixer(nn.Module):
         return routed_read(streams, idx, r, stash)
 
     def write(self, streams, sublayer_out, h_post, h_res=None, lerp=None) -> torch.Tensor:
-        if lerp is not None:
-            raise NotImplementedError("mhc_lerp is not supported with mhc_routed_topk")
         idx, w, mix, stash = h_post
         f = sublayer_out.to(streams.dtype)
+        if lerp is not None:
+            return self._write_lerp(streams, f, idx, w, mix, stash, lerp)
         if mix is not None:
             return routed_write_mix(streams, f, idx, w, mix, stash)
         if self._reversible_now(streams):
             return routed_write_reversible(streams, f, idx, w, stash)
         return routed_write(streams, f, idx, w, stash)
+
+    def _write_lerp(self, streams, f, idx, w, mix, stash, lerp) -> torch.Tensor:
+        """The nGPT LERP write: each routed stream steps toward the normalized ``f`` by
+        ``w_j alpha`` (``lerp``: the sublayer's NGPTResidual)."""
+        if mix is not None:
+            raise NotImplementedError("mhc_lerp is not supported with mhc_routed_mix yet")
+        mode = lerp.lerp_normalization
+        if mode not in LERP_WRITE_MODES:
+            raise NotImplementedError(
+                f"mhc_lerp with mhc_routed_topk supports lerp_normalization in "
+                f"{LERP_WRITE_MODES}, got {mode!r}"
+            )
+        a = f
+        if lerp.post_layer_norm:
+            a = f / torch.linalg.vector_norm(f, dim=-1, keepdim=True).clamp(min=lerp.eps)
+        return routed_write_lerp(
+            streams, a, idx, w, lerp.effective_alpha(), mode, lerp.eps, stash,
+            reversible=self._reversible_now(streams),
+        )
 
 
 def build_stream_mixer(config) -> nn.Module:
@@ -223,6 +305,7 @@ def build_stream_mixer(config) -> nn.Module:
             sinkhorn_iters=config.mhc_sinkhorn_iters,
             balance=bool(getattr(config, "mhc_routed_balance_rate", 0.0)),
             reversible=getattr(config, "mhc_routed_reversible", False),
+            key_dim=getattr(config, "mhc_routed_key_dim", 0),
         )
     from megatron.core.transformer.mhc import MHCMixer
 
