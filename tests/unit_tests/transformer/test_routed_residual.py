@@ -707,6 +707,23 @@ class TestFreeRouting:
             again = model(ids, position_ids=None, attention_mask=None)
         torch.testing.assert_close(again.detach(), out)
 
+    def test_gate_is_finite_for_a_stream_picked_through_the_bias(self):
+        """Balancing can pick a stream whose softmax probability underflows to 0: the
+        straight-through gate must stay finite (forward 1, finite gradient)."""
+        mixer = RoutedStreamMixer(hidden_size=32, expansion_rate=4, topk=1, free=True,
+                                  balance=True).cuda()
+        with torch.no_grad():
+            mixer.b_route.copy_(torch.tensor([200.0, 0.0, 0.0, -200.0]))  # p(stream 3) = 0
+            mixer.route_bias.copy_(torch.tensor([0.0, 0.0, 0.0, 1e4]))  # ... but it is picked
+        h = torch.randn(6, 2, 4, 32, device="cuda", requires_grad=True)
+        pre, post, res = mixer(h)
+        assert (post[0] == 3).all()
+        f = torch.randn(6, 2, 32, device="cuda", requires_grad=True)
+        out = mixer.write(h.clone(), f, post, res)
+        assert torch.isfinite(out).all()
+        out.square().sum().backward()
+        assert torch.isfinite(mixer.b_route.grad).all() and torch.isfinite(h.grad).all()
+
     def test_balancing_covers_every_stream(self):
         from megatron.core.transformer.routed_residual import update_routed_residual_bias
 

@@ -209,9 +209,11 @@ class RoutedStreamMixer(nn.Module):
         w = 2.0 * torch.sigmoid(self.alpha_post.float() * post + self.b_post.float())
         w = torch.gather(w, 1, idx.long())
         if self.free:
-            # straight-through gate (value 1): the selection learns from the write
-            p = torch.gather(torch.softmax(logits, dim=-1), 1, idx.long())
-            w = w * (p / p.detach())
+            # straight-through gate (value 1): the selection learns from the write. In log
+            # space: a stream picked through the balancing bias can have a softmax probability
+            # that underflows to 0, and p / sg(p) would be 0 / 0
+            logp = torch.gather(torch.log_softmax(logits, dim=-1), 1, idx.long())
+            w = w * torch.exp(logp - logp.detach())
         mix = None
         if self.mix:
             from megatron.core.transformer.mhc import sinkhorn_knopp
