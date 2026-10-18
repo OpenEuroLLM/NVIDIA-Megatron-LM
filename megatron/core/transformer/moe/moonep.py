@@ -311,14 +311,10 @@ class MoonEPGroupedMLP(MegatronModule):
                 config.output_layer_init_method(self.weight2.data[i])
         for p in (self.weight1, self.weight2):
             p.allreduce = False  # expert-data-parallel gradient reduction
-        self.register_buffer(
-            "_dummy_w", torch.zeros(epn, _DUMMY, _DUMMY, device=dev, dtype=torch.bfloat16),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_dummy_g", torch.zeros(epn, _DUMMY, _DUMMY, device=dev, dtype=torch.float32),
-            persistent=False,
-        )
+        # plain attributes, not buffers: Float16Module would cast an fp32 buffer to bf16, and
+        # MoonEP's grad reduce needs the fp32 placeholder grad
+        self._dummy_w = torch.zeros(epn, _DUMMY, _DUMMY, device=dev, dtype=torch.bfloat16)
+        self._dummy_g = torch.zeros(epn, _DUMMY, _DUMMY, device=dev, dtype=torch.float32)
         self.pool_shapes = [(2 * F, H), (H, F), (_DUMMY, _DUMMY)]
         self.state = None  # set by the dispatcher on its first dispatch
         self.holder = None
