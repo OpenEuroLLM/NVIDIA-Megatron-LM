@@ -201,7 +201,11 @@ class _MoonEPCombine(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
-        grad_nvsh, _, _, _ = ctx.state.buffer.dispatch(grad_out.contiguous(), plan=ctx.plan)
+        # zero copy: the experts' backward reads the output grad from the NVLink shard (fc2's
+        # dgrad / wgrad consume it before fc1's dgrad overwrites the shard)
+        grad_nvsh, _, _, _ = ctx.state.buffer.dispatch(
+            grad_out.contiguous(), plan=ctx.plan, zero_copy=True
+        )
         return grad_nvsh, None, None
 
 
@@ -244,6 +248,17 @@ def _gemm(weights, a, a_dim, out, out_dim, splits, offsets, layout, accumulate=F
             )
 
 
+def _wgrad(main, gpool, a, a_dim, dy, dy_dim, splits, offsets):
+    """Weight grads: the local experts accumulate into their fp32 main grads; the prefetch slots
+    are written fresh into this rank's reduce slots (cleared after each reduce; mostly empty, and
+    an empty group with accumulate=True still reads + writes its whole fp32 block)."""
+    epn = main.shape[0]
+    _gemm([main[i] for i in range(epn)], a, a_dim, dy, dy_dim, splits[:epn], offsets[: epn + 1],
+          "NT", accumulate=True)
+    _gemm([gpool[i].view_as(main[0]) for i in range(epn)], a, a_dim, dy, dy_dim, splits[epn:],
+          offsets[epn:], "NT", accumulate=False)
+
+
 class _MoonEPExperts(torch.autograd.Function):
     """Weighted SwiGLU MLP over the 2 * epn expert slots (local experts + prefetched copies)."""
 
@@ -267,14 +282,14 @@ class _MoonEPExperts(torch.autograd.Function):
         # free: the dispatch copied the tokens out; y is not saved for backward)
         y = state.buffer.hidden_nvsh_buffer_view
         _gemm(w2, a, ffn2 // 2, y, hidden, splits, offsets, "TN")
-        ctx.save_for_backward(x, h, w_nvs, splits, offsets)
+        ctx.save_for_backward(x, h, a, w_nvs, splits, offsets)
         ctx.module, ctx.plan = module, plan
         ctx.weights = (weight1, weight2)
         return y
 
     @staticmethod
     def backward(ctx, grad_y):
-        x, h, w_nvs, splits, offsets = ctx.saved_tensors
+        x, h, a, w_nvs, splits, offsets = ctx.saved_tensors
         module, plan = ctx.module, ctx.plan
         state = module.state
         weight1, weight2 = ctx.weights
@@ -289,19 +304,16 @@ class _MoonEPExperts(torch.autograd.Function):
         main1, main2 = module.main_grads()
 
         probs = w_nvs.unsqueeze(-1)
-        a = weighted_swiglu(h, probs)
         # fc2: dgrad + wgrad (into the local main grads and this rank's reduce slots)
         grad_a = torch.empty(x.shape[0], ffn, dtype=x.dtype, device=x.device)
         _gemm(w2, grad_y, hidden, grad_a, ffn, splits, offsets, "NN")
-        wg2 = [main2[i] for i in range(epn)] + [gpools[1][i].view_as(main2[0]) for i in range(epn)]
-        _gemm(wg2, a, ffn, grad_y, hidden, splits, offsets, "NT", accumulate=True)
+        _wgrad(main2, gpools[1], a, ffn, grad_y, hidden, splits, offsets)
         grad_h, grad_probs = weighted_swiglu_back(grad_a, h, probs)
         # fc1
         # zero copy: the dispatch backward (a combine) reads fc1's dgrad from the shard
         grad_x = state.buffer.hidden_nvsh_buffer_view
         _gemm(w1, grad_h, ffn2, grad_x, hidden, splits, offsets, "NN")
-        wg1 = [main1[i] for i in range(epn)] + [gpools[0][i].view_as(main1[0]) for i in range(epn)]
-        _gemm(wg1, x, hidden, grad_h, ffn2, splits, offsets, "NT", accumulate=True)
+        _wgrad(main1, gpools[0], x, hidden, grad_h, ffn2, splits, offsets)
         # the prefetched copies' grads -> their home ranks' main grads (collective)
         state.reduce_grad(plan, module.local_grads(main1, main2), module.pool_shapes)
         for w in (weight1, weight2):
