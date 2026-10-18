@@ -10,8 +10,16 @@ usage, shared-expert gates, and the decay / input gates of the native linear mix
 
 Cost. Recording only happens on *metric steps*: the training loop turns it on with
 :func:`set_active` for the steps it will report (``--arch-metrics-interval``), so the
-other steps pay one Python bool check per call site. Records are never taken during
-CUDA-graph capture or a no-grad (recompute / eval) forward.
+other steps pay one Python bool check per call site. Records are never taken in a no-grad
+(recompute / eval) forward.
+
+CUDA graphs. A replayed graph runs no Python, so a per-step switch cannot reach the
+graphed layers. In *graph mode* (:func:`set_graph_mode`, on when the run uses CUDA graphs)
+recording is on for every training step, capture included: every record is an in-place
+add into a buffer created in the eager warmup steps, so the captured graph keeps
+accumulating into the same buffers on replay, and a report is the mean over all steps
+since the previous one instead of one step's value. Call sites must stay graph-safe: torch
+ops only, no host syncs (``.item()``, boolean indexing) and no host-to-device copies.
 
 Aggregation. A metric is a per-layer ``(sum, count)`` pair (a scalar or a small
 vector per layer). :func:`report` all-reduces both over the whole world and reports
@@ -27,6 +35,7 @@ from typing import Callable, Dict, Optional
 import torch
 
 _ACTIVE = False
+_GRAPH_MODE = False
 _SUMS: Dict[str, torch.Tensor] = {}
 _COUNTS: Dict[str, torch.Tensor] = {}
 _UNIONS: Dict[str, torch.Tensor] = {}
@@ -40,13 +49,25 @@ def set_active(active: bool) -> None:
     _ACTIVE = bool(active)
 
 
+def set_graph_mode(enabled: bool) -> None:
+    """Record on every training step, CUDA-graph capture included (module docstring)."""
+    global _GRAPH_MODE
+    _GRAPH_MODE = bool(enabled)
+
+
+def graph_mode() -> bool:
+    return _GRAPH_MODE
+
+
 def active() -> bool:
     """True when a call site should compute and record its metrics now."""
     if not _ACTIVE or not torch.is_grad_enabled():
         return False
-    from megatron.core.transformer.cuda_graphs import is_graph_capturing
+    from megatron.core.transformer.cuda_graphs import is_graph_capturing, is_graph_warmup
 
-    return not is_graph_capturing()
+    if is_graph_warmup():  # the extra eager passes graph creation runs before capturing
+        return False
+    return _GRAPH_MODE or not is_graph_capturing()
 
 
 def num_layers_of(config) -> int:

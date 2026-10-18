@@ -17,7 +17,7 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.cuda_graphs import is_graph_capturing
+from megatron.core.transformer.cuda_graphs import is_graph_warmup
 
 # A deliberately internal threshold: it is a diagnostic definition, not a training knob.
 EXPERT_COLLAPSE_RMS_FRACTION = 0.10
@@ -279,13 +279,18 @@ def record_router_health_metrics(
     num_layers: int,
     reduce_group: Optional[torch.distributed.ProcessGroup],
 ) -> None:
-    """Record utilization and score-distribution stats for one router forward."""
-    if layer_number is None or is_graph_capturing():
+    """Record utilization and score-distribution stats for one router forward.
+
+    Graph-safe (also recorded inside a captured MoE-router CUDA graph): in-place adds into
+    buffers created in the eager warmup steps, padding masked by multiplication rather than
+    boolean indexing (a host sync), the token count computed on the device. Not recorded in
+    the extra eager passes graph creation runs before capturing (they repeat a step)."""
+    if layer_number is None or is_graph_warmup():
         return
     if padding_mask is not None:
-        valid = ~padding_mask
-        selected_tokens_per_expert = selected_routing_map[valid].sum(dim=0).float()
-        dispatched_tokens_per_expert = routing_map[valid].sum(dim=0).float()
+        valid = (~padding_mask).reshape(-1, 1).float()  # [tokens, 1]
+        selected_tokens_per_expert = (selected_routing_map.float() * valid).sum(dim=0)
+        dispatched_tokens_per_expert = (routing_map.float() * valid).sum(dim=0)
     else:
         valid = None
         selected_tokens_per_expert = selected_routing_map.sum(dim=0).float()
@@ -302,16 +307,19 @@ def record_router_health_metrics(
         max_scores = score_distribution.max(dim=-1).values
         score_entropy = compute_normalized_entropy(score_distribution)
         if valid is not None:
-            max_scores = max_scores[valid]
-            score_entropy = score_entropy[valid]
-            valid_logits = logits.float()[valid]
+            w = valid.reshape(-1)
+            max_scores = max_scores * w
+            score_entropy = score_entropy * w
+            valid_logits = logits.float() * valid
+            token_count = w.sum()
         else:
             valid_logits = logits.float()
+            token_count = logits.new_full((), float(logits.shape[0]), dtype=torch.float32)
         save_to_router_stats_tracker(
             max_scores.sum(),
             score_entropy.sum(),
             valid_logits.sum(dim=0),
-            torch.tensor(float(valid_logits.shape[0]), device=logits.device),
+            token_count,
             layer_number,
             num_layers,
             reduce_group=reduce_group,
@@ -476,6 +484,27 @@ def capture_expert_viability_parameter_stats(model_chunks) -> None:
                 tracker["grad_count"][layer, indices] = grad[1]
 
 
+def save_routed_expert_stat(
+    part: str, tensor: torch.Tensor, layer_number: Optional[int], num_layers: int
+) -> None:
+    """Accumulate the squared sum / count of one routed-path tensor: ``part`` is "routed"
+    (the routed experts' combined output), "input" (the MoE layer input) or "output" (the
+    layer output). In-place adds (graph-safe), so each part can be recorded in the stage
+    that sees its tensor -- under MoE partial CUDA graphs the input in the router graph, the
+    routed output in the eager expert compute, the layer output in the postprocess graph."""
+    if layer_number is None or is_graph_warmup():
+        return
+    tracker = _MOE_EXPERT_VIABILITY_TRACKER
+    if "routed_sq_sum" not in tracker:
+        device = tensor.device
+        for key in ("routed", "input", "output"):
+            tracker[f"{key}_sq_sum"] = torch.zeros(num_layers, device=device, dtype=torch.float32)
+            tracker[f"{key}_count"] = torch.zeros(num_layers, device=device, dtype=torch.float32)
+    index = layer_number - 1
+    tracker[f"{part}_sq_sum"][index] += tensor.detach().float().square().sum()
+    tracker[f"{part}_count"][index] += tensor.numel()
+
+
 def save_routed_expert_output_stats(
     routed_output: torch.Tensor,
     input_tensor: torch.Tensor,
@@ -485,25 +514,10 @@ def save_routed_expert_output_stats(
     include_layer_output: bool = True,
 ) -> None:
     """Accumulate squared-sum/count routed-path statistics without retaining activations."""
-    if layer_number is None:
-        return
-    tracker = _MOE_EXPERT_VIABILITY_TRACKER
-    if "routed_sq_sum" not in tracker:
-        device = routed_output.device
-        tracker["routed_sq_sum"] = torch.zeros(num_layers, device=device, dtype=torch.float32)
-        tracker["input_sq_sum"] = torch.zeros_like(tracker["routed_sq_sum"])
-        tracker["output_sq_sum"] = torch.zeros_like(tracker["routed_sq_sum"])
-        tracker["routed_count"] = torch.zeros_like(tracker["routed_sq_sum"])
-        tracker["input_count"] = torch.zeros_like(tracker["routed_sq_sum"])
-        tracker["output_count"] = torch.zeros_like(tracker["routed_sq_sum"])
-    index = layer_number - 1
-    tracker["routed_sq_sum"][index] += routed_output.detach().float().square().sum()
-    tracker["input_sq_sum"][index] += input_tensor.detach().float().square().sum()
-    tracker["routed_count"][index] += routed_output.numel()
-    tracker["input_count"][index] += input_tensor.numel()
+    save_routed_expert_stat("routed", routed_output, layer_number, num_layers)
+    save_routed_expert_stat("input", input_tensor, layer_number, num_layers)
     if include_layer_output:
-        tracker["output_sq_sum"][index] += layer_output.detach().float().square().sum()
-        tracker["output_count"][index] += layer_output.numel()
+        save_routed_expert_stat("output", layer_output, layer_number, num_layers)
 
 
 def _all_reduce_tensors(tensors, groups, avg_last: bool = False):

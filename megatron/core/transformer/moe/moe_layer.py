@@ -16,6 +16,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_health import (
     expert_rms_statistics,
     save_routed_expert_output_stats,
+    save_routed_expert_stat,
     should_mask_routed_moe_layer,
 )
 from megatron.core.transformer.moe.moe_utils import (
@@ -702,6 +703,11 @@ class MoELayer(BaseMoELayer):
             routed_output = None
             try:
                 if "route" in self.fwd_execution_map:
+                    if intermediate_tensors is not None and self.config.moe_expert_viability_metrics:
+                        # partial CUDA graphs: the layer input is only seen here (router graph)
+                        save_routed_expert_stat(
+                            "input", hidden_states, self.layer_number, self.config.num_layers
+                        )
                     shared_expert_output = self.shared_experts_compute(hidden_states)
                     probs, routing_map = self.route(hidden_states, padding_mask)
                     hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
@@ -731,6 +737,11 @@ class MoELayer(BaseMoELayer):
                 # `output` is the routed path only at this point: shared experts are added in
                 # postprocess below.  This is consequently also the precise masking boundary.
                 routed_output = output
+                if intermediate_tensors is not None and self.config.moe_expert_viability_metrics:
+                    # partial CUDA graphs: the routed output is only seen here (eager)
+                    save_routed_expert_stat(
+                        "routed", routed_output, self.layer_number, self.config.num_layers
+                    )
                 if should_mask_routed_moe_layer(self.layer_number):
                     output = torch.zeros_like(output)
 
@@ -743,8 +754,17 @@ class MoELayer(BaseMoELayer):
 
                 output = self.postprocess(output, shared_expert_output)
 
-                # Partial CUDA-graph execution can enter postprocess with an externally supplied
-                # intermediate, in which case this invocation did not observe the routed output.
+                # Partial CUDA-graph execution enters postprocess with an externally supplied
+                # intermediate: the input and routed parts were recorded in their own stages.
+                if (
+                    self.config.moe_expert_viability_metrics
+                    and routed_output is None
+                    and intermediate_tensors is not None
+                    and self.use_shared_expert
+                ):
+                    save_routed_expert_stat(
+                        "output", output, self.layer_number, self.config.num_layers
+                    )
                 if self.config.moe_expert_viability_metrics and routed_output is not None:
                     save_routed_expert_output_stats(
                         routed_output,

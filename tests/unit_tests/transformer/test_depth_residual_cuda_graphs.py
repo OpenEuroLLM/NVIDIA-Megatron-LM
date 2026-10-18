@@ -333,3 +333,132 @@ class TestRoutedMoEPartialCudaGraphs:
             assert set(replay_grads) == set(ref_grads)
             for pname, grad in ref_grads.items():
                 torch.testing.assert_close(replay_grads[pname], grad, msg=pname, **tol)
+
+
+class TestGraphSafeStatistics:
+    """Routing statistics under CUDA graphs (arch_metrics graph mode, the MoE router health and
+    expert-viability trackers): a replayed graph must accumulate exactly what the eager passes
+    record -- residual-stream sizes, stream picks, expert utilization, router score stats."""
+
+    def setup_method(self, method):
+        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+        Utils.initialize_model_parallel(1, 1)
+        CudaGraphManager.global_mempool = None
+
+    def teardown_method(self, method):
+        from megatron.core.transformer import arch_metrics
+
+        delete_cuda_graphs()
+        arch_metrics.set_graph_mode(False)
+        arch_metrics.set_active(False)
+        arch_metrics.reset()
+        Utils.destroy_model_parallel()
+
+    @staticmethod
+    def _reset_stats():
+        from megatron.core.transformer import arch_metrics
+        from megatron.core.transformer.moe import moe_health
+
+        arch_metrics.reset()
+        for tracker in (moe_health._MOE_EXPERT_UTILIZATION_TRACKER,
+                        moe_health._MOE_ROUTER_STATS_TRACKER,
+                        moe_health._MOE_EXPERT_VIABILITY_TRACKER):
+            tracker.clear()
+
+    @staticmethod
+    def _stats():
+        from megatron.core.transformer import arch_metrics
+        from megatron.core.transformer.moe import moe_health
+
+        # record counts too: the inputs repeat, so a mean over fewer passes would match
+        out = {f"count/{k}": float(v.sum()) for k, v in arch_metrics._COUNTS.items()}
+        out.update(arch_metrics.collect())
+        for prefix, tracker in (("util", moe_health._MOE_EXPERT_UTILIZATION_TRACKER),
+                                ("router", moe_health._MOE_ROUTER_STATS_TRACKER),
+                                ("viab", moe_health._MOE_EXPERT_VIABILITY_TRACKER)):
+            for key, value in tracker.items():
+                if torch.is_tensor(value) and value.is_floating_point():
+                    out[f"{prefix}/{key}"] = value.detach().double().cpu().clone()
+        return out
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+    @pytest.mark.parametrize("name", ["routed8", "routed4_keys"])
+    def test_graphed_statistics_match_eager(self, name):
+        from megatron.core.transformer import arch_metrics
+
+        scheme = {**ROUTED[name], "moe_expert_viability_metrics": True, "moe_per_layer_logging": True}
+        torch.manual_seed(0)
+        x = torch.randn(S, B, H, device="cuda")
+        eager = TestRoutedMoEPartialCudaGraphs._moe_build("none", **scheme)
+        with torch.no_grad():
+            for pname, p in eager.named_parameters():
+                if pname.endswith((".phi", ".key_gain", ".w_key")):
+                    p.normal_(0.0, 0.02)
+        for layer_number, layer in enumerate(eager.layers, 1):
+            assert layer.layer_number == layer_number
+
+        self._reset_stats()
+        arch_metrics.set_graph_mode(False)
+        arch_metrics.set_active(True)
+        for _ in range(3):
+            _fwd_bwd(eager, x)
+        ref = self._stats()
+        assert any(k.endswith("stream_rms/main") for k in ref) and "router/token_count" in ref
+        assert "viab/routed_sq_sum" in ref and float(ref["viab/routed_count"].sum()) > 0
+
+        graphed = TestRoutedMoEPartialCudaGraphs._moe_build(
+            "local", cuda_graph_modules=["attn", "moe_router", "moe_preprocess"], **scheme
+        )
+        graphed.load_state_dict(eager.state_dict())
+        self._reset_stats()
+        arch_metrics.set_graph_mode(True)
+        arch_metrics.set_active(True)
+        _fwd_bwd(graphed, x)  # records (eager) and creates the stat buffers
+        create_cudagraphs()  # its warmup passes must not record
+        assert _CudagraphGlobalRecord.cudagraph_created
+        for _ in range(2):  # replays accumulate into the same buffers
+            _fwd_bwd(graphed, x)
+        got = self._stats()
+        assert set(got) == set(ref)
+        for key, value in ref.items():
+            if torch.is_tensor(value):
+                torch.testing.assert_close(got[key], value, rtol=1e-6, atol=1e-6, msg=key)
+            else:
+                assert got[key] == pytest.approx(value, rel=1e-6, abs=1e-9), key
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+    @pytest.mark.parametrize("name", list(ROUTED))
+    def test_metrics_recorded_inside_whole_layer_graphs(self, name):
+        """Dense layers graphed whole: the routed read / write (and their metrics) run inside
+        the replayed graph, so only graph mode can record them."""
+        from megatron.core.transformer import arch_metrics
+
+        torch.manual_seed(0)
+        x = torch.randn(S, B, H, device="cuda")
+        eager = _build("none", **ROUTED[name])
+        with torch.no_grad():
+            for pname, p in eager.named_parameters():
+                if pname.endswith((".phi", ".key_gain", ".w_key")):
+                    p.normal_(0.0, 0.02)
+        self._reset_stats()
+        arch_metrics.set_graph_mode(False)
+        arch_metrics.set_active(True)
+        for _ in range(3):
+            _fwd_bwd(eager, x)
+        ref = self._stats()
+        assert any(k.endswith("stream_rms/main") for k in ref)
+
+        graphed = _build("local", **ROUTED[name])
+        graphed.load_state_dict(eager.state_dict())
+        self._reset_stats()
+        arch_metrics.set_graph_mode(True)
+        arch_metrics.set_active(True)
+        _fwd_bwd(graphed, x)
+        create_cudagraphs()
+        assert _CudagraphGlobalRecord.cudagraph_created
+        for _ in range(2):
+            _fwd_bwd(graphed, x)
+        got = self._stats()
+        assert set(got) == set(ref)
+        for key, value in ref.items():
+            assert got[key] == pytest.approx(value, rel=1e-6, abs=1e-9), key

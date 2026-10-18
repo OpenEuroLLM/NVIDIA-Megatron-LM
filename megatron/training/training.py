@@ -4594,10 +4594,14 @@ def train(
             max_attention_logit = None
         else:
             ft_integration.on_training_step_start()
-            # Architecture diagnostics are recorded on the steps training_log reports.
+            # Architecture diagnostics are recorded on the steps training_log reports; under
+            # CUDA graphs on every step (graph mode: a replayed graph runs no Python, so the
+            # graphed layers accumulate into static buffers, reported as interval means).
+            graphed = getattr(args, "cuda_graph_impl", "none") != "none"
+            arch_metrics.set_graph_mode(bool(args.arch_metrics_interval) and graphed)
             arch_metrics.set_active(
                 bool(args.arch_metrics_interval)
-                and (iteration + 1) % args.arch_metrics_interval == 0
+                and (graphed or (iteration + 1) % args.arch_metrics_interval == 0)
             )
             (
                 loss_dict,
