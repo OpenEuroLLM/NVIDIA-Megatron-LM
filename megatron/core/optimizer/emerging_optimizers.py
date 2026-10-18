@@ -1214,7 +1214,18 @@ class TensorParallelAngularMuown(TensorParallelMuon):
             )
             batch["params"].append(p)
         for batch in batches.values():
-            self._step_batch(group, batch)
+            # Bound the stack: the batched step keeps ~8 fp32 copies of it (params, grads,
+            # states, the update and the Newton-Schulz temporaries). Unbounded, every
+            # same-shape matrix on the rank is one stack -- e.g. all routed-expert weights of
+            # all layers -- which OOMs a MoE that otherwise fits (round 4 s2, 2026-10-18). Same
+            # bound as Muown._STACK_NUMEL; the math is per matrix, so chunking changes nothing.
+            params = batch["params"]
+            per = max(1, self._STACK_NUMEL // max(1, params[0].numel()))
+            for i in range(0, len(params), per):
+                self._step_batch(group, {**batch, "params": params[i : i + per]})
+
+    # Elements per stacked batch (bounds the transient fp32 copies of a batched step).
+    _STACK_NUMEL = 1 << 26
 
     def _step_batch(self, group: dict, batch: dict) -> None:
         """Run one AngularMuown update on a stack of same-shape parameters."""

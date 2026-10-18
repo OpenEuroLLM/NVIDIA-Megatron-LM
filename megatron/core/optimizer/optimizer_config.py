@@ -187,6 +187,13 @@ class OptimizerConfig:
     megatron/core/ssm/engram.py); the tables also get no weight decay, as in the paper.
     Applies to max_lr and min_lr alike."""
 
+    residual_mixer_lr_mult: float = 1.0
+    """Learning-rate multiplier of the residual-stream mixers' parameters (mHC, routed residual,
+    block attention residuals; marked `is_residual_mixer`). Under the Muon-family optimizers these
+    parameters run on Adam at the shared lr, which is far above Adam's own optimum when the matrix
+    optimizer's lr is high (angular MuOwn 4e-3 vs AdamW 2e-3). Applies to max_lr and min_lr alike.
+    Conflicts with ngpt_scaler_lr_mult != 1 on the mixers' scalers (both set their lr)."""
+
     pkm_lr_mult: float = 1.0
     """Learning-rate multiplier of product-key memory value tables (parameters marked
     `is_memory_table`, or the "dp"-sharded ones); they get no weight decay either."""

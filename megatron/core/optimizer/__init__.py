@@ -188,6 +188,13 @@ def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, Par
             min_lr=(config.min_lr or 0.0) * config.pkm_lr_mult,
         )
 
+    # Residual-stream mixers (mHC, routed residual, attention residuals): their own learning rate.
+    mixer_mult = getattr(config, 'residual_mixer_lr_mult', 1.0)
+    if config.lr is not None and mixer_mult != 1.0:
+        config_overrides[ParamKey(attr="is_residual_mixer")] = ParamGroupOverride(
+            max_lr=config.lr * mixer_mult, min_lr=(config.min_lr or 0.0) * mixer_mult
+        )
+
     if config.decoupled_lr is not None:
         decoupled_lr_config: ParamGroupOverride = {"max_lr": config.decoupled_lr}
         decoupled_param_key = ParamKey(attr="is_embedding_or_output_parameter")

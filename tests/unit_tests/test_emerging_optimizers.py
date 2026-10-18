@@ -2098,6 +2098,13 @@ def test_angular_muown_batched_step_matches_per_param():
                 torch.testing.assert_close(s_b[key], s_ref[key], rtol=1e-5, atol=1e-7)
 
 
+def test_angular_muown_batched_step_chunked_matches_per_param(monkeypatch):
+    """With the stack bound (_STACK_NUMEL) forcing chunks of two matrices, the batched step
+    still reproduces the per-parameter path (the chunking only splits stacks)."""
+    monkeypatch.setattr(TensorParallelAngularMuown, "_STACK_NUMEL", 96 * 64 * 2)
+    test_angular_muown_batched_step_matches_per_param()
+
+
 def test_angular_muown_batched_step_falls_back_for_gtp_remat(monkeypatch):
     """AngularMuown keeps v0.19's per-parameter GTP-remat orthogonalization."""
     weight = torch.nn.Parameter(torch.randn(32, 32, device='cuda'))

@@ -2766,6 +2766,10 @@ def _add_regularization_args(parser):
     group.add_argument('--engram-lr-mult', type=float, default=5.0,
                        help='Learning-rate multiplier of the Engram (N-layer) tables, which '
                        'also get no weight decay.')
+    group.add_argument('--residual-mixer-lr-mult', type=float, default=1.0,
+                       help='Learning-rate multiplier of the residual-stream mixers (mHC, routed '
+                       'residual, block attention residuals). Under Muon-family optimizers these '
+                       'parameters run on Adam at the shared lr.')
     group.add_argument('--embedding-wd-mult', type=float, default=1.0,
                        help='Multiplier on --weight-decay for the word-embedding matrix (2-D param '
                        'whose name contains word_embeddings). Default 1.0 = decay like every other '
