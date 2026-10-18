@@ -419,10 +419,18 @@ def _validate_packed_doc_attention(args):
         '--dataloader-inter-document-masking requires the transformer_engine spec, not '
         '--spec local.'
     )
-    assert args.cuda_graph_impl == 'none', (
+    # The MoE router / preprocess partial graphs see the packed tokens only (a fixed [t, 1, h]),
+    # never cu_seqlens: they are allowed; the attention / mixer layers are not.
+    graph_modules = {str(getattr(m, 'name', m)) for m in (args.cuda_graph_modules or [])}
+    assert args.cuda_graph_impl == 'none' or (
+        args.cuda_graph_impl == 'local'
+        and graph_modules
+        and graph_modules <= {'moe_router', 'moe_preprocess'}
+    ), (
         '--dataloader-inter-document-masking builds a cu_seqlens tensor whose length changes '
         'with the document count of every microbatch, which would force CUDA graph recapture '
-        'each step. Set --cuda-graph-impl none.'
+        'each step. Set --cuda-graph-impl none, or graph only the MoE router: '
+        '--cuda-graph-impl local --cuda-graph-modules moe_router moe_preprocess.'
     )
 
     # === ROPE VARIANTS =======================================================

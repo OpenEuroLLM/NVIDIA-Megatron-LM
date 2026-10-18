@@ -2249,9 +2249,13 @@ class MoETransformerLayer(TransformerLayer):
                     "mHC / routed streams with MoE partial cudagraphs do not combine with "
                     "MoE-layer or routed-sublayer recompute"
                 )
-            if getattr(packed_seq_params, "tokens_per_sample", None) is not None:
+            tokens_per_sample = getattr(packed_seq_params, "tokens_per_sample", None)
+            if tokens_per_sample is not None and hidden_states.shape[0] // tokens_per_sample > 1:
+                # packed micro-batches of several samples are un-flattened for the MoE; the
+                # stream read / write around the partial graphs keep the packed layout
                 raise NotImplementedError(
-                    "mHC / routed streams with MoE partial cudagraphs and packed sequences"
+                    "mHC / routed streams with MoE partial cudagraphs and packed sequences of "
+                    "more than one sample per micro-batch (use micro_batch_size 1)"
                 )
 
         if self.use_partial_cudagraphs:
