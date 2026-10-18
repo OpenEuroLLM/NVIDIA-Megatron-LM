@@ -134,6 +134,11 @@ class _MoonEPState:
         )
 
 
+def _is_shard(state, t):
+    """Is ``t`` the NVLink shard itself (written in place: combine without a boundary copy)?"""
+    return t.data_ptr() == state.buffer.hidden_nvsh_buffer_view.data_ptr()
+
+
 class _PlanHolder:
     """Carries the current layer's MoonEP plan from the dispatch to the experts and combine."""
 
@@ -161,9 +166,11 @@ class _MoonEPDispatch(torch.autograd.Function):
             grad_w_nvs = torch.zeros(
                 grad_hidden_nvsh.shape[0], dtype=torch.float32, device=grad_hidden_nvsh.device
             )
+        grad_hidden_nvsh = grad_hidden_nvsh.contiguous()
         grad_hidden, grad_w_sk, _ = ctx.state.buffer.combine(
             plan=ctx.plan,
-            hidden_nvsh=grad_hidden_nvsh.contiguous(),
+            hidden_nvsh=grad_hidden_nvsh,
+            zero_copy=_is_shard(ctx.state, grad_hidden_nvsh),
             route_weights_nvs=grad_w_nvs.float().contiguous(),
         )
         return grad_hidden, grad_w_sk, None, None, None, None
@@ -175,7 +182,10 @@ class _MoonEPCombine(torch.autograd.Function):
     @staticmethod
     def forward(ctx, out_nvsh, state, holder):
         plan = holder.plan
-        out, _, _ = state.buffer.combine(plan=plan, hidden_nvsh=out_nvsh.contiguous())
+        out_nvsh = out_nvsh.contiguous()
+        out, _, _ = state.buffer.combine(
+            plan=plan, hidden_nvsh=out_nvsh, zero_copy=_is_shard(state, out_nvsh)
+        )
         ctx.state, ctx.plan = state, plan
         return out
 
@@ -243,7 +253,9 @@ class _MoonEPExperts(torch.autograd.Function):
         _gemm(w1, x, hidden, h, ffn2, splits, offsets, "TN")
         probs = w_nvs.unsqueeze(-1)
         a = weighted_swiglu(h, probs)
-        y = torch.empty(x.shape[0], hidden, dtype=x.dtype, device=x.device)
+        # zero copy: fc2 writes straight into the NVLink shard the combine reads (the shard is
+        # free: the dispatch copied the tokens out; y is not saved for backward)
+        y = state.buffer.hidden_nvsh_buffer_view
         _gemm(w2, a, ffn2 // 2, y, hidden, splits, offsets, "TN")
         ctx.save_for_backward(x, h, w_nvs, splits, offsets)
         ctx.module, ctx.plan = module, plan
@@ -275,7 +287,8 @@ class _MoonEPExperts(torch.autograd.Function):
         _gemm(wg2, a, ffn, grad_y, hidden, splits, offsets, "NT", accumulate=True)
         grad_h, grad_probs = weighted_swiglu_back(grad_a, h, probs)
         # fc1
-        grad_x = torch.empty_like(x)
+        # zero copy: the dispatch backward (a combine) reads fc1's dgrad from the shard
+        grad_x = state.buffer.hidden_nvsh_buffer_view
         _gemm(w1, grad_h, ffn2, grad_x, hidden, splits, offsets, "NN")
         wg1 = [main1[i] for i in range(epn)] + [gpools[0][i].view_as(main1[0]) for i in range(epn)]
         _gemm(wg1, x, hidden, grad_h, ffn2, splits, offsets, "NT", accumulate=True)
