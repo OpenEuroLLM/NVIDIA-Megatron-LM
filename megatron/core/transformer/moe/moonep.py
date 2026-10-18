@@ -185,8 +185,12 @@ class _MoonEPCombine(torch.autograd.Function):
         return grad_nvsh, None, None
 
 
+_MAX_GROUPS = 64  # TE's cuBLASLt grouped GEMM: at most 64 discrete tensors per call
+
+
 def _grouped(data, splits, offsets, last_dim):
-    """A packed [rows, last_dim] buffer as a varying-first-dim TE GroupedTensor."""
+    """Rows of a packed [rows, last_dim] buffer as a varying-first-dim TE GroupedTensor: group g
+    is rows [offsets[g], offsets[g] + splits[g])."""
     return GroupedTensorStorage(
         shape=(data.size(0), last_dim),
         dtype=data.dtype,
@@ -196,6 +200,28 @@ def _grouped(data, splits, offsets, last_dim):
         first_dims=splits,
         tensor_offsets=offsets * last_dim,
     )
+
+
+def _gemm(weights, a, a_dim, out, out_dim, splits, offsets, layout, accumulate=False):
+    """Grouped GEMM over len(weights) row groups of ``a`` / ``out``, in chunks of <= 64 groups.
+
+    layout "TN" (fwd) / "NN" (dgrad): ``weights`` is the discrete A list, ``a`` the grouped B,
+    ``out`` the grouped output. layout "NT" (wgrad): ``a`` is the grouped input, ``out`` the
+    grouped output grad and ``weights`` the discrete list of weight-grad outputs."""
+    n = len(weights)
+    for lo in range(0, n, _MAX_GROUPS):
+        hi = min(n, lo + _MAX_GROUPS)
+        sp, off = splits[lo:hi], offsets[lo : hi + 1]
+        if layout == "NT":
+            general_grouped_gemm_for_grouped_tensor(
+                _grouped(a, sp, off, a_dim), _grouped(out, sp, off, out_dim), weights[lo:hi],
+                layout="NT", accumulate=accumulate,
+            )
+        else:
+            general_grouped_gemm_for_grouped_tensor(
+                weights[lo:hi], _grouped(a, sp, off, a_dim), _grouped(out, sp, off, out_dim),
+                layout=layout, accumulate=accumulate,
+            )
 
 
 class _MoonEPExperts(torch.autograd.Function):
@@ -214,17 +240,11 @@ class _MoonEPExperts(torch.autograd.Function):
         splits = torch.diff(offsets)
         ffn2, hidden = weight1.shape[1], weight1.shape[2]
         h = torch.empty(x.shape[0], ffn2, dtype=x.dtype, device=x.device)
-        general_grouped_gemm_for_grouped_tensor(
-            w1, _grouped(x, splits, offsets, hidden), _grouped(h, splits, offsets, ffn2),
-            layout="TN",
-        )
+        _gemm(w1, x, hidden, h, ffn2, splits, offsets, "TN")
         probs = w_nvs.unsqueeze(-1)
         a = weighted_swiglu(h, probs)
         y = torch.empty(x.shape[0], hidden, dtype=x.dtype, device=x.device)
-        general_grouped_gemm_for_grouped_tensor(
-            w2, _grouped(a, splits, offsets, ffn2 // 2), _grouped(y, splits, offsets, hidden),
-            layout="TN",
-        )
+        _gemm(w2, a, ffn2 // 2, y, hidden, splits, offsets, "TN")
         ctx.save_for_backward(x, h, w_nvs, splits, offsets)
         ctx.module, ctx.plan = module, plan
         ctx.weights = (weight1, weight2)
@@ -250,25 +270,15 @@ class _MoonEPExperts(torch.autograd.Function):
         a = weighted_swiglu(h, probs)
         # fc2: dgrad + wgrad (into the local main grads and this rank's reduce slots)
         grad_a = torch.empty(x.shape[0], ffn, dtype=x.dtype, device=x.device)
-        g_y = _grouped(grad_y, splits, offsets, hidden)
-        general_grouped_gemm_for_grouped_tensor(
-            w2, g_y, _grouped(grad_a, splits, offsets, ffn), layout="NN"
-        )
+        _gemm(w2, grad_y, hidden, grad_a, ffn, splits, offsets, "NN")
         wg2 = [main2[i] for i in range(epn)] + [gpools[1][i].view_as(main2[0]) for i in range(epn)]
-        general_grouped_gemm_for_grouped_tensor(
-            _grouped(a, splits, offsets, ffn), g_y, wg2, layout="NT", accumulate=True
-        )
+        _gemm(wg2, a, ffn, grad_y, hidden, splits, offsets, "NT", accumulate=True)
         grad_h, grad_probs = weighted_swiglu_back(grad_a, h, probs)
         # fc1
         grad_x = torch.empty_like(x)
-        g_h = _grouped(grad_h, splits, offsets, ffn2)
-        general_grouped_gemm_for_grouped_tensor(
-            w1, g_h, _grouped(grad_x, splits, offsets, hidden), layout="NN"
-        )
+        _gemm(w1, grad_h, ffn2, grad_x, hidden, splits, offsets, "NN")
         wg1 = [main1[i] for i in range(epn)] + [gpools[0][i].view_as(main1[0]) for i in range(epn)]
-        general_grouped_gemm_for_grouped_tensor(
-            _grouped(x, splits, offsets, hidden), g_h, wg1, layout="NT", accumulate=True
-        )
+        _gemm(wg1, x, hidden, grad_h, ffn2, splits, offsets, "NT", accumulate=True)
         # the prefetched copies' grads -> their home ranks' main grads (collective)
         state.reduce_grad(plan, module.local_grads(main1, main2), module.pool_shapes)
         for w in (weight1, weight2):
