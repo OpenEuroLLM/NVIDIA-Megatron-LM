@@ -116,7 +116,8 @@ class _MoonEPState:
         layer's recomputed forward runs right before its backward, so the backward needs no
         second push (all EP ranks see the same sequence, so they skip together)."""
         pools = self.weight_pools(shapes)
-        if owner is not None and self._last_prefetch == (owner, plan):
+        last = self._last_prefetch
+        if owner is not None and last is not None and last[0] is owner and last[1] is plan:
             return [p[self.rank] for p in pools]
         self._last_prefetch = (owner, plan)
         self.buffer.prefetch_weight(
