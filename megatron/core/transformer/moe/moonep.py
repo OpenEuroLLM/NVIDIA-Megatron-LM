@@ -78,6 +78,7 @@ class _MoonEPState:
             S, H, K, E, self.R, num_sms=num_sms, token_padding=token_padding, group=group
         )
         self.pools = {}
+        self._last_prefetch = None  # (experts module, plan) whose weights the pools hold
 
     @classmethod
     def get(cls, group, S, H, K, E, num_sms=None, token_padding=128):
@@ -109,8 +110,15 @@ class _MoonEPState:
     def grad_pools(self, shapes):
         return [self.pool(f"g{i}", s, torch.float32) for i, s in enumerate(shapes)]
 
-    def prefetch(self, plan, local_weights, shapes):
+    def prefetch(self, plan, local_weights, shapes, owner=None):
+        """Push the plan's redundant experts into every rank's prefetch slots. Skipped when the
+        pools still hold exactly this owner's experts for this plan: under full recompute a
+        layer's recomputed forward runs right before its backward, so the backward needs no
+        second push (all EP ranks see the same sequence, so they skip together)."""
         pools = self.weight_pools(shapes)
+        if owner is not None and self._last_prefetch == (owner, plan):
+            return [p[self.rank] for p in pools]
+        self._last_prefetch = (owner, plan)
         self.buffer.prefetch_weight(
             plan=plan,
             local_gate_weight=local_weights[0],
@@ -243,7 +251,7 @@ class _MoonEPExperts(torch.autograd.Function):
         state, holder = module.state, module.holder
         plan = holder.plan
         epn = weight1.shape[0]
-        slots = state.prefetch(plan, module.local_weights(), module.pool_shapes)
+        slots = state.prefetch(plan, module.local_weights(), module.pool_shapes, owner=module)
         w1 = [weight1[i] for i in range(epn)] + [slots[0][i].view_as(weight1[0]) for i in range(epn)]
         w2 = [weight2[i] for i in range(epn)] + [slots[1][i].view_as(weight2[0]) for i in range(epn)]
         ends = cu_seqlens.to(torch.int64)
@@ -273,7 +281,7 @@ class _MoonEPExperts(torch.autograd.Function):
         ffn = ffn2 // 2
         grad_y = grad_y.contiguous()
         # the pools are shared by all layers: fetch this layer's copies again
-        slots = state.prefetch(plan, module.local_weights(), module.pool_shapes)
+        slots = state.prefetch(plan, module.local_weights(), module.pool_shapes, owner=module)
         w1 = [weight1[i] for i in range(epn)] + [slots[0][i].view_as(weight1[0]) for i in range(epn)]
         w2 = [weight2[i] for i in range(epn)] + [slots[1][i].view_as(weight2[0]) for i in range(epn)]
         gpools = [p[state.rank] for p in state.grad_pools(module.pool_shapes)]
