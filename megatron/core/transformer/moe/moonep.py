@@ -31,6 +31,7 @@ Restrictions: NVLink domain only (EP group within one node), expert TP 1, SwiGLU
 from __future__ import annotations
 
 import math
+import os
 from typing import Optional
 
 import torch
@@ -387,6 +388,8 @@ class MoEMoonEPTokenDispatcher(MoETokenDispatcher):
                 self.config.moe_router_topk,
                 self.config.num_moe_experts,
                 num_sms=self.config.moe_flex_dispatcher_num_sms,
+                # per-expert-slot row padding of the dispatched layout (grouped GEMM tiles)
+                token_padding=int(os.environ.get("MOONEP_TOKEN_PADDING", "128")),
             )
             self.experts.state = self.state
         return self.state
