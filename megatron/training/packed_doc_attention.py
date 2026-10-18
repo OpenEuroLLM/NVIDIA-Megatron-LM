@@ -228,12 +228,28 @@ def prefetch_hook():
 _BATCH_STASH = {}
 # {vp_stage: [PackedSeqMetadata, ...]} -- one entry per microbatch, on EVERY rank.
 _METADATA_STASH = {}
+# {vp_stage: [(batch or None, PackedSeqMetadata), ...]} -- what pop() handed out this iteration,
+# so a re-run of the same step (PagedStashRunner's synced retry) can replay it: rewind().
+_CONSUMED = {}
 
 
 def reset():
     """Drop any prefetched state. Call between iterations."""
     _BATCH_STASH.clear()
     _METADATA_STASH.clear()
+    _CONSUMED.clear()
+
+
+def rewind():
+    """Put back everything pop() returned since the prefetch: the step runs again with the
+    same microbatches (the MoE paged-stash fallback retries a step in synced mode)."""
+    for key, items in _CONSUMED.items():
+        if not items:
+            continue
+        _METADATA_STASH[key] = [m for _, m in items] + _METADATA_STASH.get(key, [])
+        if key in _BATCH_STASH:
+            _BATCH_STASH[key] = [b for b, _ in items] + _BATCH_STASH[key]
+        items.clear()
 
 
 def is_primed(vp_stage):
@@ -281,6 +297,7 @@ def share_metadata_from(vp_stage, source_vp_stage):
     # The same list object per chunk would be popped by whichever chunk ran first, so copy
     # it. The tensors inside are read-only and safely shared.
     _METADATA_STASH[_key(vp_stage)] = list(_METADATA_STASH[source])
+    _CONSUMED.pop(_key(vp_stage), None)
 
 
 # Header columns, one row per microbatch: how many entries each array has, and the longest
@@ -435,6 +452,7 @@ def prefetch_iteration(
             )
         )
     _METADATA_STASH[key] = stash
+    _CONSUMED.pop(key, None)
 
 
 def pop(vp_stage, reads_data):
@@ -446,4 +464,5 @@ def pop(vp_stage, reads_data):
     )
     metadata = _METADATA_STASH[key].pop(0)
     batch = _BATCH_STASH[key].pop(0) if reads_data else None
+    _CONSUMED.setdefault(key, []).append((batch, metadata))
     return batch, metadata

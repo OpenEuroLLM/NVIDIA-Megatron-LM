@@ -1236,4 +1236,8 @@ class PagedStashRunner:
                     "moe_paged_stash_buffer_size_factor_cpu.",
                 )
             self.prepare_for_rerun(is_training=training)
+            # document masking: the retry consumes the same microbatches' cu_seqlens again
+            from megatron.training import packed_doc_attention
+
+            packed_doc_attention.rewind()
         return result
