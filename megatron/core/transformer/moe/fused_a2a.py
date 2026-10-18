@@ -3,6 +3,7 @@
 # Copyright (c) 2025 DeepSeek
 # Licensed under the MIT License - https://github.com/deepseek-ai/DeepEP/blob/main/LICENSE
 
+import inspect
 from typing import Optional
 
 from megatron.core.utils import internal_api
@@ -620,6 +621,7 @@ def ensure_nccl_ep_bootstrapped(
     max_tokens_per_rank,
     recv_capacity_per_rank,
     hidden_dim,
+    num_topk=None,
     num_sms=0,
     zero_copy=False,
 ):
@@ -647,6 +649,11 @@ def ensure_nccl_ep_bootstrapped(
         )
     if te_ep._BOOTSTRAPPED:  # reuse TE's own one-time guard; no parallel state to drift
         return
+    kwargs = {}
+    # TE >= 2.19 sizes its internal buffers by the per-token top-k (required argument)
+    if "num_topk" in inspect.signature(te_ep.ep_bootstrap).parameters:
+        assert num_topk is not None, "ep_bootstrap needs num_topk on this TE version"
+        kwargs["num_topk"] = num_topk
     te_ep.ep_bootstrap(
         ep_group,
         num_experts=num_experts,
@@ -655,6 +662,7 @@ def ensure_nccl_ep_bootstrapped(
         hidden_dim=hidden_dim,
         max_num_sms=num_sms,
         zero_copy=zero_copy,
+        **kwargs,
     )
 
 

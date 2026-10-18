@@ -701,7 +701,8 @@ def pad_routing_map(routing_map: torch.Tensor, pad_multiple: int) -> torch.Tenso
 
     # Create mask for elements that need to be padded (converted from 0 to 1)
     mask = zero_ranks <= num_to_pad.unsqueeze(1)
-    routing_map[mask] = 1
+    # out of place: the fused router (TE) saved routing_map for its backward
+    routing_map = torch.where(mask, torch.ones_like(routing_map), routing_map)
 
     routing_map = routing_map.transpose(0, 1)
     return routing_map
