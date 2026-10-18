@@ -328,6 +328,18 @@ class MoELayer(BaseMoELayer):
                 config=self.config,
                 pg_collection=pg_collection,
             )
+        elif (
+            config.moe_token_dispatcher_type == "flex"
+            and config.moe_flex_dispatcher_backend == "moonep"
+        ):
+            from megatron.core.transformer.moe.moonep import MoEMoonEPTokenDispatcher
+
+            self.token_dispatcher = MoEMoonEPTokenDispatcher(
+                self.num_local_experts,
+                self.local_expert_indices,
+                config=self.config,
+                pg_collection=pg_collection,
+            )
         elif config.moe_token_dispatcher_type == "flex":
             self.token_dispatcher = MoEFlexTokenDispatcher(
                 self.num_local_experts,
@@ -341,12 +353,24 @@ class MoELayer(BaseMoELayer):
             )
 
         # Initialize experts
-        self.experts = self.submodules.experts(
-            self.num_local_experts,
-            self.config,
-            pg_collection=pg_collection,
-            name=(name + ".experts") if name is not None else None,
-        )
+        if (
+            config.moe_token_dispatcher_type == "flex"
+            and config.moe_flex_dispatcher_backend == "moonep"
+        ):
+            # MoonEP computes over its own + prefetched expert weights: its own experts module
+            from megatron.core.transformer.moe.moonep import MoonEPGroupedMLP
+
+            self.experts = MoonEPGroupedMLP(
+                self.num_local_experts, self.config, pg_collection=pg_collection
+            )
+            self.token_dispatcher.attach_experts(self.experts)
+        else:
+            self.experts = self.submodules.experts(
+                self.num_local_experts,
+                self.config,
+                pg_collection=pg_collection,
+                name=(name + ".experts") if name is not None else None,
+            )
         if config.moe_expert_viability_metrics:
             initial_stats = expert_rms_statistics(self.experts, self.num_local_experts)
             if initial_stats is not None:
