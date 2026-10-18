@@ -754,7 +754,9 @@ class Attention(MegatronModule, ABC):
             return False
         reasons = {
             "self attention": self.attention_type == "self",
-            "no packed sequences": packed_seq_params is None,
+            # packed (document-masked) batches restart RoPE per document, which the kernel's
+            # position table does not; NoPE only norms q / k, per token
+            "no packed sequences with RoPE": packed_seq_params is None or rotary_pos_emb is None,
             "qk_layernorm with RMSNorm": self.config.qk_layernorm
             and self.config.normalization == "RMSNorm"
             and hasattr(self.q_layernorm, "weight")

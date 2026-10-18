@@ -27,13 +27,13 @@ from megatron.core import mpu
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
-from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.models.hybrid.hybrid_layer_allocation import (
     Symbols,
     parse_hybrid_pattern,
     select_pipeline_segment,
 )
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_context_parallel_group,
@@ -57,10 +57,9 @@ from megatron.training import (
     get_args,
     get_timers,
     inprocess_restart,
-    pretrain,
-    print_rank_0,
-    set_startup_timestamps,
 )
+from megatron.training import packed_doc_attention as pda
+from megatron.training import pretrain, print_rank_0, set_startup_timestamps
 from megatron.training.argument_utils import (
     hybrid_config_from_args,
     pretrain_cfg_container_from_args,
@@ -127,10 +126,104 @@ BATCH_KEYS = [
 ]
 
 
+def _needs_batch(args, vp_stage=None) -> bool:
+    """This stage runs MTP or Engram layers, which need the tokens (get_batch's needs_batch)."""
+    config = core_transformer_config_from_args(args)
+    return mtp_on_this_rank_func(
+        layout=config.pipeline_model_parallel_layout,
+        mtp_num_layers=config.mtp_num_layers,
+        ignore_virtual=False,
+        vp_stage=vp_stage,
+    ) or engram_on_this_rank(vp_stage)
+
+
+def _reads_dataloader(args, vp_stage=None) -> bool:
+    """Does this rank's pipeline stage pull microbatches from the dataloader? The endpoint
+    stages, and middle stages running MTP or Engram layers (as pretrain_gpt.py)."""
+    return is_first_or_last_pipeline_stage(vp_stage) or _needs_batch(args, vp_stage)
+
+
+def _read_microbatch(args, data_iterator, vp_stage=None):
+    """One microbatch through TP broadcast, pack-flatten and the context-parallel split: the
+    reading stages' half of get_batch, shared with the packed-doc-attention prefetch."""
+    is_sft = args.sft
+    cp_size = args.context_parallel_size
+    tp_rank = mpu.get_tensor_model_parallel_rank()
+    batch = {}
+    if tp_rank == 0:
+        batch = next(data_iterator)
+        for key in BATCH_KEYS:
+            batch[key] = (
+                batch[key].cuda(non_blocking=True)
+                if key in batch and batch[key] is not None
+                else None
+            )
+    batch = get_batch_on_this_tp_rank(
+        batch,
+        broadcast_src_rank=mpu.get_tensor_model_parallel_src_rank(),
+        broadcast_group=mpu.get_tensor_model_parallel_group(),
+        has_cu_seqlens=is_sft or args.dataloader_inter_document_masking,
+        is_hybrid_cp=args.hybrid_context_parallel,
+        create_attention_mask_in_dataloader=args.create_attention_mask_in_dataloader,
+        cp_size=cp_size,
+        tp_rank=tp_rank,
+        micro_batch_size=args.micro_batch_size,
+        seq_length=args.seq_length,
+        mtp_on_this_rank=_needs_batch(args, vp_stage),
+        pipeline_model_parallel_size=args.pipeline_model_parallel_size,
+        is_pipeline_first_stage=mpu.is_pipeline_first_stage(),
+        is_pipeline_last_stage=mpu.is_pipeline_last_stage(),
+    )
+    batch = flatten_batch_for_packed_sequences(batch)
+    per_sequence_balancing = args.dataloader_inter_document_masking and not is_sft
+    if per_sequence_balancing and cp_size > 1:
+        # as pretrain_gpt.py: snap the documents to 2 * cp_size, then the per-document zigzag
+        batch = pda.apply_cp_document_padding(batch, cp_size)
+        per_sequence_balancing = False
+    return get_batch_on_this_cp_rank(
+        batch,
+        is_hybrid_cp=args.hybrid_context_parallel,
+        cp_group=get_context_parallel_group(),
+        hybrid_cp_group_func=get_hybrid_data_context_parallel_groups,
+        use_per_sequence_balancing=per_sequence_balancing,
+    )
+
+
+def _get_batch_scattered(args, vp_stage=None):
+    """Document masking in pretraining (pretrain_gpt.py's OELLM patch): every rank takes
+    cu_seqlens from the one per-iteration broadcast; middle stages read no data at all."""
+    batch, metadata = pda.pop(vp_stage, reads_data=_reads_dataloader(args, vp_stage))
+    if batch is None:
+        batch = {key: None for key in BATCH_KEYS}
+    batch['cu_seqlens'] = metadata.cu_seqlens
+    batch['cu_seqlens_padded'] = metadata.cu_seqlens_padded
+    batch['max_seqlen'] = metadata.max_seqlen
+    return [batch[key] for key in BATCH_KEYS]
+
+
+def _prefetch_cu_seqlens_for_iteration(data_iterator, vp_stage, num_microbatches, derive=True):
+    """Prefetch hook, called from train_step / evaluate before the schedule runs (see
+    megatron/training/packed_doc_attention.py)."""
+    args = get_args()
+    pda.prefetch_iteration(
+        data_iterator=data_iterator,
+        vp_stage=vp_stage,
+        num_microbatches=num_microbatches,
+        fetch_batch=lambda iterator: _read_microbatch(args, iterator, vp_stage),
+        reads_data=_reads_dataloader(args, vp_stage),
+        derive=derive,
+    )
+
+
+pda.register_prefetch_hook(_prefetch_cu_seqlens_for_iteration)
+
+
 def get_batch(data_iterator, vp_stage=None):
     """Generate a batch."""
 
     args = get_args()
+    if pda.is_scattered(args):
+        return _get_batch_scattered(args, vp_stage)
     config = core_transformer_config_from_args(args)
 
     cp_size = args.context_parallel_size

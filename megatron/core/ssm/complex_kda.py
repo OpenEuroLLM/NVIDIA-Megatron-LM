@@ -39,7 +39,10 @@ longer bit-for-bit the one the reference implementation trains -- which is a
 deliberate trade, not an oversight.
 """
 
+import os
 from dataclasses import dataclass
+
+import torch
 
 try:
     from fla.layers.attn import Attention as FLAAttention
@@ -86,6 +89,10 @@ def _head_dim(config: TransformerConfig) -> int:
     return config.hidden_size // config.num_attention_heads
 
 
+# (source cu_seqlens, token count, the fla cu_seqlens): see _cu_seqlens
+_CU_CACHE = None
+
+
 class _MegatronSelfAttentionAdapter(MegatronModule):
     """Shared plumbing: layout, the ``(output, bias)`` contract, TP replication.
 
@@ -113,6 +120,15 @@ class _MegatronSelfAttentionAdapter(MegatronModule):
         from megatron.core.ssm.fla_hybrid import megatron_init_fla_layer
 
         megatron_init_fla_layer(self.layer, self.config)
+        if getattr(self.config, "linear_te_projections", False):
+            if os.environ.get("FLA_FUSE_PROJECTIONS", "0") == "1":
+                raise ValueError(
+                    "linear_te_projections does not combine with FLA_FUSE_PROJECTIONS=1 (the fused "
+                    "path reads the projection weights directly)"
+                )
+            from megatron.core.ssm.fla_te_linear import swap_linears_to_te
+
+            swap_linears_to_te(self.layer, self.config)
         replicate_across_tp(self.layer, self.tp_group)
 
     def forward(
@@ -137,24 +153,60 @@ class _MegatronSelfAttentionAdapter(MegatronModule):
         ignoring it is the honest form of that -- the alternative is letting
         Megatron believe it applied a rotary embedding the layer never saw.
         """
+        kw = {}
         if packed_seq_params is not None:
-            raise NotImplementedError(
-                "complex_kda does not support packed_seq_params: the varlen "
-                "metadata would have to reach the recurrence, and silently "
-                "ignoring it would run the sequences into each other"
-            )
+            kw["cu_seqlens"] = self._cu_seqlens(hidden_states, packed_seq_params)
         hidden_states = gather_replicated_input(hidden_states, self.config, self.tp_group)
         if self.cp_group is not None:
+            if kw:
+                raise NotImplementedError(
+                    "complex_kda: packed sequences with context parallelism are not wired yet"
+                )
             y = self._forward_cp(hidden_states)
             return scatter_replicated_output(y, self.config, self.tp_group), None
         # (s, b, h) -> (b, s, h)
         x = hidden_states.transpose(0, 1).contiguous()
-        out = self.layer(x)
+        out = self.layer(x, **kw)
         y = out[0] if isinstance(out, tuple) else out
         # Megatron's TransformerLayer expects (output, bias); the bias is
         # folded into the projections here, so there is none to return.
         y = y.transpose(0, 1).contiguous()
         return scatter_replicated_output(y, self.config, self.tp_group), None
+
+    def _cu_seqlens(self, hidden_states, packed_seq_params):
+        """Document boundaries of a packed ``[t, 1, h]`` batch (THD; document masking) as the
+        fla layer's ``cu_seqlens``: its recurrence and short convolutions restart at every
+        document, as attention's varlen mask does."""
+        if not isinstance(self.layer, ComplexKimiDeltaAttention):
+            raise NotImplementedError(
+                f"{type(self.layer).__name__}: packed sequences are only wired for complex_kda "
+                "(use Megatron's attention for the hybrid's attention layers)"
+            )
+        if hidden_states.shape[1] != 1:
+            raise ValueError(
+                f"packed sequences need batch 1 ([t, 1, h]), got {tuple(hidden_states.shape)}"
+            )
+        cu = packed_seq_params.cu_seqlens_q_padded
+        if cu is None:
+            cu = packed_seq_params.cu_seqlens_q
+        if packed_seq_params.cu_seqlens_kv is not None and not torch.equal(
+            packed_seq_params.cu_seqlens_kv, packed_seq_params.cu_seqlens_q
+        ):
+            raise ValueError("complex_kda: packed self-attention needs cu_seqlens_kv == cu_seqlens_q")
+        # One converted tensor per micro-batch, reused by every layer (forward, recompute and
+        # backward): fla memoizes its varlen index preparation (chunk indices, lengths -- host
+        # syncs) by tensor IDENTITY, so a fresh tensor per call would sync in every layer.
+        global _CU_CACHE
+        total = hidden_states.shape[0]
+        if _CU_CACHE is not None and _CU_CACHE[0] is cu and _CU_CACHE[1] == total:
+            return _CU_CACHE[2]
+        out = cu.to(torch.long)
+        # Padding after the last document (a cu_seqlens shorter than the token count) becomes
+        # its own segment, so it cannot leak into a document (one host sync per micro-batch).
+        if int(out[-1]) != total:
+            out = torch.cat([out, out.new_full((1,), total)])
+        _CU_CACHE = (cu, total, out)
+        return out
 
     def _forward_cp(self, hidden_states):
         """[s / cp, b, h] in Megatron's CP layout -> the same, through the layer."""

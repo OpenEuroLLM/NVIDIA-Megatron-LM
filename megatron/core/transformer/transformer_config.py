@@ -1382,6 +1382,12 @@ class TransformerConfig(ModelParallelConfig):
     moe_zero_expert_type: str = "identity"
     """Output of a zero-computation expert: "identity" (the input) or "zero"."""
 
+    linear_te_projections: bool = False
+    """Replace the projections of the fla-based linear mixers (complex_kda) -- plain nn.Linear --
+    by Transformer Engine linears (megatron/core/ssm/fla_te_linear.py): weight-gradient
+    accumulation fused into the wgrad GEMM (gradient_accumulation_fusion) instead of a separate
+    add per micro-batch, and fp8-eligible. Same parameter names, shapes and init."""
+
     moe_latent_size: Optional[int] = None
     """Latent projection dimension for MoE. If None, MoE latent projections are not used."""
 
@@ -2015,13 +2021,19 @@ class TransformerConfig(ModelParallelConfig):
                 "mhc_routed_mix / _balance_rate / _reversible / _key_dim need mhc_routed_topk > 0"
             )
         if self.mhc_routed_topk:
-            if (self.cuda_graph_impl != "none" or self.enable_cuda_graph) and not os.environ.get(
+            graphed = self.cuda_graph_impl != "none" or self.enable_cuda_graph
+            if graphed and self.cuda_graph_impl != "local" and not os.environ.get(
                 "MEGATRON_ROUTED_CUDA_GRAPHS"
             ):
                 # The per-step routing state (and the shared gradient buffer) lives in
-                # Python objects a captured graph freezes into static buffers: allowed only
-                # on request (MEGATRON_ROUTED_CUDA_GRAPHS=1) until verified against eager.
-                raise ValueError("mhc_routed_topk does not support CUDA graphs yet")
+                # Python objects a captured graph freezes into static buffers. The per-layer
+                # "local" graphs replay it exactly like eager (plain, content-key and
+                # reversible routing: test_depth_residual_cuda_graphs.py); other graph
+                # implementations only on request (MEGATRON_ROUTED_CUDA_GRAPHS=1).
+                raise ValueError(
+                    "mhc_routed_topk supports cuda_graph_impl='local' only (verified against "
+                    "eager); set MEGATRON_ROUTED_CUDA_GRAPHS=1 to try others"
+                )
 
         # The Liger fused LM-head + CE returns the loss before the logits exist,
         # so the logit softcap and the z-loss (both applied to the logits) would
