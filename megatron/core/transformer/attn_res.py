@@ -194,6 +194,9 @@ class BlockAttnRes(nn.Module):
         self.key_norm_weight = nn.Parameter(torch.ones(hidden_size))
         self.query.is_ngpt_scaler = True
         self.key_norm_weight.is_ngpt_scaler = True
+        # every parameter of the residual mixer: its own LR group (residual_mixer_lr_mult)
+        for p in self.parameters(recurse=False):
+            p.is_residual_mixer = True
         self.reset_parameters(query_init_std)
 
     def reset_parameters(self, query_init_std: float = 0.0) -> None:

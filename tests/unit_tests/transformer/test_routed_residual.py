@@ -239,14 +239,24 @@ class TestRoutedHybridModel:
                 mhc_expansion_rate=2,
                 mhc_routed_topk=3,
             )
-        with pytest.raises(ValueError, match="CUDA graphs"):
+        # per-layer "local" CUDA graphs are verified against eager
+        # (test_depth_residual_cuda_graphs.py); other graph implementations stay opt-in
+        TransformerConfig(
+            num_layers=2,
+            hidden_size=64,
+            num_attention_heads=4,
+            mhc=True,
+            mhc_routed_topk=2,
+            cuda_graph_impl="local",
+        )
+        with pytest.raises(ValueError, match="cuda_graph_impl='local' only"):
             TransformerConfig(
                 num_layers=2,
                 hidden_size=64,
                 num_attention_heads=4,
                 mhc=True,
                 mhc_routed_topk=2,
-                cuda_graph_impl="local",
+                cuda_graph_impl="transformer_engine",
             )
 
 
@@ -600,8 +610,10 @@ class TestRoutedLerpAndKeys:
         streams = s.clone()
         (i1, r1, st), (_, w1, _, _), _ = keyed(streams)
         assert torch.equal(i0, i1)
-        torch.testing.assert_close(r1, r0, rtol=0, atol=0)
-        torch.testing.assert_close(w1, w0, rtol=0, atol=0)
+        # equal up to fp32 summation order: the positional router runs the fused projection
+        # kernel (fused_router_coeffs), the content router the torch ops
+        torch.testing.assert_close(r1, r0, rtol=1e-6, atol=1e-6)
+        torch.testing.assert_close(w1, w0, rtol=1e-6, atol=1e-6)
         keyed.read(streams, (i1, r1, st)).sum().backward()
         assert keyed.key_gain.grad is not None and keyed.key_gain.grad.abs() > 0
 

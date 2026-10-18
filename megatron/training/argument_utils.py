@@ -281,6 +281,8 @@ def _check_hybrid_linear_layers(args) -> None:
     )
     from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 
+    if Symbols.TRIADIC in args.hybrid_layer_pattern and args.linear_triadic_e < 1:
+        raise ValueError("--hybrid-layer-pattern uses 'T' (triadic), which needs --linear-triadic-e >= 1.")
     if Symbols.LINEAR not in args.hybrid_layer_pattern:
         return
     if not is_linear_attention_variant(args.experimental_attention_variant):

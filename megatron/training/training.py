@@ -562,15 +562,16 @@ def num_floating_point_operations(
             )
         )
 
-    def linear_mixer_fmas_per_token():
+    def linear_mixer_fmas_per_token(variant=None):
         """Multiply-adds per token of ONE linear-mixer layer (forward only).
 
         The mixer is `args.experimental_attention_variant`: placed by
         `linear_attention_freq` in a GPT model, or by the `L` symbol of
         `hybrid_layer_pattern` in a hybrid model. Callers apply the FMA and
-        forward/backward factors.
+        forward/backward factors. ``variant`` overrides it (the hybrid `T` symbol: "triadic").
         """
-        if args.experimental_attention_variant == "gated_delta_net":
+        variant = variant or args.experimental_attention_variant
+        if variant == "gated_delta_net":
             # Calculate the FLOPs for the gated delta net attention.
             qk_head_dim = args.linear_key_head_dim
             v_head_dim = args.linear_value_head_dim
@@ -595,7 +596,7 @@ def num_floating_point_operations(
                     * v_dim
                 )
             )
-        elif args.experimental_attention_variant in ("kda", "signed_kda", "panini"):
+        elif variant in ("kda", "signed_kda", "panini"):
             # FLOPs for the FLA hybrids (megatron/core/ssm/fla_hybrid.py).
             # Same delta-rule skeleton as gated_delta_net, but the layer owns
             # its projections, and counts what it builds:
@@ -614,7 +615,6 @@ def num_floating_point_operations(
             qk_dim = qk_head_dim * num_heads
             v_dim = int(qk_dim * args.linear_fla_expand_v)
             v_head_dim = v_dim // num_heads
-            variant = args.experimental_attention_variant
 
             def _low_rank(out_dim):
                 return args.hidden_size * v_head_dim + v_head_dim * out_dim
@@ -644,7 +644,7 @@ def num_floating_point_operations(
                     + args.hidden_size * v_dim
                 )
             )
-        elif args.experimental_attention_variant == "power":
+        elif variant == "power":
             # megatron/core/ssm/power_retention.py: q, k, v, gate and out projections plus
             # the chunked power-retention core, whose state is binom(d+deg-1, deg) x (d+1)
             # per head; the expanded-feature matmuls dominate (~4 per token and state entry).
@@ -658,7 +658,7 @@ def num_floating_point_operations(
                 args.hidden_size * (4 * dim + num_heads)
                 + num_heads * state * 4
             )
-        elif args.experimental_attention_variant == "triadic":
+        elif variant == "triadic":
             # megatron/core/ssm/triadic.py: KDA's skeleton with a second key / query
             # (hidden x heads*E each, plus the slice-gate projection) and a delta rule
             # over a (E*D) x D state, i.e. E times KDA's recurrence.
@@ -676,7 +676,7 @@ def num_floating_point_operations(
                 + num_heads * e * head_dim * head_dim * 4        # delta rule, E slices
                 + args.hidden_size * dim                         # out proj
             )
-        elif args.experimental_attention_variant == "mlstm":
+        elif variant == "mlstm":
             # Calculate the FLOPs for the mLSTM attention variant.
             qk_head_dim = args.linear_key_head_dim
             v_head_dim = args.linear_value_head_dim
@@ -710,7 +710,7 @@ def num_floating_point_operations(
                     * v_dim
                 )
             )
-        elif args.experimental_attention_variant == "complex_kda":
+        elif variant == "complex_kda":
             # Approximate FLOPs for the Complex-KDA mixer. Like the Mamba
             # branch below, this only affects the reported
             # architecture-aware TFLOP/s, not training.
@@ -753,7 +753,7 @@ def num_floating_point_operations(
                     + args.hidden_size * v_dim
                 )
             )
-        elif args.experimental_attention_variant == "mamba":
+        elif variant == "mamba":
             # Approximate FLOPs for the Mamba2 (SSD) mixer. Only affects the
             # reported architecture-aware TFLOP/s (throughput logging), not
             # training; compare Tok/s/GPU across architectures.
@@ -783,7 +783,7 @@ def num_floating_point_operations(
         else:
             raise ValueError(
                 "Invalid experimental_attention_variant: "
-                f"{args.experimental_attention_variant}"
+                f"{variant}"
             )
 
     def short_conv_layer_flops(total_tokens, hidden_size, kernel_size=3):
@@ -831,7 +831,8 @@ def num_floating_point_operations(
 
     def hybrid_flops(total_tokens, seqlen_squared_sum, hidden_size,
                      num_attn_layers, num_mamba_layers, num_mlp_layers, num_moe_layers,
-                     num_gdn_layers=0, num_linear_layers=0, num_short_conv_layers=0,
+                     num_gdn_layers=0, num_linear_layers=0, num_triadic_layers=0,
+                     num_short_conv_layers=0,
                      short_conv_kernel_size=3, num_engram_layers=0, engram_mem_dim=0,
                      engram_conv_kernel_size=4, num_pkm_layers=0, pkm_args=None,
                      mamba_state_dim=128, mamba_head_dim=64,
@@ -880,6 +881,9 @@ def num_floating_point_operations(
                 # `L` layers: the same per-variant count the GPT path uses.
                 (num_linear_layers * 2 * total_tokens * linear_mixer_fmas_per_token()
                  if num_linear_layers else 0) +
+                # `T` layers: the triadic mixer.
+                (num_triadic_layers * 2 * total_tokens * linear_mixer_fmas_per_token("triadic")
+                 if num_triadic_layers else 0) +
                 (2 * total_tokens * hidden_size * vocab_size * (1 + mtp_num_layers)) +  # logits
                 # Per-layer embeddings: gate and output projections (hidden x dim each).
                 num_ple_layers * 2 * total_tokens * 2 * hidden_size * ple_dim
@@ -1187,6 +1191,7 @@ def num_floating_point_operations(
             num_moe_layers=num_moe_layers,
             num_gdn_layers=num_gdn_layers,
             num_linear_layers=num_linear_layers,
+            num_triadic_layers=get_hybrid_layer_counts(args.hybrid_layer_pattern)[Symbols.TRIADIC],
             num_short_conv_layers=num_short_conv_layers,
             short_conv_kernel_size=args.short_conv_kernel_size,
             num_engram_layers=num_engram_layers,

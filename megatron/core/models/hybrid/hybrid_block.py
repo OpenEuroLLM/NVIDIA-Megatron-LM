@@ -255,6 +255,16 @@ class HybridStack(MegatronModule):
                         add_layer_offset=False,
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
+                elif layer_type == LayerSymbols.TRIADIC:
+                    layer = build_module(
+                        self._triadic_layer_spec(),
+                        config=self._triadic_config(),
+                        layer_number=layer_number,
+                        pg_collection=pg_collection,
+                        # Set to False as we do not want to change offset.
+                        add_layer_offset=False,
+                        name=(name + f".layers.{i}") if name is not None else None,
+                    )
                 else:
                     raise ValueError("unexpected layer_type")
             self.layers.append(layer)
@@ -347,6 +357,28 @@ class HybridStack(MegatronModule):
         if self._linear_spec is None:
             self._linear_spec = get_hybrid_linear_layer_spec(self.config)
         return self._linear_spec
+
+    def _triadic_config(self):
+        """The stack config with experimental_attention_variant = "triadic", for `T` layers.
+
+        A shallow copy (no __post_init__ re-run): every other field, including the triadic
+        ones (linear_triadic_base / _e / _kernel), is shared with the stack.
+        """
+        if getattr(self, "_triadic_cfg", None) is None:
+            cfg = copy.copy(self.config)
+            cfg.experimental_attention_variant = "triadic"
+            self._triadic_cfg = cfg
+        return self._triadic_cfg
+
+    def _triadic_layer_spec(self) -> ModuleSpec:
+        """The spec for `T` positions: the triadic linear mixer."""
+        from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+            get_hybrid_linear_layer_spec,
+        )
+
+        if getattr(self, "_triadic_spec", None) is None:
+            self._triadic_spec = get_hybrid_linear_layer_spec(self._triadic_config())
+        return self._triadic_spec
 
     def _fuse_mla_down_proj(self, submodules: HybridStackSubmodules) -> HybridStackSubmodules:
         # Avoid modifying the original object so users don't get surprised about their `submodules`
@@ -494,12 +526,33 @@ class HybridStack(MegatronModule):
                 and self.training
             ):
                 raise NotImplementedError("per-layer embeddings with full activation recompute")
-            if depth_scheme and self.config.recompute_granularity == 'full' and self.training:
+            full_recompute = self.config.recompute_granularity == 'full' and self.training
+            if depth_scheme and full_recompute and getattr(self.config, "attn_res", False):
+                # Block AttnRes keeps its block summaries in a Python state the layers mutate
+                # (layer._depth_state), which a recomputed chunk would replay against the
+                # already-advanced state.
                 raise NotImplementedError(
-                    "mHC / Block AttnRes do not support full activation recompute; use "
+                    "Block AttnRes does not support full activation recompute; use "
                     "selective recompute."
                 )
-            if self.config.recompute_granularity == 'full' and self.training:
+            if depth_scheme and full_recompute and self.config.distribute_saved_activations:
+                raise NotImplementedError(
+                    "mHC with full recompute does not support distribute_saved_activations"
+                )
+            # Routed residual streams: recompute per sublayer instead (each TransformerLayer
+            # checkpoints its sublayer body between the routed read and the in-place write),
+            # so nothing n streams wide is saved per layer -- the layer-chunk checkpoints below
+            # would save (and copy) the whole stream state at every chunk.
+            routed_sublayer = full_recompute and getattr(self.config, "mhc_routed_topk", 0) > 0
+            for layer in self.layers:
+                if isinstance(layer, TransformerLayer):
+                    layer.routed_sublayer_recompute = routed_sublayer
+            if full_recompute and not routed_sublayer:
+                # mHC (dense or routed): the widened residual is a plain [s, b, n, h] tensor,
+                # so each checkpointed chunk saves and recomputes it like the [s, b, h]
+                # residual; enter / exit (widen, or own the incoming stage payload; collapse,
+                # or pack for the next stage) stay outside the checkpoints.
+                hidden_states, _ = self._depth_enter(hidden_states)
                 hidden_states = checkpointed_forward(
                     self,
                     hidden_states=hidden_states,
@@ -512,6 +565,7 @@ class HybridStack(MegatronModule):
                     padding_mask=padding_mask,
                     use_inner_quantization_context=(use_inner_fp8_context or use_fp4_context),
                 )
+                hidden_states = self._depth_exit(hidden_states, None)
             else:
                 if self._loop_schedule is None:
                     order = list(range(len(self.layers)))

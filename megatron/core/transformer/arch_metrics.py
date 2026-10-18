@@ -99,6 +99,29 @@ def record_share(name, layer_number, num_layers, shares: torch.Tensor) -> None:
     record(name, layer_number, num_layers, shares.sum(0), shares.shape[0])
 
 
+def record_streams(name, layer_number, num_layers, streams: torch.Tensor) -> None:
+    """Record the size of each of the ``n`` residual streams ``[..., n, h]`` (mHC / routed
+    residual) entering a sublayer: per-stream mean square over all tokens; reported as the RMS of
+    stream 0 (the main stream), the mean RMS of the others, the largest RMS and the max / min
+    ratio -- where across depth the streams grow, die or stay unused."""
+    x = streams.detach().float()
+    n = x.shape[-2]
+    ms = x.reshape(-1, n, x.shape[-1]).square().mean(-1)  # [tokens, n]
+    _VECTOR_SUMMARIES.setdefault(name, _stream_summary)
+    record(name, layer_number, num_layers, ms.sum(0), ms.shape[0])
+
+
+def _stream_summary(mean_square: torch.Tensor) -> Dict[str, float]:
+    rms = mean_square.clamp(min=0).sqrt()
+    rest = rms[1:] if rms.numel() > 1 else rms
+    return {
+        "main": float(rms[0]),
+        "others": float(rest.mean()),
+        "max": float(rms.max()),
+        "max_over_min": float(rms.max() / rms.min().clamp(min=1e-12)),
+    }
+
+
 def record_union(name, layer_number, num_layers, size: int, indices: torch.Tensor) -> None:
     """Mark ``indices`` (of ``size`` slots, e.g. memory rows) as used; reported as the
     fraction of slots used since the last report."""
@@ -138,7 +161,8 @@ def _sync_names(group) -> None:
             if name not in _UNIONS:
                 _UNIONS[name] = torch.zeros(shape, dtype=torch.uint8, device=device)
         for name in other["vec"]:
-            _VECTOR_SUMMARIES.setdefault(name, _share_summary)
+            summary = _stream_summary if name.endswith("/stream_rms") else _share_summary
+            _VECTOR_SUMMARIES.setdefault(name, summary)
 
 
 def collect(group=None) -> Dict[str, float]:

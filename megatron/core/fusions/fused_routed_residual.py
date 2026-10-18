@@ -127,7 +127,8 @@ if HAVE_TRITON:
 
     @triton.jit
     def _read_fwd(
-        s_ptr, idx_ptr, r_ptr, x_ptr, rows_ptr, N, C, K: tl.constexpr, BLOCK: tl.constexpr
+        s_ptr, idx_ptr, r_ptr, x_ptr, rows_ptr, N, C, K: tl.constexpr, BLOCK: tl.constexpr,
+        STORE_ROWS: tl.constexpr = True,
     ):
         t = tl.program_id(0).to(tl.int64)
         cb = tl.program_id(1)
@@ -138,15 +139,18 @@ if HAVE_TRITON:
             i = tl.load(idx_ptr + t * K + j).to(tl.int64)
             rj = tl.load(r_ptr + t * K + j).to(tl.float32)
             row = tl.load(s_ptr + (t * N + i) * C + c, mask=m, other=0.0)
-            tl.store(rows_ptr + (t * K + j) * C + c, row, mask=m)
+            if STORE_ROWS:
+                tl.store(rows_ptr + (t * K + j) * C + c, row, mask=m)
             acc += rj * row.to(tl.float32)
         tl.store(x_ptr + t * C + c, acc.to(x_ptr.dtype.element_ty), mask=m)
 
     @triton.jit
     def _read_bwd(
         dx_ptr, rows_ptr, idx_ptr, r_ptr, ds_ptr, dr_ptr, N, C,
-        K: tl.constexpr, BLOCK: tl.constexpr,
+        K: tl.constexpr, BLOCK: tl.constexpr, FROM_STREAMS: tl.constexpr = False,
     ):
+        # FROM_STREAMS: rows_ptr is the (restored) [T, N, C] stream state, indexed by idx,
+        # instead of the [T, K, C] rows the forward gathered
         # One program per token: dr needs a reduction over all of C, kept in registers.
         t = tl.program_id(0).to(tl.int64)
         for j in tl.static_range(K):
@@ -157,7 +161,11 @@ if HAVE_TRITON:
                 c = c0 + tl.arange(0, BLOCK)
                 m = c < C
                 dx = tl.load(dx_ptr + t * C + c, mask=m, other=0.0).to(tl.float32)
-                row = tl.load(rows_ptr + (t * K + j) * C + c, mask=m, other=0.0).to(tl.float32)
+                if FROM_STREAMS:
+                    row = tl.load(rows_ptr + (t * N + i) * C + c, mask=m, other=0.0)
+                else:
+                    row = tl.load(rows_ptr + (t * K + j) * C + c, mask=m, other=0.0)
+                row = row.to(tl.float32)
                 dot += dx * row
                 ds_off = ds_ptr + (t * N + i) * C + c
                 ds = tl.load(ds_off, mask=m, other=0.0).to(tl.float32)
@@ -695,9 +703,10 @@ class _RoutedReadReversible(torch.autograd.Function):
         t, n, c = _dims(streams)
         k = idx.shape[-1]
         x = streams.new_empty(streams.shape[:-2] + (c,))
-        rows = streams.new_empty(t, k, c)  # scratch, freed after the forward
         block = _block(c)
-        _read_fwd[(t, triton.cdiv(c, block))](streams, idx, r, x, rows, n, c, K=k, BLOCK=block)
+        _read_fwd[(t, triton.cdiv(c, block))](
+            streams, idx, r, x, x, n, c, K=k, BLOCK=block, STORE_ROWS=False
+        )
         ctx.save_for_backward(idx, r)
         ctx.streams, ctx.n, ctx.stash = streams, n, stash
         return x
@@ -709,12 +718,13 @@ class _RoutedReadReversible(torch.autograd.Function):
         ctx.streams = None
         t, n, c = _dims(streams)
         k = idx.shape[-1]
-        flat = streams.view(t, n, c)
-        rows = torch.gather(flat, 1, idx.long().unsqueeze(-1).expand(-1, -1, c))
         own = ctx.stash.grad is None
-        ds = rows.new_zeros(streams.shape) if own else ctx.stash.grad
-        dr = torch.empty(t, k, dtype=torch.float32, device=rows.device)
-        _read_bwd[(t,)](dx.contiguous(), rows, idx, r, ds, dr, n, c, K=k, BLOCK=_block(c))
+        ds = streams.new_zeros(streams.shape) if own else ctx.stash.grad
+        dr = torch.empty(t, k, dtype=torch.float32, device=streams.device)
+        # the rows straight from the restored state (no gather copy)
+        _read_bwd[(t,)](
+            dx.contiguous(), streams, idx, r, ds, dr, n, c, K=k, BLOCK=_block(c), FROM_STREAMS=True
+        )
         return (ds if own else None), None, dr.to(r.dtype), None
 
 
@@ -765,7 +775,160 @@ def routed_read_reversible(streams, idx, r, stash):
 
 def routed_write_reversible(streams, f, idx, w, stash):
     """:func:`routed_write` whose backward undoes the write (reversible routed residual)."""
-    return _RoutedWriteReversible.apply(streams, f, idx.int().contiguous(), w.float().contiguous(), stash)
+    # _writable: under CUDA-graph recording a layer's input is a view of the record node's
+    # output, which may not be written in place -- the write then takes a copy, and the
+    # read / router (which reference the untouched input) still see the pre-write state
+    return _RoutedWriteReversible.apply(
+        _writable(streams), f, idx.int().contiguous(), w.float().contiguous(), stash
+    )
+
+
+if HAVE_TRITON:
+
+    @triton.jit
+    def _router_fwd(
+        s_ptr, row_stride, off, phi_ptr, out_ptr, inv_ptr, s0_ptr, T, C, M, eps,
+        BT: tl.constexpr, BC: tl.constexpr, MP: tl.constexpr, PREC: tl.constexpr,
+        WRITE_S0: tl.constexpr,
+    ):
+        """coeffs = (s0 @ phi) / max(rms(s0), eps) and 1 / that rms, in one pass over s0
+        (``WRITE_S0``: also a copy of s0, for a backward that cannot re-read it)."""
+        rows = tl.program_id(0).to(tl.int64) * BT + tl.arange(0, BT)
+        rmask = rows < T
+        cm = tl.arange(0, MP)
+        mmask = cm < M
+        acc = tl.zeros((BT, MP), dtype=tl.float32)
+        ss = tl.zeros((BT,), dtype=tl.float32)
+        for c0 in range(0, C, BC):
+            cc = c0 + tl.arange(0, BC)
+            cmask = cc < C
+            x = tl.load(s_ptr + rows[:, None] * row_stride + off + cc[None, :],
+                        mask=rmask[:, None] & cmask[None, :], other=0.0)
+            w = tl.load(phi_ptr + cc[:, None] * M + cm[None, :],
+                        mask=cmask[:, None] & mmask[None, :], other=0.0)
+            acc += tl.dot(x, w.to(x.dtype), input_precision=PREC)
+            if WRITE_S0:
+                tl.store(s0_ptr + rows[:, None] * C + cc[None, :], x,
+                         mask=rmask[:, None] & cmask[None, :])
+            xf = x.to(tl.float32)
+            ss += tl.sum(xf * xf, axis=1)
+        rms = tl.maximum(tl.sqrt(ss / C), eps)
+        inv = 1.0 / rms
+        tl.store(out_ptr + rows[:, None] * M + cm[None, :], acc * inv[:, None],
+                 mask=rmask[:, None] & mmask[None, :])
+        tl.store(inv_ptr + rows, inv, mask=rmask)
+
+    @triton.jit
+    def _router_bwd(
+        s_ptr, row_stride, off, phi_ptr, g_ptr, out_ptr, inv_ptr, ds_ptr, ds_stride, ds_off,
+        dphi_ptr, T, C, M, eps,
+        BT: tl.constexpr, BC: tl.constexpr, MP: tl.constexpr, PREC: tl.constexpr,
+    ):
+        """ds0 (added in place into the stream gradient) and dphi (atomically accumulated)
+        of coeffs = (s0 @ phi) * inv, inv = 1 / max(rms(s0), eps)."""
+        rows = tl.program_id(0).to(tl.int64) * BT + tl.arange(0, BT)
+        rmask = rows < T
+        cm = tl.arange(0, MP)
+        mmask = cm < M
+        rm2 = rmask[:, None] & mmask[None, :]
+        g = tl.load(g_ptr + rows[:, None] * M + cm[None, :], mask=rm2, other=0.0)
+        o = tl.load(out_ptr + rows[:, None] * M + cm[None, :], mask=rm2, other=0.0)
+        inv = tl.load(inv_ptr + rows, mask=rmask, other=1.0)
+        # d inv = sum_j g_j P_j with P = o / inv; inv = mean(s0^2)^-1/2 unless clamped
+        dinv = tl.sum(g * o, axis=1) / inv
+        clamped = inv >= (1.0 / eps) * (1.0 - 1e-6)
+        scal = tl.where(clamped, 0.0, -dinv * inv * inv * inv / C)
+        dp = g * inv[:, None]
+        for c0 in range(0, C, BC):
+            cc = c0 + tl.arange(0, BC)
+            cmask = cc < C
+            m2 = rmask[:, None] & cmask[None, :]
+            x = tl.load(s_ptr + rows[:, None] * row_stride + off + cc[None, :], mask=m2, other=0.0)
+            w = tl.load(phi_ptr + cc[:, None] * M + cm[None, :],
+                        mask=cmask[:, None] & mmask[None, :], other=0.0).to(x.dtype)
+            ds = tl.dot(dp.to(x.dtype), tl.trans(w), input_precision=PREC)
+            ds += x.to(tl.float32) * scal[:, None]
+            dst = ds_ptr + rows[:, None] * ds_stride + ds_off + cc[None, :]
+            prev = tl.load(dst, mask=m2, other=0.0)
+            tl.store(dst, (prev.to(tl.float32) + ds).to(prev.dtype), mask=m2)
+            dw = tl.dot(tl.trans(x), dp.to(x.dtype), input_precision=PREC)
+            tl.atomic_add(dphi_ptr + cc[:, None] * M + cm[None, :], dw,
+                          mask=cmask[:, None] & mmask[None, :])
+
+
+class _FusedRouterCoeffs(torch.autograd.Function):
+    """The router projection ``(s0 @ phi) / rms(s0)`` of stream ``main``, ``[T, M]`` fp32,
+    straight from the stream state. Its backward is the sublayer's last: it adds ``ds0``
+    into the shared stream gradient in place. ``s0`` for the backward is re-read from the
+    restored streams (reversible), else a copy the forward kernel writes in the same pass
+    (the streams are written in place after the router)."""
+
+    BT = 32
+
+    @staticmethod
+    def _tiles(mp, dtype):
+        # shared memory: wide routers (mixing: 2n + n^2 columns) take narrower C tiles
+        return (64 if mp <= 32 else 32), ("ieee" if dtype == torch.float32 else "tf32")
+
+    @staticmethod
+    def forward(ctx, streams, phi, eps, main, stash, reversible):
+        t, n, c = _dims(streams)
+        m = phi.shape[1]
+        mp = max(16, triton.next_power_of_2(m))
+        out = torch.empty(t, m, dtype=torch.float32, device=streams.device)
+        inv = torch.empty(t, dtype=torch.float32, device=streams.device)
+        s0 = None if reversible else streams.new_empty(t, c)
+        bt = _FusedRouterCoeffs.BT
+        bc, prec = _FusedRouterCoeffs._tiles(mp, streams.dtype)
+        _router_fwd[(triton.cdiv(t, bt),)](
+            streams, n * c, main * c, phi.contiguous(), out, inv, inv if s0 is None else s0,
+            t, c, m, eps, BT=bt, BC=bc, MP=mp, PREC=prec, WRITE_S0=s0 is not None,
+            num_stages=2,
+        )
+        ctx.save_for_backward(phi, out, inv, *(() if s0 is None else (s0,)))
+        ctx.streams = streams.detach() if reversible else None
+        ctx.eps, ctx.main, ctx.stash, ctx.shape, ctx.mp = eps, main, stash, streams.shape, mp
+        return out
+
+    @staticmethod
+    def backward(ctx, g):
+        phi, out, inv, *s0 = ctx.saved_tensors
+        stash = ctx.stash
+        t, m = out.shape
+        n, c = ctx.shape[-2], ctx.shape[-1]
+        if ctx.streams is not None:
+            src, stride, off = ctx.streams, n * c, ctx.main * c
+        else:
+            src, stride, off = s0[0], c, 0
+        if stash.grad is not None:
+            grad, stash.grad = stash.grad, None
+            own = False
+        else:
+            grad, own = torch.zeros(ctx.shape, dtype=src.dtype, device=src.device), True
+        stash.rows = None
+        ctx.streams = None
+        dphi = torch.zeros(phi.shape, dtype=torch.float32, device=phi.device)
+        _, prec = _FusedRouterCoeffs._tiles(ctx.mp, src.dtype)
+        # larger token tiles: fewer programs, so fewer atomic adds into dphi (RTX 3090 Ti,
+        # T 8192 x C 2048 x M 16: 290 -> 168 us); the wide mixing router keeps small tiles
+        if ctx.mp > 32:
+            bt, bc, warps = 32, 32, 4
+        elif src.element_size() <= 2:
+            bt, bc, warps = 128, 128, 8
+        else:  # fp32 tiles: twice the shared memory
+            bt, bc, warps = 64, 64, 4
+        _router_bwd[(triton.cdiv(t, bt),)](
+            src, stride, off, phi.contiguous(), g.contiguous().float(), out, inv,
+            grad, n * c, ctx.main * c, dphi, t, c, m, ctx.eps, BT=bt, BC=bc, MP=ctx.mp,
+            PREC=prec, num_stages=2, num_warps=warps,
+        )
+        return (grad if own else None), dphi.to(phi.dtype), None, None, None, None
+
+
+def fused_router_coeffs(streams, phi, eps, stash, main: int = 0, reversible: bool = False):
+    """``(streams[..., main, :] @ phi) / max(rms, eps)`` as ``[T, M]`` fp32, fused (one pass
+    over stream ``main`` forward and backward)."""
+    return _FusedRouterCoeffs.apply(streams, phi, eps, main, stash, reversible)
 
 
 def _fused(streams):
@@ -864,7 +1027,7 @@ def routed_write_lerp(
         raise ValueError(f"routed LERP write: mode must be one of {LERP_WRITE_MODES}, got {mode!r}")
     if _fused(streams):
         return _RoutedWriteLerp.apply(
-            streams if reversible else _writable(streams), a, idx.int().contiguous(),
+            _writable(streams), a, idx.int().contiguous(),
             w.float().contiguous(), alpha.float().contiguous(), _LERP_MODE_IDS[mode], eps,
             stash, reversible,
         )

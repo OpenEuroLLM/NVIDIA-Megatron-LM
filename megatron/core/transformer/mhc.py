@@ -486,6 +486,9 @@ class MHCMixer(nn.Module):
             # Magnitude / connectivity parameters: never row-normalized by the
             # nGPT weight normalizer, and eligible for the scaler LR group.
             p.is_ngpt_scaler = True
+        # every parameter of the residual mixer: its own LR group (residual_mixer_lr_mult)
+        for p in self.parameters(recurse=False):
+            p.is_residual_mixer = True
 
         self.reset_parameters(res_init, identity_bias)
 
@@ -582,6 +585,7 @@ class MHCMixer(nn.Module):
             f"{p}/read_share", layer, num_layers, read / read.sum(-1, keepdim=True).clamp(min=1e-12)
         )
         arch_metrics.record_mean(f"{p}/write", layer, num_layers, h_post)
+        arch_metrics.record_streams(f"{p}/stream_rms", layer, num_layers, streams)
         arch_metrics.record_mean(
             f"{p}/res_diag", layer, num_layers, torch.diagonal(h_res, dim1=-2, dim2=-1)
         )

@@ -37,7 +37,7 @@ from tests.unit_tests.test_utilities import Utils
 S, B, H, L, N = 16, 2, 64, 4, 4
 
 
-def _config(cuda_graph_impl: str) -> TransformerConfig:
+def _config(cuda_graph_impl: str, **scheme) -> TransformerConfig:
     kwargs = dict(
         num_layers=L,
         hidden_size=H,
@@ -53,16 +53,17 @@ def _config(cuda_graph_impl: str) -> TransformerConfig:
         mhc_expansion_rate=N,
         mhc_sinkhorn_iters=4,
     )
+    kwargs.update(scheme)
     if cuda_graph_impl != "none":
         kwargs["cuda_graph_impl"] = cuda_graph_impl
         kwargs["cuda_graph_warmup_steps"] = 2
     return TransformerConfig(**kwargs)
 
 
-def _build(cuda_graph_impl: str) -> TransformerBlock:
+def _build(cuda_graph_impl: str, **scheme) -> TransformerBlock:
     model_parallel_cuda_manual_seed(123)
     spec = get_gpt_layer_with_transformer_engine_spec()
-    return TransformerBlock(_config(cuda_graph_impl), spec).cuda()
+    return TransformerBlock(_config(cuda_graph_impl, **scheme), spec).cuda()
 
 
 def _fwd_bwd(block: TransformerBlock, x: torch.Tensor):
@@ -165,6 +166,59 @@ class TestMHCCudaGraphs:
             assert layer._depth_state is None
 
 
+ROUTED = {
+    "routed8": dict(mhc_expansion_rate=8, mhc_routed_topk=2),
+    "routed8_reversible": dict(mhc_expansion_rate=8, mhc_routed_topk=2, mhc_routed_reversible=True),
+    "routed4_keys": dict(mhc_expansion_rate=4, mhc_routed_topk=2, mhc_routed_key_dim=8),
+}
+
+
+class TestRoutedCudaGraphs:
+    """Routed residual streams under CUDA graphs: the per-step routing state and the shared
+    gradient buffer (GradStash) live in Python objects that a capture freezes, so a replay
+    must reproduce eager results exactly before the config guard can go."""
+
+    def setup_method(self, method):
+        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+        Utils.initialize_model_parallel(1, 1)
+        CudaGraphManager.global_mempool = None
+
+    def teardown_method(self, method):
+        delete_cuda_graphs()
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+    @pytest.mark.parametrize("name", list(ROUTED))
+    def test_graph_replay_matches_eager(self, name):
+        # "local" graphs need no opt-in (transformer_config: verified by this test)
+        torch.manual_seed(0)
+        x = torch.randn(S, B, H, device="cuda")
+        eager = _build("none", **ROUTED[name])
+        with torch.no_grad():
+            for pname, p in eager.named_parameters():
+                if pname.endswith((".phi", ".key_gain", ".w_key")):
+                    p.normal_(0.0, 0.02)
+        ref_out, ref_grads = _fwd_bwd(eager, x)
+
+        graphed = _build("local", **ROUTED[name])
+        graphed.load_state_dict(eager.state_dict())
+        _fwd_bwd(graphed, x)
+        create_cudagraphs()
+        assert _CudagraphGlobalRecord.cudagraph_created, "no cudagraphs were created"
+        # Reversible: eager reconstructs the router's input by undoing the writes (exact up to
+        # rounding), the graphed run reads the untouched input (its writes go to a copy of the
+        # recorded view) -- so only the router gradients may differ, by rounding. Here they
+        # are ~1e-12 (near-zero at this init), hence an absolute tolerance.
+        tol = dict(rtol=1e-5, atol=1e-8) if "reversible" in name else dict(rtol=0, atol=0)
+        # two replays: a graph that reads a stale buffer often only diverges on the second
+        for _ in range(2):
+            replay_out, replay_grads = _fwd_bwd(graphed, x)
+            torch.testing.assert_close(replay_out, ref_out, rtol=0, atol=0)
+            assert set(replay_grads) == set(ref_grads)
+            for pname, grad in ref_grads.items():
+                torch.testing.assert_close(replay_grads[pname], grad, msg=pname, **tol)
+
+
 class TestNGPTScalersInAttention:
     """s_qk must be sized to broadcast against q/k as attention actually holds them.
 
@@ -208,3 +262,74 @@ class TestNGPTScalersInAttention:
         out = block(hidden_states=x, attention_mask=None)
         out.square().mean().backward()
         assert torch.isfinite(out).all() and torch.isfinite(x.grad).all()
+
+
+MOE = dict(
+    num_moe_experts=4,
+    moe_router_topk=2,
+    moe_ffn_hidden_size=32,
+    moe_shared_expert_intermediate_size=32,
+    moe_grouped_gemm=True,
+    # the unfused permute's backward hits an out-of-bounds gather on local partial-graph
+    # replay even without mHC (the "plain" control); training uses the fused permute
+    moe_permute_fusion=True,
+    moe_token_dispatcher_type="alltoall",
+    moe_router_load_balancing_type="none",
+    add_bias_linear=False,
+)
+MOE_SCOPES = {
+    "router": ["attn", "moe_router"],
+    "router_preprocess": ["attn", "moe_router", "moe_preprocess"],
+}
+
+
+class TestRoutedMoEPartialCudaGraphs:
+    """mHC / routed streams through the MoE partial graphs (router + postprocess graphed,
+    the stream read / write eager around them): replay must match eager exactly."""
+
+    def setup_method(self, method):
+        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+        Utils.initialize_model_parallel(1, 1)
+        CudaGraphManager.global_mempool = None
+
+    def teardown_method(self, method):
+        delete_cuda_graphs()
+        Utils.destroy_model_parallel()
+
+    @staticmethod
+    def _moe_build(cuda_graph_impl, **kw):
+        model_parallel_cuda_manual_seed(123)
+        from megatron.core.transformer.transformer_layer import MoETransformerLayer
+
+        spec = get_gpt_layer_with_transformer_engine_spec(num_experts=4, moe_grouped_gemm=True)
+        spec.module = MoETransformerLayer  # the partial-graph MoE layer, as HybridModel's "E"
+        return TransformerBlock(_config(cuda_graph_impl, **MOE, **kw), spec).cuda()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+    @pytest.mark.parametrize("scope", list(MOE_SCOPES))
+    @pytest.mark.parametrize("name", ["plain", "mhc", "routed8", "routed8_reversible"])
+    def test_graph_replay_matches_eager(self, name, scope):
+        # plain: the residual stream without mHC, the control for the test setup
+        scheme = {"plain": dict(mhc=False), "mhc": {}, **ROUTED}[name]
+        torch.manual_seed(0)
+        x = torch.randn(S, B, H, device="cuda")
+        eager = self._moe_build("none", **scheme)
+        with torch.no_grad():
+            for pname, p in eager.named_parameters():
+                if pname.endswith(".phi"):
+                    p.normal_(0.0, 0.02)
+        ref_out, ref_grads = _fwd_bwd(eager, x)
+
+        graphed = self._moe_build("local", cuda_graph_modules=MOE_SCOPES[scope], **scheme)
+        graphed.load_state_dict(eager.state_dict())
+        assert all(getattr(l, "use_partial_cudagraphs", False) for l in graphed.layers)
+        _fwd_bwd(graphed, x)
+        create_cudagraphs()
+        assert _CudagraphGlobalRecord.cudagraph_created, "no cudagraphs were created"
+        tol = dict(rtol=1e-5, atol=1e-8) if "reversible" in name else dict(rtol=0, atol=0)
+        for _ in range(2):
+            replay_out, replay_grads = _fwd_bwd(graphed, x)
+            torch.testing.assert_close(replay_out, ref_out, rtol=0, atol=0)
+            assert set(replay_grads) == set(ref_grads)
+            for pname, grad in ref_grads.items():
+                torch.testing.assert_close(replay_grads[pname], grad, msg=pname, **tol)

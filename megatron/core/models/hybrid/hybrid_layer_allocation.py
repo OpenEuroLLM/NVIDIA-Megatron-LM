@@ -20,6 +20,10 @@ class Symbols:
     # (mlstm, gated_delta_net, kda, signed_kda, panini, complex_kda, mamba),
     # built exactly as the GPT path builds its linear-attention layers.
     LINEAR = 'L'
+    # A triadic linear mixer (megatron/core/ssm/triadic.py, base linear_triadic_base, E =
+    # linear_triadic_e) whatever experimental_attention_variant names: mixes triadic and
+    # plain `L` layers in one stack (e.g. one triadic CKDA layer next to complex_kda `L`s).
+    TRIADIC = 'T'
     # Gated short convolution (LFM2), see megatron/core/ssm/short_conv.py.
     SHORT_CONV = 'C'
     # Engram n-gram memory (hashed lookup into large tables), see megatron/core/ssm/engram.py.
@@ -41,6 +45,7 @@ class Symbols:
         MAMBA,
         GDN,
         LINEAR,
+        TRIADIC,
         SHORT_CONV,
         ENGRAM,
         PRODUCT_KEY_MEMORY,
@@ -325,7 +330,7 @@ def _validate_pattern(pattern: str, pattern_name: str, allow_pipe: bool = False)
         raise ValueError("Not supported to have both Attention and MLA/DSA in one model")
 
     # `L` and `D` are both configured through `experimental_attention_variant`.
-    if Symbols.LINEAR in pattern and Symbols.DS_ATTENTION in pattern:
+    if (Symbols.LINEAR in pattern or Symbols.TRIADIC in pattern) and Symbols.DS_ATTENTION in pattern:
         raise ValueError("Not supported to have both linear (L) and DSA (D) layers in one model")
 
 
@@ -357,7 +362,7 @@ def validate_segment_layers(segment: str) -> List[str]:
         raise ValueError("Not supported to have both Attention and MLA/DSA in one model")
 
     # `L` and `D` are both configured through `experimental_attention_variant`.
-    if Symbols.LINEAR in segment and Symbols.DS_ATTENTION in segment:
+    if (Symbols.LINEAR in segment or Symbols.TRIADIC in segment) and Symbols.DS_ATTENTION in segment:
         raise ValueError("Not supported to have both linear (L) and DSA (D) layers in one model")
 
     return layer_type_list

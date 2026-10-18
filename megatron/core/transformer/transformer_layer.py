@@ -766,77 +766,124 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         elif self._depth_enabled("attn"):
             hidden_states = self._depth_read("attn")
 
-        # Optional Input Layer norm
-        attn_norm_manager = self.off_interface(self.offload_attn_norm, hidden_states, "attn_norm")
-        if self.recompute_input_layernorm:
-            self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            with attn_norm_manager as hidden_states:
-                sublayer_input = (
-                    self.canon_a(hidden_states) if self.canon_a is not None else hidden_states
+        # Routed residual under full activation recompute (HybridStack sets
+        # routed_sublayer_recompute): checkpoint only this sublayer's body, from the read
+        # output x ([s, b, h]) to its output f, and keep the routed write outside -- the saved
+        # state is then x (+ f, + the read's k rows unless reversible) per sublayer, never
+        # the n-stream state.
+        routed_ckpt = mhc_streams is not None and getattr(self, "routed_sublayer_recompute", False)
+        if routed_ckpt:
+            if self.recompute_input_layernorm or self.offload_attn_norm:
+                raise NotImplementedError(
+                    "routed sublayer recompute does not combine with input-layernorm recompute "
+                    "or attention-norm offloading"
                 )
-                input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
-                    apply_module(self.input_layernorm), sublayer_input
-                )
-        else:
-            with attn_norm_manager as hidden_states:
-                # Canon A changes what the sublayer reads, not the residual.
-                sublayer_input = (
-                    self.canon_a(hidden_states) if self.canon_a is not None else hidden_states
-                )
-                input_layernorm_output = apply_module(self.input_layernorm)(sublayer_input)
 
-        if isinstance(input_layernorm_output, tuple):
-            if len(input_layernorm_output) != 2:
-                raise ValueError(
-                    f"When the output of input_layernorm is a tuple, it is "
-                    f"expected to have 2 elements (output, residual), but "
-                    f"got {len(input_layernorm_output)}"
+            def attn_body(x):
+                y = self.canon_a(x) if self.canon_a is not None else x
+                y = apply_module(self.input_layernorm)(y)
+                if isinstance(y, tuple):
+                    y = y[0]
+                out = self.self_attention(
+                    y,
+                    attention_mask=attention_mask,
+                    inference_context=inference_context,
+                    rotary_pos_emb=rotary_pos_emb,
+                    rotary_pos_cos=rotary_pos_cos,
+                    rotary_pos_sin=rotary_pos_sin,
+                    rotary_pos_cos_sin=rotary_pos_cos_sin,
+                    attention_bias=attention_bias,
+                    packed_seq_params=packed_seq_params,
+                    sequence_len_offset=sequence_len_offset,
                 )
-            input_layernorm_output, residual = input_layernorm_output
-        else:
+                return self._sublayer_output(out)
+
+            attention_output_with_bias = (
+                tensor_parallel.checkpoint(attn_body, False, hidden_states),
+                None,
+            )
             residual = hidden_states
+            using_fused_tp_inference_kernel = False
+            # offloading is off here (checked above): a no-op manager for the shared tail
+            attn_norm_manager = self.off_interface(self.offload_attn_norm, hidden_states, "attn_norm")
+            if self.post_attn_norm is not None:
+                from megatron.core.transformer.post_norm import apply_post_norm
 
-        if self.config.fp32_residual_connection:
-            residual = residual.float()
+                attention_output_with_bias = apply_post_norm(
+                    self.post_attn_norm, attention_output_with_bias
+                )
+        else:
+            # Optional Input Layer norm
+            attn_norm_manager = self.off_interface(self.offload_attn_norm, hidden_states, "attn_norm")
+            if self.recompute_input_layernorm:
+                self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+                with attn_norm_manager as hidden_states:
+                    sublayer_input = (
+                        self.canon_a(hidden_states) if self.canon_a is not None else hidden_states
+                    )
+                    input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
+                        apply_module(self.input_layernorm), sublayer_input
+                    )
+            else:
+                with attn_norm_manager as hidden_states:
+                    # Canon A changes what the sublayer reads, not the residual.
+                    sublayer_input = (
+                        self.canon_a(hidden_states) if self.canon_a is not None else hidden_states
+                    )
+                    input_layernorm_output = apply_module(self.input_layernorm)(sublayer_input)
 
-        using_fused_tp_inference_kernel = (
-            InferenceMode.is_active() and self.config.inference_fuse_tp_communication
-        )
+            if isinstance(input_layernorm_output, tuple):
+                if len(input_layernorm_output) != 2:
+                    raise ValueError(
+                        f"When the output of input_layernorm is a tuple, it is "
+                        f"expected to have 2 elements (output, residual), but "
+                        f"got {len(input_layernorm_output)}"
+                    )
+                input_layernorm_output, residual = input_layernorm_output
+            else:
+                residual = hidden_states
 
-        if using_fused_tp_inference_kernel:
-            # Set the residual for fused reduce-scatter + add + layer-norm + all-gather
-            # operation in attention's out_proj (linear_proj)
-            self._set_proj_residual(residual)
+            if self.config.fp32_residual_connection:
+                residual = residual.float()
 
-        # Self attention.
-        nvtx_range_push(suffix="self_attention")
-        attention_output_with_bias = self.self_attention(
-            input_layernorm_output,
-            attention_mask=attention_mask,
-            inference_context=inference_context,
-            rotary_pos_emb=rotary_pos_emb,
-            rotary_pos_cos=rotary_pos_cos,
-            rotary_pos_sin=rotary_pos_sin,
-            rotary_pos_cos_sin=rotary_pos_cos_sin,
-            attention_bias=attention_bias,
-            packed_seq_params=packed_seq_params,
-            sequence_len_offset=sequence_len_offset,
-        )
-        nvtx_range_pop(suffix="self_attention")
-
-        if self.recompute_input_layernorm:
-            # discard the output of the input layernorm and register the recompute
-            # as a gradient hook of attention_output_with_bias[0]
-            self.input_layernorm_checkpoint.discard_output_and_register_recompute(
-                attention_output_with_bias[0]
+            using_fused_tp_inference_kernel = (
+                InferenceMode.is_active() and self.config.inference_fuse_tp_communication
             )
 
-        if self.post_attn_norm is not None:
-            from megatron.core.transformer.post_norm import apply_post_norm
+            if using_fused_tp_inference_kernel:
+                # Set the residual for fused reduce-scatter + add + layer-norm + all-gather
+                # operation in attention's out_proj (linear_proj)
+                self._set_proj_residual(residual)
 
-            attention_output_with_bias = apply_post_norm(
-                self.post_attn_norm, attention_output_with_bias
+            # Self attention.
+            nvtx_range_push(suffix="self_attention")
+            attention_output_with_bias = self.self_attention(
+                input_layernorm_output,
+                attention_mask=attention_mask,
+                inference_context=inference_context,
+                rotary_pos_emb=rotary_pos_emb,
+                rotary_pos_cos=rotary_pos_cos,
+                rotary_pos_sin=rotary_pos_sin,
+                rotary_pos_cos_sin=rotary_pos_cos_sin,
+                attention_bias=attention_bias,
+                packed_seq_params=packed_seq_params,
+                sequence_len_offset=sequence_len_offset,
             )
+            nvtx_range_pop(suffix="self_attention")
+
+            if self.recompute_input_layernorm:
+                # discard the output of the input layernorm and register the recompute
+                # as a gradient hook of attention_output_with_bias[0]
+                self.input_layernorm_checkpoint.discard_output_and_register_recompute(
+                    attention_output_with_bias[0]
+                )
+
+            if self.post_attn_norm is not None:
+                from megatron.core.transformer.post_norm import apply_post_norm
+
+                attention_output_with_bias = apply_post_norm(
+                    self.post_attn_norm, attention_output_with_bias
+                )
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
@@ -1182,104 +1229,128 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         elif self._depth_enabled("mlp"):
             hidden_states = self._depth_read("mlp")
 
-        # Optional Layer norm post the cross-attention.
-        pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(hidden_states)
-
-        if isinstance(pre_mlp_layernorm_output, tuple):
-            if len(pre_mlp_layernorm_output) != 2:
-                raise ValueError(
-                    f"When the output of pre_mlp_layernorm is a tuple, it is "
-                    f"expected to have 2 elements (output, residual), but "
-                    f"got {len(pre_mlp_layernorm_output)}"
+        # Routed residual under full activation recompute: see _forward_attention.
+        routed_ckpt = mhc_streams is not None and getattr(self, "routed_sublayer_recompute", False)
+        if routed_ckpt:
+            if self.recompute_pre_mlp_layernorm or self.recompute_mlp:
+                raise NotImplementedError(
+                    "routed sublayer recompute does not combine with selective recompute of the "
+                    "pre-MLP norm / MLP (the whole sublayer is recomputed already)"
                 )
-            pre_mlp_layernorm_output, residual = pre_mlp_layernorm_output
-        else:
-            # Residual connection.
+
+            def mlp_body(x):
+                y = apply_module(self.pre_mlp_layernorm)(x)
+                if isinstance(y, tuple):
+                    y = y[0]
+                # packed sequences (document masking): the MoE sees [S, mbs, H] (see
+                # _maybe_unflatten_for_moe), the residual write the packed [mbs * S, 1, H]
+                y, mask, mbs = self._maybe_unflatten_for_moe(y, padding_mask, packed_seq_params)
+                out = self._sublayer_output(apply_module(self.mlp)(y, padding_mask=mask))
+                return self._maybe_reflatten_from_moe(out, packed_seq_params, mbs)
+
+            nvtx_range_push(suffix="mlp")
+            mlp_output_with_bias = (tensor_parallel.checkpoint(mlp_body, False, hidden_states), None)
             residual = hidden_states
-
-        if self.config.fp32_residual_connection:
-            residual = residual.float()
-
-        pre_mlp_layernorm_output, padding_mask, moe_unflatten_mbs = self._maybe_unflatten_for_moe(
-            pre_mlp_layernorm_output, padding_mask, packed_seq_params
-        )
-
-        nvtx_range_push(suffix="mlp")
-        # Potentially chunk the MLP computation during prefill to minimize the peak activation size
-        should_chunk_mlp_for_prefill = (
-            self.config.mlp_chunks_for_prefill > 1
-            and inference_context is not None
-            and not inference_context.is_decode_only()
-            and not isinstance(self.mlp, IdentityOp)
-            and not self.config.transformer_impl == "inference_optimized"
-        )
-        should_chunk_mlp_for_training = (
-            self.config.mlp_chunks_for_training > 1
-            and inference_context is None
-            and self.training
-            and not isinstance(self.mlp, IdentityOp)
-        )
-
-        using_fused_tp_inference_kernel = (
-            InferenceMode.is_active() and self.config.inference_fuse_tp_communication
-        )
-
-        if self.recompute_mlp:
-            if self.config.fp8 or self.config.fp4:
-                # import here to avoid circular import
-                from megatron.core.extensions.transformer_engine import te_checkpoint
-
-                mlp_output_with_bias = te_checkpoint(
-                    apply_module(self.mlp),
-                    False,
-                    tensor_parallel.random.get_cuda_rng_tracker,
-                    self.pg_collection.tp,
-                    pre_mlp_layernorm_output,
-                    padding_mask=padding_mask,
-                )
-            else:
-                mlp_output_with_bias = tensor_parallel.checkpoint(
-                    functools.partial(apply_module(self.mlp), padding_mask=padding_mask),
-                    False,
-                    pre_mlp_layernorm_output,
-                )
-        elif should_chunk_mlp_for_prefill or should_chunk_mlp_for_training:
-            # Chunk input along sequence dimension
-            num_chunks = min(
-                (
-                    self.config.mlp_chunks_for_prefill
-                    if should_chunk_mlp_for_prefill
-                    else self.config.mlp_chunks_for_training
-                ),
-                pre_mlp_layernorm_output.shape[0],
-            )
-
-            chunks = pre_mlp_layernorm_output.chunk(num_chunks, dim=0)
-
-            # Compute outputs for each chunk
-            outputs = [apply_module(self.mlp)(chunk) for chunk in chunks]
-
-            # Aggregate chunk outputs
-            mlp_output = torch.cat([out for out, _ in outputs], dim=0)
-            bias_chunks = [bias for _, bias in outputs if bias is not None]
-            # elements in bias_chunks are the same for all chunks, so we can just use the first one
-            bias_output = bias_chunks[0] if bias_chunks else None
-            mlp_output_with_bias = (mlp_output, bias_output)
+            moe_unflatten_mbs = None
         else:
-            if using_fused_tp_inference_kernel:
-                # Set the residual for fused reduce-scatter + add + layer-norm + all-gather
-                # operation in MLP's fc2.
-                self._set_fc2_residual(residual)
-            mlp_output_with_bias = apply_module(self.mlp)(
-                pre_mlp_layernorm_output, padding_mask=padding_mask
+            # Optional Layer norm post the cross-attention.
+            pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(hidden_states)
+
+            if isinstance(pre_mlp_layernorm_output, tuple):
+                if len(pre_mlp_layernorm_output) != 2:
+                    raise ValueError(
+                        f"When the output of pre_mlp_layernorm is a tuple, it is "
+                        f"expected to have 2 elements (output, residual), but "
+                        f"got {len(pre_mlp_layernorm_output)}"
+                    )
+                pre_mlp_layernorm_output, residual = pre_mlp_layernorm_output
+            else:
+                # Residual connection.
+                residual = hidden_states
+
+            if self.config.fp32_residual_connection:
+                residual = residual.float()
+
+            pre_mlp_layernorm_output, padding_mask, moe_unflatten_mbs = self._maybe_unflatten_for_moe(
+                pre_mlp_layernorm_output, padding_mask, packed_seq_params
             )
 
-        if moe_unflatten_mbs is not None:
-            mlp_output, mlp_bias = mlp_output_with_bias
-            mlp_output = self._maybe_reflatten_from_moe(
-                mlp_output, packed_seq_params, moe_unflatten_mbs
+            nvtx_range_push(suffix="mlp")
+            # Potentially chunk the MLP computation during prefill to minimize the peak activation size
+            should_chunk_mlp_for_prefill = (
+                self.config.mlp_chunks_for_prefill > 1
+                and inference_context is not None
+                and not inference_context.is_decode_only()
+                and not isinstance(self.mlp, IdentityOp)
+                and not self.config.transformer_impl == "inference_optimized"
             )
-            mlp_output_with_bias = (mlp_output, mlp_bias)
+            should_chunk_mlp_for_training = (
+                self.config.mlp_chunks_for_training > 1
+                and inference_context is None
+                and self.training
+                and not isinstance(self.mlp, IdentityOp)
+            )
+
+            using_fused_tp_inference_kernel = (
+                InferenceMode.is_active() and self.config.inference_fuse_tp_communication
+            )
+
+            if self.recompute_mlp:
+                if self.config.fp8 or self.config.fp4:
+                    # import here to avoid circular import
+                    from megatron.core.extensions.transformer_engine import te_checkpoint
+
+                    mlp_output_with_bias = te_checkpoint(
+                        apply_module(self.mlp),
+                        False,
+                        tensor_parallel.random.get_cuda_rng_tracker,
+                        self.pg_collection.tp,
+                        pre_mlp_layernorm_output,
+                        padding_mask=padding_mask,
+                    )
+                else:
+                    mlp_output_with_bias = tensor_parallel.checkpoint(
+                        functools.partial(apply_module(self.mlp), padding_mask=padding_mask),
+                        False,
+                        pre_mlp_layernorm_output,
+                    )
+            elif should_chunk_mlp_for_prefill or should_chunk_mlp_for_training:
+                # Chunk input along sequence dimension
+                num_chunks = min(
+                    (
+                        self.config.mlp_chunks_for_prefill
+                        if should_chunk_mlp_for_prefill
+                        else self.config.mlp_chunks_for_training
+                    ),
+                    pre_mlp_layernorm_output.shape[0],
+                )
+
+                chunks = pre_mlp_layernorm_output.chunk(num_chunks, dim=0)
+
+                # Compute outputs for each chunk
+                outputs = [apply_module(self.mlp)(chunk) for chunk in chunks]
+
+                # Aggregate chunk outputs
+                mlp_output = torch.cat([out for out, _ in outputs], dim=0)
+                bias_chunks = [bias for _, bias in outputs if bias is not None]
+                # elements in bias_chunks are the same for all chunks, so we can just use the first one
+                bias_output = bias_chunks[0] if bias_chunks else None
+                mlp_output_with_bias = (mlp_output, bias_output)
+            else:
+                if using_fused_tp_inference_kernel:
+                    # Set the residual for fused reduce-scatter + add + layer-norm + all-gather
+                    # operation in MLP's fc2.
+                    self._set_fc2_residual(residual)
+                mlp_output_with_bias = apply_module(self.mlp)(
+                    pre_mlp_layernorm_output, padding_mask=padding_mask
+                )
+
+            if moe_unflatten_mbs is not None:
+                mlp_output, mlp_bias = mlp_output_with_bias
+                mlp_output = self._maybe_reflatten_from_moe(
+                    mlp_output, packed_seq_params, moe_unflatten_mbs
+                )
+                mlp_output_with_bias = (mlp_output, mlp_bias)
 
         nvtx_range_pop(suffix="mlp")
 
@@ -2055,7 +2126,11 @@ class MoETransformerLayer(TransformerLayer):
         else:
             residual = hidden_states
 
-        if self.config.fp32_residual_connection:
+        if self.mhc_mlp_mixer is not None:
+            # mHC / routed: the residual is the stream state, written eagerly after the
+            # postprocess graph; an unused graph input / output would get no gradient
+            residual = None
+        elif self.config.fp32_residual_connection:
             residual = residual.float()
 
         hidden_states, probs, shared_expert_output = apply_module(self.mlp)(
@@ -2108,6 +2183,9 @@ class MoETransformerLayer(TransformerLayer):
 
         self.mlp.fwd_execution_map = "postprocess"
         output = apply_module(self.mlp)(None, intermediate_tensors=(output, shared_expert_output))
+        if self.mhc_mlp_mixer is not None:
+            # mHC / routed streams: the write runs eagerly after this graph (_forward_mlp)
+            return output
         return self._forward_post_mlp((output, mlp_bias), residual)
 
     def _forward_mlp(
@@ -2130,6 +2208,15 @@ class MoETransformerLayer(TransformerLayer):
         def _forward_mlp_partial_cudagraphs(
             hidden_states, inference_context=None, padding_mask=None
         ):
+            # mHC / routed residual streams: the stream read and write run eagerly around the
+            # graphed router and postprocess. Their coefficients (and the routed residual's
+            # shared gradient stash) then never cross a graph boundary, and the graphs see
+            # the plain [s, b, h] sublayer input, as without mHC.
+            mhc = None
+            if self.mhc_mlp_mixer is not None:
+                streams = hidden_states
+                hidden_states, pending = self._mhc_read(self.mhc_mlp_mixer, streams)
+                mhc = (streams, pending)
             router_outputs = self._forward_mlp_router(hidden_states, padding_mask=padding_mask)
             (
                 residual,
@@ -2149,9 +2236,23 @@ class MoETransformerLayer(TransformerLayer):
             expert_output, mlp_bias = self._forward_mlp_expert_compute(
                 hidden_states, probs, token_dispatcher_attr_outputs
             )
-            return self._forward_mlp_postprocess(
+            output = self._forward_mlp_postprocess(
                 residual, expert_output, shared_expert_output, mlp_bias
             )
+            if mhc is not None:
+                return self._forward_post_mlp((output, mlp_bias), mhc[0], mhc=mhc)
+            return output
+
+        if self.use_partial_cudagraphs and self.mhc_mlp_mixer is not None:
+            if self.moe_layer_recompute or getattr(self, "routed_sublayer_recompute", False):
+                raise NotImplementedError(
+                    "mHC / routed streams with MoE partial cudagraphs do not combine with "
+                    "MoE-layer or routed-sublayer recompute"
+                )
+            if getattr(packed_seq_params, "tokens_per_sample", None) is not None:
+                raise NotImplementedError(
+                    "mHC / routed streams with MoE partial cudagraphs and packed sequences"
+                )
 
         if self.use_partial_cudagraphs:
             hidden_states, padding_mask, moe_unflatten_mbs = self._maybe_unflatten_for_moe(

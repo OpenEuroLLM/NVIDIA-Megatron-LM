@@ -83,6 +83,13 @@ def checkpointed_forward(
                 else rotary_pos_emb_global
             )
 
+            if hidden_states.dim() == 4 and getattr(self.config, "mhc_routed_topk", 0):
+                # Routed residual streams are updated in place (routed_residual.py): a chunk
+                # must not write into its input, which the checkpoint saves and, in the
+                # backward replay, is a detached leaf. Take ownership with one copy.
+                from megatron.core.transformer.routed_residual import own_streams
+
+                hidden_states = own_streams(hidden_states, self.config)
             for position in range(start, end):
                 # Use self.layers[...] (not self._get_layer) so this
                 # function works for both TransformerBlock and HybridStack.

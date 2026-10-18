@@ -133,6 +133,10 @@ def test_feature_model_reports_every_feature():
         assert key in out, (key, sorted(out))
         assert 0.0 <= out[key] <= 2.0, (key, out[key])
     # Layer attribution: the PKM layer is layer 4, the attention gates layers 2 and 5.
+    # the size of every residual stream entering the routed sublayers, per layer
+    assert out["routed_attn/stream_rms/main"] > 0
+    assert out["routed_mlp/stream_rms/max"] >= out["routed_mlp/stream_rms/main"]
+    assert any(k.startswith("routed_attn/stream_rms/others/layer_") for k in out)
     assert "pkm/rows_used/layer_4" in out
     assert {"attn_gate/mean/layer_2", "attn_gate/mean/layer_5"} <= set(out)
     assert 0 < out["pkm/rows_used"] <= 1
@@ -147,6 +151,9 @@ def test_dense_mhc_stream_usage():
     assert out["mhc_attn/read_share/entropy"] == pytest.approx(1.0, abs=1e-3)
     assert out["mhc_mlp/res_diag"] > 0.9
     assert out["mhc_attn/write"] == pytest.approx(1.0, abs=1e-2)
+    # every stream starts as a copy of the embedding: balanced
+    assert out["mhc_attn/stream_rms/main"] > 0
+    assert out["mhc_attn/stream_rms/max_over_min"] == pytest.approx(1.0, abs=1e-2)
 
 
 def test_attn_res_depth_attention():

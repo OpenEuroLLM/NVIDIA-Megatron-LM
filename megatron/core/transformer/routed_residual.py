@@ -58,11 +58,15 @@ Engram / PKM layers, pipeline payloads -- works unchanged); the per-call routing
 state travels in the coefficient tuples.
 """
 
+import os
+
 import torch
 from torch import nn
 
 from megatron.core.fusions.fused_routed_residual import (
     GradStash,
+    _fused,
+    fused_router_coeffs,
     LERP_WRITE_MODES,
     route_streams,
     routed_read,
@@ -75,6 +79,10 @@ from megatron.core.fusions.fused_routed_residual import (
     stream_tap,
     stream_tap_tags,
 )
+
+
+# MEGATRON_ROUTED_FUSED_ROUTER=0 falls back to the unfused router (tap + torch ops)
+_FUSED_ROUTER = os.environ.get("MEGATRON_ROUTED_FUSED_ROUTER", "1") != "0"
 
 
 class RoutedStreamMixer(nn.Module):
@@ -127,6 +135,9 @@ class RoutedStreamMixer(nn.Module):
         self.phi.use_adam_with_emerging_optimizers = True
         for p in scalers:
             p.is_ngpt_scaler = True
+        # every parameter of the residual mixer: its own LR group (residual_mixer_lr_mult)
+        for p in self.parameters(recurse=False):
+            p.is_residual_mixer = True
         self.balance = balance
         if balance:
             # fp32 like the MoE expert bias (kept so by _apply); updated by
@@ -162,7 +173,13 @@ class RoutedStreamMixer(nn.Module):
         """``streams`` ``[s, b, n, C]`` -> ``(pre, post, None)`` routing state."""
         stash = GradStash()
         params = (self.phi, self.w_key, self.key_gain) if self.key_dim else (self.phi,)
-        if self._reversible_now(streams):
+        if not self.key_dim and _FUSED_ROUTER and _fused(streams):
+            # one pass over stream 0 forward and backward, no tap copy (its backward reads
+            # stream 0 from the restored state or the read's saved rows)
+            coeffs = fused_router_coeffs(
+                streams, self.phi, self.eps, stash, reversible=self._reversible_now(streams)
+            )
+        elif self._reversible_now(streams):
             coeffs = router_coeffs_reversible(
                 streams, params, self._router, stash, tag_dim=self.key_dim
             )
@@ -219,6 +236,7 @@ class RoutedStreamMixer(nn.Module):
             arch_metrics.record_share(f"{p}/pick_share", layer, num_layers, onehot)
         arch_metrics.record_mean(f"{p}/main_read", layer, num_layers, r[:, 0])
         arch_metrics.record_mean(f"{p}/write", layer, num_layers, w)
+        arch_metrics.record_streams(f"{p}/stream_rms", layer, num_layers, streams)
         if self.key_dim:
             arch_metrics.record_mean(f"{p}/key_gain", layer, num_layers, self.key_gain)
         if mix is not None:

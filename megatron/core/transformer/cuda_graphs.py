@@ -1613,10 +1613,15 @@ class _CudaGraphRunner(torch.nn.Module):
         # tracks when the runner completes its bwd pass.
         # If it's the first bwd encountered by this runner, record it to _CudagraphGlobalRecord
         # We record the noop autograd node to the first output tensor. This is sufficient for
-        # TransformerLayer and MambaLayer as their output is just the hidden_states.
+        # TransformerLayer and MambaLayer as their output is just the hidden_states. Partial
+        # graphs may lead with an output that gets no gradient (None, or a non-grad tensor --
+        # the MoE router graph under mHC): take the first output that requires grad.
+        tensor_idx = [i for i, o in enumerate(out) if torch.is_tensor(o)]
+        grad_idx = [i for i in tensor_idx if out[i].requires_grad]
+        record_idx = (grad_idx or tensor_idx or [None])[0]
         out = tuple(
             [
-                _CudagraphRecordNode.apply(self, o) if torch.is_tensor(o) and i == 0 else o
+                _CudagraphRecordNode.apply(self, o) if i == record_idx else o
                 for i, o in enumerate(out)
             ]
         )
