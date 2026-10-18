@@ -748,7 +748,33 @@ class TEGroupedMLP(MegatronModule):
         Return:
             output (torch.Tensor): The output of the local experts.
         """
+        if self.config.fp8_experts_only:
+            from megatron.core.fp8_utils import get_fp8_context
 
+            with get_fp8_context(self.config, experts=True):
+                return self._forward(
+                    permuted_local_hidden_states,
+                    tokens_per_expert,
+                    permuted_probs,
+                    output_buffer,
+                    grad_input_buffer,
+                )
+        return self._forward(
+            permuted_local_hidden_states,
+            tokens_per_expert,
+            permuted_probs,
+            output_buffer,
+            grad_input_buffer,
+        )
+
+    def _forward(
+        self,
+        permuted_local_hidden_states,
+        tokens_per_expert,
+        permuted_probs,
+        output_buffer=None,
+        grad_input_buffer=None,
+    ):
         # Call fused impl if enabled
         if self._with_fused_impl:
             output = self._fused_forward(

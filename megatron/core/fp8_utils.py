@@ -771,7 +771,9 @@ if HAVE_TE:
             )
         return fp8_recipe
 
-    def get_fp8_context(config: TransformerConfig, layer_no: int = -1, is_init: bool = False):
+    def get_fp8_context(
+        config: TransformerConfig, layer_no: int = -1, is_init: bool = False, experts: bool = False
+    ):
         """Return fp8 context manager.
 
         Arguments:
@@ -788,6 +790,10 @@ if HAVE_TE:
         """
 
         need_fp8_context = config.fp8 if not is_init else config.fp8_param
+        if not is_init and getattr(config, "fp8_experts_only", False) != experts:
+            # fp8_experts_only: the layer-level autocast is off and the routed experts open
+            # their own (experts=True); without it the experts run in their layer's context
+            need_fp8_context = False
 
         if not need_fp8_context or is_first_last_bf16_layer(config, layer_no):
             # bf16 training or bf16 layer in fp8 training
@@ -837,7 +843,9 @@ else:
         """Returns None since TE is not available."""
         return None
 
-    def get_fp8_context(config: TransformerConfig, layer_no: int = -1, is_init: bool = False):
+    def get_fp8_context(
+        config: TransformerConfig, layer_no: int = -1, is_init: bool = False, experts: bool = False
+    ):
         """Returns dummy fp8 context manager since TE is not available."""
         return nullcontext()
 
