@@ -1312,6 +1312,12 @@ class TensorParallelAngularMuown(TensorParallelMuon):
         expanded columns are identical copies, so the round-trip is exact; the
         only cost is extra checkpoint footprint for these states. The live
         optimizer state is left untouched (still ``(rows, 1)``).
+
+        The expanded states are built on the host: three weight-sized fp32 tensors per matrix
+        on the GPU ran an s2 MoE (5.7B parameters) out of memory while LOADING a checkpoint
+        (the loading templates come from this method, on top of the live state); on the host
+        a save copies only the ``(rows, 1)`` vectors, and the loaded values are collapsed
+        there before ``load_state_dict`` moves them to the parameter's device.
         """
         state_dict = super().state_dict()
         packed_state = state_dict.get("state")
@@ -1327,7 +1333,7 @@ class TensorParallelAngularMuown(TensorParallelMuon):
                 for key in ANGULAR_MUOWN_ROW_STATE_KEYS:
                     tensor = param_state.get(key)
                     if tensor is not None and tensor.dim() == 2 and tensor.shape[1] == 1:
-                        new_param_state[key] = tensor.expand(-1, cols).contiguous()
+                        new_param_state[key] = tensor.detach().cpu().expand(-1, cols).contiguous()
             expanded_state[param_id] = new_param_state
 
         state_dict["state"] = expanded_state

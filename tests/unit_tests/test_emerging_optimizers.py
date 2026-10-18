@@ -1937,12 +1937,18 @@ def test_angular_muown_state_dict_round_trip():
         assert live_state[key].shape == (rows, 1)
     assert live_state["m_u"].shape == (rows, cols)
 
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_allocated()
     saved = optimizer.state_dict()
+    # The expanded per-row states are built on the host: no weight-sized GPU tensors (they
+    # ran an s2 MoE out of memory while loading a checkpoint).
+    assert torch.cuda.memory_allocated() - before < weight.numel() * weight.element_size()
     saved_state = saved["state"][0]
     # Per-row states are expanded to full shape with identical columns.
     for key in ("g", "m_g", "v_g"):
         assert saved_state[key].shape == (rows, cols)
-        assert torch.equal(saved_state[key], live_state[key].expand(-1, cols))
+        assert saved_state[key].device.type == "cpu"
+        assert torch.equal(saved_state[key], live_state[key].cpu().expand(-1, cols))
     assert saved_state["m_u"].shape == (rows, cols)
     # Saving must not mutate the live reduced-shape states.
     for key in ("g", "m_g", "v_g"):
@@ -1957,6 +1963,7 @@ def test_angular_muown_state_dict_round_trip():
     loaded_state = optimizer2.state[weight2]
     for key in ("g", "m_g", "v_g"):
         assert loaded_state[key].shape == (rows, 1)
+        assert loaded_state[key].device == weight2.device  # back on the parameter's device
         assert torch.equal(loaded_state[key], live_state[key])
     assert torch.equal(loaded_state["m_u"], live_state["m_u"])
     assert loaded_state["step"] == live_state["step"]
