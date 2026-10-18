@@ -1911,6 +1911,15 @@ class TransformerConfig(ModelParallelConfig):
     balances how often each stream is picked (as moe_router_bias_update_rate; 1e-3 is
     DeepSeek-V3's). 0 disables."""
 
+    mhc_routed_free: bool = False
+    """Routed residual streams: pick all mhc_routed_topk streams by score instead of stream 0
+    plus the top-(k-1) others, so topk 1 routes each sublayer to one of the n streams (the
+    cheapest routed residual: 3 rows of stream state moved per token and sublayer). The write
+    carries a straight-through gate p / sg(p) (p: the softmax over all n routing logits at the
+    picked streams; value 1), so the selection learns from the write also at topk 1, where the
+    read weights are constant. Balancing then covers all n streams. Not with
+    mhc_routed_reversible."""
+
     ####################
     # Block Attention Residuals
     ####################
@@ -2016,10 +2025,14 @@ class TransformerConfig(ModelParallelConfig):
             or self.mhc_routed_balance_rate
             or self.mhc_routed_reversible
             or self.mhc_routed_key_dim
+            or self.mhc_routed_free
         ):
             raise ValueError(
-                "mhc_routed_mix / _balance_rate / _reversible / _key_dim need mhc_routed_topk > 0"
+                "mhc_routed_mix / _balance_rate / _reversible / _key_dim / _free need "
+                "mhc_routed_topk > 0"
             )
+        if self.mhc_routed_free and self.mhc_routed_reversible:
+            raise ValueError("mhc_routed_free does not combine with mhc_routed_reversible yet")
         if self.mhc_routed_topk:
             graphed = self.cuda_graph_impl != "none" or self.enable_cuda_graph
             if graphed and self.cuda_graph_impl != "local" and not os.environ.get(

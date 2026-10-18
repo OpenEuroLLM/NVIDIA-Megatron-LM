@@ -1044,7 +1044,8 @@ def route_streams(
     main: Optional[int] = 0,
     select_bias: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Stream ``main`` plus the top-(k-1) others by ``logits`` [T, n].
+    """Stream ``main`` plus the top-(k-1) others by ``logits`` [T, n] (``main`` None: the
+    top-k of all streams).
 
     Returns ``(idx [T, k] int32, read weights [T, k])``, the read weights a softmax
     over the selected logits (a convex combination, as mHC's read; the router learns
@@ -1055,6 +1056,10 @@ def route_streams(
     if not 1 <= k <= n:
         raise ValueError(f"routed top-k must be in [1, {n}], got {k}")
     scores = logits.detach() if select_bias is None else logits.detach() + select_bias
+    if main is None:
+        idx = scores.topk(k, dim=-1).indices
+        r = torch.softmax(torch.gather(logits.float(), 1, idx), dim=-1)
+        return idx.int(), r
     others = torch.cat([scores[:, :main], scores[:, main + 1 :]], dim=1)
     if k > 1:
         top = others.topk(k - 1, dim=-1).indices

@@ -101,8 +101,12 @@ class RoutedStreamMixer(nn.Module):
         balance: bool = False,
         reversible: bool = False,
         key_dim: int = 0,
+        free: bool = False,
     ) -> None:
         super().__init__()
+        if free and reversible:
+            raise ValueError("mhc_routed_free does not combine with mhc_routed_reversible yet")
+        self.free = free
         if reversible and mix:
             raise ValueError("mhc_routed_reversible does not combine with mhc_routed_mix")
         if not 0 <= key_dim <= hidden_size:
@@ -173,7 +177,9 @@ class RoutedStreamMixer(nn.Module):
         """``streams`` ``[s, b, n, C]`` -> ``(pre, post, None)`` routing state."""
         stash = GradStash()
         params = (self.phi, self.w_key, self.key_gain) if self.key_dim else (self.phi,)
-        if not self.key_dim and _FUSED_ROUTER and _fused(streams):
+        # the fused router's backward reads stream 0 from the read's saved rows: it needs
+        # stream 0 picked (not so in free mode)
+        if not self.key_dim and _FUSED_ROUTER and _fused(streams) and not self.free:
             # one pass over stream 0 forward and backward, no tap copy (its backward reads
             # stream 0 from the restored state or the read's saved rows)
             coeffs = fused_router_coeffs(
@@ -190,15 +196,22 @@ class RoutedStreamMixer(nn.Module):
             coeffs = self._router(stream_tap(streams, 0, stash), None, *params)
         z, post = coeffs[:, : self.n], coeffs[:, self.n : 2 * self.n]
         select_bias = self.route_bias if self.balance else None
-        idx, r = route_streams(z + self.b_route.float(), self.k, select_bias=select_bias)
+        logits = z + self.b_route.float()
+        idx, r = route_streams(
+            logits, self.k, main=None if self.free else 0, select_bias=select_bias
+        )
         if self.balance and self.training and torch.is_grad_enabled():
             with torch.no_grad():
-                picks = idx[:, 1:].long()
+                picks = idx.long() if self.free else idx[:, 1:].long()
                 self.local_picks_per_stream.scatter_add_(
                     0, picks.reshape(-1), torch.ones(picks.numel(), device=picks.device)
                 )
         w = 2.0 * torch.sigmoid(self.alpha_post.float() * post + self.b_post.float())
         w = torch.gather(w, 1, idx.long())
+        if self.free:
+            # straight-through gate (value 1): the selection learns from the write
+            p = torch.gather(torch.softmax(logits, dim=-1), 1, idx.long())
+            w = w * (p / p.detach())
         mix = None
         if self.mix:
             from megatron.core.transformer.mhc import sinkhorn_knopp
@@ -229,7 +242,12 @@ class RoutedStreamMixer(nn.Module):
         kind, layer, num_layers = tag
         (idx, r, _), (_, w, mix, _), _ = coeffs
         p = f"routed_{kind}"
-        if self.k > 1 and self.n > 2:
+        if self.free:
+            picks = idx.long()  # every stream can be picked
+            onehot = torch.zeros(idx.shape[0], self.n, device=idx.device)
+            onehot.scatter_(1, picks, 1.0 / picks.shape[1])
+            arch_metrics.record_share(f"{p}/pick_share", layer, num_layers, onehot)
+        elif self.k > 1 and self.n > 2:
             picks = idx[:, 1:].long() - 1  # non-main streams, numbered 0..n-2
             onehot = torch.zeros(idx.shape[0], self.n - 1, device=idx.device)
             onehot.scatter_(1, picks, 1.0 / picks.shape[1])
@@ -324,6 +342,7 @@ def build_stream_mixer(config) -> nn.Module:
             balance=bool(getattr(config, "mhc_routed_balance_rate", 0.0)),
             reversible=getattr(config, "mhc_routed_reversible", False),
             key_dim=getattr(config, "mhc_routed_key_dim", 0),
+            free=getattr(config, "mhc_routed_free", False),
         )
     from megatron.core.transformer.mhc import MHCMixer
 
@@ -352,13 +371,19 @@ def update_routed_residual_bias(model_chunks, config, tp_dp_cp_group=None) -> No
     ]
     if not rate or not mixers:
         return
-    # The main stream is always picked: balance the others.
-    counts = torch.stack([m.local_picks_per_stream[1:] for m in mixers])
-    biases = torch.stack([m.route_bias[1:] for m in mixers])
-    updated = get_updated_expert_bias(counts, biases, rate, tp_dp_cp_group=tp_dp_cp_group)
-    for m, b in zip(mixers, updated):
-        m.route_bias[1:].copy_(b)
-        m.local_picks_per_stream.zero_()
+    # The main stream is always picked: balance the others (free mode: all streams). One
+    # stacked update per mode (the stack needs equal widths).
+    for free in (False, True):
+        group = [m for m in mixers if m.free == free]
+        if not group:
+            continue
+        s0 = 0 if free else 1
+        counts = torch.stack([m.local_picks_per_stream[s0:] for m in group])
+        biases = torch.stack([m.route_bias[s0:] for m in group])
+        updated = get_updated_expert_bias(counts, biases, rate, tp_dp_cp_group=tp_dp_cp_group)
+        for m, b in zip(group, updated):
+            m.route_bias[s0:].copy_(b)
+            m.local_picks_per_stream.zero_()
 
 
 def own_streams(streams: torch.Tensor, config) -> torch.Tensor:

@@ -134,6 +134,16 @@ def test_route_streams_always_keeps_the_main_stream():
     torch.testing.assert_close(r.sum(-1), torch.ones(100, device="cuda"))
 
 
+def test_route_streams_free_takes_the_topk_of_all_streams():
+    logits = torch.randn(100, 6, device="cuda")
+    logits[:, 0] = -1e4  # free routing: the main stream is not forced in
+    idx, r = rr.route_streams(logits, 2, main=None)
+    assert not (idx == 0).any()
+    expected = logits.topk(2, dim=-1).indices
+    assert (idx.long().sort(-1).values == expected.sort(-1).values).all()
+    torch.testing.assert_close(r.sum(-1), torch.ones(100, device="cuda"))
+
+
 def test_single_stream_is_the_plain_residual():
     mixer = RoutedStreamMixer(hidden_size=32, expansion_rate=1, topk=1).cuda()
     h = torch.randn(6, 2, 1, 32, device="cuda")
@@ -161,13 +171,11 @@ def _hybrid_model(pattern, **kw):
         attention_dropout=0.0,
         is_hybrid_model=True,
         mhc=True,
-        mhc_expansion_rate=4,
-        mhc_routed_topk=2,
         pkm_heads=2,
         pkm_num_keys=16,
         pkm_key_dim=16,
         pkm_topk=4,
-        **kw,
+        **{"mhc_expansion_rate": 4, "mhc_routed_topk": 2, **kw},
     )
     return HybridModel(
         config=config,
@@ -641,7 +649,7 @@ class TestRoutedLerpAndKeys:
 
     def test_config_validation(self):
         base = dict(num_layers=2, hidden_size=64, num_attention_heads=4)
-        with pytest.raises(ValueError, match="_key_dim need mhc_routed_topk"):
+        with pytest.raises(ValueError, match="_key_dim .*need mhc_routed_topk"):
             TransformerConfig(**base, mhc=True, mhc_routed_key_dim=8)
         with pytest.raises(ValueError, match="mhc_routed_key_dim must be in"):
             TransformerConfig(**base, mhc=True, mhc_routed_topk=2, mhc_routed_key_dim=65)
@@ -655,3 +663,86 @@ class TestRoutedLerpAndKeys:
                 **base, mhc=True, mhc_routed_topk=2, mhc_lerp=True, ngpt=True,
                 ngpt_lerp_normalization_ffn="direct_ste",
             )
+
+
+class TestFreeRouting:
+    """mhc_routed_free: every one of the k streams picked by score (topk 1: one of n)."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+        yield
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize("key_dim", [0, 8], ids=["positional", "keyed"])
+    def test_topk1_selection_learns_through_the_write(self, key_dim):
+        """At topk 1 the read weight is constant 1: without the straight-through write gate the
+        routing logits would get no gradient at all."""
+        kw = dict(mhc_expansion_rate=8, mhc_routed_topk=1, mhc_routed_key_dim=key_dim)
+        ids = torch.randint(0, 128, (2, 16), device="cuda")
+        for free in (False, True):
+            model = _hybrid_model("*-*-", mhc_routed_free=free, **kw)
+            model(ids, position_ids=None, attention_mask=None).float().logsumexp(-1).mean().backward()
+            mixer = model.decoder.layers[0].mhc_attn_mixer
+            g = mixer.b_route.grad
+            if free:
+                assert g is not None and g.abs().sum() > 0
+                assert mixer.phi.grad[:, : mixer.n].abs().sum() > 0
+            else:  # forced main stream at topk 1: the plain residual, nothing routed
+                assert g is None or g.abs().sum() == 0
+
+    def test_the_gate_does_not_change_the_forward(self):
+        """The straight-through gate's value is 1: the output is the ungated routing's."""
+        ids = torch.randint(0, 128, (2, 16), device="cuda")
+        model = _hybrid_model("*-*-", mhc_expansion_rate=8, mhc_routed_topk=2,
+                              mhc_routed_free=True)
+        with torch.no_grad():
+            out = model(ids, position_ids=None, attention_mask=None)
+        for layer in model.decoder.layers:
+            for mixer in (layer.mhc_attn_mixer, layer.mhc_mlp_mixer):
+                if mixer is not None:
+                    mixer.free = True
+        with torch.enable_grad():
+            again = model(ids, position_ids=None, attention_mask=None)
+        torch.testing.assert_close(again.detach(), out)
+
+    def test_balancing_covers_every_stream(self):
+        from megatron.core.transformer.routed_residual import update_routed_residual_bias
+
+        model = _hybrid_model("*-*-", mhc_expansion_rate=4, mhc_routed_topk=1,
+                              mhc_routed_free=True, mhc_routed_balance_rate=1e-2)
+        mixer = model.decoder.layers[0].mhc_attn_mixer
+        with torch.no_grad():  # make stream 1 the router's favourite
+            mixer.b_route[1] = 10.0
+        ids = torch.randint(0, 128, (2, 16), device="cuda")
+        model(ids, position_ids=None, attention_mask=None).float().mean().backward()
+        picks = mixer.local_picks_per_stream.clone()
+        assert picks[1] == picks.sum() == 32  # one pick per token, all on stream 1
+        update_routed_residual_bias([model], model.config)
+        bias = mixer.route_bias
+        assert bias[1] < 0 and bias[0] > 0 and (bias[2:] > 0).all()
+
+    def test_trains(self):
+        model = _hybrid_model("*-C-*-", mhc_expansion_rate=8, mhc_routed_topk=1,
+                              mhc_routed_free=True, mhc_routed_key_dim=8,
+                              mhc_routed_balance_rate=1e-3)
+        opt = torch.optim.Adam(model.parameters(), lr=3e-3)
+        ids = torch.randint(0, 128, (4, 16), device="cuda")
+        losses = []
+        for _ in range(8):
+            logits = model(ids[:, :-1], position_ids=None, attention_mask=None)
+            loss = torch.nn.functional.cross_entropy(
+                logits.float().reshape(-1, 128), ids[:, 1:].reshape(-1)
+            )
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            losses.append(loss.item())
+        assert losses[-1] < losses[0]
+
+    def test_config_validation(self):
+        with pytest.raises(ValueError, match="mhc_routed_free does not combine"):
+            _hybrid_model("*-", mhc_routed_free=True, mhc_routed_reversible=True)
+        with pytest.raises(ValueError, match="need mhc_routed_topk > 0"):
+            _hybrid_model("*-", mhc_routed_topk=0, mhc_routed_free=True)
