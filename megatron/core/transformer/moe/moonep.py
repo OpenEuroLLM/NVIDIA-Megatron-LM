@@ -175,7 +175,8 @@ class _PlanHolder:
 
 # MOONEP_CHUNK_DEBUG (chunked path): "keepalive" keeps every tensor the path touches alive until the
 # next optimizer step (rules out allocator lifetimes); "serial" makes the compute stream wait for each
-# communication op right away (same kernels, no concurrency).
+# communication op right away (same kernels, no concurrency); "fullserial" also makes the
+# communication stream wait for the compute stream before each op (two streams, total order).
 _CHUNK_DEBUG = os.environ.get("MOONEP_CHUNK_DEBUG", "")
 _KEEPALIVE = {"step": -1, "tensors": []}
 
@@ -224,6 +225,8 @@ class _MoonEPDispatch(torch.autograd.Function):
         if ctx.streams is not None:  # chunked: this runs on the communication stream
             compute, comm = ctx.streams
             _record(ctx.state, comm, grad_hidden_nvsh, grad_w_nvs)
+            if _CHUNK_DEBUG == "fullserial":
+                comm.wait_stream(compute)
         grad_hidden, grad_w_sk, _ = ctx.state.buffer.combine(
             plan=ctx.plan,
             hidden_nvsh=grad_hidden_nvsh,
@@ -233,7 +236,7 @@ class _MoonEPDispatch(torch.autograd.Function):
         if ctx.streams is not None:
             _record(ctx.state, compute, grad_hidden, grad_w_sk)
             _keep(grad_hidden_nvsh, grad_w_nvs, grad_hidden, grad_w_sk)
-            if _CHUNK_DEBUG == "serial":
+            if _CHUNK_DEBUG in ("serial", "fullserial"):
                 compute.wait_stream(comm)
         return grad_hidden, grad_w_sk, None, None, None, None
 
@@ -259,11 +262,13 @@ class _MoonEPCombine(torch.autograd.Function):
         if ctx.streams is not None:  # chunked: this runs on the communication stream
             compute, comm = ctx.streams
             _record(ctx.state, comm, grad_out)
+            if _CHUNK_DEBUG == "fullserial":
+                comm.wait_stream(compute)
         grad_nvsh, _, _, _ = ctx.state.buffer.dispatch(grad_out, plan=ctx.plan, zero_copy=True)
         if ctx.streams is not None:
             _record(ctx.state, compute, grad_nvsh)
             _keep(grad_out, grad_nvsh)
-            if _CHUNK_DEBUG == "serial":
+            if _CHUNK_DEBUG in ("serial", "fullserial"):
                 compute.wait_stream(comm)
         return grad_nvsh, None, None
 
@@ -742,6 +747,8 @@ class MoEMoonEPTokenDispatcher(MoETokenDispatcher):
         dispatched = []
         for c in range(n):
             tpe = rm[c].sum(dim=0, dtype=torch.int32).contiguous()
+            if _CHUNK_DEBUG == "fullserial":
+                comm.wait_stream(cur)
             with torch.cuda.stream(comm):
                 x, w, cu = _MoonEPDispatch.apply(
                     hs[c], ws[c].contiguous(), tk[c].contiguous(), tpe, states[c],
@@ -749,7 +756,7 @@ class MoEMoonEPTokenDispatcher(MoETokenDispatcher):
                 )
             ev = torch.cuda.Event()
             ev.record(comm)
-            if _CHUNK_DEBUG == "serial":
+            if _CHUNK_DEBUG in ("serial", "fullserial"):
                 cur.wait_event(ev)
             _keep(hs[c], ws[c], tk[c], tpe, x, w, cu)
             dispatched.append((x, w, cu, ev, tpe))
@@ -766,9 +773,11 @@ class MoEMoonEPTokenDispatcher(MoETokenDispatcher):
             ev = torch.cuda.Event()
             ev.record(cur)
             comm.wait_event(ev)
+            if _CHUNK_DEBUG == "fullserial":
+                comm.wait_stream(cur)
             with torch.cuda.stream(comm):
                 outs.append(_MoonEPCombine.apply(y, states[c], self.chunk_holders[c]))
-            if _CHUNK_DEBUG == "serial":
+            if _CHUNK_DEBUG in ("serial", "fullserial"):
                 cur.wait_stream(comm)
             _keep(y, outs[-1])
             y.record_stream(comm)
