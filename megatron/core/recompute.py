@@ -68,6 +68,22 @@ def checkpointed_forward(
     )
 
     def custom(start: int, end: int):
+        # Layers that read the micro-batch's token ids from an attribute (Engram `N`, layers
+        # with uses_input_ids): the ids they hold NOW belong to this micro-batch, but by the
+        # time a pipelined schedule recomputes this chunk (in its backward) later micro-batches
+        # have run their forwards and replaced them. Capture them here and hand them back
+        # before the recompute, or the recompute runs on another micro-batch's tokens.
+        stack_ids = getattr(self, "_input_ids", None)  # HybridStack: this micro-batch's ids
+        captured_ids = []
+        if stack_ids is not None:
+            for position in range(start, end):
+                layer = self.layers[order[position]]
+                # the layers HybridStack.forward hands the ids to (Engram, uses_input_ids)
+                if hasattr(layer, "set_input_ids") and (
+                    hasattr(layer, "_input_ids") or getattr(layer, "uses_input_ids", False)
+                ):
+                    captured_ids.append((layer, stack_ids))
+
         def custom_forward(
             hidden_states,
             attention_mask,
@@ -77,6 +93,8 @@ def checkpointed_forward(
             rotary_pos_emb_global,
             padding_mask=None,
         ):
+            for layer, ids in captured_ids:
+                layer.set_input_ids(ids)
             rotary_pos_emb = (
                 (rotary_pos_emb_local, rotary_pos_emb_global)
                 if is_dual_rope
