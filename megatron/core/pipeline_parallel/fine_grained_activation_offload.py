@@ -607,6 +607,12 @@ class PipelineOffloadManager:
                     group.offload = False
         # Disable the later groups to meet the activation offload fraction.
         for chunk in self._cached_chunks_backward:
+            # An empty warmup group may gain eligible tensors when sequence lengths grow:
+            # fraction zero must keep even those groups on GPU (upstream PR #7908, 6fd448e50).
+            if self._activation_offload_fraction == 0:
+                for group in chunk.offload_groups:
+                    group.offload = False
+                continue
             eligible_offload_groups = [
                 group
                 for group in chunk.offload_groups
@@ -917,20 +923,17 @@ class ChunkOffloadHandler:
             return self.find_group_with_name(self.offload_groups, name) is None
         return self._max_group_size == 0
 
-    def finish_all_groups(self, name=None) -> bool:
-        """Finish all groups."""
+    def finish_all_groups(self, name: str) -> bool:
+        """Return whether this chunk has no remaining forward group of this name."""
         debug_rank(
             f"------finish_all_groups {self} {self._max_group_size} {self._offloaded_group_index}"
         )
-        # TODO: check if this is correct
-        # Mark it as finished when there are no groups to offload or reload
-        if (
-            len(self._groups_to_reload) == 0
-            and len(self._groups_to_offload) == 0
-            and self._offloaded_group_index > 0
-        ):
-            return True
-        assert name is not None, "Name is required"
+        # Forward progress depends on the scheduled groups, not on pending transfers: a chunk
+        # whose started groups all stay on GPU (the offload margin keeps every group of a
+        # one-layer chunk -- e.g. the last VPP chunk "t*1L" -- on GPU; fraction < 1 / zero
+        # does the same) has empty queues before its forward is complete, and treating it as
+        # finished moved the next group into the following micro-batch's chunk ("Chunk
+        # mismatch" in the backward). Upstream NVIDIA/Megatron-LM PR #7908 (e734bd0fc).
         return (
             self.find_group_with_name(self.offload_groups, name, self._offloaded_group_index)
             is None
