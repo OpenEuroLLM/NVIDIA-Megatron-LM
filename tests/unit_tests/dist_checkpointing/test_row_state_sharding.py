@@ -6,6 +6,7 @@ import torch
 
 from megatron.core.dist_checkpointing.mapping import ShardedTensor
 from megatron.core.dist_checkpointing.optimizer import make_sharded_optimizer_tensor
+from megatron.core.ssm.utils import _split_tensor_factory
 
 
 def test_plain_weight():
@@ -41,3 +42,17 @@ def test_full_shape_state_unchanged():
     w = ShardedTensor.from_rank_offsets("decoder.w", torch.zeros(32, 64))
     st = make_sharded_optimizer_tensor(w, torch.zeros(32, 64), prefix="optimizer.state.m_u")
     assert st.local_shape == (32, 64) and st.global_shape == (32, 64)
+
+
+def test_factory_weight_gets_expanded_row_state():
+    """The split GDN / Mamba in_proj is a ShardedTensorFactory: a compact (rows, 1) state is
+    expanded to the weight shape so the factory's narrow + metadata checks hold (qwen35 s2 save
+    crashed with 'Data shape should match local_shape')."""
+    w = ShardedTensor.from_rank_offsets("decoder.in_proj.weight", torch.zeros(48, 64))
+    fac = _split_tensor_factory(w, [16, 32], ["a", "b"], 0)
+    g = torch.arange(48.0).reshape(48, 1)
+    opt = make_sharded_optimizer_tensor(fac, g, prefix="optimizer.state.g")
+    assert opt.data.shape == (48, 64) and torch.equal(opt.data[:, 63:], g)
+    chunks = opt.build()
+    assert [c.local_shape for c in chunks] == [(16, 64), (32, 64)]
+    assert torch.equal(chunks[1].data[:, :1], g[16:])

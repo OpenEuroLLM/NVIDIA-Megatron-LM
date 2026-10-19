@@ -125,6 +125,18 @@ def make_sharded_optimizer_tensor(
     """
     optim_param = to_local_if_dtensor(optim_param)
     if isinstance(model_param, ShardedTensorFactory):
+        weight = model_param.data
+        if (
+            optim_param.dim() == weight.dim() >= 1
+            and optim_param.shape[-1] == 1
+            and weight.shape[-1] > 1
+            and tuple(optim_param.shape[:-1]) == tuple(weight.shape[:-1])
+        ):
+            # a per-row state (..., 1) of a factory-built weight (e.g. the split GDN / Mamba
+            # in_proj): the factory narrows along the weight's own axes, so give it the weight
+            # shape -- expanded on the host (identical columns, collapsed again by the
+            # optimizer's load_state_dict)
+            optim_param = optim_param.detach().cpu().expand(weight.shape).contiguous()
         return replace(model_param, key=f'{prefix}.{model_param.key}', data=optim_param)
 
     row_state = _row_state_sharded_tensor(model_param, optim_param, f'{prefix}.{model_param.key}')
