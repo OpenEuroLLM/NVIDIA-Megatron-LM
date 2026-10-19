@@ -120,7 +120,9 @@ def test_packed_documents_match_separate(recompute, fused_qk):
 
 @pytest.mark.parametrize("table_parallel", ["tp", "dp"])
 def test_packed_documents_match_separate_with_engram(table_parallel):
-    """Engram (`N`) in the packed hybrid: its n-grams and causal conv restart per document."""
+    """Engram (`N`) in the packed hybrid: its n-grams and causal conv restart per document.
+    In fp32: with a non-zero conv the bf16 model differs by ~0.06 of the logit spread,
+    evenly over every document (rounding; packed vs separate leak ~4), fp32 matches exactly."""
     model = _model(
         pattern="NLELE*E",
         engram_ngram_orders=[2, 3],
@@ -130,7 +132,7 @@ def test_packed_documents_match_separate_with_engram(table_parallel):
         engram_table_parallel=table_parallel,
         mhc=False,  # the sweep's arms: plain residual
         mhc_routed_topk=0,
-    )
+    ).float()
     model.train()
     engram = model.decoder.layers[0]
     with torch.no_grad():
@@ -149,7 +151,9 @@ def test_packed_documents_match_separate_with_engram(table_parallel):
     together = run(torch.cat(docs, dim=1), packed).float()
     scale = ref.std()
     err = (together - ref).abs().max() / scale
-    assert err < 0.05, float(err)
+    assert err < 1e-3, float(err)
+    leaked = (run(torch.cat(docs, dim=1)).float() - ref)[:, LENGTHS[0]:].abs().max() / scale
+    assert leaked > 0.5, float(leaked)  # the check has teeth
     together.logsumexp(-1).mean().backward()
     if table_parallel == "dp":
         assert engram.table_grad.abs().sum() > 0
