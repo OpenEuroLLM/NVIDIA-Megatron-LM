@@ -231,6 +231,8 @@ class _MoonEPDispatch(torch.autograd.Function):
         if ctx.streams is not None:
             _record(ctx.state, compute, grad_hidden, grad_w_sk)
             _keep(grad_hidden_nvsh, grad_w_nvs, grad_hidden, grad_w_sk)
+            if _CHUNK_DEBUG == "serial":
+                compute.wait_stream(comm)
         return grad_hidden, grad_w_sk, None, None, None, None
 
 
@@ -259,6 +261,8 @@ class _MoonEPCombine(torch.autograd.Function):
         if ctx.streams is not None:
             _record(ctx.state, compute, grad_nvsh)
             _keep(grad_out, grad_nvsh)
+            if _CHUNK_DEBUG == "serial":
+                compute.wait_stream(comm)
         return grad_nvsh, None, None
 
 
