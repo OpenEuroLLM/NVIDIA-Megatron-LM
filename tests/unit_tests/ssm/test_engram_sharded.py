@@ -182,3 +182,60 @@ def test_sharded_matches_whole_table(tp):
         torch.testing.assert_close(layer.table_grad, ref_grad[lo:hi], rtol=1e-4, atol=1e-5)
     finally:
         Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(Utils.world_size < 2, reason="needs 2+ GPUs")
+def test_step_lookup_matches_per_microbatch():
+    """ENGRAM_STEP_LOOKUP: one row exchange per step (prefetch_step_lookup) and one gradient
+    exchange at the flush give the per-micro-batch path's outputs and table gradients, over
+    three packed (document-masked) micro-batches with different tokens per rank."""
+    from megatron.core.packed_seq_params import PackedSeqParams
+    from megatron.core.ssm.engram_sharded import flush_step_lookups
+
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        layer = EngramLayer(
+            _config(engram_table_parallel="dp"), layer_number=1, pg_collection=_pg()
+        ).cuda()
+        with torch.no_grad():
+            gen = torch.Generator(device="cuda").manual_seed(5)
+            layer.conv1d.weight.copy_(
+                torch.randn(layer.conv1d.weight.shape, generator=gen, device="cuda")
+            )
+        dp_rank = parallel_state.get_data_parallel_rank()
+        gen = torch.Generator(device="cuda").manual_seed(100 + dp_rank)
+        T = 3 * SEQ
+        mbs = []
+        for k in range(3):
+            ids = torch.randint(0, 5000, (1, T), device="cuda", generator=gen)
+            cu = torch.tensor([0, 17 + k, 40, 77, T - 2], dtype=torch.int32, device="cuda")
+            psp = PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu,
+                                  max_seqlen_q=40, max_seqlen_kv=40)
+            h = torch.randn(T, 1, HIDDEN, device="cuda", generator=gen)
+            g = torch.randn(T, 1, HIDDEN, device="cuda", generator=gen)
+            mbs.append((ids, cu, psp, h, g))
+
+        def run():
+            outs = []
+            for ids, cu, psp, h, g in mbs:
+                layer.set_input_ids(ids)
+                out = layer(h, packed_seq_params=psp)
+                out.backward(g)
+                outs.append(out.detach())
+            return outs
+
+        layer.table_grad.zero_()
+        ref_outs = run()
+        ref_grad = layer.table_grad.clone()
+        layer.table_grad.zero_()
+        layer.prefetch_step_lookup([m[0] for m in mbs], [m[1] for m in mbs])
+        outs = run()
+        assert layer.table_grad.abs().sum() == 0  # nothing exchanged before the flush
+        flush_step_lookups()
+        for a, b in zip(outs, ref_outs):
+            torch.testing.assert_close(a, b)
+        torch.testing.assert_close(layer.table_grad, ref_grad, rtol=1e-4, atol=1e-5)
+        assert layer._step_lookup is None
+    finally:
+        Utils.destroy_model_parallel()

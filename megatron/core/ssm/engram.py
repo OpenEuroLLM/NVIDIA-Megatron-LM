@@ -69,6 +69,11 @@ def document_positions(packed_seq_params, total: int, device) -> torch.Tensor:
     cu = packed_seq_params.cu_seqlens_q_padded
     if cu is None:
         cu = packed_seq_params.cu_seqlens_q
+    return positions_from_cu(cu, total, device)
+
+
+def positions_from_cu(cu: torch.Tensor, total: int, device) -> torch.Tensor:
+    """:func:`document_positions` from a cu_seqlens tensor."""
     cu = cu.to(device=device, dtype=torch.int64).reshape(-1)
     t = torch.arange(total, device=device, dtype=torch.int64)
     doc = torch.searchsorted(cu[1:], t, right=True).clamp_max(cu.numel() - 1)
@@ -271,6 +276,7 @@ class EngramLayer(MegatronModule):
         ):
             replicate_across_tp(module, self.tp_group)
         self._input_ids = None
+        self._step_lookup = None  # see prefetch_step_lookup
         # mHC / Block AttnRes / nGPT replace `h + Engram(h)` (residual_scheme_adapter.py).
         from megatron.core.transformer.residual_scheme_adapter import (
             ResidualSchemeAdapter,
@@ -319,12 +325,66 @@ class EngramLayer(MegatronModule):
         self.config.output_layer_init_method(self.value_proj.weight)
         nn.init.zeros_(self.conv1d.weight)  # starts as Y = v~
 
+    def step_lookup_supported(self) -> bool:
+        """The step-level lookup (engram_sharded.py): sharded tables, TP 1, no CP."""
+        return self.sharded and self.tp_group.size() == 1 and self.cp_group is None
+
+    def prefetch_step_lookup(self, tokens_list, cu_seqlens_list) -> None:
+        """Fetch every row this step's micro-batches look up (packed ``[1, T]`` token tensors and
+        their cu_seqlens), deduplicated, in one exchange; each micro-batch's forward then gathers
+        locally (keyed by its token tensor) and the row gradients go to their owners at
+        flush_step_lookup (EngramTableOptimizer.prepare_grads)."""
+        from megatron.core.ssm.engram_sharded import PENDING_STEP_LOOKUPS, exchange_rows
+
+        rows_all, keys, sizes = [], [], []
+        for ids, cu in zip(tokens_list, cu_seqlens_list):
+            ids = ids.reshape(1, -1)
+            positions = positions_from_cu(cu, ids.shape[1], ids.device).unsqueeze(0)
+            mapped = ids if self.token_map is None else self.token_map[ids]
+            rows = engram_hash(
+                mapped, self.orders, self.num_heads, self.hash_mult, self.sizes, positions=positions
+            )
+            rows = (rows + self.row_offsets).reshape(-1)
+            rows_all.append(rows)
+            sizes.append(rows.numel())
+            keys.append((ids.data_ptr(), ids.numel()))
+        uniq, inverse = torch.unique(torch.cat(rows_all), return_inverse=True)
+        values, state = exchange_rows(self, uniq, self.config.params_dtype)
+        grad = torch.zeros(uniq.numel(), self.embed_dim, dtype=torch.float32, device=values.device)
+        self._step_lookup = {
+            "values": values,
+            "grad": grad,
+            "state": state,
+            "inverse": dict(zip(keys, inverse.split(sizes))),
+        }
+        PENDING_STEP_LOOKUPS.append(self)
+
+    def flush_step_lookup(self) -> None:
+        """The step's row gradients -> their owners' table_grad (one exchange)."""
+        from megatron.core.ssm.engram_sharded import exchange_grads
+
+        step, self._step_lookup = self._step_lookup, None
+        if step is not None:
+            exchange_grads(self, step["state"], step["grad"], self.config.params_dtype)
+
     def set_input_ids(self, input_ids: Optional[torch.Tensor]) -> None:
         """Token ids [b, s] of the current micro-batch (set by HybridStack)."""
         self._input_ids = input_ids
 
     def _memory(self, input_ids: torch.Tensor, positions=None) -> torch.Tensor:
         """e_t for every position: [b, s] -> [s, b, lookups * embed_dim], full on every rank."""
+        step = self._step_lookup
+        if step is not None:
+            inverse = step["inverse"].get((input_ids.data_ptr(), input_ids.numel()))
+            if inverse is not None:
+                from megatron.core.ssm.engram_sharded import StepRowGather
+
+                anchor = torch.zeros(
+                    (), device=input_ids.device, requires_grad=torch.is_grad_enabled()
+                )
+                emb = StepRowGather.apply(anchor, step["values"], step["grad"], inverse)
+                b, s = input_ids.shape
+                return emb.reshape(b, s, -1).transpose(0, 1)
         ids = input_ids if self.token_map is None else self.token_map[input_ids]
         rows = engram_hash(
             ids, self.orders, self.num_heads, self.hash_mult, self.sizes, positions=positions
@@ -492,3 +552,24 @@ class EngramLayer(MegatronModule):
             prepend_axis_num=prepend,
         )
         return out
+
+
+def prefetch_engram_step_lookups(model_chunks, packed_doc_attention) -> None:
+    """ENGRAM_STEP_LOOKUP=1 (training, document masking): one row exchange per step and Engram
+    layer, from the micro-batches packed_doc_attention prefetched for every model chunk."""
+    chunks = model_chunks if isinstance(model_chunks, (list, tuple)) else [model_chunks]
+    for vp_stage, chunk in enumerate(chunks):
+        layers = [
+            m for m in chunk.modules() if isinstance(m, EngramLayer) and m.step_lookup_supported()
+        ]
+        if not layers:
+            continue
+        key = packed_doc_attention._key(vp_stage if len(chunks) > 1 else None)
+        batches = packed_doc_attention._BATCH_STASH.get(key)
+        metadata = packed_doc_attention._METADATA_STASH.get(key)
+        if not batches or batches[0] is None or not metadata:
+            continue
+        tokens = [b["tokens"] for b in batches]
+        cus = [m.cu_seqlens for m in metadata]
+        for layer in layers:
+            layer.prefetch_step_lookup(tokens, cus)

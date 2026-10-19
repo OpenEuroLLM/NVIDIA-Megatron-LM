@@ -76,6 +76,10 @@ class EngramTableOptimizer(MegatronOptimizer):
         return list(self.params)
 
     def prepare_grads(self) -> bool:
+        # step-level lookups (ENGRAM_STEP_LOOKUP): the step's row gradients reach their owners now
+        from megatron.core.ssm.engram_sharded import flush_step_lookups
+
+        flush_step_lookups()
         for p in self.params:
             p.grad = p.engram_grad
         return False

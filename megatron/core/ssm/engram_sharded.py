@@ -146,3 +146,71 @@ def sharded_lookup_unique(layer, rows: torch.Tensor, dtype: torch.dtype):
     uniq, inverse = torch.unique(rows, return_inverse=True)
     anchor = torch.zeros((), device=rows.device, requires_grad=torch.is_grad_enabled())
     return _ShardedUniqueRows.apply(anchor, layer, uniq, dtype), inverse
+
+
+# ---- step-level lookup (ENGRAM_STEP_LOOKUP=1) ------------------------------------------------
+# The rows a micro-batch looks up depend on its token ids alone, and with document masking the
+# whole step's micro-batches are fetched before the schedule runs (packed_doc_attention). So a
+# layer can fetch every row the step needs in ONE exchange, serve each micro-batch's forward and
+# recompute by a local gather, accumulate the row gradients locally (fp32) and send them to their
+# owners in ONE exchange before the optimizer step -- the tables do not change within a step, so
+# this is exact. It replaces two host syncs and four all-to-alls per micro-batch and layer (plus
+# the recompute's) by the same per step.
+
+
+def exchange_rows(layer, uniq: torch.Tensor, dtype: torch.dtype):
+    """Sorted unique global rows -> (their values ``[u, embed_dim]`` in ``dtype``, the state the
+    gradient exchange needs)."""
+    group, size = layer.shard_group, layer.shard_size
+    if size == 1:
+        return layer.table.index_select(0, uniq - layer.row_start).to(dtype), (uniq, None)
+    owners = row_owner(uniq, layer.total_rows, size)
+    send = torch.bincount(owners, minlength=size)
+    recv = torch.empty_like(send)
+    dist.all_to_all_single(recv, send, group=group)
+    send_splits, recv_splits = send.tolist(), recv.tolist()
+    requested = _exchange(group, uniq, recv_splits, send_splits)  # rows I own
+    values = layer.table.index_select(0, requested - layer.row_start).to(dtype)
+    return _exchange(group, values, send_splits, recv_splits), (requested, (send_splits, recv_splits))
+
+
+def exchange_grads(layer, state, grad_uniq: torch.Tensor, dtype: torch.dtype) -> None:
+    """``[u, embed_dim]`` fp32 row gradients (the order of :func:`exchange_rows`) -> accumulated
+    into their owners' ``table_grad`` (sent in ``dtype``, as the per-micro-batch path does)."""
+    requested, splits = state
+    if splits is None:
+        layer.table_grad.index_add_(0, requested - layer.row_start, grad_uniq)
+        return
+    send_splits, recv_splits = splits
+    owned = _exchange(layer.shard_group, grad_uniq.to(dtype), recv_splits, send_splits)
+    layer.table_grad.index_add_(0, requested - layer.row_start, owned.float())
+
+
+class StepRowGather(torch.autograd.Function):
+    """``values[inverse]`` for one micro-batch; the backward accumulates into the step's fp32 row
+    gradient buffer (no exchange). ``anchor`` gives the result a backward (values is no leaf)."""
+
+    @staticmethod
+    def forward(ctx, anchor, values, grad_buffer, inverse):
+        ctx.grad_buffer = grad_buffer
+        ctx.save_for_backward(inverse)
+        return values.index_select(0, inverse)
+
+    @staticmethod
+    def backward(ctx, grad):
+        (inverse,) = ctx.saved_tensors
+        ctx.grad_buffer.index_add_(0, inverse, grad.float())
+        return grad.new_zeros(()), None, None, None
+
+
+# Layers holding a step lookup whose gradients still have to go to their owners, in the order
+# they prefetched (identical on every rank of a shard group, so the exchanges match).
+PENDING_STEP_LOOKUPS = []
+
+
+def flush_step_lookups() -> None:
+    """Send every pending step lookup's row gradients to their owners (before the optimizer step:
+    EngramTableOptimizer.prepare_grads)."""
+    for layer in PENDING_STEP_LOOKUPS:
+        layer.flush_step_lookup()
+    PENDING_STEP_LOOKUPS.clear()

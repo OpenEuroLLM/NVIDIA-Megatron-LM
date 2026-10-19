@@ -3052,6 +3052,11 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         # OELLM PATCH: cu_seqlens for the whole iteration, published before the schedule
         # starts. Must precede forward_backward_func -- a collective inside it deadlocks.
         maybe_prefetch_cu_seqlens(args, data_iterator, get_num_microbatches())
+        if os.environ.get("ENGRAM_STEP_LOOKUP") == "1" and packed_doc_attention.is_scattered(args):
+            # one Engram row exchange per step and layer (megatron/core/ssm/engram_sharded.py)
+            from megatron.core.ssm.engram import prefetch_engram_step_lookups
+
+            prefetch_engram_step_lookups(model, packed_doc_attention)
         pipeline_seq_length, pipeline_micro_batch_size = get_pipeline_tensor_shapes(args)
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step_func,
