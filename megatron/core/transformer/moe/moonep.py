@@ -13,10 +13,12 @@ This is not a token dispatcher alone: the experts compute over ``2 * epn`` weigh
 own + the prefetched ones), so the backend replaces both the token dispatcher
 (:class:`MoEMoonEPTokenDispatcher`) and the experts (:class:`MoonEPGroupedMLP`).
 
-* Weights: ``weight1 [epn, 2F, H]`` (gate rows then up rows, Megatron's SwiGLU layout) and
-  ``weight2 [epn, H, F]`` as single contiguous parameters (MoonEP pushes ``[epn, ...]``
-  contiguous expert tensors). MoonEP's API carries three projections; the third is a 32 KiB
-  per-expert placeholder.
+* Weights: TEGroupedMLP's ``linear_fc1.weight{i}`` [2F, H] (gate rows then up rows) and
+  ``linear_fc2.weight{i}`` [H, F], one 2-D parameter per local expert (so angular MuOwn sees
+  each expert as a matrix) and TEGroupedMLP's sharded checkpoint keys. MoonEP pushes
+  ``[epn, ...]`` contiguous expert tensors: a zero-copy view when the DDP buffer holds the
+  experts back to back, else a mirror refreshed once per optimizer step. MoonEP's API carries
+  three projections; the third is a 32 KiB per-expert placeholder.
 * GEMMs: Transformer Engine's grouped-tensor grouped GEMM (cuBLASLt) with a discrete weight
   list (the local experts followed by this rank's prefetch slots) and device-side group sizes
   from MoonEP's ``cu_seqlens``.
@@ -258,30 +260,66 @@ def _gemm(weights, a, a_dim, out, out_dim, splits, offsets, layout, accumulate=F
 
 
 def _wgrad(main, gpool, a, a_dim, dy, dy_dim, splits, offsets):
-    """Weight grads: the local experts accumulate into their fp32 main grads; the prefetch slots
-    are written fresh into this rank's reduce slots (cleared after each reduce; mostly empty, and
-    an empty group with accumulate=True still reads + writes its whole fp32 block)."""
-    epn = main.shape[0]
-    _gemm([main[i] for i in range(epn)], a, a_dim, dy, dy_dim, splits[:epn], offsets[: epn + 1],
-          "NT", accumulate=True)
+    """Weight grads: the local experts accumulate into their fp32 main grads (a list, one per
+    expert); the prefetch slots are written fresh into this rank's reduce slots (cleared after
+    each reduce; mostly empty, and an empty group with accumulate=True still reads + writes its
+    whole fp32 block)."""
+    epn = len(main)
+    _gemm(main, a, a_dim, dy, dy_dim, splits[:epn], offsets[: epn + 1], "NT", accumulate=True)
     _gemm([gpool[i].view_as(main[0]) for i in range(epn)], a, a_dim, dy, dy_dim, splits[epn:],
           offsets[epn:], "NT", accumulate=False)
 
 
+# Optimizer steps so far (every torch optimizer's step, via a global post-step hook): the
+# contiguous weight mirrors of the experts are refreshed once per step, lazily, at the first
+# forward after one (see MoonEPGroupedMLP.local_weights).
+_OPTIMIZER_STEPS = [0]
+
+
+def _count_optimizer_step(optimizer, args, kwargs):
+    _OPTIMIZER_STEPS[0] += 1
+
+
+torch.optim.optimizer.register_optimizer_step_post_hook(_count_optimizer_step)
+
+
+def _stacked_view(tensors):
+    """``[n, *shape]`` zero-copy view of ``n`` same-shape tensors that lie back to back in one
+    storage (Megatron's DDP buffers place one module's parameters / main grads that way when
+    no bucket boundary falls between them), else None."""
+    t0 = tensors[0]
+    nbytes = t0.numel() * t0.element_size()
+    base = t0.untyped_storage().data_ptr()
+    for i, t in enumerate(tensors):
+        if (
+            t.dtype != t0.dtype
+            or t.shape != t0.shape
+            or not t.is_contiguous()
+            or t.untyped_storage().data_ptr() != base
+            or t.data_ptr() != t0.data_ptr() + i * nbytes
+        ):
+            return None
+    return torch.as_strided(
+        t0.detach(), (len(tensors), *t0.shape), (t0.numel(), *t0.stride()), t0.storage_offset()
+    )
+
+
 class _MoonEPExperts(torch.autograd.Function):
-    """Weighted SwiGLU MLP over the 2 * epn expert slots (local experts + prefetched copies)."""
+    """Weighted SwiGLU MLP over the 2 * epn expert slots (local experts + prefetched copies).
+    ``weights``: the fc1 then the fc2 expert parameters (one 2-D tensor per expert)."""
 
     @staticmethod
-    def forward(ctx, x, w_nvs, cu_seqlens, weight1, weight2, module, state, holder):
+    def forward(ctx, x, w_nvs, cu_seqlens, module, state, holder, *weights):
         plan = holder.plan
-        epn = weight1.shape[0]
+        epn = module.num_local_experts
+        fc1, fc2 = [w.detach() for w in weights[:epn]], [w.detach() for w in weights[epn:]]
         slots = state.prefetch(plan, module.local_weights(), module.pool_shapes, owner=module)
-        w1 = [weight1[i] for i in range(epn)] + [slots[0][i].view_as(weight1[0]) for i in range(epn)]
-        w2 = [weight2[i] for i in range(epn)] + [slots[1][i].view_as(weight2[0]) for i in range(epn)]
+        w1 = fc1 + [slots[0][i].view_as(fc1[0]) for i in range(epn)]
+        w2 = fc2 + [slots[1][i].view_as(fc2[0]) for i in range(epn)]
         ends = cu_seqlens.to(torch.int64)
         offsets = torch.cat([ends.new_zeros(1), ends])
         splits = torch.diff(offsets)
-        ffn2, hidden = weight1.shape[1], weight1.shape[2]
+        ffn2, hidden = fc1[0].shape
         h = torch.empty(x.shape[0], ffn2, dtype=x.dtype, device=x.device)
         _gemm(w1, x, hidden, h, ffn2, splits, offsets, "TN")
         probs = w_nvs.unsqueeze(-1)
@@ -292,21 +330,23 @@ class _MoonEPExperts(torch.autograd.Function):
         _gemm(w2, a, ffn2 // 2, y, hidden, splits, offsets, "TN")
         ctx.save_for_backward(x, h, a, w_nvs, splits, offsets)
         ctx.module, ctx.plan, ctx.state = module, plan, state
-        ctx.weights = (weight1, weight2)
+        ctx.weights = weights
         return y
 
     @staticmethod
     def backward(ctx, grad_y):
         x, h, a, w_nvs, splits, offsets = ctx.saved_tensors
         module, plan, state = ctx.module, ctx.plan, ctx.state
-        weight1, weight2 = ctx.weights
-        epn, ffn2, hidden = weight1.shape
+        weights = ctx.weights
+        epn = module.num_local_experts
+        fc1, fc2 = [w.detach() for w in weights[:epn]], [w.detach() for w in weights[epn:]]
+        ffn2, hidden = fc1[0].shape
         ffn = ffn2 // 2
         grad_y = grad_y.contiguous()
         # the pools are shared by all layers: fetch this layer's copies again
         slots = state.prefetch(plan, module.local_weights(), module.pool_shapes, owner=module)
-        w1 = [weight1[i] for i in range(epn)] + [slots[0][i].view_as(weight1[0]) for i in range(epn)]
-        w2 = [weight2[i] for i in range(epn)] + [slots[1][i].view_as(weight2[0]) for i in range(epn)]
+        w1 = fc1 + [slots[0][i].view_as(fc1[0]) for i in range(epn)]
+        w2 = fc2 + [slots[1][i].view_as(fc2[0]) for i in range(epn)]
         gpools = [p[state.rank] for p in state.grad_pools(module.pool_shapes)]
         main1, main2 = module.main_grads()
 
@@ -322,16 +362,42 @@ class _MoonEPExperts(torch.autograd.Function):
         _gemm(w1, grad_h, ffn2, grad_x, hidden, splits, offsets, "NN")
         _wgrad(main1, gpools[0], x, hidden, grad_h, ffn2, splits, offsets)
         # the prefetched copies' grads -> their home ranks' main grads (collective)
-        state.reduce_grad(plan, module.local_grads(main1, main2), module.pool_shapes)
-        for w in (weight1, weight2):
+        module.reduce_copies_grad(state, plan, main1, main2)
+        dummies = []
+        for w in weights:
             w.grad_added_to_main_grad = True
-        dummy1 = torch.empty(1, dtype=weight1.dtype, device=weight1.device).expand_as(weight1)
-        dummy2 = torch.empty(1, dtype=weight2.dtype, device=weight2.device).expand_as(weight2)
-        return grad_x, grad_probs.squeeze(-1).to(w_nvs.dtype), None, dummy1, dummy2, None, None, None
+            dummies.append(torch.empty(1, dtype=w.dtype, device=w.device).expand_as(w))
+        return (grad_x, grad_probs.squeeze(-1).to(w_nvs.dtype), None, None, None, None, *dummies)
+
+
+class _ExpertWeights(torch.nn.Module):
+    """``weight0 .. weight{n-1}``: one 2-D parameter per local expert, TEGroupedMLP's names and
+    shapes (2-D: the emerging optimizers -- angular MuOwn -- orthogonalize each expert; a 3-D
+    stack would fall back to Adam). Registered in reverse so Megatron's DDP buffer (filled in
+    reverse parameter order) holds them back to back in expert order."""
+
+    def __init__(self, n, shape, init_method, perform_init, dtype, device):
+        super().__init__()
+        self.num = n
+        for i in reversed(range(n)):
+            w = torch.nn.Parameter(torch.empty(*shape, device=device, dtype=dtype))
+            if perform_init:
+                init_method(w.data)
+            w.allreduce = False  # expert-data-parallel gradient reduction
+            self.register_parameter(f"weight{i}", w)
+
+    def weights(self):
+        return [getattr(self, f"weight{i}") for i in range(self.num)]
 
 
 class MoonEPGroupedMLP(MegatronModule):
-    """The routed experts of the MoonEP backend (see the module docstring)."""
+    """The routed experts of the MoonEP backend (see the module docstring).
+
+    Parameters as TEGroupedMLP: ``linear_fc1.weight{i}`` [2F, H] (gate rows then up rows) and
+    ``linear_fc2.weight{i}`` [H, F], one per local expert, with the same sharded checkpoint keys
+    (global expert axis). MoonEP pushes ``[epn, ...]`` contiguous weights to the other ranks and
+    reduces into contiguous fp32 grads: zero-copy views when the DDP buffers hold the experts back
+    to back, else a weight mirror refreshed once per optimizer step and an fp32 scratch."""
 
     def __init__(self, num_local_experts, config, pg_collection=None, name=None):
         super().__init__(config=config)
@@ -345,53 +411,127 @@ class MoonEPGroupedMLP(MegatronModule):
         H, F = config.hidden_size, config.moe_ffn_hidden_size
         dev = torch.cuda.current_device()
         dtype = config.params_dtype
-        self.weight1 = torch.nn.Parameter(torch.empty(epn, 2 * F, H, device=dev, dtype=dtype))
-        self.weight2 = torch.nn.Parameter(torch.empty(epn, H, F, device=dev, dtype=dtype))
-        if config.perform_initialization:
-            for i in range(epn):
-                config.init_method(self.weight1.data[i])
-                config.output_layer_init_method(self.weight2.data[i])
-        for p in (self.weight1, self.weight2):
-            p.allreduce = False  # expert-data-parallel gradient reduction
+        init = config.perform_initialization
+        self.linear_fc1 = _ExpertWeights(epn, (2 * F, H), config.init_method, init, dtype, dev)
+        self.linear_fc2 = _ExpertWeights(
+            epn, (H, F), config.output_layer_init_method, init, dtype, dev
+        )
+        self.ep_group = getattr(pg_collection, "ep", None) if pg_collection is not None else None
+        self.tp_group = getattr(pg_collection, "expt_tp", None) if pg_collection is not None else None
         # plain attributes, not buffers: Float16Module would cast an fp32 buffer to bf16, and
         # MoonEP's grad reduce needs the fp32 placeholder grad
         self._dummy_w = torch.zeros(epn, _DUMMY, _DUMMY, device=dev, dtype=torch.bfloat16)
         self._dummy_g = torch.zeros(epn, _DUMMY, _DUMMY, device=dev, dtype=torch.float32)
         self.pool_shapes = [(2 * F, H), (H, F), (_DUMMY, _DUMMY)]
+        self._mirrors = None  # (fc1, fc2) contiguous copies, if the parameters are not
+        self._mirror_step = -1
+        self._grad_scratch = None
         self.state = None  # set by the dispatcher on its first dispatch
         self.holder = None
 
+    def weights(self):
+        return self.linear_fc1.weights() + self.linear_fc2.weights()
+
     def local_weights(self):
-        return [self.weight1.data, self.weight2.data, self._dummy_w]
+        """[epn, 2F, H] / [epn, H, F] contiguous local weights for MoonEP's weight push."""
+        fc1 = [w.detach() for w in self.linear_fc1.weights()]
+        fc2 = [w.detach() for w in self.linear_fc2.weights()]
+        v1, v2 = _stacked_view(fc1), _stacked_view(fc2)
+        if v1 is None or v2 is None:
+            if self._mirrors is None:
+                self._mirrors = (torch.empty(len(fc1), *fc1[0].shape, dtype=fc1[0].dtype,
+                                             device=fc1[0].device),
+                                 torch.empty(len(fc2), *fc2[0].shape, dtype=fc2[0].dtype,
+                                             device=fc2[0].device))
+                self._mirror_step = -1
+            if self._mirror_step != _OPTIMIZER_STEPS[0]:
+                torch._foreach_copy_(list(self._mirrors[0].unbind(0)), fc1)
+                torch._foreach_copy_(list(self._mirrors[1].unbind(0)), fc2)
+                self._mirror_step = _OPTIMIZER_STEPS[0]
+            v1 = self._mirrors[0] if v1 is None else v1
+            v2 = self._mirrors[1] if v2 is None else v2
+        return [v1, v2, self._dummy_w]
 
     def main_grads(self):
-        mg = []
-        for p in (self.weight1, self.weight2):
-            g = getattr(p, "main_grad", None)
-            if g is None:  # no Megatron DDP (unit tests): an fp32 grad of our own
-                if getattr(p, "_moonep_grad", None) is None:
-                    p._moonep_grad = torch.zeros(p.shape, dtype=torch.float32, device=p.device)
-                g = p._moonep_grad
-            assert g.dtype == torch.float32, "MoonEP experts need fp32 main grads"
-            mg.append(g.view(p.shape))
-        return mg
+        """Per-expert fp32 main grads ([2F, H] list, [H, F] list)."""
+        out = []
+        for mod in (self.linear_fc1, self.linear_fc2):
+            mg = []
+            for p in mod.weights():
+                g = getattr(p, "main_grad", None)
+                if g is None:  # no Megatron DDP (unit tests): an fp32 grad of our own
+                    if getattr(p, "_moonep_grad", None) is None:
+                        p._moonep_grad = torch.zeros(p.shape, dtype=torch.float32, device=p.device)
+                    g = p._moonep_grad
+                assert g.dtype == torch.float32, "MoonEP experts need fp32 main grads"
+                mg.append(g.view(p.shape))
+            out.append(mg)
+        return out
 
-    def local_grads(self, main1, main2):
-        return [main1, main2, self._dummy_g]
+    def reduce_copies_grad(self, state, plan, main1, main2):
+        """The prefetched copies' weight grads -> their home ranks' main grads (MoonEP's reduce
+        accumulates into contiguous [epn, ...] fp32 grads: the main grads themselves when they
+        lie back to back, else a zeroed scratch added into them afterwards)."""
+        g1, g2 = _stacked_view(main1), _stacked_view(main2)
+        if g1 is not None and g2 is not None:
+            state.reduce_grad(plan, [g1, g2, self._dummy_g], self.pool_shapes)
+            return
+        if self._grad_scratch is None:
+            self._grad_scratch = (
+                torch.empty(len(main1), *main1[0].shape, dtype=torch.float32, device=main1[0].device),
+                torch.empty(len(main2), *main2[0].shape, dtype=torch.float32, device=main2[0].device),
+            )
+        s1, s2 = self._grad_scratch
+        s1.zero_()
+        s2.zero_()
+        state.reduce_grad(plan, [s1, s2, self._dummy_g], self.pool_shapes)
+        torch._foreach_add_(main1, list(s1.unbind(0)))
+        torch._foreach_add_(main2, list(s2.unbind(0)))
 
     def forward(self, permuted_hidden, tokens_per_expert, permuted_probs, **_):
         # tokens_per_expert carries MoonEP's cu_seqlens [2 * epn]
         out = _MoonEPExperts.apply(
-            permuted_hidden, permuted_probs, tokens_per_expert, self.weight1, self.weight2, self,
-            self.state, self.holder,
+            permuted_hidden, permuted_probs, tokens_per_expert, self, self.state, self.holder,
+            *self.weights(),
         )
         return out, None
 
     def chunk_forward(self, x, w_nvs, cu_seqlens, state, holder):
         """The experts over one token chunk's dispatched slots (MOONEP_CHUNKS > 1)."""
-        return _MoonEPExperts.apply(
-            x, w_nvs, cu_seqlens, self.weight1, self.weight2, self, state, holder
+        return _MoonEPExperts.apply(x, w_nvs, cu_seqlens, self, state, holder, *self.weights())
+
+    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
+        """TEGroupedMLP's sharded keys: ``{prefix}experts.linear_fc{1,2}.weight`` with a global
+        expert axis (fc1 through the SwiGLU factory), so TEGroupedMLP checkpoints load into
+        MoonEP experts (theirs also carry TE's per-GEMM ``_extra_state``, which this has not)."""
+        from megatron.core.transformer.mlp import apply_swiglu_sharded_factory
+        from megatron.core.transformer.utils import (
+            ensure_metadata_has_dp_cp_group,
+            make_sharded_tensors_for_checkpoint,
         )
+
+        metadata = ensure_metadata_has_dp_cp_group(metadata)
+        ep = self.ep_group
+        ep_size = ep.size() if ep is not None else 1
+        ep_rank = ep.rank() if ep is not None else 0
+        epn = self.num_local_experts
+        num_global, offset = ep_size * epn, ep_rank * epn
+        ep_axis = len(sharded_offsets)
+        out = {}
+        for name, mod in (("linear_fc1", self.linear_fc1), ("linear_fc2", self.linear_fc2)):
+            for i, w in enumerate(mod.weights()):
+                offs = (*sharded_offsets, (ep_axis, offset + i, num_global))
+                sub = make_sharded_tensors_for_checkpoint(
+                    {"weight": w}, f"{prefix}experts.{name}.", {}, offs,
+                    tp_group=self.tp_group, dp_cp_group=metadata["dp_cp_group"],
+                )
+                st = sub[f"{prefix}experts.{name}.weight"]
+                if name == "linear_fc1":
+                    st = apply_swiglu_sharded_factory(
+                        st, offs, tp_group=self.tp_group, dp_group=metadata["dp_cp_group"]
+                    )
+                out[f"{prefix}{name}.weight{i}"] = st
+        return out
 
     def backward_dw(self):
         pass
