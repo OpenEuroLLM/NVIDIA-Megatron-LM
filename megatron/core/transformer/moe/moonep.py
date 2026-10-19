@@ -427,10 +427,20 @@ class MoEMoonEPTokenDispatcher(MoETokenDispatcher):
 
     def token_dispatch(self, hidden_states, probs):
         state = self._state(hidden_states.shape[0], hidden_states.shape[-1])
+        # moe_shared_expert_overlap: the shared expert's fc1 runs on its own stream while the
+        # dispatch kernels (on this stream, num_sms SMs) move the tokens; fc2 overlaps the
+        # combine. Same call order as the flex dispatcher.
+        if self.shared_experts is not None:
+            self.shared_experts.wait_current_stream()
         hidden_nvsh, w_nvs, cu_seqlens = _MoonEPDispatch.apply(
             hidden_states.contiguous(), probs, self.topk, self.tokens_per_expert, state,
             self.holder,
         )
+        if self.shared_experts is not None:
+            self.shared_experts.pre_forward_comm(
+                hidden_states.view(self.hidden_shape), wait_current_stream=False
+            )
+            self.shared_experts.linear_fc1_forward_and_act(hidden_nvsh)
         self._cu_seqlens = cu_seqlens
         return hidden_nvsh, w_nvs
 
@@ -441,7 +451,15 @@ class MoEMoonEPTokenDispatcher(MoETokenDispatcher):
         return hidden_states
 
     def token_combine(self, hidden_states):
+        # the shared expert's fc2 must not overlap the routed experts' GEMMs
+        if self.shared_experts is not None:
+            self.shared_experts.wait_current_stream()
         return _MoonEPCombine.apply(hidden_states, self.state, self.holder)
 
     def combine_postprocess(self, hidden_states):
-        return hidden_states.view(self.hidden_shape)
+        hidden_states = hidden_states.view(self.hidden_shape)
+        if self.shared_experts is not None:
+            self.shared_experts.linear_fc2_forward(hidden_states)
+            self.shared_experts.post_forward_comm()
+            hidden_states = hidden_states + self.shared_experts.get_output()
+        return hidden_states
