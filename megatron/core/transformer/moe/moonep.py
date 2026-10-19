@@ -391,6 +391,12 @@ class _ExpertWeights(torch.nn.Module):
     def weights(self):
         return [getattr(self, f"weight{i}") for i in range(self.num)]
 
+    def forward(self):
+        """The weights, through ``__call__``: Megatron's DDP finishes a bucket's parameter
+        all-gather (overlap_param_gather) in a forward pre-hook of the module that owns the
+        parameters, so they have to be fetched this way before every use."""
+        return self.weights()
+
 
 class MoonEPGroupedMLP(MegatronModule):
     """The routed experts of the MoonEP backend (see the module docstring).
@@ -490,17 +496,23 @@ class MoonEPGroupedMLP(MegatronModule):
         torch._foreach_add_(main1, list(s1.unbind(0)))
         torch._foreach_add_(main2, list(s2.unbind(0)))
 
+    def _gathered_weights(self):
+        # through the submodules' __call__ (DDP's param-gather pre-hooks, see _ExpertWeights)
+        return self.linear_fc1() + self.linear_fc2()
+
     def forward(self, permuted_hidden, tokens_per_expert, permuted_probs, **_):
         # tokens_per_expert carries MoonEP's cu_seqlens [2 * epn]
         out = _MoonEPExperts.apply(
             permuted_hidden, permuted_probs, tokens_per_expert, self, self.state, self.holder,
-            *self.weights(),
+            *self._gathered_weights(),
         )
         return out, None
 
     def chunk_forward(self, x, w_nvs, cu_seqlens, state, holder):
         """The experts over one token chunk's dispatched slots (MOONEP_CHUNKS > 1)."""
-        return _MoonEPExperts.apply(x, w_nvs, cu_seqlens, self, state, holder, *self.weights())
+        return _MoonEPExperts.apply(
+            x, w_nvs, cu_seqlens, self, state, holder, *self._gathered_weights()
+        )
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """TEGroupedMLP's sharded keys: ``{prefix}experts.linear_fc{1,2}.weight`` with a global
