@@ -286,23 +286,56 @@ class DepthMemoryMixer(nn.Module):
         pass
 
 
-def _query(read: "DepthMemoryRead", stream: torch.Tensor):
-    query, gate = read.net(stream)
-    return query * (gate * read.read_gain.float()).unsqueeze(-1)
+def _site_addresses(stream, eps: float, groups: int, key_dim: int, w_norm, w1, b1, w_addr,
+                    b_addr, w_gate, b_gate, logit, q_norm, q1, qb1, q_addr, qb_addr, q_gate,
+                    qb_gate, gain):
+    """The write's (key, sqrt(weight), forgetting) and the next read's gated query from one
+    stream: ONE RMS normalization and ONE first-layer GEMM for both address networks (their
+    RMSNorm gains folded into the stacked W1, as the paper's fused address op), then the small
+    heads. Compiled: Inductor fuses the norm, SiLU, L2 normalizations and gates around the GEMMs.
+    """
+    x = stream.float()
+    xn = (x * torch.rsqrt(x.square().mean(-1, keepdim=True) + eps)).to(w1.dtype)
+    weight = torch.cat((w1 * w_norm.to(w1.dtype), q1 * q_norm.to(q1.dtype)), dim=0)
+    hidden = F.silu(F.linear(xn, weight, torch.cat((b1, qb1))))
+    hw, hq = hidden.split((w1.shape[0], q1.shape[0]), dim=-1)
+    shape = (*stream.shape[:-1], groups, key_dim)
+    key = F.normalize(F.linear(hw, w_addr, b_addr).float().view(shape), dim=-1, eps=1e-6)
+    scale = (2.0 * torch.sigmoid(F.linear(hw, w_gate, b_gate).float())).clamp_min(1e-6).sqrt()
+    query = F.normalize(F.linear(hq, q_addr, qb_addr).float().view(shape), dim=-1, eps=1e-6)
+    gate = 2.0 * torch.sigmoid(F.linear(hq, q_gate, qb_gate).float())
+    query = query * (gate * gain.float()).unsqueeze(-1)
+    lam = torch.sigmoid(logit.float()).clamp_min(1e-6)
+    return key, scale, query, lam
+
+
+def _site_addresses_eager(*args):
+    return _site_addresses(*args)
+
+
+_site_addresses_compiled = None
 
 
 def ldm_fused_step(write, next_read, workspace, edge, stream, value) -> torch.Tensor:
     """Write ``value`` under the key of ``stream``, then read with ``next_read``'s query of
     ``stream``; returns the read as ``[..., h]`` in the stream's dtype."""
+    global _site_addresses_compiled
+    from megatron.core.transformer.attn_res import _maybe_compile
     from megatron.core.transformer.depth_memory_state import depth_memory_step
 
+    if _site_addresses_compiled is None:
+        _site_addresses_compiled = _maybe_compile(_site_addresses_eager)
     shape = stream.shape
     n = stream.numel() // shape[-1]
     workspace.ensure(n, stream.device)
-    key, weight = write.net(stream)
-    scale = weight.clamp_min(1e-6).sqrt()
-    lam = torch.sigmoid(write.forget_logit.float()).clamp_min(1e-6)
-    query = _query(next_read, stream)
+    wn, qn = write.net, next_read.net
+    key, scale, query, lam = _site_addresses_compiled(
+        stream, wn.eps, wn.groups, wn.key_dim,
+        wn.norm_weight, wn.w1.weight, wn.w1.bias, wn.address.weight, wn.address.bias,
+        wn.gate.weight, wn.gate.bias, write.forget_logit,
+        qn.norm_weight, qn.w1.weight, qn.w1.bias, qn.address.weight, qn.address.bias,
+        qn.gate.weight, qn.gate.bias, next_read.read_gain,
+    )
     g = key.shape[-2]
     read = depth_memory_step(
         workspace,
