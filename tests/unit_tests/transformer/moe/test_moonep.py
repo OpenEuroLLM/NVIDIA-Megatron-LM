@@ -140,3 +140,72 @@ def test_moonep_matches_dense_reference(skew):
         assert v < 2e-2, (k, v)
     if skew > 0:
         assert remote > 0, "skewed routing should create redundant experts"
+
+
+@pytest.mark.parametrize("chunks,skew", [(2, 0.0), (2, 4.0), (4, 4.0)])
+def test_moonep_chunked_matches_dense_reference(chunks, skew, monkeypatch):
+    """MOONEP_CHUNKS > 1: dispatch / experts / combine pipelined over token chunks on two streams
+    (chunked_compute), against the same dense fp32 reference -- forward, input / probability
+    gradients and the expert weight gradients (both chunks accumulate into the main grads)."""
+    rank, R = _init()
+    if R != 4:
+        pytest.skip("needs 4 ranks (torchrun --nproc-per-node 4)")
+    monkeypatch.setenv("MOONEP_CHUNKS", str(chunks))
+    S, H, Fh, E, K = 1024, 512, 256, 32, 4
+    epn = E // R
+    group = dist.new_group(list(range(R)))
+    singles = [dist.new_group([r]) for r in range(R)]
+    cfg = _config(H, Fh, E, K, R)
+    pgc = SimpleNamespace(ep=group, expt_tp=singles[rank], tp_ep=group, tp=singles[rank],
+                          expt_dp=singles[rank])
+
+    torch.manual_seed(0)
+    w1 = (torch.randn(E, 2 * Fh, H, device="cuda") / H**0.5)
+    w2 = (torch.randn(E, H, Fh, device="cuda") / Fh**0.5)
+    torch.manual_seed(100 + rank)
+    x = torch.randn(S, H, device="cuda")
+    logits = torch.randn(S, E, device="cuda")
+    logits[:, :3] += skew
+    top = logits.topk(K, dim=-1)
+    routing_map = torch.zeros(S, E, dtype=torch.bool, device="cuda").scatter_(1, top.indices, True)
+    probs = torch.zeros(S, E, device="cuda").scatter_(1, top.indices, torch.sigmoid(top.values))
+
+    experts = MoonEPGroupedMLP(epn, cfg)
+    experts.weight1.data.copy_(w1[rank * epn : (rank + 1) * epn])
+    experts.weight2.data.copy_(w2[rank * epn : (rank + 1) * epn])
+    disp = MoEMoonEPTokenDispatcher(epn, list(range(rank * epn, (rank + 1) * epn)), cfg, pgc)
+    disp.attach_experts(experts)
+    assert disp.num_chunks == chunks
+    xb = x.to(torch.bfloat16).requires_grad_(True)
+    pb = probs.clone().requires_grad_(True)
+    h, w_sk = disp.dispatch_preprocess(xb, routing_map, pb)
+    out = disp.combine_postprocess(disp.chunked_compute(h, w_sk))
+    torch.manual_seed(7 + rank)
+    gout = torch.randn_like(x)
+    out.float().backward(gout.to(torch.bfloat16).float())
+    torch.cuda.synchronize()
+
+    xr = x.clone().requires_grad_(True)
+    pr = probs.clone().requires_grad_(True)
+    w1r = w1.clone().requires_grad_(True)
+    w2r = w2.clone().requires_grad_(True)
+    ref = _reference(xr, pr, routing_map, w1r, w2r)
+    ref.backward(gout.to(torch.bfloat16).float())
+    gw1 = w1r.grad.clone()
+    gw2 = w2r.grad.clone()
+    dist.all_reduce(gw1, group=group)
+    dist.all_reduce(gw2, group=group)
+
+    def rel(a, b):
+        return ((a.float() - b.float()).norm() / b.float().norm().clamp_min(1e-12)).item()
+
+    errs = {
+        "out": rel(out, ref),
+        "dx": rel(xb.grad, xr.grad),
+        "dprobs": rel(pb.grad * routing_map, pr.grad * routing_map),
+        "dw1": rel(experts.main_grads()[0], gw1[rank * epn : (rank + 1) * epn]),
+        "dw2": rel(experts.main_grads()[1], gw2[rank * epn : (rank + 1) * epn]),
+    }
+    print(f"rank {rank} chunks {chunks} skew {skew}: rel errors {errs}", flush=True)
+    for k, v in errs.items():
+        assert v < 2e-2, (k, v)

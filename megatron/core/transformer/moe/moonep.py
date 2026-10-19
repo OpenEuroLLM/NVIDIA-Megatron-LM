@@ -81,8 +81,10 @@ class _MoonEPState:
         self._last_prefetch = None  # (experts module, plan) whose weights the pools hold
 
     @classmethod
-    def get(cls, group, S, H, K, E, num_sms=None, token_padding=128):
-        key = id(group)
+    def get(cls, group, S, H, K, E, num_sms=None, token_padding=128, slot=0):
+        """``slot``: the token chunk (MOONEP_CHUNKS) -- each chunk has its own Buffer and pools, so
+        one chunk's dispatch / combine can run while another chunk's experts compute."""
+        key = (id(group), slot)
         inst = cls._instances.get(key)
         if inst is None or (inst.S, inst.H, inst.K, inst.E) != (S, H, K, E):
             if inst is not None:
@@ -263,8 +265,7 @@ class _MoonEPExperts(torch.autograd.Function):
     """Weighted SwiGLU MLP over the 2 * epn expert slots (local experts + prefetched copies)."""
 
     @staticmethod
-    def forward(ctx, x, w_nvs, cu_seqlens, weight1, weight2, module):
-        state, holder = module.state, module.holder
+    def forward(ctx, x, w_nvs, cu_seqlens, weight1, weight2, module, state, holder):
         plan = holder.plan
         epn = weight1.shape[0]
         slots = state.prefetch(plan, module.local_weights(), module.pool_shapes, owner=module)
@@ -283,15 +284,14 @@ class _MoonEPExperts(torch.autograd.Function):
         y = state.buffer.hidden_nvsh_buffer_view
         _gemm(w2, a, ffn2 // 2, y, hidden, splits, offsets, "TN")
         ctx.save_for_backward(x, h, a, w_nvs, splits, offsets)
-        ctx.module, ctx.plan = module, plan
+        ctx.module, ctx.plan, ctx.state = module, plan, state
         ctx.weights = (weight1, weight2)
         return y
 
     @staticmethod
     def backward(ctx, grad_y):
         x, h, a, w_nvs, splits, offsets = ctx.saved_tensors
-        module, plan = ctx.module, ctx.plan
-        state = module.state
+        module, plan, state = ctx.module, ctx.plan, ctx.state
         weight1, weight2 = ctx.weights
         epn, ffn2, hidden = weight1.shape
         ffn = ffn2 // 2
@@ -320,7 +320,7 @@ class _MoonEPExperts(torch.autograd.Function):
             w.grad_added_to_main_grad = True
         dummy1 = torch.empty(1, dtype=weight1.dtype, device=weight1.device).expand_as(weight1)
         dummy2 = torch.empty(1, dtype=weight2.dtype, device=weight2.device).expand_as(weight2)
-        return grad_x, grad_probs.squeeze(-1).to(w_nvs.dtype), None, dummy1, dummy2, None
+        return grad_x, grad_probs.squeeze(-1).to(w_nvs.dtype), None, dummy1, dummy2, None, None, None
 
 
 class MoonEPGroupedMLP(MegatronModule):
@@ -375,9 +375,16 @@ class MoonEPGroupedMLP(MegatronModule):
     def forward(self, permuted_hidden, tokens_per_expert, permuted_probs, **_):
         # tokens_per_expert carries MoonEP's cu_seqlens [2 * epn]
         out = _MoonEPExperts.apply(
-            permuted_hidden, permuted_probs, tokens_per_expert, self.weight1, self.weight2, self
+            permuted_hidden, permuted_probs, tokens_per_expert, self.weight1, self.weight2, self,
+            self.state, self.holder,
         )
         return out, None
+
+    def chunk_forward(self, x, w_nvs, cu_seqlens, state, holder):
+        """The experts over one token chunk's dispatched slots (MOONEP_CHUNKS > 1)."""
+        return _MoonEPExperts.apply(
+            x, w_nvs, cu_seqlens, self.weight1, self.weight2, self, state, holder
+        )
 
     def backward_dw(self):
         pass
@@ -395,25 +402,43 @@ class MoEMoonEPTokenDispatcher(MoETokenDispatcher):
         self.holder = _PlanHolder()
         self.experts = None
         self.state = None
+        # MOONEP_CHUNKS = n > 1: the layer's tokens are split into n chunks, pipelined so that a
+        # chunk's dispatch / combine (on a communication stream) runs under another chunk's expert
+        # GEMMs; the shared expert runs under the first dispatch (see chunked_compute).
+        self.num_chunks = int(os.environ.get("MOONEP_CHUNKS", "1"))
+        self.chunk_holders = [_PlanHolder() for _ in range(self.num_chunks)]
+        self.chunk_states = [None] * self.num_chunks
+        self._comm_stream = None
+        self._chunked_shared_output = None
 
     def attach_experts(self, experts: MoonEPGroupedMLP):
         self.experts = experts
         experts.holder = self.holder
 
+    def _new_state(self, num_tokens, hidden, slot=0):
+        return _MoonEPState.get(
+            self.ep_group,
+            num_tokens,
+            hidden,
+            self.config.moe_router_topk,
+            self.config.num_moe_experts,
+            num_sms=self.config.moe_flex_dispatcher_num_sms,
+            # per-expert-slot row padding of the dispatched layout (grouped GEMM tiles)
+            token_padding=int(os.environ.get("MOONEP_TOKEN_PADDING", "128")),
+            slot=slot,
+        )
+
     def _state(self, num_tokens, hidden):
         if self.state is None or self.state.S != num_tokens:
-            self.state = _MoonEPState.get(
-                self.ep_group,
-                num_tokens,
-                hidden,
-                self.config.moe_router_topk,
-                self.config.num_moe_experts,
-                num_sms=self.config.moe_flex_dispatcher_num_sms,
-                # per-expert-slot row padding of the dispatched layout (grouped GEMM tiles)
-                token_padding=int(os.environ.get("MOONEP_TOKEN_PADDING", "128")),
-            )
+            self.state = self._new_state(num_tokens, hidden)
             self.experts.state = self.state
         return self.state
+
+    def _chunk_state(self, c, num_tokens, hidden):
+        st = self.chunk_states[c]
+        if st is None or st.S != num_tokens:
+            st = self.chunk_states[c] = self._new_state(num_tokens, hidden, slot=c)
+        return st
 
     def dispatch_preprocess(self, hidden_states, routing_map, probs):
         self.hidden_shape = hidden_states.shape
@@ -421,6 +446,7 @@ class MoEMoonEPTokenDispatcher(MoETokenDispatcher):
         k = self.config.moe_router_topk
         topk = probs.masked_fill(~routing_map, -1.0).topk(k, dim=-1).indices
         self.topk = topk.to(torch.int32).contiguous()
+        self.routing_map = routing_map
         self.tokens_per_expert = routing_map.sum(dim=0, dtype=torch.int32).contiguous()
         weights_sk = probs.gather(-1, topk).float().contiguous()
         return hidden_states, weights_sk
@@ -456,8 +482,70 @@ class MoEMoonEPTokenDispatcher(MoETokenDispatcher):
             self.shared_experts.wait_current_stream()
         return _MoonEPCombine.apply(hidden_states, self.state, self.holder)
 
+    def chunked_compute(self, hidden_states, weights_sk, shared_experts=None):
+        """dispatch -> experts -> combine over ``num_chunks`` token chunks, pipelined.
+
+        Communication stream: D0 D1 .. C0 C1 ..; compute stream: (shared expert) E0 E1 ..; chunk c's
+        experts wait for D_c, C_c waits for E_c, so D_{c+1} runs under E_c and C_c under E_{c+1}.
+        Every op is an autograd Function recorded on its stream, so the backward replays on the
+        same streams in reverse (C1' | E1' + C0' | E0' + D1' | D0') with the same overlap. Each
+        chunk has its own MoonEP Buffer and pools (_MoonEPState slot), so chunks never share a
+        shard. Returns the routed output [S, H]; the shared expert's output (computed under D0
+        on the compute stream) is added in combine_postprocess."""
+        n = self.num_chunks
+        S, H = hidden_states.shape
+        assert S % n == 0, f"MOONEP_CHUNKS={n} must divide the {S} tokens per micro-batch"
+        Sc = S // n
+        cur = torch.cuda.current_stream()
+        if self._comm_stream is None:
+            self._comm_stream = torch.cuda.Stream()
+        comm = self._comm_stream
+        comm.wait_stream(cur)
+        hidden_states = hidden_states.contiguous()
+        hs, ws, tk = hidden_states.split(Sc), weights_sk.split(Sc), self.topk.split(Sc)
+        rm = self.routing_map.split(Sc)
+        states = [self._chunk_state(c, Sc, H) for c in range(n)]
+        dispatched = []
+        for c in range(n):
+            tpe = rm[c].sum(dim=0, dtype=torch.int32).contiguous()
+            with torch.cuda.stream(comm):
+                x, w, cu = _MoonEPDispatch.apply(
+                    hs[c], ws[c].contiguous(), tk[c].contiguous(), tpe, states[c],
+                    self.chunk_holders[c],
+                )
+            ev = torch.cuda.Event()
+            ev.record(comm)
+            dispatched.append((x, w, cu, ev, tpe))
+        self._chunked_shared_output = (
+            shared_experts(hidden_states) if shared_experts is not None else None
+        )
+        outs = []
+        for c in range(n):
+            x, w, cu, ev, tpe = dispatched[c]
+            cur.wait_event(ev)
+            for t in (x, w, cu):
+                t.record_stream(cur)
+            y = self.experts.chunk_forward(x, w, cu, states[c], self.chunk_holders[c])
+            ev = torch.cuda.Event()
+            ev.record(cur)
+            comm.wait_event(ev)
+            with torch.cuda.stream(comm):
+                outs.append(_MoonEPCombine.apply(y, states[c], self.chunk_holders[c]))
+            y.record_stream(comm)
+            tpe.record_stream(comm)
+        cur.wait_stream(comm)
+        hidden_states.record_stream(comm)
+        for o in outs:
+            o.record_stream(cur)
+        self.holder.plan = self.chunk_holders[-1].plan  # for callers that inspect the plan
+        return torch.cat(outs)
+
     def combine_postprocess(self, hidden_states):
         hidden_states = hidden_states.view(self.hidden_shape)
+        if self._chunked_shared_output is not None:
+            hidden_states = hidden_states + self._chunked_shared_output.view(self.hidden_shape)
+            self._chunked_shared_output = None
+            return hidden_states
         if self.shared_experts is not None:
             self.shared_experts.linear_fc2_forward(hidden_states)
             self.shared_experts.post_forward_comm()

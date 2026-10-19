@@ -751,12 +751,22 @@ class MoELayer(BaseMoELayer):
                 if intermediate_tensors is not None:
                     hidden_states, probs = intermediate_tensors
 
-                dispatched_input, probs = self.dispatch(hidden_states, probs)
-                output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
+                if getattr(self.token_dispatcher, "num_chunks", 1) > 1 and intermediate_tensors is None:
+                    # MoonEP, MOONEP_CHUNKS > 1: dispatch / experts / combine pipelined over token
+                    # chunks (the shared expert under the first dispatch when overlapped)
+                    output = self.token_dispatcher.chunked_compute(
+                        hidden_states,
+                        probs,
+                        self.shared_experts if self.shared_expert_overlap else None,
+                    )
+                    mlp_bias = None
+                else:
+                    dispatched_input, probs = self.dispatch(hidden_states, probs)
+                    output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
+                    output = self.combine(output)
                 assert (
                     mlp_bias is None
                 ), f"mlp_bias is not supported for {type(self.token_dispatcher)}"
-                output = self.combine(output)
 
                 # `output` is the routed path only at this point: shared experts are added in
                 # postprocess below.  This is consequently also the precise masking boundary.
