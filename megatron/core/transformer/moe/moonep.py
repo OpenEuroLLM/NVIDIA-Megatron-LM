@@ -78,7 +78,9 @@ class _MoonEPState:
         self.S, self.H, self.K, self.E = S, H, K, E
         self.epn = E // self.R
         self.buffer = moonep.Buffer(
-            S, H, K, E, self.R, num_sms=num_sms, token_padding=token_padding, group=group
+            S, H, K, E, self.R, num_sms=num_sms, token_padding=token_padding, group=group,
+            # MOONEP_PDL=0: no programmatic dependent launch between MoonEP's kernels
+            enable_pdl=os.environ.get("MOONEP_PDL", "1") != "0",
         )
         self.pools = {}
         self._last_prefetch = None  # (experts module, plan) whose weights the pools hold
