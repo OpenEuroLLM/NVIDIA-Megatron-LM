@@ -627,6 +627,8 @@ class MoEMoonEPTokenDispatcher(MoETokenDispatcher):
         # chunk's dispatch / combine (on a communication stream) runs under another chunk's expert
         # GEMMs; the shared expert runs under the first dispatch (see chunked_compute).
         self.num_chunks = int(os.environ.get("MOONEP_CHUNKS", "1"))
+        # debug: MOONEP_FORCE_CHUNKED=1 sends even 1 chunk through chunked_compute
+        self.force_chunked = os.environ.get("MOONEP_FORCE_CHUNKED", "0") == "1"
         self.chunk_holders = [_PlanHolder() for _ in range(self.num_chunks)]
         self.chunk_states = [None] * self.num_chunks
         self._comm_stream = None
@@ -719,7 +721,9 @@ class MoEMoonEPTokenDispatcher(MoETokenDispatcher):
         Sc = S // n
         cur = torch.cuda.current_stream()
         if self._comm_stream is None:
-            self._comm_stream = torch.cuda.Stream()
+            # debug: MOONEP_CHUNK_STREAM=same runs the communication on the compute stream
+            same = os.environ.get("MOONEP_CHUNK_STREAM", "") == "same"
+            self._comm_stream = cur if same else torch.cuda.Stream()
         comm = self._comm_stream
         comm.wait_stream(cur)
         hidden_states = hidden_states.contiguous()

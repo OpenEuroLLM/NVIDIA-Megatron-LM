@@ -751,7 +751,10 @@ class MoELayer(BaseMoELayer):
                 if intermediate_tensors is not None:
                     hidden_states, probs = intermediate_tensors
 
-                if getattr(self.token_dispatcher, "num_chunks", 1) > 1 and intermediate_tensors is None:
+                if (
+                    getattr(self.token_dispatcher, "num_chunks", 1) > 1
+                    or getattr(self.token_dispatcher, "force_chunked", False)
+                ) and intermediate_tensors is None:
                     # MoonEP, MOONEP_CHUNKS > 1: dispatch / experts / combine pipelined over token
                     # chunks (the shared expert under the first dispatch when overlapped)
                     output = self.token_dispatcher.chunked_compute(
