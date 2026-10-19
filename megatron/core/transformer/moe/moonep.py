@@ -375,13 +375,14 @@ class _MoonEPExperts(torch.autograd.Function):
 class _ExpertWeights(torch.nn.Module):
     """``weight0 .. weight{n-1}``: one 2-D parameter per local expert, TEGroupedMLP's names and
     shapes (2-D: the emerging optimizers -- angular MuOwn -- orthogonalize each expert; a 3-D
-    stack would fall back to Adam). Registered in reverse so Megatron's DDP buffer (filled in
-    reverse parameter order) holds them back to back in expert order."""
+    stack would fall back to Adam). Registered in expert order, as TEGroupedMLP: the overlapped
+    param all-gather chains its buckets in registration order, and a reversed registration (which
+    would have laid them out back to back in expert order in the DDP buffer) broke that chain."""
 
     def __init__(self, n, shape, init_method, perform_init, dtype, device):
         super().__init__()
         self.num = n
-        for i in reversed(range(n)):
+        for i in range(n):
             w = torch.nn.Parameter(torch.empty(*shape, device=device, dtype=dtype))
             if perform_init:
                 init_method(w.data)
