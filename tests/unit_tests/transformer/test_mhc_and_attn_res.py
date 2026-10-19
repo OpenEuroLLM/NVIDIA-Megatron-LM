@@ -57,6 +57,30 @@ class TestSinkhornKnopp:
         m = sinkhorn_knopp(torch.tensor([[1e4, -1e4], [-1e4, 1e4]]))
         assert torch.isfinite(m).all()
 
+    def test_matches_the_exp_form_on_moderate_logits(self):
+        """Log space has the plain exp / normalize form's fixed point."""
+        torch.manual_seed(0)
+        z = torch.randn(16, 4, 4) * 3 + 5 * torch.eye(4)
+        m = torch.exp(z - z.amax(dim=(-2, -1), keepdim=True))
+        for _ in range(20):
+            m = m / m.sum(-2, keepdim=True)
+            m = m / m.sum(-1, keepdim=True)
+        torch.testing.assert_close(sinkhorn_knopp(z), m, rtol=1e-5, atol=1e-6)
+
+    def test_spread_logits_keep_finite_gradients(self):
+        """Logits spread far beyond ~20 (a grown dynamic part): the plain form's clamped column
+        sums gave NaN gradients with a finite loss -- dense mHC under MoE went NaN at step ~30."""
+        torch.manual_seed(0)
+        for scale in (50.0, 100.0):
+            z = (torch.randn(64, 4, 4) * scale + 5 * torch.eye(4)).requires_grad_(True)
+            m = sinkhorn_knopp(z)
+            # rows exact (the sweep ends on them); near-permutation matrices converge slowly in
+            # the columns within 20 sweeps (docstring) -- not what this test is about
+            assert torch.allclose(m.sum(-1), torch.ones(64, 4), atol=1e-4)
+            assert torch.isfinite(m).all()
+            (m * torch.randn_like(m)).sum().backward()
+            assert torch.isfinite(z.grad).all(), scale
+
 
 class TestMHCMixer:
     def test_init_gives_uniform_read_and_unit_write(self):

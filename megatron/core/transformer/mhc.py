@@ -76,16 +76,19 @@ def _sinkhorn_knopp_impl(
 
     Returns:
         A row-stochastic, approximately doubly stochastic tensor, in fp32.
+
+    Computed in log space (logsumexp normalizations), exp() only at the end. The plain form --
+    exp, then divide by column / row sums clamped at ``eps`` -- breaks once the logits spread
+    beyond ~20: a whole column underflows after the max subtraction, its sum hits the clamp, the
+    forward returns a different matrix and the backward of x / sum scales by ~1 / eps^2 (NaN
+    gradients with a finite loss: dense mHC and the routed residual's mixing went NaN under MoE,
+    round 4). Same fixed point; ``eps`` is kept for the signature.
     """
-    # exp() in fp32; subtract the max for numerical safety (this cancels in the
-    # subsequent normalization, so it does not change the fixed point).
     x = logits.float()
-    x = x - x.amax(dim=(-2, -1), keepdim=True)
-    m = torch.exp(x)
     for _ in range(num_iters):
-        m = m / m.sum(dim=-2, keepdim=True).clamp(min=eps)  # columns sum to 1
-        m = m / m.sum(dim=-1, keepdim=True).clamp(min=eps)  # rows sum to 1
-    return m
+        x = x - torch.logsumexp(x, dim=-2, keepdim=True)  # columns sum to 1
+        x = x - torch.logsumexp(x, dim=-1, keepdim=True)  # rows sum to 1
+    return torch.exp(x)
 
 
 # The loop is the hot spot: each sweep is ~4 memory-bound elementwise passes over
