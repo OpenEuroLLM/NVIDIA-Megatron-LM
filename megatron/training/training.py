@@ -2956,6 +2956,31 @@ def _set_count_zeros(optimizer, enabled):
             config.log_num_zeros_in_grad = enabled
 
 
+def _maybe_start_mem_trace(iteration):
+    """MEM_TRACE_DIR / MEM_TRACE_RANKS (comma list, default 0) / MEM_TRACE_ITER (default 2):
+    record the allocator history over that iteration's forward-backward on those ranks (any
+    pipeline stage, unlike --record-memory-history) and dump a snapshot after it."""
+    out = os.environ.get("MEM_TRACE_DIR")
+    if not out or iteration != int(os.environ.get("MEM_TRACE_ITER", "2")):
+        return None
+    rank = torch.distributed.get_rank()
+    if rank not in {int(r) for r in os.environ.get("MEM_TRACE_RANKS", "0").split(",")}:
+        return None
+    torch.cuda.reset_peak_memory_stats()
+    torch.cuda.memory._record_memory_history(
+        True, trace_alloc_max_entries=2_000_000, trace_alloc_record_context=True
+    )
+    return os.path.join(out, f"mem_rank{rank}_iter{iteration}.pickle")
+
+
+def _dump_mem_trace(path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    torch.cuda.memory._dump_snapshot(path)
+    torch.cuda.memory._record_memory_history(None)
+    print(f"[mem_trace] {path}: peak allocated {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB, "
+          f"reserved {torch.cuda.max_memory_reserved() / 2**30:.2f} GiB", flush=True)
+
+
 def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None, pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None, p2p_communicator: Optional[P2PCommunicator] = None):
     """Single training step.
 
@@ -3058,6 +3083,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
             prefetch_engram_step_lookups(model, packed_doc_attention)
         pipeline_seq_length, pipeline_micro_batch_size = get_pipeline_tensor_shapes(args)
+        _mem_trace = _maybe_start_mem_trace(iteration)
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step_func,
             data_iterator=data_iterator,
@@ -3072,6 +3098,8 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             p2p_communicator=p2p_communicator,
             pg_collection=pg_collection,
         )
+        if _mem_trace is not None:
+            _dump_mem_trace(_mem_trace)
         if save_activations_in_this_iteration:
             save_activations(iteration + 1)
             disable_activation_logging()
