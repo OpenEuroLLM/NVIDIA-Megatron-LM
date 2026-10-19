@@ -87,4 +87,52 @@ def test_fused_matches_compiled(monkeypatch, T, C):
         assert fu is not None and co is not None, name
         # no worse than the compiled bf16 path's own error against fp32
         err_fused, err_compiled = _rel(fu, gt), _rel(co, gt)
-        assert err_fused < max(2e-2, 1.5 * err_compiled), (name, err_fused, err_compiled)
+        # scalar gates: a sum over all tokens of the upstream bf16 noise (both paths are a few %
+        # off there; the single-read test below checks them tightly)
+        tol = 5e-2 if gt.numel() == 1 else max(2e-2, 1.5 * err_compiled)
+        assert err_fused < tol, (name, err_fused, err_compiled)
+
+
+@pytest.mark.skipif(not (torch.cuda.is_available() and mhc_fused.HAVE_TRITON), reason="needs Triton")
+def test_fused_read_all_grads(monkeypatch):
+    """One read (coefficients, read, write coefficients out): every gradient, against fp32."""
+    monkeypatch.setattr(mhc_fused, "ENABLED", True)
+    torch.manual_seed(0)
+    T, C = 4096, 2048
+    m = MHCMixer(C, N).cuda()
+    with torch.no_grad():
+        m.phi.normal_(0, 0.5 / (N * C) ** 0.5)
+        for a in (m.alpha_pre, m.alpha_post, m.alpha_res):
+            a.fill_(0.5)
+    s0 = torch.randn(T, 1, N, C, device="cuda", dtype=torch.bfloat16)
+    gx = torch.randn(T, 1, C, device="cuda", dtype=torch.bfloat16).float()
+    gp = torch.randn(T, 1, N, device="cuda")
+    gr = torch.randn(T, 1, N, N, device="cuda")
+    res = {}
+    for mode in ("gt", "compiled", "fused"):
+        for p in m.parameters():
+            p.grad = None
+        if mode == "gt":
+            s = s0.float().requires_grad_()
+            n = N
+            flat = s.flatten(-2)
+            r = (flat.norm(dim=-1, keepdim=True) / flat.shape[-1] ** 0.5).clamp(min=m.eps)
+            pre, post, rs = torch.split(flat @ m.phi / r, [n, n, n * n], dim=-1)
+            h_pre = torch.sigmoid(m.alpha_pre * pre + m.b_pre)
+            hp = 2.0 * torch.sigmoid(m.alpha_post * post + m.b_post)
+            hr = _sinkhorn_knopp_impl(m.alpha_res * rs.view(*rs.shape[:-1], n, n) + m.b_res,
+                                      m.num_sinkhorn_iters)
+            x = (h_pre.unsqueeze(-1) * s).sum(-2)
+        elif mode == "compiled":
+            s = s0.clone().requires_grad_()
+            x, _, hp, hr = m.coeffs_and_read(s)
+        else:
+            s = s0.clone().requires_grad_()
+            x, _, hp, hr = mhc_fused.coeffs_and_read(m, s, mhc_fused.ReadWriteLink())
+        ((x.float() * gx).sum() + (hp * gp).sum() + (hr * gr).sum()).backward()
+        res[mode] = [x.detach(), hp.detach(), hr.detach(), s.grad,
+                     *(p.grad.clone() for p in m.parameters())]
+    names = ["x", "h_post", "h_res", "d_streams"] + [n for n, _ in m.named_parameters()]
+    for name, fu, co, gt in zip(names, res["fused"], res["compiled"], res["gt"]):
+        err_fused, err_compiled = _rel(fu, gt), _rel(co, gt)
+        assert err_fused < max(1e-2, 1.5 * err_compiled), (name, err_fused, err_compiled)

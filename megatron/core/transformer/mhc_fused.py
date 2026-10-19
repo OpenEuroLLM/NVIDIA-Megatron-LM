@@ -244,10 +244,22 @@ if HAVE_TRITON:
         tl.store(ds_ptr + offs, ds.to(tl.bfloat16), mask=mt[:, None])
         return tl.dot(tl.trans(s), dp, acc)
 
+    _DS_CONFIGS = [
+        triton.Config({"BC": bc, "BT": bt, "SPLITS": sp}, num_warps=w, num_stages=st)
+        for bc in (32, 64, 128)
+        for bt in (16, 32, 64)
+        for sp in (8, 16, 32)
+        for w in (4, 8)
+        for st in (2, 3)
+        if bc * bt <= 4096
+    ]
+
+    @triton.autotune(configs=_DS_CONFIGS, key=["C", "T_BUCKET", "HAS_DSW"])
     @triton.jit
     def _dstreams_kernel(s_ptr, dsw_ptr, dx_ptr, hpre_ptr, dp_ptr, dsq_ptr, phi_ptr, ds_ptr,
-                         dphi_ptr, T, TPS, C: tl.constexpr, M: tl.constexpr,
-                         HAS_DSW: tl.constexpr, BT: tl.constexpr, BC: tl.constexpr):
+                         dphi_ptr, T, T_BUCKET, C: tl.constexpr, M: tl.constexpr,
+                         HAS_DSW: tl.constexpr, BT: tl.constexpr, BC: tl.constexpr,
+                         SPLITS: tl.constexpr):
         """d_s and this program's share of d_phi, for one C-block over one token split (n = 4).
 
         Owning a C-block keeps its rows of phi in registers for the whole split and lets d_phi
@@ -265,8 +277,9 @@ if HAVE_TRITON:
         a1 = tl.zeros((BC, M), dtype=tl.float32)
         a2 = tl.zeros((BC, M), dtype=tl.float32)
         a3 = tl.zeros((BC, M), dtype=tl.float32)
+        TPS = tl.cdiv(tl.cdiv(T, SPLITS), BT) * BT
         t0 = sp * TPS
-        for tt in range(t0, t0 + TPS, BT):
+        for tt in range(t0, tl.minimum(t0 + TPS, T), BT):
             t = tt + tl.arange(0, BT)
             mt = t < T
             row = t[:, None].to(tl.int64)
@@ -374,18 +387,15 @@ class _FusedCoeffsRead(torch.autograd.Function):
         d_params = _unpack(d_prm.sum(0), params)
         phi32 = _phi_tile(phi)
         d_s = torch.empty_like(streams)
-        BC, BT = 64, 32
-        splits = max(1, min(16, triton.cdiv(T, 1024)))
-        tps = triton.cdiv(triton.cdiv(T, splits), BT) * BT
-        splits = triton.cdiv(T, tps)
-        d_phi_parts = torch.empty(splits, K, _M, dtype=torch.float32, device=streams.device)
+        # one [K, M] partial per token split (autotuned: at most 32)
+        d_phi_parts = torch.empty(32, K, _M, dtype=torch.float32, device=streams.device)
         dsw_arg = dsw.contiguous() if dsw is not None else streams
-        _dstreams_kernel[(c // BC, splits)](
+        _dstreams_kernel[lambda meta: (c // meta["BC"], meta["SPLITS"])](
             streams, dsw_arg, d_x, h_pre, d_proj.contiguous(), d_sumsq.contiguous(), phi32, d_s,
-            d_phi_parts, T, tps, C=c, M=_M, HAS_DSW=dsw is not None, BT=BT, BC=BC,
-            num_warps=8,
+            d_phi_parts, T, triton.next_power_of_2(T), C=c, M=_M, HAS_DSW=dsw is not None,
         )
-        d_phi = d_phi_parts.sum(0)[:, : phi.shape[1]].to(phi.dtype)
+        splits = _dstreams_kernel.best_config.kwargs["SPLITS"]
+        d_phi = d_phi_parts[:splits].sum(0)[:, : phi.shape[1]].to(phi.dtype)
         return (d_s, d_phi, *d_params, None, None, None, None)
 
 
