@@ -7,7 +7,7 @@ for model parameters.
 import logging
 from copy import deepcopy
 from dataclasses import replace
-from typing import Dict, Iterable, Tuple, Union
+from typing import Dict, Iterable, Optional, Tuple, Union
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +80,36 @@ def get_param_id_to_sharded_param_map(
     return id_to_sharded_param_map
 
 
+def _row_state_sharded_tensor(
+    model_param: ShardedTensor, optim_param: torch.Tensor, key: str
+) -> Optional[ShardedTensor]:
+    """A per-row optimizer state ``(..., 1)`` of a weight ``(..., C)`` (e.g. angular MuOwn's row
+    statistics): the weight's ShardedTensor with the last axis collapsed to 1. Only when that axis
+    is not fragmented across ranks (no tensor parallelism along it) and the tensor is not
+    flattened -- otherwise None (the caller then needs a weight-shaped state)."""
+    local = tuple(model_param.local_shape)
+    if (
+        optim_param.dim() != len(local)
+        or tuple(optim_param.shape[:-1]) != local[:-1]
+        or optim_param.shape[-1] != 1
+        or local[-1] == 1
+        or model_param.axis_fragmentations[-1] != 1
+        or model_param.flattened_range is not None
+    ):
+        return None
+    sh_ten = replace(
+        model_param,
+        key=key,
+        data=optim_param,
+        dtype=optim_param.dtype,
+        local_shape=(*local[:-1], 1),
+        global_shape=(*tuple(model_param.global_shape)[:-1], 1),
+        global_offset=(*tuple(model_param.global_offset)[:-1], 0),
+    )
+    sh_ten.validate_metadata_integrity()
+    return sh_ten
+
+
 def make_sharded_optimizer_tensor(
     model_param: Union[ShardedTensor, ShardedTensorFactory], optim_param: torch.Tensor, prefix: str
 ) -> Union[ShardedTensor, ShardedTensorFactory]:
@@ -96,6 +126,10 @@ def make_sharded_optimizer_tensor(
     optim_param = to_local_if_dtensor(optim_param)
     if isinstance(model_param, ShardedTensorFactory):
         return replace(model_param, key=f'{prefix}.{model_param.key}', data=optim_param)
+
+    row_state = _row_state_sharded_tensor(model_param, optim_param, f'{prefix}.{model_param.key}')
+    if row_state is not None:
+        return row_state
 
     assert tuple(optim_param.shape) == model_param.local_shape, (
         f'Optimizer shape ({tuple(optim_param.shape)} does not match model shape '

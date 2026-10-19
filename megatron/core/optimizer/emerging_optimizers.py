@@ -9,6 +9,7 @@ To add a new emerging optimizer:
 """
 
 import inspect
+import os
 import logging
 import math
 from dataclasses import dataclass, field
@@ -617,6 +618,11 @@ ANGULAR_MUOWN_ZERO_ROW_SCALE = 0.33**0.5
 # ``TensorParallelAngularMuown.state_dict``). ``m_u`` already matches the weight
 # shape and ``step`` is a scalar, so neither needs expansion.
 ANGULAR_MUOWN_ROW_STATE_KEYS = ("g", "m_g", "v_g")
+# Checkpoint the per-row states at (rows, 1) instead of expanded to the weight shape: ~12 bytes per
+# matrix parameter less in every save's host staging (the expanded form OOM-killed s2 MoE nodes
+# at saves) and in the checkpoint. A different checkpoint format: a run must use one setting
+# throughout (expanded checkpoints do not load into compact templates and vice versa).
+_COMPACT_ROW_STATES = os.environ.get("ANGULAR_MUOWN_COMPACT_CKPT", "0") == "1"
 
 
 @torch.compile
@@ -1321,7 +1327,9 @@ class TensorParallelAngularMuown(TensorParallelMuon):
         """
         state_dict = super().state_dict()
         packed_state = state_dict.get("state")
-        if not packed_state:
+        if not packed_state or _COMPACT_ROW_STATES:
+            # compact: the (rows, 1) states as they are -- the optimizer-state sharding maps them
+            # onto the weight's metadata with the last axis collapsed (_row_state_sharded_tensor)
             return state_dict
 
         expanded_state = {}
