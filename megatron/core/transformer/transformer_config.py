@@ -1962,6 +1962,12 @@ class TransformerConfig(ModelParallelConfig):
     zero query, i.e. uniform attention over depth at init - exactly the averaging a standard
     residual performs."""
 
+    attn_res_impl: str = "state"
+    """Block AttnRes implementation. "state": the sources as a Python list stashed on the layers
+    (not CUDA-graph capturable). "streams": the sources as one [s, b, slots, h] tensor through the
+    mHC plumbing, each sublayer reading a static slice and replacing one slot (HybridStack only,
+    CUDA-graph capturable, pipeline_model_parallel_size == 1, no LERP)."""
+
     attn_res_lerp: bool = False
     """Compose Block AttnRes with the nGPT LERP residual: accumulate each block via a LERP step
     toward the normalized sublayer output instead of a plain sum, keeping block summaries on

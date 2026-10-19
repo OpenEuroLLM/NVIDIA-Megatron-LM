@@ -526,9 +526,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         self.attnres_attn = None
         self.attnres_mlp = None
         self._depth_state = None
+        from megatron.core.transformer.attn_res import attn_res_streams
         from megatron.core.transformer.depth_memory import ldm_streams
 
-        if getattr(self.config, "mhc", False) or ldm_streams(self.config):
+        if (
+            getattr(self.config, "mhc", False)
+            or ldm_streams(self.config)
+            or attn_res_streams(self.config)
+        ):
             # Dense mHC, routed residual streams with mhc_routed_topk, or the stream form of
             # Linear Depth Memory.
             from megatron.core.transformer.routed_residual import build_stream_mixer

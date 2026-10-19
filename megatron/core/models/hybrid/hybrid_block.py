@@ -278,8 +278,13 @@ class HybridStack(MegatronModule):
         # Linear Depth Memory: the embedding write and the final read (depth_memory.py)
         from megatron.core.transformer.depth_memory import ldm_streams
 
+        from megatron.core.transformer.attn_res import attn_res_streams
+
         self.ldm_boundary = None
         self.ldm_stream_boundary = None
+        self.attnres_stream_boundary = None
+        if attn_res_streams(self.config):
+            self._wire_attn_res_streams()
         if ldm_streams(self.config):
             self._wire_depth_memory()
         elif getattr(self.config, "depth_memory", False):
@@ -712,6 +717,37 @@ class HybridStack(MegatronModule):
         for edge, mixer in enumerate(mixers, start=1):
             mixer.wire(edge, self.ldm_workspace)
 
+    def _wire_attn_res_streams(self) -> None:
+        """Block AttnRes, stream form: every mixer's source slice, block slot and seed, from the
+        sublayer order and the block size (a block closes after the layer whose number is a
+        multiple of layers_per_block, as DepthResidualState.should_seal)."""
+        from megatron.core.transformer.attn_res import (
+            AttnResStreamBoundary,
+            AttnResStreamMixer,
+            resolve_layers_per_block,
+        )
+
+        if self._loop_schedule_requested():
+            raise NotImplementedError("attn_res streams with looped (weight-tied) depth")
+        per_block = resolve_layers_per_block(self.config.num_layers, self.config.attn_res_num_blocks)
+        completed, partial, slots = 0, False, 1
+        for layer in self.layers:
+            if isinstance(layer, TransformerLayer):
+                candidates = (layer.mhc_attn_mixer, layer.mhc_mlp_mixer)
+            else:
+                scheme = getattr(layer, "residual_scheme", None)
+                candidates = (scheme.mhc_mixer if scheme is not None else None,)
+            for mixer in candidates:
+                if not isinstance(mixer, AttnResStreamMixer):
+                    continue
+                mixer.wire(live=1 + completed + int(partial), slot=1 + completed, seed=not partial)
+                partial = True
+                slots = max(slots, 2 + completed)
+            if partial and layer.layer_number % per_block == 0:
+                completed, partial = completed + 1, False
+        last = 1 + completed if partial else completed
+        self.attnres_stream_boundary = AttnResStreamBoundary(slots, last)
+
     def _loop_schedule_requested(self) -> bool:
         return build_loop_schedule(self.config) is not None
 
@@ -734,6 +770,10 @@ class HybridStack(MegatronModule):
             if not (self.pre_process and self.post_process):
                 raise NotImplementedError("depth_memory needs the whole stack on one stage")
             return self.ldm_stream_boundary.expand(hidden_states), None
+        if self.attnres_stream_boundary is not None:
+            if not (self.pre_process and self.post_process):
+                raise NotImplementedError("attn_res streams need the whole stack on one stage")
+            return self.attnres_stream_boundary.expand(hidden_states), None
         if self.ldm_boundary is not None:
             if not (self.pre_process and self.post_process):
                 raise NotImplementedError("depth_memory needs the whole stack on one stage")
@@ -783,6 +823,8 @@ class HybridStack(MegatronModule):
 
         if self.ldm_stream_boundary is not None and hidden_states.dim() == 4:
             return self.ldm_stream_boundary.collapse(hidden_states)
+        if self.attnres_stream_boundary is not None and hidden_states.dim() == 4:
+            return self.attnres_stream_boundary.collapse(hidden_states)
         if getattr(self.config, "mhc", False) and hidden_states.dim() == 4:
             from megatron.core.transformer.mhc import collapse_streams
 

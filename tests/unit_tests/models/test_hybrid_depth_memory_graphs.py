@@ -41,7 +41,7 @@ def _model(pattern, impl, graphs=None, **kw):
         moe_grouped_gemm=True, moe_permute_fusion=True, moe_token_dispatcher_type="alltoall",
         moe_router_load_balancing_type="none",
     ) if "E" in pattern else {}
-    config = TransformerConfig(
+    base = dict(
         num_layers=len(pattern), hidden_size=64, num_attention_heads=4, ffn_hidden_size=128,
         use_cpu_initialization=True, hidden_dropout=0.0, attention_dropout=0.0,
         normalization="RMSNorm", add_bias_linear=False, gated_linear_unit=True,
@@ -50,8 +50,9 @@ def _model(pattern, impl, graphs=None, **kw):
         depth_memory_key_dim=8, depth_memory_hidden_dim=16,
         **({"cuda_graph_impl": "local", "cuda_graph_warmup_steps": 2,
             "cuda_graph_modules": graphs} if graphs else {}),
-        **moe, **kw,
+        **moe,
     )
+    config = TransformerConfig(**{**base, **kw})
     return HybridModel(
         config=config, hybrid_stack_spec=hybrid_stack_spec, vocab_size=VOCAB,
         max_sequence_length=S, hybrid_layer_pattern=pattern, position_embedding_type="rope",

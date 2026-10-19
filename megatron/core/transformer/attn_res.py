@@ -313,3 +313,93 @@ def resolve_layers_per_block(num_layers: int, num_blocks: int) -> int:
     if num_blocks < 1:
         raise ValueError(f"num_blocks must be >= 1, got {num_blocks}")
     return max(1, num_layers // num_blocks)
+
+
+# --------------------------------------------------------------------------------------------
+# Stream form (attn_res_impl "streams"): CUDA-graph capturable
+# --------------------------------------------------------------------------------------------
+# The sources travel as one [s, b, slots, h] tensor through the mHC plumbing: slot 0 is the
+# embedding, slot 1 + j the j-th block. The block being filled always sits in the next free slot,
+# so sealing it moves nothing -- the next block just starts one slot further. Every sublayer reads
+# a contiguous slice of slots (its source count is static), and its write replaces one slot. The
+# HybridStack wires each mixer's slice / slot / seed from the sublayer order and the block size.
+
+
+def attn_res_streams(config) -> bool:
+    """True when Block AttnRes runs in the CUDA-graph-capturable stream form."""
+    return bool(getattr(config, "attn_res", False)) and getattr(
+        config, "attn_res_impl", "state"
+    ) == "streams"
+
+
+def _attn_res_aggregate_streams(values, query, gain, eps):
+    """Softmax over depth of ``values`` [..., k, h] (the stream slots): [..., h]."""
+    qg = (query * gain).to(values.dtype)
+    dot = torch.einsum("...kd,d->...k", values, qg).float()
+    inv = torch.rsqrt(values.float().pow(2).mean(dim=-1) + eps)
+    weights = torch.softmax(dot * inv, dim=-1).to(values.dtype)
+    return torch.einsum("...k,...kd->...d", weights, values)
+
+
+_attn_res_streams_compiled = _maybe_compile(_attn_res_aggregate_streams)
+
+
+class AttnResStreamMixer(nn.Module):
+    """Block AttnRes around one sublayer, mHC mixer API (stream form; see above)."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.attnres = BlockAttnRes(
+            hidden_size=config.hidden_size,
+            eps=config.layernorm_epsilon,
+            query_init_std=config.attn_res_query_init_std,
+        )
+        self.live = self.slot = None
+        self.seed = True
+
+    def wire(self, live: int, slot: int, seed: bool) -> None:
+        """``live`` sources before the read (slots ``0 .. live-1``), the block slot this write
+        goes to, and whether the block starts here (``seed``: no partial sum yet)."""
+        self.live, self.slot, self.seed = live, slot, seed
+
+    def forward(self, streams: torch.Tensor):
+        return None, None, None
+
+    def read(self, streams: torch.Tensor, h_pre=None) -> torch.Tensor:
+        if self.live is None:
+            raise RuntimeError("attn_res streams: the mixer was not wired by its HybridStack")
+        from megatron.core.transformer import arch_metrics
+
+        sources = streams[..., : self.live, :]
+        if arch_metrics.active():
+            self.attnres._record_arch_metrics(list(sources.unbind(-2)))
+        return _attn_res_streams_compiled(
+            sources, self.attnres.query.float(), self.attnres.key_norm_weight.float(),
+            self.attnres.eps,
+        )
+
+    def write(self, streams, sublayer_out, h_post=None, h_res=None, lerp=None) -> torch.Tensor:
+        if lerp is not None:
+            raise NotImplementedError("attn_res streams with the nGPT LERP residual")
+        partial = sublayer_out if self.seed else streams[..., self.slot, :] + sublayer_out
+        return torch.cat(
+            (streams[..., : self.slot, :], partial.unsqueeze(-2), streams[..., self.slot + 1 :, :]),
+            dim=-2,
+        )
+
+    def record_metrics(self, streams, coeffs) -> None:
+        pass
+
+
+class AttnResStreamBoundary:
+    """Enter (the embedding in slot 0) and exit (the last written slot) of the stream form."""
+
+    def __init__(self, slots: int, last_slot: int):
+        self.slots, self.last_slot = slots, last_slot
+
+    def expand(self, embedding: torch.Tensor) -> torch.Tensor:
+        empty = embedding.new_zeros(*embedding.shape[:-1], self.slots - 1, embedding.shape[-1])
+        return torch.cat((embedding.unsqueeze(-2), empty), dim=-2)
+
+    def collapse(self, streams: torch.Tensor) -> torch.Tensor:
+        return streams[..., self.last_slot, :]
