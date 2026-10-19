@@ -207,7 +207,13 @@ class _MegatronSelfAttentionAdapter(MegatronModule):
         if hit is not None and hit[0] is cu and hit[1] == total:
             _CU_CACHE.move_to_end(id(cu))
             return hit[2]
-        out = cu.to(torch.long)
+        seg = int(os.environ.get("CKDA_BENCH_SEGMENT_ONLY", "0"))
+        if seg > 0:
+            # Benchmark only (measures what document masking costs inside CKDA): restart at every
+            # `seg` tokens -- the packed samples -- instead of at every document.
+            out = torch.arange(0, total + 1, seg, dtype=torch.long, device=cu.device)
+        else:
+            out = cu.to(torch.long)
         # Padding after the last document (a cu_seqlens shorter than the token count) becomes
         # its own segment, so it cannot leak into a document (one host sync per micro-batch).
         if int(out[-1]) != total:
