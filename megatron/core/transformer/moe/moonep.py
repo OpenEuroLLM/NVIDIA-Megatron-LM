@@ -161,11 +161,26 @@ def _is_shard(state, t):
 
 
 class _PlanHolder:
-    """Carries the current layer's MoonEP plan from the dispatch to the experts and combine."""
+    """Carries the current layer's MoonEP plan from the dispatch to the experts and combine.
+    ``streams`` (chunked path): (compute, communication) -- the backward of a communication op
+    records the tensors it shares with the compute stream (see _record)."""
 
     def __init__(self):
         self.plan = None
         self.cu_seqlens = None
+        self.streams = None
+
+
+def _record(state, stream, *tensors):
+    """record_stream for allocator-owned tensors used across the chunked path's two streams (the
+    caching allocator otherwise reuses -- or, with expandable segments, unmaps -- a block whose
+    Python reference is gone while the other stream still reads it). NVLink shard views are not
+    allocator memory and are skipped."""
+    if stream is None:
+        return
+    for t in tensors:
+        if t is not None and t.numel() and not _is_shard(state, t):
+            t.record_stream(stream)
 
 
 class _MoonEPDispatch(torch.autograd.Function):
@@ -177,7 +192,7 @@ class _MoonEPDispatch(torch.autograd.Function):
             hidden, weights_sk, topk, tokens_per_expert
         )
         holder.plan, holder.cu_seqlens = plan, cu_seqlens
-        ctx.state, ctx.plan = state, plan
+        ctx.state, ctx.plan, ctx.streams = state, plan, holder.streams
         ctx.mark_non_differentiable(cu_seqlens)
         return hidden_nvsh, w_nvs, cu_seqlens
 
@@ -188,12 +203,18 @@ class _MoonEPDispatch(torch.autograd.Function):
                 grad_hidden_nvsh.shape[0], dtype=torch.float32, device=grad_hidden_nvsh.device
             )
         grad_hidden_nvsh = grad_hidden_nvsh.contiguous()
+        grad_w_nvs = grad_w_nvs.float().contiguous()
+        if ctx.streams is not None:  # chunked: this runs on the communication stream
+            compute, comm = ctx.streams
+            _record(ctx.state, comm, grad_hidden_nvsh, grad_w_nvs)
         grad_hidden, grad_w_sk, _ = ctx.state.buffer.combine(
             plan=ctx.plan,
             hidden_nvsh=grad_hidden_nvsh,
             zero_copy=_is_shard(ctx.state, grad_hidden_nvsh),
-            route_weights_nvs=grad_w_nvs.float().contiguous(),
+            route_weights_nvs=grad_w_nvs,
         )
+        if ctx.streams is not None:
+            _record(ctx.state, compute, grad_hidden, grad_w_sk)
         return grad_hidden, grad_w_sk, None, None, None, None
 
 
@@ -207,16 +228,20 @@ class _MoonEPCombine(torch.autograd.Function):
         out, _, _ = state.buffer.combine(
             plan=plan, hidden_nvsh=out_nvsh, zero_copy=_is_shard(state, out_nvsh)
         )
-        ctx.state, ctx.plan = state, plan
+        ctx.state, ctx.plan, ctx.streams = state, plan, holder.streams
         return out
 
     @staticmethod
     def backward(ctx, grad_out):
         # zero copy: the experts' backward reads the output grad from the NVLink shard (fc2's
         # dgrad / wgrad consume it before fc1's dgrad overwrites the shard)
-        grad_nvsh, _, _, _ = ctx.state.buffer.dispatch(
-            grad_out.contiguous(), plan=ctx.plan, zero_copy=True
-        )
+        grad_out = grad_out.contiguous()
+        if ctx.streams is not None:  # chunked: this runs on the communication stream
+            compute, comm = ctx.streams
+            _record(ctx.state, comm, grad_out)
+        grad_nvsh, _, _, _ = ctx.state.buffer.dispatch(grad_out, plan=ctx.plan, zero_copy=True)
+        if ctx.streams is not None:
+            _record(ctx.state, compute, grad_nvsh)
         return grad_nvsh, None, None
 
 
@@ -345,7 +370,7 @@ class _MoonEPExperts(torch.autograd.Function):
         y = state.buffer.hidden_nvsh_buffer_view
         _gemm(w2, a, ffn2 // 2, y, hidden, splits, offsets, "TN")
         ctx.save_for_backward(x, h, a, w_nvs, splits, offsets)
-        ctx.module, ctx.plan, ctx.state = module, plan, state
+        ctx.module, ctx.plan, ctx.state, ctx.streams = module, plan, state, holder.streams
         ctx.weights = weights
         return y
 
@@ -379,11 +404,14 @@ class _MoonEPExperts(torch.autograd.Function):
         _wgrad(main1, gpools[0], x, hidden, grad_h, ffn2, splits, offsets)
         # the prefetched copies' grads -> their home ranks' main grads (collective)
         module.reduce_copies_grad(state, plan, main1, main2)
+        grad_w = grad_probs.squeeze(-1).to(w_nvs.dtype)
+        if ctx.streams is not None:  # chunked: the dispatch backward reads it on the comm stream
+            _record(state, ctx.streams[1], grad_w)
         dummies = []
         for w in weights:
             w.grad_added_to_main_grad = True
             dummies.append(torch.empty(1, dtype=w.dtype, device=w.device).expand_as(w))
-        return (grad_x, grad_probs.squeeze(-1).to(w_nvs.dtype), None, None, None, None, *dummies)
+        return (grad_x, grad_w, None, None, None, None, *dummies)
 
 
 class _ExpertWeights(torch.nn.Module):
@@ -681,6 +709,8 @@ class MoEMoonEPTokenDispatcher(MoETokenDispatcher):
         hs, ws, tk = hidden_states.split(Sc), weights_sk.split(Sc), self.topk.split(Sc)
         rm = self.routing_map.split(Sc)
         states = [self._chunk_state(c, Sc, H) for c in range(n)]
+        for holder in self.chunk_holders:
+            holder.streams = (cur, comm)
         dispatched = []
         for c in range(n):
             tpe = rm[c].sum(dim=0, dtype=torch.int32).contiguous()
