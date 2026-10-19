@@ -82,3 +82,28 @@ class TestAttnResStreams:
             torch.testing.assert_close(out, ref_out, rtol=0, atol=0)
             for k, g in ref_grads.items():
                 torch.testing.assert_close(grads[k], g, rtol=0, atol=0, msg=k)
+
+
+def test_streams_under_full_recompute():
+    """The stream form is plain tensors, so full activation recompute works (the state form
+    raises): the same outputs and gradients as without recompute."""
+    initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        torch.manual_seed(0)
+        ids = torch.randint(0, VOCAB, (B, S), device="cuda")
+        plain = _model("*E*E*E", "streams")
+        _perturb(plain)
+        recompute = _ldm_model("*E*E*E", "torch", depth_memory=False, attn_res=True,
+                               attn_res_impl="streams", attn_res_num_blocks=2,
+                               recompute_granularity="full", recompute_method="uniform",
+                               recompute_num_layers=1)
+        recompute.load_state_dict(plain.state_dict())
+        recompute.train()
+        out_a, g_a = _fwd_bwd(plain, ids)
+        out_b, g_b = _fwd_bwd(recompute, ids)
+        torch.testing.assert_close(out_b, out_a, rtol=1e-5, atol=1e-6)  # fp32 op order
+        for k, g in g_a.items():
+            torch.testing.assert_close(g_b[k], g, rtol=1e-4, atol=1e-6, msg=k)
+    finally:
+        Utils.destroy_model_parallel()

@@ -546,7 +546,12 @@ class HybridStack(MegatronModule):
             ):
                 raise NotImplementedError("per-layer embeddings with full activation recompute")
             full_recompute = self.config.recompute_granularity == 'full' and self.training
-            if depth_scheme and full_recompute and getattr(self.config, "attn_res", False):
+            if (
+                depth_scheme
+                and full_recompute
+                and getattr(self.config, "attn_res", False)
+                and self.attnres_stream_boundary is None
+            ):
                 # Block AttnRes keeps its block summaries in a Python state the layers mutate
                 # (layer._depth_state), which a recomputed chunk would replay against the
                 # already-advanced state.
