@@ -3645,6 +3645,12 @@ def _add_data_args(parser):
                        'only reads attention_mask for padding and arbitrary mask types, so the '
                        'dataloader mask is silently discarded. This also restarts RoPE at every '
                        'document boundary, making --reset-position-ids redundant.')
+    group.add_argument('--dataloader-document-segment-length', type=int, default=None,
+                       help='With --dataloader-inter-document-masking: also cut every sample at '
+                       'each multiple of this many tokens (a document boundary + position reset '
+                       'there). A sample of k x N tokens then trains exactly as k contiguous '
+                       'samples of N tokens in one packed micro-batch: fewer, larger micro-batches '
+                       '(packed sequences take micro batch 1) at the same context length N.')
     group.add_argument('--packed-doc-attention-log-cu-seqlens', type=int, default=0,
                        help='With --dataloader-inter-document-masking, print this rank\'s '
                        'cu_seqlens for the first N calls to get_batch. cu_seqlens is a few '

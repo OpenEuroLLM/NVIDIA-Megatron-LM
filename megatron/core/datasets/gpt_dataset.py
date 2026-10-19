@@ -81,6 +81,11 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     """When True, return cu_seqlens marking document boundaries within each sample so
     that attention is restricted to individual documents."""
 
+    document_segment_length: Optional[int] = None
+    """With inter_document_masking: also put a document boundary (and a position reset) at every
+    multiple of this many tokens, so a k x N-token sample is exactly k contiguous N-token samples
+    packed into one micro-batch (context length N)."""
+
     def __post_init__(self) -> None:
         """Do asserts and set fields post init"""
         super().__post_init__()
@@ -304,6 +309,13 @@ class GPTDataset(MegatronDataset):
                     document_lengths[-1] += shortfall
                 else:
                     document_lengths.append(shortfall)
+            seg = self.config.document_segment_length
+            if seg:
+                # cut at every multiple of seg as well: k contiguous seg-token samples in one
+                bounds = set(numpy.cumsum([0] + document_lengths).tolist())
+                bounds.update(range(0, self.config.sequence_length + 1, seg))
+                bounds = sorted(b for b in bounds if b <= self.config.sequence_length)
+                document_lengths = [b - a for a, b in zip(bounds[:-1], bounds[1:])]
             cu_seqlens = torch.tensor(numpy.cumsum([0] + document_lengths), dtype=torch.int32)
 
             max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
