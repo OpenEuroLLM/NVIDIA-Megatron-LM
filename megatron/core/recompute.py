@@ -10,6 +10,7 @@ from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.tensor_parallel import checkpoint_offload
 from megatron.core.transformer.transformer_layer import TransformerLayer
 
 if HAVE_TE:
@@ -176,6 +177,7 @@ def checkpointed_forward(
                     *args,
                 )
             else:
+                checkpoint_offload.arm()
                 hidden_states, context = tensor_parallel.checkpoint(
                     cf, self.config.distribute_saved_activations, *args
                 )
@@ -191,6 +193,7 @@ def checkpointed_forward(
             if (start + layer_offset) in extract_layer_indices:
                 intermediate_hidden_states.append(hidden_states)
 
+    checkpoint_offload.new_sequence()
     if self.config.recompute_method == 'uniform':
         # Uniformly divide the total number of layers and checkpoint
         # the input activation of each divided chunk.

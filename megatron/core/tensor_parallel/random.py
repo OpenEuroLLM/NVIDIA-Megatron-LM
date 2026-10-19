@@ -596,6 +596,9 @@ class CheckpointFunction(torch.autograd.Function):
     ) -> _R:
         """Forward pass."""
         _set_checkpointing()
+        from megatron.core.tensor_parallel import checkpoint_offload
+
+        armed = checkpoint_offload.take_armed()  # before run_function: nested checkpoints are not
 
         ctx.run_function = run_function
         ctx.distribute_saved_activations = distribute_saved_activations
@@ -614,8 +617,16 @@ class CheckpointFunction(torch.autograd.Function):
                 args[0], split_tensor_into_1d_equal_chunks(args[0].data, new_buffer=True)
             )
 
-        # Store everything.
-        ctx.save_for_backward(*args)
+        # Store everything (RECOMPUTE_OFFLOAD: the chunk input in pinned host memory instead).
+        from megatron.core.tensor_parallel import checkpoint_offload
+
+        ctx.offload_slot = None
+        if armed and not distribute_saved_activations:
+            ctx.offload_slot = checkpoint_offload.register(args[0])
+        if ctx.offload_slot is not None:
+            ctx.save_for_backward(None, *args[1:])
+        else:
+            ctx.save_for_backward(*args)
 
         _unset_checkpointing()
         return outputs
@@ -632,6 +643,13 @@ class CheckpointFunction(torch.autograd.Function):
         _set_checkpointing()
 
         inputs = ctx.saved_tensors
+        slot = ctx.offload_slot
+        if slot is not None:
+            ctx.offload_slot = None
+            inputs = (slot.get(), *inputs[1:])
+            if slot.prev is not None:
+                slot.prev.fetch()  # the next chunk to run backward copies back under this one
+            slot.prev = None
         if ctx.distribute_saved_activations:
             safely_set_viewless_tensor_data(
                 inputs[0], gather_split_1d_tensor(inputs[0].data).view(ctx.input_0_shape)
