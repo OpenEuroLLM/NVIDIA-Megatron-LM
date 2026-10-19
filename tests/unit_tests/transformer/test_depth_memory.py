@@ -124,3 +124,93 @@ def test_config_validation():
         _config(depth_memory_groups=5)
     with pytest.raises(ValueError, match="CUDA-graph"):
         _config(cuda_graph_impl="local")
+
+
+# ---- stream form (depth_memory_impl torch): static workspace + unwinding backward ----------
+
+
+def _stream_chain(cfg, sites: int):
+    from megatron.core.transformer.depth_memory import DepthMemoryMixer, DepthMemoryStreamBoundary
+    from megatron.core.transformer.depth_memory_state import make_workspace
+
+    boundary = DepthMemoryStreamBoundary(cfg)
+    mixers = [DepthMemoryMixer(cfg) for _ in range(sites)]
+    ws = make_workspace(cfg, total_edges=sites + 1)
+    boundary.wire(ws)
+    for e, m in enumerate(mixers, start=1):
+        m.wire(e, ws)
+    return boundary, mixers
+
+
+@pytest.mark.parametrize("sites", [1, 4])
+def test_stream_form_matches_the_reference(sites):
+    """The torch workspace (state in static buffers, M unwound in the backward) gives the
+    reference's outputs and every parameter / input gradient."""
+    torch.manual_seed(0)
+    cfg = _config(depth_memory_impl="torch")
+    boundary, mixers = _stream_chain(cfg, sites)
+    ref_boundary, ref_sites = DepthMemoryBoundary(cfg), [DepthMemorySite(cfg) for _ in range(sites)]
+    with torch.no_grad():  # random (not init) parameters, so gates / gains / forgetting matter
+        for p in [*boundary.parameters(), *(p for m in mixers for p in m.parameters())]:
+            p.add_(torch.randn_like(p) * 0.3)
+    # site i's read is owned by the writer before it (the boundary for the first)
+    ref_boundary.embed_write.load_state_dict(boundary.embed_write.state_dict())
+    ref_boundary.final_read.load_state_dict(mixers[-1].next_query.state_dict())
+    queries = [boundary.first_query] + [m.next_query for m in mixers[:-1]]
+    for site, mixer, query in zip(ref_sites, mixers, queries):
+        site.read.load_state_dict(query.state_dict())
+        site.write.load_state_dict(mixer.write_site.state_dict())
+    lins = [torch.nn.Linear(H, H) for _ in range(sites)]
+    emb = torch.randn(7, 3, H)
+
+    e1 = emb.clone().requires_grad_(True)
+    streams = boundary.expand(e1)
+    for mixer, lin in zip(mixers, lins):
+        streams = mixer.write(streams, torch.tanh(lin(mixer.read(streams))))
+    out = boundary.collapse(streams)
+
+    e2 = emb.clone().requires_grad_(True)
+    state = ref_boundary.enter(e2)
+    for site, lin in zip(ref_sites, lins):
+        site.write_output(state, torch.tanh(lin(site.read_input(state))))
+    ref = ref_boundary.exit(state)
+    torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-5)
+
+    w = torch.randn_like(ref)
+    grads = torch.autograd.grad((out * w).sum(), [e1, *boundary.parameters(),
+                                                  *(p for m in mixers for p in m.parameters())])
+    # the stream-form parameter order: boundary (embed_write, first_query), then per mixer
+    # (write_site, next_query)
+    ref_params = [*ref_boundary.embed_write.parameters(), *ref_sites[0].read.parameters()]
+    nexts = [s.read for s in ref_sites[1:]] + [ref_boundary.final_read]
+    for site, nxt in zip(ref_sites, nexts):
+        ref_params += [*site.write.parameters(), *nxt.parameters()]
+    ref_grads = torch.autograd.grad((ref * w).sum(), [e2, *ref_params])
+    names = ["emb"] + [n for n, _ in boundary.named_parameters()] + [
+        f"{i}.{n}" for i, m in enumerate(mixers) for n, _ in m.named_parameters()]
+    for name, g, rg in zip(names, grads, ref_grads):
+        torch.testing.assert_close(g, rg, rtol=1e-4, atol=1e-5, msg=name)
+
+
+def test_stream_form_runs_again_with_the_same_buffers():
+    """Two forward / backward passes (micro-batches) on one workspace: the same buffers, and
+    the second pass is as correct as the first (edge 0 resets the state)."""
+    torch.manual_seed(0)
+    cfg = _config(depth_memory_impl="torch")
+    boundary, mixers = _stream_chain(cfg, 2)
+
+    def loss(x):
+        s = boundary.expand(x)
+        for m in mixers:
+            s = m.write(s, torch.sin(m.read(s)))
+        return boundary.collapse(s).square().sum()
+
+    x = torch.randn(5, 2, H)
+    g1 = torch.autograd.grad(loss(x), list(boundary.parameters()))
+    ws = mixers[0]._workspace[0]
+    ptr = ws.m.data_ptr()
+    loss(torch.randn(5, 2, H)).backward()  # another micro-batch in between
+    g2 = torch.autograd.grad(loss(x), list(boundary.parameters()))
+    assert ws.m.data_ptr() == ptr
+    for a, b in zip(g1, g2):
+        torch.testing.assert_close(a, b)

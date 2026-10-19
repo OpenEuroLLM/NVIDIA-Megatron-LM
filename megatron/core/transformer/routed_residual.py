@@ -330,7 +330,12 @@ class RoutedStreamMixer(nn.Module):
 
 
 def build_stream_mixer(config) -> nn.Module:
-    """The mHC mixer of one sublayer: dense mHC, or routed when ``mhc_routed_topk``."""
+    """The mHC mixer of one sublayer: dense mHC, or routed when ``mhc_routed_topk``; the Linear
+    Depth Memory mixer in its stream form (depth_memory_impl torch / cute)."""
+    from megatron.core.transformer.depth_memory import DepthMemoryMixer, ldm_streams
+
+    if ldm_streams(config):
+        return DepthMemoryMixer(config)
     topk = getattr(config, "mhc_routed_topk", 0)
     if topk:
         return RoutedStreamMixer(

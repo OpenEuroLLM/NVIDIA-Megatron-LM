@@ -276,8 +276,13 @@ class HybridStack(MegatronModule):
         self.num_layers_per_pipeline_rank = len(self.layers)
 
         # Linear Depth Memory: the embedding write and the final read (depth_memory.py)
+        from megatron.core.transformer.depth_memory import ldm_streams
+
         self.ldm_boundary = None
-        if getattr(self.config, "depth_memory", False):
+        self.ldm_stream_boundary = None
+        if ldm_streams(self.config):
+            self._wire_depth_memory()
+        elif getattr(self.config, "depth_memory", False):
             from megatron.core.transformer.depth_memory import DepthMemoryBoundary
 
             self.ldm_boundary = DepthMemoryBoundary(self.config)
@@ -678,6 +683,38 @@ class HybridStack(MegatronModule):
             return hidden_states
         return ple(hidden_states, self._input_ids)
 
+    def _wire_depth_memory(self) -> None:
+        """Linear Depth Memory, stream form: the boundary, the static state workspace and every
+        mixer's step (edge 0 the embedding write, then the sublayers in execution order)."""
+        from megatron.core.transformer.depth_memory import (
+            DepthMemoryMixer,
+            DepthMemoryStreamBoundary,
+        )
+        from megatron.core.transformer.depth_memory_state import make_workspace
+
+        if self._loop_schedule_requested():
+            raise NotImplementedError("depth_memory with looped (weight-tied) depth")
+        mixers = []
+        for layer in self.layers:
+            if isinstance(layer, TransformerLayer):
+                candidates = (layer.mhc_attn_mixer, layer.mhc_mlp_mixer)
+            else:
+                scheme = getattr(layer, "residual_scheme", None)
+                candidates = (scheme.mhc_mixer if scheme is not None else None,)
+            mixers += [m for m in candidates if isinstance(m, DepthMemoryMixer)]
+        if not mixers:
+            raise ValueError("depth_memory: no sublayer has a depth-memory mixer")
+        self.ldm_stream_boundary = DepthMemoryStreamBoundary(self.config)
+        for param in self.ldm_stream_boundary.parameters():
+            param.sequence_parallel = self.config.sequence_parallel
+        self.ldm_workspace = make_workspace(self.config, total_edges=len(mixers) + 1)
+        self.ldm_stream_boundary.wire(self.ldm_workspace)
+        for edge, mixer in enumerate(mixers, start=1):
+            mixer.wire(edge, self.ldm_workspace)
+
+    def _loop_schedule_requested(self) -> bool:
+        return build_loop_schedule(self.config) is not None
+
     def _depth_enter(self, hidden_states: Tensor):
         """Widen the residual for mHC or build the Block AttnRes state.
 
@@ -693,6 +730,10 @@ class HybridStack(MegatronModule):
         """
         mhc = getattr(self.config, "mhc", False)
         attn_res = getattr(self.config, "attn_res", False)
+        if self.ldm_stream_boundary is not None:
+            if not (self.pre_process and self.post_process):
+                raise NotImplementedError("depth_memory needs the whole stack on one stage")
+            return self.ldm_stream_boundary.expand(hidden_states), None
         if self.ldm_boundary is not None:
             if not (self.pre_process and self.post_process):
                 raise NotImplementedError("depth_memory needs the whole stack on one stage")
@@ -740,6 +781,8 @@ class HybridStack(MegatronModule):
         """Collapse the depth state on the last stage, else pack it for the next one."""
         from megatron.core.transformer.depth_residual import depth_payload_slots, pack_payload
 
+        if self.ldm_stream_boundary is not None and hidden_states.dim() == 4:
+            return self.ldm_stream_boundary.collapse(hidden_states)
         if getattr(self.config, "mhc", False) and hidden_states.dim() == 4:
             from megatron.core.transformer.mhc import collapse_streams
 

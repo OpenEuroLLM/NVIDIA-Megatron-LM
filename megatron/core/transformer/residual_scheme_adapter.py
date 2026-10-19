@@ -67,7 +67,9 @@ class ResidualSchemeAdapter(nn.Module):
                 post_layer_norm=config.ngpt_post_layer_norm_attn,
                 eps=config.layernorm_epsilon,
             )
-        if getattr(config, "mhc", False):
+        from megatron.core.transformer.depth_memory import ldm_streams
+
+        if getattr(config, "mhc", False) or ldm_streams(config):
             from megatron.core.transformer.routed_residual import build_stream_mixer
 
             self.mhc_mixer = build_stream_mixer(config)

@@ -222,3 +222,120 @@ class DepthMemoryBoundary(nn.Module):
 def depth_memory_site(config) -> Optional[DepthMemorySite]:
     """A site for one sublayer when LDM is on."""
     return DepthMemorySite(config) if getattr(config, "depth_memory", False) else None
+
+
+# --------------------------------------------------------------------------------------------
+# Stream form (depth_memory_impl "torch" / "cute"): CUDA-graph capturable
+# --------------------------------------------------------------------------------------------
+# The residual travels as [s, b, 2, h] "streams" through the mHC plumbing: slot 0 is the stream
+# x, slot 1 the next sublayer's memory read r. The state (M, P) lives in a static workspace
+# (depth_memory_state.py) that every step updates in place; each write site runs the fused step
+# of the paper's kernels -- write its output, then read with the NEXT site's query (taken from
+# the updated stream, as the next read's query source is). So a sublayer reads x + r from its
+# input streams, and its write hands the next sublayer (x', r'), with nothing on the module that
+# a CUDA graph would bake in.
+
+
+def ldm_streams(config) -> bool:
+    """True when Linear Depth Memory runs in the CUDA-graph-capturable stream form."""
+    return bool(getattr(config, "depth_memory", False)) and getattr(
+        config, "depth_memory_impl", "reference"
+    ) in ("torch", "cute")
+
+
+class DepthMemoryMixer(nn.Module):
+    """The read before and the fused write (+ next read) after one sublayer, mHC mixer API.
+
+    The mixer owns its write (key, weight, forgetting) and the query network of the read that
+    FOLLOWS it -- the next sublayer's, or the final read before the LM head for the last mixer --
+    because the read is fused into its write step: a CUDA graph of this layer then touches only
+    its own parameters. ``edge`` (this site's step) and the workspace are wired by the HybridStack.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.write_site = DepthMemoryWrite(config)  # this sublayer's key / weight + forgetting
+        self.next_query = DepthMemoryRead(config)  # the following read's query network + gain
+        for p in self.parameters():
+            p.is_residual_mixer = True
+        self.edge = None
+        self._workspace = None  # a plain list: the workspace is not a module
+
+    def wire(self, edge: int, workspace) -> None:
+        self.edge, self._workspace = edge, [workspace]
+
+    # -- mHC mixer API (TransformerLayer._mhc_read / _mhc_write, ResidualSchemeAdapter) --------
+    def forward(self, streams: torch.Tensor):
+        return None, None, None
+
+    def read(self, streams: torch.Tensor, h_pre=None) -> torch.Tensor:
+        return streams[..., 0, :] + streams[..., 1, :]
+
+    def write(self, streams, sublayer_out, h_post=None, h_res=None, lerp=None) -> torch.Tensor:
+        if lerp is not None:
+            raise NotImplementedError("depth_memory with the nGPT LERP residual")
+        if self.edge is None:
+            raise RuntimeError("depth_memory: the mixer was not wired by its HybridStack")
+        stream = streams[..., 0, :] + sublayer_out
+        read = ldm_fused_step(
+            self.write_site, self.next_query, self._workspace[0], self.edge, stream, sublayer_out
+        )
+        return torch.stack((stream, read), dim=-2)
+
+    def record_metrics(self, streams, coeffs) -> None:
+        pass
+
+
+def _query(read: "DepthMemoryRead", stream: torch.Tensor):
+    query, gate = read.net(stream)
+    return query * (gate * read.read_gain.float()).unsqueeze(-1)
+
+
+def ldm_fused_step(write, next_read, workspace, edge, stream, value) -> torch.Tensor:
+    """Write ``value`` under the key of ``stream``, then read with ``next_read``'s query of
+    ``stream``; returns the read as ``[..., h]`` in the stream's dtype."""
+    from megatron.core.transformer.depth_memory_state import depth_memory_step
+
+    shape = stream.shape
+    n = stream.numel() // shape[-1]
+    workspace.ensure(n, stream.device)
+    key, weight = write.net(stream)
+    scale = weight.clamp_min(1e-6).sqrt()
+    lam = torch.sigmoid(write.forget_logit.float()).clamp_min(1e-6)
+    query = _query(next_read, stream)
+    g = key.shape[-2]
+    read = depth_memory_step(
+        workspace,
+        edge,
+        key.reshape(n, g, -1),
+        query.reshape(n, g, -1),
+        value.reshape(n, g, shape[-1] // g),
+        scale.reshape(n, g),
+        lam,
+    )
+    return read.reshape(shape).to(stream.dtype)
+
+
+class DepthMemoryStreamBoundary(nn.Module):
+    """Stream form: the embedding write (edge 0) with the first sublayer's query; the final read
+    is the last mixer's (its ``next_query``), so ``collapse`` only adds it to the stream."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.embed_write = DepthMemoryWrite(config)
+        self.first_query = DepthMemoryRead(config)
+        for p in self.parameters():
+            p.is_residual_mixer = True
+        self._workspace = None
+
+    def wire(self, workspace) -> None:
+        self._workspace = [workspace]
+
+    def expand(self, embedding: torch.Tensor) -> torch.Tensor:
+        read = ldm_fused_step(
+            self.embed_write, self.first_query, self._workspace[0], 0, embedding, embedding
+        )
+        return torch.stack((embedding, read), dim=-2)
+
+    def collapse(self, streams: torch.Tensor) -> torch.Tensor:
+        return streams[..., 0, :] + streams[..., 1, :]

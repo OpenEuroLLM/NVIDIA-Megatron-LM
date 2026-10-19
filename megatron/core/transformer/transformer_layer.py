@@ -526,8 +526,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         self.attnres_attn = None
         self.attnres_mlp = None
         self._depth_state = None
-        if getattr(self.config, "mhc", False):
-            # Dense mHC, or routed residual streams with mhc_routed_topk.
+        from megatron.core.transformer.depth_memory import ldm_streams
+
+        if getattr(self.config, "mhc", False) or ldm_streams(self.config):
+            # Dense mHC, routed residual streams with mhc_routed_topk, or the stream form of
+            # Linear Depth Memory.
             from megatron.core.transformer.routed_residual import build_stream_mixer
 
             self.mhc_attn_mixer = build_stream_mixer(self.config) if has_attn else None
@@ -548,7 +551,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # matrix memory the HybridStack stashes on `_depth_state` (as Block AttnRes').
         self.ldm_attn = None
         self.ldm_mlp = None
-        if getattr(self.config, "depth_memory", False):
+        if getattr(self.config, "depth_memory", False) and not ldm_streams(self.config):
             from megatron.core.transformer.depth_memory import DepthMemorySite
 
             self.ldm_attn = DepthMemorySite(self.config) if has_attn else None

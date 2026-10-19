@@ -1992,6 +1992,20 @@ class TransformerConfig(ModelParallelConfig):
     depth_memory_alpha: float = 1.0
     """Initial inverse covariance P = alpha I (ridge 1 / alpha) of the LDM fit."""
 
+    depth_memory_impl: str = "reference"
+    """LDM implementation. "reference": every write's state is an autograd tensor, kept on the
+    layers (no CUDA graphs). "torch": the state in a static workspace with the paper's unwinding
+    backward (depth_memory_state.py), the residual as [s, b, 2, h] streams -- CUDA-graph
+    capturable. "cute": the same with the paper's CuTe DSL kernels (cute_kernels cute_ldm;
+    Hopper / Blackwell)."""
+
+    depth_memory_window: int = 4
+    """LDM "cute": the window E of deferred writes (the paper: 4)."""
+
+    depth_memory_covariance_dtype: str = "float32"
+    """LDM "cute": dtype of the running covariance P ("float32" or "bfloat16"; the paper's BF16
+    default can drift indefinite in deep stacks)."""
+
     # ---- Looped (weight-tied) depth ----
     # A prelude/loop/coda stack: the middle block is built once and applied
     # ``loop_iterations`` times, so effective depth exceeds parameter depth. The
@@ -2048,9 +2062,14 @@ class TransformerConfig(ModelParallelConfig):
                 )
             if self.pipeline_model_parallel_size > 1:
                 raise ValueError("depth_memory does not support pipeline parallelism yet")
-            if self.cuda_graph_impl != "none" or self.enable_cuda_graph:
+            if self.depth_memory_impl not in ("reference", "torch", "cute"):
+                raise ValueError("depth_memory_impl must be reference, torch or cute")
+            if self.depth_memory_impl == "reference" and (
+                self.cuda_graph_impl != "none" or self.enable_cuda_graph
+            ):
                 raise ValueError(
-                    "depth_memory keeps its state on the layers (not CUDA-graph capturable)"
+                    "depth_memory_impl=reference keeps its state on the layers (not CUDA-graph "
+                    "capturable); use depth_memory_impl torch or cute"
                 )
             if self.recompute_granularity == "full":
                 raise ValueError("depth_memory does not support full activation recompute")
