@@ -401,6 +401,11 @@ def loss_func(
     return loss, num_tokens, report
 
 
+def _has_mamba_layers(args):
+    pattern = getattr(args, "hybrid_layer_pattern", None) or ""
+    return "M" in pattern
+
+
 def forward_step(data_iterator, model: HybridModel, return_schedule_plan: bool = False):
     """Forward training step.
 
@@ -451,7 +456,12 @@ def forward_step(data_iterator, model: HybridModel, return_schedule_plan: bool =
             max_seqlen_kv=int(max_seqlen.item()),
             local_cp_size=int(local_cp_size.item()) if local_cp_size is not None else None,
             cp_group=hybrid_cp_group,
-            total_tokens=int(cu_seqlens_for_params[-1].item()),
+            # total_tokens (and the seq_idx PackedSeqParams derives from it) are for Mamba
+            # layers only, and cost two device syncs per micro-batch on every stage (.item()
+            # and a repeat_interleave sized on the host): skip them without Mamba layers.
+            total_tokens=(
+                int(cu_seqlens_for_params[-1].item()) if _has_mamba_layers(args) else None
+            ),
             tokens_per_sample=args.seq_length,
         )
 
