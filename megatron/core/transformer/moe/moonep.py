@@ -280,7 +280,9 @@ def _count_optimizer_step(optimizer, args, kwargs):
     _OPTIMIZER_STEPS[0] += 1
 
 
-torch.optim.optimizer.register_optimizer_step_post_hook(_count_optimizer_step)
+from torch.optim.optimizer import register_optimizer_step_post_hook  # noqa: E402
+
+register_optimizer_step_post_hook(_count_optimizer_step)
 
 
 def _stacked_view(tensors):
