@@ -3637,6 +3637,9 @@ def _add_data_args(parser):
     group.add_argument('--reset-attention-mask', action='store_true',
                        help='Reset self attention mask after '
                        'end-of-document token.')
+    group.add_argument('--dataloader-add-bos', action='store_true',
+                       help='Prepend the tokenizer BOS token to every document at load time '
+                       '(the tokenized data carries only an EOD at each document end).')
     group.add_argument('--dataloader-inter-document-masking', action='store_true',
                        help='Return cu_seqlens marking document boundaries '
                        'within each sample so that attention is restricted '

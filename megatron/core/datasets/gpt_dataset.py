@@ -1,5 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import hashlib
+import json
 import logging
 import os
 import time
@@ -81,6 +83,12 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     """When True, return cu_seqlens marking document boundaries within each sample so
     that attention is restricted to individual documents."""
 
+    add_bos: bool = False
+    """Prepend the tokenizer's BOS token to every document at load time (the tokenized data
+    carries only an EOD at each document end): each document reads as [BOS] + tokens, its
+    length +1 in the sample index, so samples and document boundaries (cu_seqlens) include it.
+    Part of the dataset's cache key only when set (existing caches stay valid)."""
+
     document_segment_length: Optional[int] = None
     """With inter_document_masking: also put a document boundary (and a position reset) at every
     multiple of this many tokens, so a k x N-token sample is exactly k contiguous N-token samples
@@ -138,6 +146,19 @@ class GPTDataset(MegatronDataset):
         super().__init__(
             indexed_dataset, dataset_path, indexed_indices, num_samples, index_split, config
         )
+        self._bos = None
+        if getattr(self.config, "add_bos", False):
+            self._bos = self.config.tokenizer.bos
+            assert self._bos is not None, "add_bos needs a tokenizer with a BOS token"
+            # in the cache key only when set: indices built with and without BOS never mix,
+            # and every cache built before this option keeps its key
+            self.unique_identifiers["add_bos"] = True
+            self.unique_description = json.dumps(
+                self.unique_identifiers, indent=4, default=lambda obj: obj.unique_identifiers
+            )
+            self.unique_description_hash = hashlib.md5(
+                self.unique_description.encode("utf-8"), usedforsecurity=False
+            ).hexdigest()
         self.masks_and_position_ids_are_cacheable = not any(
             [
                 self.config.reset_position_ids,
@@ -362,6 +383,19 @@ class GPTDataset(MegatronDataset):
 
         return result
 
+    def _get_document(self, doc: int, offset: int = 0, length: Optional[int] = None):
+        """Tokens ``[offset, offset + length)`` of document ``doc`` -- with add_bos, of the virtual
+        document [BOS] + tokens (offsets shift by one, offset 0 is the BOS)."""
+        if self._bos is None:
+            return self.dataset.get(doc, offset=offset, length=length)
+        if offset > 0:
+            return self.dataset.get(doc, offset=offset - 1, length=length)
+        if length is not None and length <= 1:
+            dtype = self.dataset.get(doc, offset=0, length=1).dtype
+            return numpy.array([self._bos], dtype=dtype)[: max(length, 0)]
+        inner = self.dataset.get(doc, offset=0, length=None if length is None else length - 1)
+        return numpy.concatenate([numpy.array([self._bos], dtype=inner.dtype), inner])
+
     def _query_document_sample_shuffle_indices(
         self, idx: int
     ) -> Tuple[numpy.ndarray, numpy.ndarray, list]:
@@ -403,7 +437,7 @@ class GPTDataset(MegatronDataset):
 
             # Add the entire sample
             sample_parts.append(
-                self.dataset.get(
+                self._get_document(
                     self.document_index[doc_index_beg],
                     offset=int(doc_index_beg_offset),
                     length=doc_index_end_offset
@@ -426,7 +460,7 @@ class GPTDataset(MegatronDataset):
                     else doc_index_end_offset + self.config.add_extra_token_to_sequence
                 )
                 sample_parts.append(
-                    self.dataset.get(self.document_index[i], offset=int(offset), length=length)
+                    self._get_document(self.document_index[i], offset=int(offset), length=length)
                 )
         assert len(document_ids) == len(
             sample_parts
@@ -581,7 +615,10 @@ class GPTDataset(MegatronDataset):
 
             assert document_index.dtype == numpy.int32
             assert self.dataset.sequence_lengths.dtype == numpy.int32
-            if len(document_index) * 2 > len(self.dataset.sequence_lengths):
+            if self._bos is not None:
+                # every document one token longer: its BOS
+                sequence_lengths_for_cpp = (self.dataset.sequence_lengths + 1).astype(numpy.int32)
+            elif len(document_index) * 2 > len(self.dataset.sequence_lengths):
                 # If "access density" of sequence_lengths is high, force load the mmap-ed array
                 # into memory by making a copy.
                 #
@@ -683,7 +720,8 @@ class GPTDataset(MegatronDataset):
         Returns:
             int: The number of tokens in a single epoch
         """
-        return int(numpy.sum(self.dataset.sequence_lengths[self.indices]))
+        bos = len(self.indices) if self._bos is not None else 0  # one BOS per document
+        return int(numpy.sum(self.dataset.sequence_lengths[self.indices])) + bos
 
     def _get_num_epochs(self, num_tokens_per_epoch: int) -> int:
         """Calculate the number of epochs
