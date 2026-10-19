@@ -171,6 +171,21 @@ class _PlanHolder:
         self.streams = None
 
 
+# MOONEP_CHUNK_DEBUG (chunked path): "keepalive" keeps every tensor the path touches alive until the
+# next optimizer step (rules out allocator lifetimes); "serial" makes the compute stream wait for each
+# communication op right away (same kernels, no concurrency).
+_CHUNK_DEBUG = os.environ.get("MOONEP_CHUNK_DEBUG", "")
+_KEEPALIVE = {"step": -1, "tensors": []}
+
+
+def _keep(*tensors):
+    if _CHUNK_DEBUG != "keepalive":
+        return
+    if _KEEPALIVE["step"] != _OPTIMIZER_STEPS[0]:
+        _KEEPALIVE["step"], _KEEPALIVE["tensors"] = _OPTIMIZER_STEPS[0], []
+    _KEEPALIVE["tensors"].extend(t for t in tensors if isinstance(t, torch.Tensor))
+
+
 def _record(state, stream, *tensors):
     """record_stream for allocator-owned tensors used across the chunked path's two streams (the
     caching allocator otherwise reuses -- or, with expandable segments, unmaps -- a block whose
@@ -215,6 +230,7 @@ class _MoonEPDispatch(torch.autograd.Function):
         )
         if ctx.streams is not None:
             _record(ctx.state, compute, grad_hidden, grad_w_sk)
+            _keep(grad_hidden_nvsh, grad_w_nvs, grad_hidden, grad_w_sk)
         return grad_hidden, grad_w_sk, None, None, None, None
 
 
@@ -242,6 +258,7 @@ class _MoonEPCombine(torch.autograd.Function):
         grad_nvsh, _, _, _ = ctx.state.buffer.dispatch(grad_out, plan=ctx.plan, zero_copy=True)
         if ctx.streams is not None:
             _record(ctx.state, compute, grad_nvsh)
+            _keep(grad_out, grad_nvsh)
         return grad_nvsh, None, None
 
 
@@ -407,6 +424,7 @@ class _MoonEPExperts(torch.autograd.Function):
         grad_w = grad_probs.squeeze(-1).to(w_nvs.dtype)
         if ctx.streams is not None:  # chunked: the dispatch backward reads it on the comm stream
             _record(state, ctx.streams[1], grad_w)
+            _keep(grad_w, grad_y, grad_a, grad_h)
         dummies = []
         for w in weights:
             w.grad_added_to_main_grad = True
@@ -721,6 +739,9 @@ class MoEMoonEPTokenDispatcher(MoETokenDispatcher):
                 )
             ev = torch.cuda.Event()
             ev.record(comm)
+            if _CHUNK_DEBUG == "serial":
+                cur.wait_event(ev)
+            _keep(hs[c], ws[c], tk[c], tpe, x, w, cu)
             dispatched.append((x, w, cu, ev, tpe))
         self._chunked_shared_output = (
             shared_experts(hidden_states) if shared_experts is not None else None
@@ -737,9 +758,13 @@ class MoEMoonEPTokenDispatcher(MoETokenDispatcher):
             comm.wait_event(ev)
             with torch.cuda.stream(comm):
                 outs.append(_MoonEPCombine.apply(y, states[c], self.chunk_holders[c]))
+            if _CHUNK_DEBUG == "serial":
+                cur.wait_stream(comm)
+            _keep(y, outs[-1])
             y.record_stream(comm)
             tpe.record_stream(comm)
         cur.wait_stream(comm)
+        _keep(hidden_states, weights_sk, self.topk, self.routing_map)
         for o in outs:
             o.record_stream(cur)
         self.holder.plan = self.chunk_holders[-1].plan  # for callers that inspect the plan
