@@ -44,6 +44,7 @@ from megatron.core.transformer.moe.token_dispatcher import MoETokenDispatcher
 try:
     import moonep  # noqa: F401
     from moonep.buffer import create_nvl_dist_tensor, pad_dim0_for_alignment
+    from moonep.inter_rank_sync import launch_inter_rank_sync
 
     HAVE_MOONEP = True
 except ImportError:  # pragma: no cover
@@ -135,6 +136,12 @@ class _MoonEPState:
 
     def reduce_grad(self, plan, local_grads, shapes):
         pools = self.grad_pools(shapes)
+        # reduce_grad PULLS: every rank reads the other ranks' reduce pools, and the caller must
+        # make sure those are written (MoonEP's Buffer.reduce_grad contract). Fence all EP ranks
+        # on this stream, after this rank's weight-grad GEMMs into its pools; without it a fast
+        # rank read a peer's pool before the peer's fc1 wgrad landed (wrong dw1 of the
+        # prefetched experts, visible with MOONEP_CHUNKS > 1, latent before).
+        launch_inter_rank_sync(self.buffer._require_ctx())
         self.buffer.reduce_grad(
             plan=plan,
             local_gate_grad=local_grads[0],
