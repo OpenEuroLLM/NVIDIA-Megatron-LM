@@ -72,7 +72,14 @@ from .optimizer import (
     param_group_identifier_keys,
 )
 from .optimizer_config import OptimizerConfig
-from .param_layout import FullParamLayout, PerBufferParamLayout, pad_bucket_end, pad_param_start
+from .param_layout import (
+    FullParamLayout,
+    PerBufferParamLayout,
+    continues_group,
+    group_contiguous,
+    pad_bucket_end,
+    pad_param_start,
+)
 
 logger = getLogger(__name__)
 
@@ -551,8 +558,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             bucket_indices.append((bucket_start_index, bucket_end_index))
             return bucket_end_index, bucket_id + 1
 
-        for param in params[::-1]:
+        ordered = group_contiguous(list(params[::-1]))
+        for position, param in enumerate(ordered):
             param_start_index = pad_param_start(param_start_index)
+            open_group = continues_group(
+                param, ordered[position + 1] if position + 1 < len(ordered) else None
+            )
 
             # Split shared embedding params into separate bucket.
             if _does_param_require_new_bucket(param) and len(bucket_params) > 0:
@@ -568,8 +579,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             bucket_params.add(param)
 
             if (
-                bucket_size is not None and (param_end_index - bucket_start_index) >= bucket_size
-            ) or _does_param_require_new_bucket(param):
+                (bucket_size is not None and (param_end_index - bucket_start_index) >= bucket_size)
+                or _does_param_require_new_bucket(param)
+            ) and not open_group:
                 bucket_start_index, bucket_id = _finalize_bucket(
                     param_end_index, bucket_start_index, bucket_id
                 )

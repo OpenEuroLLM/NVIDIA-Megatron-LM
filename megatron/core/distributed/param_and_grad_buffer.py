@@ -982,13 +982,23 @@ def _compute_default_per_buffer_param_layout(
     bucket_params = set()
     bucket_id = 0
 
-    for param in params[::-1]:
+    from ..optimizer.param_layout import continues_group, group_contiguous
+
+    ordered = group_contiguous(list(params[::-1]))
+    for position, param in enumerate(ordered):
         this_numel = param.data.nelement()
         param_end_index = param_start_index + this_numel
         param_index_map[param] = (param_start_index, param_end_index, bucket_id)
         bucket_params.add(param)
+        open_group = continues_group(
+            param, ordered[position + 1] if position + 1 < len(ordered) else None
+        )
 
-        if bucket_size is not None and (param_end_index - bucket_start_index) >= bucket_size:
+        if (
+            bucket_size is not None
+            and (param_end_index - bucket_start_index) >= bucket_size
+            and not open_group
+        ):
             per_bucket_numel_unpadded.append(param_end_index - bucket_start_index)
             bucket_indices.append((bucket_start_index, param_end_index))
             bucket_start_index = param_end_index

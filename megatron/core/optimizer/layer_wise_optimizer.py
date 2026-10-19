@@ -28,6 +28,8 @@ from .param_layout import (
     FullParamLayout,
     PerBufferParamLayout,
     bucket_end_divisor,
+    continues_group,
+    group_contiguous,
     pad_param_start,
     pad_to_divisor,
 )
@@ -281,12 +283,29 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 # that is fine because all params in the chunk share the same
                 # bucket_id, so DDP's backprop-order iteration still sees
                 # monotonic bucket_ids across the chunk boundary.
-                for param in sorted(chunk_params, key=lambda p: -p.data.nelement()):
-                    numel = param.data.nelement()
+                # A contiguous group (param.contiguous_group, see param_layout.group_contiguous)
+                # is one unit: all its members go to one shard, back to back in group order.
+                units, by_key = [], {}
+                for param in chunk_params:
+                    group = getattr(param, "contiguous_group", None)
+                    if group is None:
+                        units.append([param])
+                    elif group[0] in by_key:
+                        by_key[group[0]].append(param)
+                    else:
+                        by_key[group[0]] = [param]
+                        units.append(by_key[group[0]])
+                for unit in units:
+                    unit.sort(key=lambda q: getattr(q, "contiguous_group", (0, 0))[1])
+                for unit in sorted(units, key=lambda u: -sum(p.data.nelement() for p in u)):
                     min_shard = min(range(dp_size), key=lambda s: shard_cursors[s])
-                    placement = pad_param_start(shard_cursors[min_shard])
-                    shard_assignments[min_shard].append((param, numel))
-                    shard_cursors[min_shard] = placement + numel
+                    cursor = shard_cursors[min_shard]
+                    for param in unit:
+                        numel = param.data.nelement()
+                        cursor = pad_param_start(cursor)
+                        shard_assignments[min_shard].append((param, numel))
+                        cursor += numel
+                    shard_cursors[min_shard] = cursor
 
             padded_shard_size = pad_to_divisor(max(shard_cursors), shard_divisor)
             bucket_start_index = buffer_cursor
@@ -323,8 +342,12 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         chunk_params: List[torch.nn.Parameter] = []
         chunk_numel = 0
         chunk_max_param = 0
-        for param in reversed(params):
+        ordered = group_contiguous(list(reversed(params)))
+        for position, param in enumerate(ordered):
             param_numel = param.data.nelement()
+            open_group = continues_group(
+                param, ordered[position + 1] if position + 1 < len(ordered) else None
+            )
             if getattr(param, 'shared_embedding', False):
                 # Finalize any in-progress chunk so the shared-embedding
                 # bucket comes after it in backprop order.
@@ -337,7 +360,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             chunk_params.append(param)
             chunk_numel += param_numel
             chunk_max_param = max(chunk_max_param, param_numel)
-            if bucket_size is not None:
+            if bucket_size is not None and not open_group:
                 threshold = max(bucket_size, int(dp_size * chunk_max_param * PADDING_FLOOR))
                 if chunk_numel >= threshold:
                     _emit_bucket(chunk_params)

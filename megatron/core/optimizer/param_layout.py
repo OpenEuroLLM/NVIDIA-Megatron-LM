@@ -42,6 +42,38 @@ def pad_bucket_end(
     )
 
 
+def group_contiguous(params: List[torch.nn.Parameter]) -> List[torch.nn.Parameter]:
+    """Order ``params`` (already in backprop order) so that every contiguous group -- params
+    tagged ``param.contiguous_group = (key, index, size)`` -- is consecutive, in ``index`` order,
+    at the position of its first member. Buffer layouts walk this order, so a group occupies one
+    back-to-back block (e.g. MoonEP's per-expert weights: the experts need an ``[n, ...]`` view of
+    their weights and main grads)."""
+    members = {}
+    for param in params:
+        group = getattr(param, "contiguous_group", None)
+        if group is not None:
+            members.setdefault(group[0], []).append(param)
+    out, seen = [], set()
+    for param in params:
+        group = getattr(param, "contiguous_group", None)
+        if group is None:
+            out.append(param)
+        elif group[0] not in seen:
+            seen.add(group[0])
+            out.extend(sorted(members[group[0]], key=lambda q: q.contiguous_group[1]))
+    return out
+
+
+def continues_group(param: torch.nn.Parameter, next_param: Optional[torch.nn.Parameter]) -> bool:
+    """Is ``next_param`` (the next in :func:`group_contiguous` order) in ``param``'s group? A
+    bucket must not close between them."""
+    if next_param is None:
+        return False
+    group = getattr(param, "contiguous_group", None)
+    nxt = getattr(next_param, "contiguous_group", None)
+    return group is not None and nxt is not None and group[0] == nxt[0]
+
+
 @dataclass(frozen=True)
 class BufferKey:
     """Identifies a distinct parameter buffer.

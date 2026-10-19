@@ -285,6 +285,20 @@ from torch.optim.optimizer import register_optimizer_step_post_hook  # noqa: E40
 register_optimizer_step_post_hook(_count_optimizer_step)
 
 
+# Fallback buffers when the weights / main grads are not back to back (no DDP buffer, or a
+# layout that ignores contiguous_group): ONE per shape for all layers -- (owner, step) tells
+# whether the weight mirror still holds this layer's weights of this optimizer step.
+_SHARED = {}
+
+
+def _shared(name, shape, dtype, device):
+    key = (name, tuple(shape), dtype)
+    buf = _SHARED.get(key)
+    if buf is None:
+        buf = _SHARED[key] = {"t": torch.empty(*shape, dtype=dtype, device=device), "tag": None}
+    return buf
+
+
 def _stacked_view(tensors):
     """``[n, *shape]`` zero-copy view of ``n`` same-shape tensors that lie back to back in one
     storage (Megatron's DDP buffers place one module's parameters / main grads that way when
@@ -387,6 +401,9 @@ class _ExpertWeights(torch.nn.Module):
             if perform_init:
                 init_method(w.data)
             w.allreduce = False  # expert-data-parallel gradient reduction
+            # one back-to-back block in the DDP buffers, in expert order (param_layout.
+            # group_contiguous): MoonEP reads [n, ...] views of the weights and main grads
+            w.contiguous_group = (id(self), i, n)
             self.register_parameter(f"weight{i}", w)
 
     def weights(self):
@@ -432,9 +449,6 @@ class MoonEPGroupedMLP(MegatronModule):
         self._dummy_w = torch.zeros(epn, _DUMMY, _DUMMY, device=dev, dtype=torch.bfloat16)
         self._dummy_g = torch.zeros(epn, _DUMMY, _DUMMY, device=dev, dtype=torch.float32)
         self.pool_shapes = [(2 * F, H), (H, F), (_DUMMY, _DUMMY)]
-        self._mirrors = None  # (fc1, fc2) contiguous copies, if the parameters are not
-        self._mirror_step = -1
-        self._grad_scratch = None
         self.state = None  # set by the dispatcher on its first dispatch
         self.holder = None
 
@@ -445,21 +459,18 @@ class MoonEPGroupedMLP(MegatronModule):
         """[epn, 2F, H] / [epn, H, F] contiguous local weights for MoonEP's weight push."""
         fc1 = [w.detach() for w in self.linear_fc1.weights()]
         fc2 = [w.detach() for w in self.linear_fc2.weights()]
-        v1, v2 = _stacked_view(fc1), _stacked_view(fc2)
-        if v1 is None or v2 is None:
-            if self._mirrors is None:
-                self._mirrors = (torch.empty(len(fc1), *fc1[0].shape, dtype=fc1[0].dtype,
-                                             device=fc1[0].device),
-                                 torch.empty(len(fc2), *fc2[0].shape, dtype=fc2[0].dtype,
-                                             device=fc2[0].device))
-                self._mirror_step = -1
-            if self._mirror_step != _OPTIMIZER_STEPS[0]:
-                torch._foreach_copy_(list(self._mirrors[0].unbind(0)), fc1)
-                torch._foreach_copy_(list(self._mirrors[1].unbind(0)), fc2)
-                self._mirror_step = _OPTIMIZER_STEPS[0]
-            v1 = self._mirrors[0] if v1 is None else v1
-            v2 = self._mirrors[1] if v2 is None else v2
-        return [v1, v2, self._dummy_w]
+        out = []
+        for name, ws in (("w1", fc1), ("w2", fc2)):
+            v = _stacked_view(ws)
+            if v is None:
+                buf = _shared(name, (len(ws), *ws[0].shape), ws[0].dtype, ws[0].device)
+                tag = (id(self), _OPTIMIZER_STEPS[0])
+                if buf["tag"] != tag:
+                    torch._foreach_copy_(list(buf["t"].unbind(0)), ws)
+                    buf["tag"] = tag
+                v = buf["t"]
+            out.append(v)
+        return [*out, self._dummy_w]
 
     def main_grads(self):
         """Per-expert fp32 main grads ([2F, H] list, [H, F] list)."""
@@ -485,12 +496,8 @@ class MoonEPGroupedMLP(MegatronModule):
         if g1 is not None and g2 is not None:
             state.reduce_grad(plan, [g1, g2, self._dummy_g], self.pool_shapes)
             return
-        if self._grad_scratch is None:
-            self._grad_scratch = (
-                torch.empty(len(main1), *main1[0].shape, dtype=torch.float32, device=main1[0].device),
-                torch.empty(len(main2), *main2[0].shape, dtype=torch.float32, device=main2[0].device),
-            )
-        s1, s2 = self._grad_scratch
+        s1 = _shared("g1", (len(main1), *main1[0].shape), torch.float32, main1[0].device)["t"]
+        s2 = _shared("g2", (len(main2), *main2[0].shape), torch.float32, main2[0].device)["t"]
         s1.zero_()
         s2.zero_()
         state.reduce_grad(plan, [s1, s2, self._dummy_g], self.pool_shapes)
