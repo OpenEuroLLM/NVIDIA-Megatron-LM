@@ -147,3 +147,33 @@ class TestDepthMemoryGraphs:
         out_s, _ = _fwd_bwd(stream, ids)
         out_r, _ = _fwd_bwd(ref, ids)
         torch.testing.assert_close(out_s, out_r, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (9, 10),
+    reason="the CuTe LDM kernels need sm90 / sm100",
+)
+class TestDepthMemoryCuteGraphs(TestDepthMemoryGraphs):
+    """The CuTe kernels: graph replay = eager (same kernels, same buffers), and cute ~ torch."""
+
+    @pytest.mark.parametrize("pattern", list(SCOPES))
+    def test_graph_replay_matches_eager(self, pattern):
+        pytest.importorskip("cute_ldm.workspace")
+        torch.manual_seed(0)
+        ids = torch.randint(0, VOCAB, (B, S), device="cuda")
+        kw = dict(bf16=True, params_dtype=torch.bfloat16)
+        eager = _model(pattern, "cute", **kw).bfloat16()
+        ref_out, ref_grads = _fwd_bwd(eager, ids)
+        graphed = _model(pattern, "cute", graphs=SCOPES[pattern], **kw).bfloat16()
+        graphed.load_state_dict(eager.state_dict())
+        _fwd_bwd(graphed, ids)
+        create_cudagraphs()
+        assert _CudagraphGlobalRecord.cudagraph_created, "no cudagraphs were created"
+        for _ in range(2):
+            out, grads = _fwd_bwd(graphed, ids)
+            torch.testing.assert_close(out, ref_out, rtol=0, atol=0)
+            for k, g in ref_grads.items():
+                torch.testing.assert_close(grads[k], g, rtol=0, atol=0, msg=k)
+
+    def test_stream_form_matches_reference_model(self):
+        pytest.skip("covered by the torch class; cute vs torch in test_depth_memory_cute.py")
