@@ -64,6 +64,7 @@ class Slot:
 
     def __init__(self, tensor, prev):
         self.gpu, self.host, self.event, self.prev = tensor, None, None, prev
+        self.requires_grad = tensor.requires_grad
 
     def offload(self):
         t, side = self.gpu, _side_stream()
@@ -87,10 +88,14 @@ class Slot:
         self.gpu, self.host = g, None
 
     def get(self):
+        """The input, on the GPU, as the checkpoint saved it (a fetched copy is a new leaf: without
+        requires_grad the recompute would cut the gradient to the earlier chunks)."""
         self.fetch()
         if self.event is not None:
             torch.cuda.current_stream().wait_event(self.event)
         g, self.gpu, self.event = self.gpu, None, None
+        if g.is_leaf and g.requires_grad != self.requires_grad:
+            g.requires_grad_(self.requires_grad)
         return g
 
 
