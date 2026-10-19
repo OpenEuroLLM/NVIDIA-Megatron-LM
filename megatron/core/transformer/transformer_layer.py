@@ -1038,6 +1038,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         """
         from megatron.core.transformer import arch_metrics
 
+        if not arch_metrics.active():
+            from megatron.core.transformer import mhc_fused
+
+            if mhc_fused.can_use(streams, streams.shape[-2], mixer.phi):
+                # Triton coefficients + read; the write hands its stream gradient to this
+                # read's backward through the link (megatron/core/transformer/mhc_fused.py)
+                link = mhc_fused.ReadWriteLink()
+                layer_input, _, h_post, h_res = mhc_fused.coeffs_and_read(mixer, streams, link)
+                return layer_input, (h_post, h_res, link)
         fused = getattr(mixer, "coeffs_and_read", None)
         if fused is not None and not arch_metrics.active():
             out = fused(streams)
@@ -1064,13 +1073,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             The updated ``[s, b, n, h]`` stream state, which is what the rest of
             the layer and the enclosing block carry as ``hidden_states``.
         """
-        h_post, h_res = pending
+        h_post, h_res, *link = pending
         return mixer.write(
             streams,
             self._sublayer_output(output_with_bias),
             h_post,
             h_res,
             lerp=self._depth_lerp(kind, self.config.mhc_lerp),
+            link=link[0] if link else None,
         )
 
     # -------------------------------------------------------------- AttnRes

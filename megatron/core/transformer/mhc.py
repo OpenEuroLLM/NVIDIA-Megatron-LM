@@ -185,8 +185,9 @@ class _MHCWrite(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, streams, sublayer_out, h_post, h_res):
+    def forward(ctx, streams, sublayer_out, h_post, h_res, link=None):
         ctx.save_for_backward(streams, sublayer_out, h_post, h_res)
+        ctx.link = link
         out = _mhc_write_dispatch(streams, sublayer_out, h_post, h_res)
         _prewarm_backward(out, streams, sublayer_out, h_post, h_res)
         return out
@@ -197,7 +198,14 @@ class _MHCWrite(torch.autograd.Function):
 
         streams, sublayer_out, h_post, h_res = ctx.saved_tensors
         # The kernel indexes as if contiguous; g arrives from whatever produced it.
-        return write_backward(g.contiguous(), streams, sublayer_out, h_post, h_res)
+        d_streams, d_out, d_post, d_res = write_backward(
+            g.contiguous(), streams, sublayer_out, h_post, h_res
+        )
+        if ctx.link is not None:
+            # the fused read of the same streams adds it inside its own backward kernel
+            # (mhc_fused.py), saving autograd's accumulation pass
+            ctx.link.grad, d_streams = d_streams, None
+        return d_streams, d_out, d_post, d_res, None
 
 
 _BACKWARD_PREWARMED = False
@@ -643,6 +651,7 @@ class MHCMixer(nn.Module):
         h_post: torch.Tensor,
         h_res: torch.Tensor,
         lerp: nn.Module | None = None,
+        link=None,
     ) -> torch.Tensor:
         """Mix the streams and scatter the sublayer output back onto them.
 
@@ -670,7 +679,7 @@ class MHCMixer(nn.Module):
             if can_use(streams, n):
                 # Fused Triton backward: one pass over the upstream gradient
                 # instead of the four Inductor derives from the forward.
-                return _MHCWrite.apply(streams, sublayer_out, post, res)
+                return _MHCWrite.apply(streams, sublayer_out, post, res, link)
             return _mhc_write_dispatch(streams, sublayer_out, post, res)
         post, res = h_post.to(streams.dtype), h_res.to(streams.dtype)
         try:
