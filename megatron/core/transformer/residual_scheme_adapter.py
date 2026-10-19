@@ -28,6 +28,7 @@ def residual_scheme_active(config) -> bool:
     return bool(
         getattr(config, "mhc", False)
         or getattr(config, "attn_res", False)
+        or getattr(config, "depth_memory", False)
         or getattr(config, "ngpt", False)
         or getattr(config, "post_sublayer_norm", False)
     )
@@ -46,6 +47,7 @@ class ResidualSchemeAdapter(nn.Module):
         self.config = config
         self.mhc_mixer = None
         self.attnres = None
+        self.ldm = None
         self.ngpt_residual = None
         self.post_norm = None
         if getattr(config, "post_sublayer_norm", False):
@@ -77,10 +79,17 @@ class ResidualSchemeAdapter(nn.Module):
                 eps=config.layernorm_epsilon,
                 query_init_std=config.attn_res_query_init_std,
             )
+        elif getattr(config, "depth_memory", False):
+            from megatron.core.transformer.depth_memory import DepthMemorySite
+
+            self.ldm = DepthMemorySite(config)
         from megatron.core.transformer import arch_metrics
 
         for module in (self.mhc_mixer, self.attnres, self.ngpt_residual):
             arch_metrics.tag(module, "mixer", layer_number, config)
+        if self.ldm is not None:
+            arch_metrics.tag(self.ldm.read, "mixer", layer_number, config)
+            arch_metrics.tag(self.ldm.write, "mixer", layer_number, config)
         # Per-token modules: under sequence parallelism each TP rank sees only its own
         # tokens, so their gradients are summed over TP like a norm's.
         for param in self.parameters():
@@ -107,6 +116,10 @@ class ResidualSchemeAdapter(nn.Module):
             if depth_state is None:
                 raise RuntimeError("Block AttnRes layer called without the stack's depth state.")
             return self.attnres(depth_state.sources()), ()
+        if self.ldm is not None:
+            if depth_state is None:
+                raise RuntimeError("depth_memory layer called without the stack's depth state.")
+            return self.ldm.read_input(depth_state), ()
         return hidden_states, (hidden_states,)
 
     def write(
@@ -120,6 +133,8 @@ class ResidualSchemeAdapter(nn.Module):
             return self.mhc_mixer.write(
                 streams, out, h_post, h_res, lerp=self._lerp(self.config.mhc_lerp)
             )
+        if self.ldm is not None:
+            return self.ldm.write_output(depth_state, out)
         if self.attnres is not None:
             from megatron.core.transformer.attn_res import accumulate_block
 

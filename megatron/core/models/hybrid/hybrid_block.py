@@ -275,6 +275,15 @@ class HybridStack(MegatronModule):
         # Required for activation recomputation
         self.num_layers_per_pipeline_rank = len(self.layers)
 
+        # Linear Depth Memory: the embedding write and the final read (depth_memory.py)
+        self.ldm_boundary = None
+        if getattr(self.config, "depth_memory", False):
+            from megatron.core.transformer.depth_memory import DepthMemoryBoundary
+
+            self.ldm_boundary = DepthMemoryBoundary(self.config)
+            for param in self.ldm_boundary.parameters():
+                param.sequence_parallel = self.config.sequence_parallel
+
         if self.post_process and self.post_layer_norm:
             # Final layer norm before output.
             self.final_norm = TENorm(
@@ -610,6 +619,11 @@ class HybridStack(MegatronModule):
                     # for cross-attention, and is not needed in our model.
                     if isinstance(hidden_states, tuple):
                         hidden_states = hidden_states[0]
+                    if self.ldm_boundary is not None and hidden_states is not depth_state.stream:
+                        raise RuntimeError(
+                            f"depth_memory: {type(layer).__name__} kept its own residual "
+                            "(it has no depth-memory read / write)"
+                        )
                     hidden_states = self._apply_per_layer_embedding(layer_index, hidden_states)
                 hidden_states = self._depth_exit(hidden_states, depth_state)
 
@@ -634,8 +648,11 @@ class HybridStack(MegatronModule):
         dim = getattr(self.config, "per_layer_embedding_dim", 0)
         if dim:
             if getattr(self.config, "mhc", False) or getattr(self.config, "attn_res", False) \
-                    or getattr(self.config, "ngpt", False):
-                raise NotImplementedError("per-layer embeddings with mHC / AttnRes / nGPT")
+                    or getattr(self.config, "ngpt", False) \
+                    or getattr(self.config, "depth_memory", False):
+                raise NotImplementedError(
+                    "per-layer embeddings with mHC / AttnRes / nGPT / depth memory"
+                )
             which = self.config.per_layer_embedding_layers
             if which not in ("mlp", "all"):
                 raise ValueError(f"per_layer_embedding_layers must be mlp or all, got {which}")
@@ -676,6 +693,10 @@ class HybridStack(MegatronModule):
         """
         mhc = getattr(self.config, "mhc", False)
         attn_res = getattr(self.config, "attn_res", False)
+        if self.ldm_boundary is not None:
+            if not (self.pre_process and self.post_process):
+                raise NotImplementedError("depth_memory needs the whole stack on one stage")
+            return hidden_states, self.ldm_boundary.enter(hidden_states)
         if not mhc and not attn_res:
             return hidden_states, None
         if mhc and attn_res:
@@ -729,6 +750,11 @@ class HybridStack(MegatronModule):
                 inp=hidden_states.reshape(s, b, n * h), requires_grad=True, keep_graph=True
             )
         if depth_state is None:
+            return hidden_states
+        if self.ldm_boundary is not None:
+            hidden_states = self.ldm_boundary.exit(depth_state)
+            for layer in self.layers:
+                layer._depth_state = None
             return hidden_states
         if self.post_process:
             hidden_states = depth_state.collapse()

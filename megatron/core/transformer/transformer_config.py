@@ -1967,6 +1967,31 @@ class TransformerConfig(ModelParallelConfig):
     toward the normalized sublayer output instead of a plain sum, keeping block summaries on
     the unit sphere rather than growing with block size. Requires ngpt=True."""
 
+    ####################
+    # Linear Depth Memory
+    ####################
+    depth_memory: bool = False
+    """Linear Depth Memory (LDM, arXiv:2610.18809, megatron/core/transformer/depth_memory.py):
+    next to the residual stream, every token carries a matrix memory of the sublayer outputs
+    over depth, fit by recursive least squares; every sublayer reads x + M q and writes its
+    output. HybridStack only, pipeline_model_parallel_size == 1, no CUDA graphs, no full
+    activation recompute. Mutually exclusive with mhc and attn_res."""
+
+    depth_memory_key_dim: int = 8
+    """LDM key / query width K per group (the paper's main setting: 8)."""
+
+    depth_memory_groups: int = 16
+    """LDM memory groups G (value width hidden_size / G per group; the paper: 16)."""
+
+    depth_memory_hidden_dim: int = 32
+    """Width H of LDM's address networks (the paper: 32 at 400M, 64 at 1.5B)."""
+
+    depth_memory_lambda_init: float = 0.99
+    """Initial forgetting factor of every LDM write (learned per group)."""
+
+    depth_memory_alpha: float = 1.0
+    """Initial inverse covariance P = alpha I (ridge 1 / alpha) of the LDM fit."""
+
     # ---- Looped (weight-tied) depth ----
     # A prelude/loop/coda stack: the middle block is built once and applied
     # ``loop_iterations`` times, so effective depth exceeds parameter depth. The
@@ -2013,6 +2038,24 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError("moe_zero_expert_num does not support padding to capacity")
             if self.cuda_graph_impl != "none" or self.enable_cuda_graph:
                 raise ValueError("moe_zero_expert_num does not support CUDA graphs yet")
+        if self.depth_memory:
+            if self.mhc or self.attn_res:
+                raise ValueError("depth_memory is mutually exclusive with mhc and attn_res")
+            if self.hidden_size % self.depth_memory_groups:
+                raise ValueError(
+                    f"depth_memory_groups ({self.depth_memory_groups}) must divide hidden_size "
+                    f"({self.hidden_size})"
+                )
+            if self.pipeline_model_parallel_size > 1:
+                raise ValueError("depth_memory does not support pipeline parallelism yet")
+            if self.cuda_graph_impl != "none" or self.enable_cuda_graph:
+                raise ValueError(
+                    "depth_memory keeps its state on the layers (not CUDA-graph capturable)"
+                )
+            if self.recompute_granularity == "full":
+                raise ValueError("depth_memory does not support full activation recompute")
+            if not 0 < self.depth_memory_lambda_init < 1:
+                raise ValueError("depth_memory_lambda_init must be in (0, 1)")
         if self.mhc_routed_topk:
             if not self.mhc:
                 raise ValueError("mhc_routed_topk requires mhc=True")

@@ -155,3 +155,41 @@ def test_packed_documents_match_separate_with_engram(table_parallel):
         assert engram.table_grad.abs().sum() > 0
     else:
         assert engram.table.grad is not None or getattr(engram.table, "main_grad", None) is not None
+
+
+@pytest.mark.parametrize("pattern", ["LELE*E", "NLELE*E"], ids=["hybrid", "hybrid_engram"])
+def test_packed_documents_match_separate_with_depth_memory(pattern):
+    """Linear Depth Memory (depth_memory.py) through the packed hybrid: per-token state, so
+    documents stay independent; every LDM parameter gets a gradient."""
+    model = _model(
+        pattern=pattern,
+        mhc=False,
+        mhc_routed_topk=0,
+        depth_memory=True,
+        depth_memory_groups=4,
+        depth_memory_key_dim=8,
+        depth_memory_hidden_dim=16,
+        engram_ngram_orders=[2, 3],
+        engram_num_heads=2,
+        engram_table_size=1000,
+        engram_embed_dim=16,
+    )
+    model.train()
+    docs = [torch.randint(0, VOCAB, (1, n), device="cuda") for n in LENGTHS]
+
+    def run(ids, packed=None):
+        pos = torch.arange(ids.shape[1], device="cuda").unsqueeze(0)
+        return model(ids, position_ids=pos, attention_mask=None, packed_seq_params=packed)
+
+    ref = torch.cat([run(d).float() for d in docs], dim=1)
+    cu = torch.tensor([0, *torch.tensor(LENGTHS).cumsum(0).tolist()], dtype=torch.int32,
+                      device="cuda")
+    packed = PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu,
+                             max_seqlen_q=max(LENGTHS), max_seqlen_kv=max(LENGTHS))
+    together = run(torch.cat(docs, dim=1), packed).float()
+    err = (together - ref).abs().max() / ref.std()
+    assert err < 0.05, float(err)
+    together.logsumexp(-1).mean().backward()
+    ldm = [(n, p) for n, p in model.named_parameters() if getattr(p, "is_residual_mixer", False)]
+    assert ldm and all(p.grad is not None or getattr(p, "main_grad", None) is not None
+                       for _, p in ldm), [n for n, p in ldm if p.grad is None]
