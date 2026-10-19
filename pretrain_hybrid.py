@@ -402,8 +402,9 @@ def loss_func(
 
 
 def _has_mamba_layers(args):
-    pattern = getattr(args, "hybrid_layer_pattern", None) or ""
-    return "M" in pattern
+    pattern = getattr(args, "hybrid_layer_pattern", None)
+    # no pattern (ratio-built layouts): keep the Mamba inputs
+    return "M" in pattern if pattern else True
 
 
 def forward_step(data_iterator, model: HybridModel, return_schedule_plan: bool = False):
