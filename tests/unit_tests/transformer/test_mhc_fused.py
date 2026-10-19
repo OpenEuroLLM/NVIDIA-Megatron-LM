@@ -7,14 +7,36 @@ import pytest
 import torch
 
 from megatron.core.transformer import mhc_fused
-from megatron.core.transformer.mhc import MHCMixer
+from megatron.core.transformer.mhc import MHCMixer, _sinkhorn_knopp_impl
 
 N = 4
+
+
+def _fp32_chain(s0, mixers, ws):
+    """Ground truth: the same chain in fp32, eager."""
+    s = s0
+    for mixer, w in zip(mixers, ws):
+        n = s.shape[-2]
+        flat = s.flatten(-2)
+        r = (flat.norm(dim=-1, keepdim=True) / flat.shape[-1] ** 0.5).clamp(min=mixer.eps)
+        pre, post, res = torch.split(flat @ mixer.phi / r, [n, n, n * n], dim=-1)
+        h_pre = torch.sigmoid(mixer.alpha_pre * pre + mixer.b_pre)
+        h_post = 2.0 * torch.sigmoid(mixer.alpha_post * post + mixer.b_post)
+        h_res = _sinkhorn_knopp_impl(
+            mixer.alpha_res * res.view(*res.shape[:-1], n, n) + mixer.b_res,
+            mixer.num_sinkhorn_iters,
+        )
+        x = (h_pre.unsqueeze(-1) * s).sum(-2)
+        f = torch.tanh(x @ w)
+        s = (h_res.unsqueeze(-1) * s.unsqueeze(-3)).sum(-2) + h_post.unsqueeze(-1) * f.unsqueeze(-2)
+    return s
 
 
 def _chain(fused, s0, mixers, ws):
     s = s0
     for mixer, w in zip(mixers, ws):
+        if fused is None:
+            return _fp32_chain(s0, mixers, ws)
         if fused:
             link = mhc_fused.ReadWriteLink()
             x, _, hp, hr = mhc_fused.coeffs_and_read(mixer, s, link)
@@ -48,16 +70,21 @@ def test_fused_matches_compiled(monkeypatch, T, C):
     assert mhc_fused.can_use(s0, N, mixers[0].phi)
 
     res = {}
-    for fused in (False, True):
+    for fused in (None, False, True):  # fp32 ground truth, compiled bf16, fused bf16
         for p in [*ws, *(q for m in mixers for q in m.parameters())]:
             p.grad = None
-        s = s0.clone().requires_grad_()
-        y = _chain(fused, s, mixers, ws)
-        y.backward(g)
-        res[fused] = [y.detach(), s.grad, *(w.grad for w in ws),
-                      *(q.grad for m in mixers for q in m.parameters())]
+        dt = torch.float32 if fused is None else torch.bfloat16
+        wl = [w.detach().to(dt).requires_grad_() for w in ws]
+        s = s0.to(dt).requires_grad_()
+        y = _chain(fused, s, mixers, wl)
+        y.backward(g.to(dt))
+        ws_grads = [w.grad for w in wl]
+        res[fused] = [y.detach(), s.grad, *ws_grads,
+                      *(q.grad.clone() for m in mixers for q in m.parameters())]
     names = ["out", "d_streams", "d_w0", "d_w1"] + [
         f"m{i}.{n}" for i, m in enumerate(mixers) for n, _ in m.named_parameters()]
-    for name, a, b in zip(names, res[True], res[False]):
-        assert a is not None and b is not None, name
-        assert _rel(a, b) < 2e-2, (name, _rel(a, b))
+    for name, fu, co, gt in zip(names, res[True], res[False], res[None]):
+        assert fu is not None and co is not None, name
+        # no worse than the compiled bf16 path's own error against fp32
+        err_fused, err_compiled = _rel(fu, gt), _rel(co, gt)
+        assert err_fused < max(2e-2, 1.5 * err_compiled), (name, err_fused, err_compiled)
