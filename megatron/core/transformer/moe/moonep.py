@@ -649,6 +649,13 @@ class MoEMoonEPTokenDispatcher(MoETokenDispatcher):
         comm = self._comm_stream
         comm.wait_stream(cur)
         hidden_states = hidden_states.contiguous()
+        weights_sk = weights_sk.contiguous()
+        # Everything the communication stream reads that this stream allocated: without the
+        # record the caching allocator may hand out (or, with expandable segments, unmap) the
+        # block once Python drops it while a chunk's dispatch still reads it -- illegal
+        # address under memory pressure (8-node runs), invisible with CUDA_LAUNCH_BLOCKING.
+        for t in (hidden_states, weights_sk, self.topk, self.routing_map):
+            t.record_stream(comm)
         hs, ws, tk = hidden_states.split(Sc), weights_sk.split(Sc), self.topk.split(Sc)
         rm = self.routing_map.split(Sc)
         states = [self._chunk_state(c, Sc, H) for c in range(n)]
@@ -681,7 +688,6 @@ class MoEMoonEPTokenDispatcher(MoETokenDispatcher):
             y.record_stream(comm)
             tpe.record_stream(comm)
         cur.wait_stream(comm)
-        hidden_states.record_stream(comm)
         for o in outs:
             o.record_stream(cur)
         self.holder.plan = self.chunk_holders[-1].plan  # for callers that inspect the plan
