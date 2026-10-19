@@ -730,35 +730,42 @@ class MoEMoonEPTokenDispatcher(MoETokenDispatcher):
             same = os.environ.get("MOONEP_CHUNK_STREAM", "") == "same"
             self._comm_stream = cur if same else torch.cuda.Stream()
         comm = self._comm_stream
-        comm.wait_stream(cur)
         hidden_states = hidden_states.contiguous()
         weights_sk = weights_sk.contiguous()
+        # every input of the communication stream is produced on this stream BEFORE the wait
+        # (a chunk histogram computed after it raced the dispatch's planning: illegal address /
+        # instruction in training, invisible with CUDA_LAUNCH_BLOCKING or one stream)
+        tpes = [
+            r.sum(dim=0, dtype=torch.int32).contiguous() for r in self.routing_map.split(S // n)
+        ]
+        tks = [t.contiguous() for t in self.topk.split(S // n)]
+        wss = [w.contiguous() for w in weights_sk.split(S // n)]
+        comm.wait_stream(cur)
         # Everything the communication stream reads that this stream allocated: without the
         # record the caching allocator may hand out (or, with expandable segments, unmap) the
         # block once Python drops it while a chunk's dispatch still reads it -- illegal
         # address under memory pressure (8-node runs), invisible with CUDA_LAUNCH_BLOCKING.
         for t in (hidden_states, weights_sk, self.topk, self.routing_map):
             t.record_stream(comm)
-        hs, ws, tk = hidden_states.split(Sc), weights_sk.split(Sc), self.topk.split(Sc)
-        rm = self.routing_map.split(Sc)
+        hs = hidden_states.split(Sc)
         states = [self._chunk_state(c, Sc, H) for c in range(n)]
         for holder in self.chunk_holders:
             holder.streams = (cur, comm)
         dispatched = []
         for c in range(n):
-            tpe = rm[c].sum(dim=0, dtype=torch.int32).contiguous()
+            tpe = tpes[c]
             if _CHUNK_DEBUG == "fullserial":
                 comm.wait_stream(cur)
             with torch.cuda.stream(comm):
                 x, w, cu = _MoonEPDispatch.apply(
-                    hs[c], ws[c].contiguous(), tk[c].contiguous(), tpe, states[c],
+                    hs[c], wss[c], tks[c], tpe, states[c],
                     self.chunk_holders[c],
                 )
             ev = torch.cuda.Event()
             ev.record(comm)
             if _CHUNK_DEBUG in ("serial", "fullserial"):
                 cur.wait_event(ev)
-            _keep(hs[c], ws[c], tk[c], tpe, x, w, cu)
+            _keep(hs[c], wss[c], tks[c], tpe, x, w, cu)
             dispatched.append((x, w, cu, ev, tpe))
         self._chunked_shared_output = (
             shared_experts(hidden_states) if shared_experts is not None else None
