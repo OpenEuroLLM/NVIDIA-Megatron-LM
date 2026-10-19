@@ -21,9 +21,9 @@ LENGTHS = (40, 64, 24)
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 
 
-def _model(**kw):
-    config = TransformerConfig(
-        num_layers=len(PATTERN),
+def _model(pattern=PATTERN, **kw):
+    config = TransformerConfig(**{**dict(
+        num_layers=len(pattern),
         hidden_size=128,
         num_attention_heads=4,
         num_query_groups=2,
@@ -61,14 +61,13 @@ def _model(**kw):
         bf16=True,
         params_dtype=torch.bfloat16,
         is_hybrid_model=True,
-        **kw,
-    )
+    ), **kw})
     return HybridModel(
         config=config,
         hybrid_stack_spec=hybrid_stack_spec,
         vocab_size=VOCAB,
         max_sequence_length=128,
-        hybrid_layer_pattern=PATTERN,
+        hybrid_layer_pattern=pattern,
         position_embedding_type="none",
         share_embeddings_and_output_weights=False,
     ).cuda().bfloat16()  # as Float16Module casts it in training
@@ -117,3 +116,42 @@ def test_packed_documents_match_separate(recompute, fused_qk):
     together.logsumexp(-1).mean().backward()
     assert all(p.grad is not None or getattr(p, "main_grad", None) is not None
                for n, p in model.named_parameters() if "expert_bias" not in n and p.requires_grad)
+
+
+@pytest.mark.parametrize("table_parallel", ["tp", "dp"])
+def test_packed_documents_match_separate_with_engram(table_parallel):
+    """Engram (`N`) in the packed hybrid: its n-grams and causal conv restart per document."""
+    model = _model(
+        pattern="NLELE*E",
+        engram_ngram_orders=[2, 3],
+        engram_num_heads=2,
+        engram_table_size=1000,
+        engram_embed_dim=16,
+        engram_table_parallel=table_parallel,
+        mhc=False,  # the sweep's arms: plain residual
+        mhc_routed_topk=0,
+    )
+    model.train()
+    engram = model.decoder.layers[0]
+    with torch.no_grad():
+        engram.conv1d.weight.normal_(std=0.5)  # non-zero, so its dilated taps matter
+    docs = [torch.randint(0, VOCAB, (1, n), device="cuda") for n in LENGTHS]
+
+    def run(ids, packed=None):
+        pos = torch.arange(ids.shape[1], device="cuda").unsqueeze(0)
+        return model(ids, position_ids=pos, attention_mask=None, packed_seq_params=packed)
+
+    ref = torch.cat([run(d).float() for d in docs], dim=1)
+    cu = torch.tensor([0, *torch.tensor(LENGTHS).cumsum(0).tolist()], dtype=torch.int32,
+                      device="cuda")
+    packed = PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu,
+                             max_seqlen_q=max(LENGTHS), max_seqlen_kv=max(LENGTHS))
+    together = run(torch.cat(docs, dim=1), packed).float()
+    scale = ref.std()
+    err = (together - ref).abs().max() / scale
+    assert err < 0.05, float(err)
+    together.logsumexp(-1).mean().backward()
+    if table_parallel == "dp":
+        assert engram.table_grad.abs().sum() > 0
+    else:
+        assert engram.table.grad is not None or getattr(engram.table, "main_grad", None) is not None

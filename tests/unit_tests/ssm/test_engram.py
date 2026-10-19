@@ -8,8 +8,10 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.ssm.engram import (
     EngramLayer,
+    document_positions,
     engram_hash,
     engram_hash_multipliers,
     engram_table_sizes,
@@ -69,6 +71,32 @@ class TestHashing:
         assert torch.equal(a[:, 13:], b[:, 13:])
 
 
+def test_hash_per_layer():
+    shared = _config()
+    own = _config(engram_hash_per_layer=True)
+    assert torch.equal(engram_hash_multipliers(shared, 1), engram_hash_multipliers(shared, 5))
+    assert not torch.equal(engram_hash_multipliers(own, 1), engram_hash_multipliers(own, 5))
+    assert bool((engram_hash_multipliers(own, 5) % 2 == 1).all())
+
+
+class TestDocumentPositions:
+    def test_positions_restart_at_every_document(self):
+        cu = torch.tensor([0, 3, 4, 9], dtype=torch.int32)
+        pos = document_positions(cu, 10)  # token 9: padding, continues the last document
+        assert pos.tolist() == [0, 1, 2, 0, 0, 1, 2, 3, 4, 5]
+
+    def test_hash_of_a_packed_document_equals_its_own(self):
+        cfg = _config()
+        sizes, mult = engram_table_sizes(cfg), engram_hash_multipliers(cfg)
+        a, b = torch.randint(0, 50000, (1, 7)), torch.randint(0, 50000, (1, 5))
+        cu = torch.tensor([0, 7, 12])
+        packed = engram_hash(
+            torch.cat([a, b], 1), [2, 3], 2, mult, sizes, document_positions(cu, 12)[None]
+        )
+        assert torch.equal(packed[:, :7], engram_hash(a, [2, 3], 2, mult, sizes))
+        assert torch.equal(packed[:, 7:], engram_hash(b, [2, 3], 2, mult, sizes))
+
+
 @pytest.mark.internal
 class TestEngramLayer:
 
@@ -114,6 +142,64 @@ class TestEngramLayer:
         changed = self.layer(h)
         torch.testing.assert_close(base[:15], changed[:15])
         assert not torch.allclose(base[15], changed[15])
+
+    def test_packed_documents_match_separate_sequences(self):
+        """Document masking: every document of a packed [t, 1, h] batch gets exactly the
+        output it gets alone (n-grams and the dilated causal conv restart at its start)."""
+        torch.manual_seed(1)
+        with torch.no_grad():
+            self.layer.conv1d.weight.normal_()  # a non-zero conv, so its taps matter
+        lens = [5, 1, 11, 7]
+        ids = [torch.randint(0, 50000, (1, n), device="cuda") for n in lens]
+        hs = [torch.randn(n, 1, HIDDEN, device="cuda") for n in lens]
+        cu = torch.tensor([0] + list(torch.tensor(lens).cumsum(0)), dtype=torch.int32).cuda()
+        params = PackedSeqParams(
+            qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu,
+            max_seqlen_q=max(lens), max_seqlen_kv=max(lens),
+        )
+        self.layer.set_input_ids(torch.cat(ids, 1))
+        packed = self.layer(torch.cat(hs, 0), packed_seq_params=params)
+        alone = []
+        for i, h in zip(ids, hs):
+            self.layer.set_input_ids(i)
+            alone.append(self.layer(h))
+        torch.testing.assert_close(packed, torch.cat(alone, 0))
+
+    def test_reference_code_gate_and_conv_prenorm(self):
+        """engram_gate_signed_sqrt + engram_conv_prenorm (DeepSeek's engram_demo_v1.py);
+        packed documents still match their separate outputs."""
+        pg = ProcessGroupCollection(
+            tp=parallel_state.get_tensor_model_parallel_group(),
+            cp=parallel_state.get_context_parallel_group(),
+        )
+        layer = EngramLayer(
+            _config(engram_gate_signed_sqrt=True, engram_conv_prenorm=True),
+            layer_number=1,
+            pg_collection=pg,
+        ).cuda()
+        torch.manual_seed(2)
+        ids = torch.randint(0, 50000, (1, 20), device="cuda")
+        h = torch.randn(20, 1, HIDDEN, device="cuda")
+        layer.set_input_ids(ids)
+        out = layer(h)  # zero conv: Y = SiLU(0) + v~
+        e = layer._memory(ids)
+        k, v = layer.key_proj(e), layer.value_proj(e)
+        x = (layer.hidden_norm(h) * layer.key_norm(k)).sum(-1, keepdim=True) / HIDDEN**0.5
+        torch.testing.assert_close(out, h + torch.sigmoid(x.sign() * x.abs().sqrt()) * v)
+        with torch.no_grad():
+            layer.conv1d.weight.normal_()
+            layer.conv_norm.weight.normal_()
+        lens = [8, 12]
+        cu = torch.tensor([0, 8, 20], dtype=torch.int32, device="cuda")
+        params = PackedSeqParams(
+            qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu, max_seqlen_q=12, max_seqlen_kv=12
+        )
+        packed = layer(h, packed_seq_params=params)
+        alone = []
+        for lo, n in zip((0, 8), lens):
+            layer.set_input_ids(ids[:, lo : lo + n])
+            alone.append(layer(h[lo : lo + n]))
+        torch.testing.assert_close(packed, torch.cat(alone, 0))
 
     def test_table_stays_fp32_through_the_bf16_cast(self):
         self.layer.bfloat16()  # what Float16Module does to the whole model

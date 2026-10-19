@@ -5,7 +5,8 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.optimizer.engram_optimizer import EngramTableOptimizer
+from megatron.core.optimizer import engram_optimizer
+from megatron.core.optimizer.engram_optimizer import EngramTableOptimizer, TableAdam
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.engram import EngramLayer
@@ -114,6 +115,70 @@ class TestEngramShardedSingle:
         torch.testing.assert_close(layer.table.data, reference.data)
         assert opt.param_groups[0]["max_lr"] == pytest.approx(5e-3)
         assert opt.param_groups[0]["wd_mult"] == 0.0
+
+    def test_lean_states_memory_and_checkpoint_shapes(self):
+        """Row-wise second moment + bf16 momentum: 10 B per table parameter instead of 16
+        (table + gradient buffer + moments), and checkpoint templates of those shapes."""
+        layer = EngramLayer(
+            _config(engram_table_parallel="dp"), layer_number=1, pg_collection=self._pg()
+        ).cuda()
+        nbytes = lambda opt: sum(  # noqa: E731
+            t.numel() * t.element_size()
+            for st in opt.optimizer.state.values()
+            for t in st.values()
+            if t.dim()
+        )
+        params = layer.table.numel()
+        fixed = 4 + 4  # fp32 table + fp32 gradient buffer
+        lean = {"engram_table_rowwise_v": True, "engram_table_momentum_dtype": "bf16"}
+        # row-wise v: 4 B per row = 4 / embed_dim B per parameter
+        for kw, per_param in (({}, 16), (lean, 10 + 4 / layer.embed_dim)):
+            config = OptimizerConfig(optimizer="adam", lr=1e-3, **kw)
+            opt = EngramTableOptimizer([layer.table], config)
+            sharded = layer.sharded_state_dict()
+            sd = opt.sharded_state_dict(sharded, is_loading=True)
+            state = opt.optimizer.state[layer.table]
+            bytes_per = fixed + nbytes(opt) / params
+            assert bytes_per == pytest.approx(per_param)
+            (entry,) = sd["param_state"].values()
+            assert entry["exp_avg_sq"].local_shape == tuple(state["exp_avg_sq"].shape)
+            assert entry["exp_avg"].dtype == state["exp_avg"].dtype
+            assert entry["exp_avg_sq"].global_shape[0] == layer.total_rows
+
+
+def test_table_adam_matches_torch_adam_over_chunks(monkeypatch):
+    monkeypatch.setattr(engram_optimizer, "_CHUNK_ELEMENTS", 40)  # several row chunks
+    torch.manual_seed(0)
+    w = torch.nn.Parameter(torch.randn(23, 8))
+    ref = torch.nn.Parameter(w.detach().clone())
+    opt = TableAdam([w], lr=1e-2, betas=(0.9, 0.95), eps=1e-8)
+    ref_opt = torch.optim.Adam([ref], lr=1e-2, betas=(0.9, 0.95), eps=1e-8)
+    for _ in range(3):
+        g = torch.randn(23, 8)
+        w.grad, ref.grad = g.clone(), g.clone()
+        opt.step()
+        ref_opt.step()
+    torch.testing.assert_close(w.data, ref.data)
+
+
+def test_table_adam_rowwise_v_and_bf16_momentum(monkeypatch):
+    monkeypatch.setattr(engram_optimizer, "_CHUNK_ELEMENTS", 40)
+    torch.manual_seed(0)
+    w = torch.nn.Parameter(torch.randn(23, 8))
+    w0 = w.detach().clone()
+    opt = TableAdam([w], lr=1e-2, betas=(0.9, 0.95), eps=1e-8, rowwise_v=True,
+                    momentum_dtype=torch.bfloat16)
+    m, v = torch.zeros(23, 8), torch.zeros(23, 1)
+    for t in range(1, 4):
+        g = torch.randn(23, 8)
+        w.grad = g.clone()
+        opt.step()
+        m = 0.9 * m + 0.1 * g
+        v = 0.95 * v + 0.05 * g.square().mean(-1, keepdim=True)
+        w0 -= 1e-2 / (1 - 0.9**t) * m / ((v / (1 - 0.95**t)).sqrt() + 1e-8)
+    state = opt.state[w]
+    assert state["exp_avg"].dtype == torch.bfloat16 and state["exp_avg_sq"].shape == (23, 1)
+    torch.testing.assert_close(w.data, w0, atol=2e-4, rtol=0)  # bf16 momentum storage
 
 
 @pytest.mark.skipif(Utils.world_size < 2, reason="needs 2+ GPUs")
