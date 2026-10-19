@@ -39,6 +39,7 @@ longer bit-for-bit the one the reference implementation trains -- which is a
 deliberate trade, not an oversight.
 """
 
+import collections
 import os
 from dataclasses import dataclass
 
@@ -89,8 +90,13 @@ def _head_dim(config: TransformerConfig) -> int:
     return config.hidden_size // config.num_attention_heads
 
 
-# (source cu_seqlens, token count, the fla cu_seqlens): see _cu_seqlens
-_CU_CACHE = None
+# id(source cu_seqlens) -> (source cu_seqlens, token count, the fla cu_seqlens): see _cu_seqlens.
+# One entry per micro-batch in flight: under PP 1F1B / VPP with full recompute the forward,
+# recompute and backward of different micro-batches interleave, and a single-entry cache handed
+# fla a fresh tensor on every switch (fla memoizes its varlen index preparation -- host syncs --
+# by tensor identity, FLA_TENSOR_CACHE_SIZE entries per function).
+_CU_CACHE = collections.OrderedDict()
+_CU_CACHE_SIZE = 128
 
 
 class _MegatronSelfAttentionAdapter(MegatronModule):
@@ -196,16 +202,19 @@ class _MegatronSelfAttentionAdapter(MegatronModule):
         # One converted tensor per micro-batch, reused by every layer (forward, recompute and
         # backward): fla memoizes its varlen index preparation (chunk indices, lengths -- host
         # syncs) by tensor IDENTITY, so a fresh tensor per call would sync in every layer.
-        global _CU_CACHE
         total = hidden_states.shape[0]
-        if _CU_CACHE is not None and _CU_CACHE[0] is cu and _CU_CACHE[1] == total:
-            return _CU_CACHE[2]
+        hit = _CU_CACHE.get(id(cu))
+        if hit is not None and hit[0] is cu and hit[1] == total:
+            _CU_CACHE.move_to_end(id(cu))
+            return hit[2]
         out = cu.to(torch.long)
         # Padding after the last document (a cu_seqlens shorter than the token count) becomes
         # its own segment, so it cannot leak into a document (one host sync per micro-batch).
         if int(out[-1]) != total:
             out = torch.cat([out, out.new_full((1,), total)])
-        _CU_CACHE = (cu, total, out)
+        _CU_CACHE[id(cu)] = (cu, total, out)
+        while len(_CU_CACHE) > _CU_CACHE_SIZE:
+            _CU_CACHE.popitem(last=False)
         return out
 
     def _forward_cp(self, hidden_states):
