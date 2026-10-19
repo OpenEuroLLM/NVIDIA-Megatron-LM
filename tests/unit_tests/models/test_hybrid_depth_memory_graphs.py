@@ -147,7 +147,10 @@ class TestDepthMemoryGraphs:
         assert not unexpected, unexpected
         out_s, _ = _fwd_bwd(stream, ids)
         out_r, _ = _fwd_bwd(ref, ids)
-        torch.testing.assert_close(out_s, out_r, rtol=1e-4, atol=1e-4)
+        # relative to the logits' spread: the stream form folds the norm gains into one stacked
+        # GEMM, which rounds differently under TF32 (the cluster tests' matmul precision)
+        err = (out_s - out_r).abs().max() / out_r.std()
+        assert err < 2e-3, float(err)
 
 
 @pytest.mark.skipif(
