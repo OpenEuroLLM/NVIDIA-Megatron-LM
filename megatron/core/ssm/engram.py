@@ -22,9 +22,10 @@ GPU at inference. Here they are trained on the GPU: under tensor parallelism the
 rows of the (concatenated) table are sharded like a vocab-parallel embedding (masked
 local lookup, then all-reduce); the small projections, norms and conv are replicated
 across TP ranks (tp_replicated.py) and the layer runs on the whole sequence, so it
-also works with sequence parallelism. Context parallelism and packed sequences are
-not supported: the n-grams and the conv would need tokens across chunk / document
-boundaries.
+also works with sequence parallelism. Packed sequences (document masking) restart the
+n-gram history and the conv at every document start: positions before it read the
+filler, exactly as at the start of an unpacked sequence. Context parallelism gathers the
+sequence (fla_cp); it is not combined with packed sequences.
 
 The table parameters carry ``is_engram_table`` so the optimizer can give them their
 own learning-rate multiplier and no weight decay (``engram_lr_mult``).
@@ -60,6 +61,18 @@ _ROW_ALIGN = 4096
 _HASH_SEED = 0x5EED_E46A
 # A token-id offset so that the "before the sequence start" filler (0) is distinct.
 _PAD_ID = 0
+
+
+def document_positions(packed_seq_params, total: int, device) -> torch.Tensor:
+    """[total] position of every token in its document, from the packed cu_seqlens (on the
+    device: no host sync). Tokens after the last document form their own segment."""
+    cu = packed_seq_params.cu_seqlens_q_padded
+    if cu is None:
+        cu = packed_seq_params.cu_seqlens_q
+    cu = cu.to(device=device, dtype=torch.int64).reshape(-1)
+    t = torch.arange(total, device=device, dtype=torch.int64)
+    doc = torch.searchsorted(cu[1:], t, right=True).clamp_max(cu.numel() - 1)
+    return t - cu[doc]
 
 
 def _is_prime(n: int) -> bool:
@@ -100,12 +113,14 @@ def engram_hash(
     num_heads: int,
     multipliers: torch.Tensor,
     sizes: list[int],
+    positions: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Row index per (order, head) of every suffix n-gram: [b, s] -> [b, s, orders*heads].
 
     ``h = XOR_i (x_{t-i} + 1) * a_i`` over the last n tokens, then ``h mod M``. Positions
     before the sequence start contribute the filler 0. Products stay below 2**52, so
-    the int64 arithmetic never overflows.
+    the int64 arithmetic never overflows. ``positions`` ([b, s], packed sequences): each
+    token's position in its document; history before the document start is the filler.
     """
     b, s = token_ids.shape
     shifted = token_ids.to(torch.int64) + 1
@@ -113,6 +128,9 @@ def engram_hash(
     history = [shifted] + [
         F.pad(shifted, (i, 0), value=_PAD_ID)[:, :s] for i in range(1, max(orders))
     ]
+    if positions is not None:
+        history = [hist if i == 0 else hist.masked_fill(positions < i, _PAD_ID)
+                   for i, hist in enumerate(history)]
     out = []
     lookup = 0
     for n in orders:
@@ -305,10 +323,12 @@ class EngramLayer(MegatronModule):
         """Token ids [b, s] of the current micro-batch (set by HybridStack)."""
         self._input_ids = input_ids
 
-    def _memory(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def _memory(self, input_ids: torch.Tensor, positions=None) -> torch.Tensor:
         """e_t for every position: [b, s] -> [s, b, lookups * embed_dim], full on every rank."""
         ids = input_ids if self.token_map is None else self.token_map[input_ids]
-        rows = engram_hash(ids, self.orders, self.num_heads, self.hash_mult, self.sizes)
+        rows = engram_hash(
+            ids, self.orders, self.num_heads, self.hash_mult, self.sizes, positions=positions
+        )
         rows = rows + self.row_offsets  # [b, s, L] global row ids
         if self.sharded:
             return self._sharded_memory(rows)
@@ -346,6 +366,24 @@ class EngramLayer(MegatronModule):
             )
         return emb
 
+    def _document_conv(self, v: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        """The depthwise causal conv tap by tap ([s, b, h]), each tap masked at the document
+        starts: output t sums w_k v_{t - (K-1-k) d} only over taps inside t's document --
+        Conv1d's left-padded result on every document of a packed sequence."""
+        s = v.shape[0]
+        w = self.conv1d.weight[:, 0, :]  # [h, K]
+        out = None
+        for k in range(self.kernel_size):
+            off = (self.kernel_size - 1 - k) * self.dilation
+            if off >= s:
+                continue
+            tap = v if off == 0 else F.pad(v, (0, 0, 0, 0, off, 0))[:s]
+            if off:
+                tap = tap * (positions >= off).to(v.dtype).view(s, 1, 1)
+            term = tap * w[:, k]
+            out = term if out is None else out + term
+        return out
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -356,8 +394,6 @@ class EngramLayer(MegatronModule):
     ) -> torch.Tensor:
         if inference_context is not None:
             raise NotImplementedError("Engram does not support Megatron inference.")
-        if packed_seq_params is not None:
-            raise NotImplementedError("Engram does not support packed sequences.")
         if self._input_ids is None:
             raise RuntimeError(
                 "EngramLayer needs the token ids; HybridStack passes them on the pipeline "
@@ -368,6 +404,15 @@ class EngramLayer(MegatronModule):
             hidden_states, ctx = self.residual_scheme.read(hidden_states, self._depth_state)
         h = gather_replicated_input(hidden_states, self.config, self.tp_group)  # [s, b, h]
         input_ids = self._input_ids
+        positions = None
+        if packed_seq_params is not None:
+            if self.cp_group is not None:
+                raise NotImplementedError(
+                    "Engram: packed sequences with context parallelism are not supported"
+                )
+            if input_ids.shape[0] != 1:
+                raise ValueError(f"packed sequences need batch 1, got {tuple(input_ids.shape)}")
+            positions = document_positions(packed_seq_params, input_ids.shape[1], h.device)
         if self.cp_group is not None:
             from megatron.core.ssm import fla_cp
 
@@ -375,7 +420,9 @@ class EngramLayer(MegatronModule):
             input_ids = fla_cp.full_sequence(
                 input_ids.transpose(0, 1), self.cp_group, differentiable=False
             ).transpose(0, 1)
-        e = self._memory(input_ids).to(h.dtype)
+        e = self._memory(
+            input_ids, None if positions is None else positions.unsqueeze(0)
+        ).to(h.dtype)
         k = self.key_proj(e)
         v = self.value_proj(e)
         gate = (self.hidden_norm(h).float() * self.key_norm(k).float()).sum(-1, keepdim=True)
@@ -388,8 +435,11 @@ class EngramLayer(MegatronModule):
             arch_metrics.record_mean("engram/gate_closed", self.layer_number, n, alpha < 0.05)
             arch_metrics.record_mean("engram/gate_open", self.layer_number, n, alpha > 0.95)
         v = alpha * v
-        pad = (self.kernel_size - 1) * self.dilation
-        conv = self.conv1d(F.pad(v.permute(1, 2, 0), (pad, 0))).permute(2, 0, 1)
+        if positions is None:
+            pad = (self.kernel_size - 1) * self.dilation
+            conv = self.conv1d(F.pad(v.permute(1, 2, 0), (pad, 0))).permute(2, 0, 1)
+        else:
+            conv = self._document_conv(v, positions)
         y = F.silu(conv) + v
         if self.cp_group is not None:
             y = fla_cp.local_sequence(y, self.cp_group)
