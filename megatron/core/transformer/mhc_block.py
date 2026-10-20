@@ -12,7 +12,7 @@ transformer layer, e.g. ``L E`` or ``* E`` -- and the block is the mHC layer:
 
     x = H_pre S                       (first layer of the block; its mixer is the block's)
     h = x;  h = h + F_1(h);  ...      (the block's layers, plain residual on [s, b, h])
-    S' = H_res S + H_post^T (h - x)   (last layer)
+    S' = H_res S + H_post^T (h - x)   (last layer; one bf16 subtraction)
 
 That halves the mHC applications of a mixer + MoE pattern (the bandwidth-bound part of an mHC-4
 step). The in-block state (the streams, ``x``, the read's coefficients) goes from the first to the
@@ -106,7 +106,9 @@ def block_forward(layer, inner, args, kwargs):
     if layer._mhc_block_last:
         streams, x, pending = state.streams, state.x, state.pending
         state.streams = state.x = state.pending = None
-        update = (out.float() - x.float()).to(out.dtype)  # the block's F(x); fp32 difference
+        # the block's F(x): one bf16 subtraction is the correctly rounded difference already
+        # (an fp32 round trip cost ~4 extra passes per block, as much as the saved mHC work)
+        update = out - x
         h_post, h_res, *link = pending
         out = state.mixer.write(streams, update, h_post, h_res, link=link[0] if link else None)
     return out, context
