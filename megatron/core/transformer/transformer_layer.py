@@ -538,8 +538,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             # Linear Depth Memory.
             from megatron.core.transformer.routed_residual import build_stream_mixer
 
-            self.mhc_attn_mixer = build_stream_mixer(self.config) if has_attn else None
-            self.mhc_mlp_mixer = build_stream_mixer(self.config) if has_mlp else None
+            self.mhc_attn_mixer = build_stream_mixer(self.config, "mixer") if has_attn else None
+            self.mhc_mlp_mixer = build_stream_mixer(self.config, "mlp") if has_mlp else None
         elif getattr(self.config, "attn_res", False):
             from megatron.core.transformer.attn_res import BlockAttnRes
 

@@ -64,14 +64,14 @@ import torch
 from torch import nn
 
 from megatron.core.fusions.fused_routed_residual import (
+    LERP_WRITE_MODES,
     GradStash,
     _fused,
     fused_router_coeffs,
-    LERP_WRITE_MODES,
     route_streams,
     routed_read,
-    routed_write,
     routed_read_reversible,
+    routed_write,
     routed_write_lerp,
     routed_write_mix,
     routed_write_reversible,
@@ -79,7 +79,6 @@ from megatron.core.fusions.fused_routed_residual import (
     stream_tap,
     stream_tap_tags,
 )
-
 
 # MEGATRON_ROUTED_FUSED_ROUTER=0 falls back to the unfused router (tap + torch ops)
 _FUSED_ROUTER = os.environ.get("MEGATRON_ROUTED_FUSED_ROUTER", "1") != "0"
@@ -329,13 +328,22 @@ class RoutedStreamMixer(nn.Module):
         )
 
 
-def build_stream_mixer(config) -> nn.Module:
+def build_stream_mixer(config, kind: str = "mixer") -> nn.Module:
     """The mHC mixer of one sublayer: dense mHC, or routed when ``mhc_routed_topk``; the Linear
-    Depth Memory mixer in its stream form (depth_memory_impl torch / cute)."""
-    from megatron.core.transformer.depth_memory import DepthMemoryMixer, ldm_streams
+    Depth Memory mixer in its stream form (depth_memory_impl torch / cute) -- or its pass-through
+    at a sublayer outside ``depth_memory_sites`` (``kind``: "mixer" for attention / linear mixers /
+    Mamba / Engram, "mlp" for MLP / MoE)."""
+    from megatron.core.transformer.depth_memory import (
+        DepthMemoryMixer,
+        DepthMemoryPassThrough,
+        ldm_streams,
+    )
 
     if ldm_streams(config):
-        return DepthMemoryMixer(config)
+        sites = getattr(config, "depth_memory_sites", "all")
+        if sites in ("all", kind):
+            return DepthMemoryMixer(config)
+        return DepthMemoryPassThrough()
     from megatron.core.transformer.attn_res import AttnResStreamMixer, attn_res_streams
 
     if attn_res_streams(config):

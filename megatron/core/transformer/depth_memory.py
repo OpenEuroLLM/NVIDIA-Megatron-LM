@@ -286,6 +286,26 @@ class DepthMemoryMixer(nn.Module):
         pass
 
 
+class DepthMemoryPassThrough(nn.Module):
+    """A sublayer outside ``depth_memory_sites``: the plain residual on the stream x, the pending
+    read r carried to the next site unchanged (that site reads x + r, its query taken at the
+    previous site's write). No parameters, no step."""
+
+    def forward(self, streams: torch.Tensor):
+        return None, None, None
+
+    def read(self, streams: torch.Tensor, h_pre=None) -> torch.Tensor:
+        return streams[..., 0, :]
+
+    def write(self, streams, sublayer_out, h_post=None, h_res=None, lerp=None) -> torch.Tensor:
+        if lerp is not None:
+            raise NotImplementedError("depth_memory with the nGPT LERP residual")
+        return torch.stack((streams[..., 0, :] + sublayer_out, streams[..., 1, :]), dim=-2)
+
+    def record_metrics(self, streams, coeffs) -> None:
+        pass
+
+
 def _site_addresses(stream, eps: float, groups: int, key_dim: int, w_norm, w1, b1, w_addr,
                     b_addr, w_gate, b_gate, logit, q_norm, q1, qb1, q_addr, qb_addr, q_gate,
                     qb_gate, gain):

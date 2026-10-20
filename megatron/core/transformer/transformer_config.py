@@ -2014,6 +2014,11 @@ class TransformerConfig(ModelParallelConfig):
     capturable. "cute": the same with the paper's CuTe DSL kernels (cute_kernels cute_ldm;
     Hopper / Blackwell)."""
 
+    depth_memory_sites: str = "all"
+    """LDM stream form: the sublayers with a depth-memory read / write -- "all", "mixer"
+    (attention, linear mixers, Mamba, Engram) or "mlp" (MLP / MoE); the others keep the plain
+    residual and pass the pending read on to the next site (ablation of where the gain sits)."""
+
     depth_memory_window: int = 4
     """LDM "cute": the window E of deferred writes (the paper: 4)."""
 
@@ -2099,6 +2104,10 @@ class TransformerConfig(ModelParallelConfig):
                 )
             if self.pipeline_model_parallel_size > 1:
                 raise ValueError("depth_memory does not support pipeline parallelism yet")
+            if self.depth_memory_sites not in ("all", "mixer", "mlp"):
+                raise ValueError("depth_memory_sites must be all, mixer or mlp")
+            if self.depth_memory_sites != "all" and self.mhc_per_layer:
+                raise ValueError("depth_memory_sites with mhc_per_layer")
             if self.depth_memory_impl not in ("reference", "torch", "cute"):
                 raise ValueError("depth_memory_impl must be reference, torch or cute")
             if self.depth_memory_impl == "reference" and (

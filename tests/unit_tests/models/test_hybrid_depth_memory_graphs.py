@@ -251,3 +251,32 @@ class TestDepthMemoryPerLayer(TestDepthMemoryGraphs):
 
     def test_stream_form_matches_reference_model(self):
         pytest.skip("per-layer has no per-sublayer reference")
+
+
+@pytest.mark.parametrize("sites,mixer_edges", [("mixer", [1, 2]), ("mlp", [1, 2])])
+def test_depth_memory_sites(sites, mixer_edges):
+    """depth_memory_sites: LDM at the mixer or the MLP / MoE sublayers only; the others pass
+    the streams through (plain residual on x, r unchanged) and take no step."""
+    from megatron.core.transformer.depth_memory import DepthMemoryMixer, DepthMemoryPassThrough
+
+    initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        model = _model("*E*E", "torch", depth_memory_sites=sites)
+        layers = model.decoder.layers
+        attn = [l.mhc_attn_mixer for l in layers if l.mhc_attn_mixer is not None]
+        mlp = [l.mhc_mlp_mixer for l in layers if l.mhc_mlp_mixer is not None]
+        live, passing = (attn, mlp) if sites == "mixer" else (mlp, attn)
+        assert all(isinstance(m, DepthMemoryMixer) for m in live)
+        assert all(isinstance(m, DepthMemoryPassThrough) for m in passing)
+        assert [m.edge for m in live] == mixer_edges
+        assert model.decoder.ldm_workspace.total_edges == len(live) + 1
+        streams = torch.randn(4, 1, 2, 64, device="cuda")
+        out = passing[0].write(streams, torch.ones(4, 1, 64, device="cuda"))
+        torch.testing.assert_close(out[..., 1, :], streams[..., 1, :])
+        torch.testing.assert_close(out[..., 0, :], streams[..., 0, :] + 1)
+        ids = torch.randint(0, VOCAB, (B, S), device="cuda")
+        logits, grads = _fwd_bwd(model, ids)
+        assert torch.isfinite(logits).all()
+    finally:
+        Utils.destroy_model_parallel()
