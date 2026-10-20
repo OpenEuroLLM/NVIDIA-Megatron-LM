@@ -18,6 +18,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires 
 
 
 def _model(pattern, impl, **kw):
+    torch.manual_seed(0)  # use_cpu_initialization: the CPU generator draws the weights
     model_parallel_cuda_manual_seed(123)
     config = TransformerConfig(
         num_layers=len(pattern), hidden_size=64, num_attention_heads=4, ffn_hidden_size=128,
@@ -55,6 +56,8 @@ def test_segments_match_one_sequence(impl, variant):
         pattern = "*-*-*-"
         ids = torch.randint(0, VOCAB, (B, S), device="cuda")
         ref_out, ref_grads = _fwd_bwd(_model(pattern, impl), ids)
+        again, _ = _fwd_bwd(_model(pattern, impl), ids)
+        torch.testing.assert_close(again, ref_out, rtol=0, atol=0)  # same weights both builds
         kw = dict(depth_memory_segments=True)
         if variant != "no_recompute":
             kw.update(recompute_granularity="full", recompute_method="uniform",
