@@ -141,3 +141,17 @@ def test_missing_layer_names_the_module():
     with mock.patch.object(fla_hybrid, "_FLAPanini", None):
         with pytest.raises(ImportError, match="panini_delta_attention"):
             fla_hybrid.PaniniDeltaAttention(_config("panini"), layer_number=1)
+
+
+
+@pytest.mark.skipif(fla_hybrid._FLAKronLSTM is None, reason="no fla.layers.kronlstm")
+def test_kronlstm_qkv_tagged_for_the_muon_split():
+    """KronLSTM's fused qkv_proj is split into q, k, v for Muon-type orthogonalization: one query
+    group ([q; k; v] stacked), the shapes the optimizer's split reads per parameter."""
+    mixer = fla_hybrid.KronLSTM(_config("kronlstm", linear_fla_gate="softplus"), layer_number=1)
+    w = mixer.layer.qkv_proj.weight
+    assert w.is_qkv
+    assert w.qkv_split_shapes == [HIDDEN, HIDDEN, HIDDEN]
+    assert w.shape[0] == sum(w.qkv_split_shapes)  # a single group: the optimizer's view(1, ...)
+    # nothing else is tagged
+    assert [n for n, p in mixer.named_parameters() if getattr(p, "is_qkv", False)] == ["layer.qkv_proj.weight"]

@@ -561,6 +561,16 @@ class KronLSTM(_FLALayerWrapper):
     _PACKED = True
     _FLA_CP = True
 
+    def __init__(self, config: TransformerConfig, *args, **kwargs):
+        super().__init__(config, *args, **kwargs)
+        # The layer's q, k and v share ONE projection weight ([q; k; v] stacked). Muon-type
+        # optimizers orthogonalize per matrix: tag it as a fused QKV, as Megatron tags attention's
+        # linear_qkv, so (angular_)muon_split_qkv orthogonalizes q, k and v separately -- as
+        # complex_kda's three projections are -- not as one 3h x h matrix.
+        w = self.layer.qkv_proj.weight
+        w.is_qkv = True
+        w.qkv_split_shapes = [self.layer.key_dim, self.layer.key_dim, self.layer.value_dim]
+
     @staticmethod
     def _fla_class():
         return _FLAKronLSTM
