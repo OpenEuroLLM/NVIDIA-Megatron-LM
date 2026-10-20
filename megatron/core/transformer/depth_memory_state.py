@@ -153,6 +153,12 @@ class TorchDepthMemoryWorkspace:
     def export_grad(self):
         return self.dm, self.dp
 
+    def state_layout(self):
+        """(per-token shape, dtype) of the carried state (M, P) and of its gradient (dM, dP)."""
+        g, k, d = self.groups, self.key_dim, self.value_dim
+        both = [((g, k, d), torch.float32), ((g, k, k), torch.float32)]
+        return both, both
+
 
 class DepthMemoryStep(torch.autograd.Function):
     """One edge of a workspace as an autograd node: the read is the output; the state is not."""
@@ -194,3 +200,140 @@ def make_workspace(config, total_edges: int):
     return TorchDepthMemoryWorkspace(total_edges, groups, key_dim, value_dim,
                                      config.depth_memory_alpha)
 
+
+
+# --------------------------------------------------------------------------------------------
+# Segments: the state across recompute chunks and pipeline stages (depth_memory_segments)
+# --------------------------------------------------------------------------------------------
+# One workspace holds one micro-batch's state and tapes, which forces PP 1 and no full recompute
+# when the whole stack is one sequence of edges. With segments, every recompute chunk (or, without
+# recompute, every stage) is its own sequence of edges: its start loads the state carried in the
+# streams, its end writes the state back into them, and the backward runs the other way (the
+# workspaces' load_grad / export_grad, the CuTe window fold included). Between segments the streams
+# are [s, b, 2 + state slots, h]: x, the pending read r, then the state (M, P) as raw bits in bf16
+# slots -- a container, never added to (only these functions read it, forward and backward).
+
+
+def _bits(t: torch.Tensor) -> torch.Tensor:
+    """``t`` (bf16 / fp32, contiguous) as flat bf16 bit patterns per token: [n, ...] -> [n, w]."""
+    t = t.contiguous()
+    return t.view(torch.bfloat16).reshape(t.shape[0], -1)
+
+
+def state_slots(config) -> int:
+    """How many [s, b, h] slots the carried state -- and its gradient, the larger of the two --
+    takes for this config (the layouts of the workspaces' ``state_layout``)."""
+    ws = make_workspace(config, total_edges=1)
+    return max(
+        -(-sum(_numel(shape) * dtype.itemsize for shape, dtype in layout) // (2 * config.hidden_size))
+        for layout in ws.state_layout()
+    )
+
+
+def _numel(shape) -> int:
+    count = 1
+    for size in shape:
+        count *= size
+    return count
+
+
+def _pack_state(tensors, slots: int, h: int, like: torch.Tensor) -> torch.Tensor:
+    """State tensors -> [n, slots, h] bf16 bits (zero padded)."""
+    flat = torch.cat([_bits(t) for t in tensors], dim=1)
+    out = like.new_zeros((flat.shape[0], slots * h))
+    out[:, : flat.shape[1]] = flat
+    return out.view(flat.shape[0], slots, h)
+
+
+def _unpack_state(packed: torch.Tensor, layout) -> list:
+    """[n, slots, h] bf16 bits -> the state tensors (copies)."""
+    n = packed.shape[0]
+    flat = packed.reshape(n, -1)
+    out, offset = [], 0
+    for shape, dtype in layout:
+        width = _numel(shape) * dtype.itemsize // 2
+        out.append(flat[:, offset : offset + width].contiguous().view(dtype).view(n, *shape))
+        offset += width
+    return out
+
+
+class SegmentedWorkspace:
+    """A workspace whose edges are numbered per segment: ``begin(base, count)`` makes edges
+    base .. base + count - 1 its local 0 .. count - 1 (the CuTe windows start at the segment's
+    first edge). Buffers are sized for the largest segment (``max_edges``)."""
+
+    def __init__(self, workspace, max_edges: int):
+        self.ws, self.max_edges = workspace, max_edges
+        self.base, self.count = 0, max_edges
+
+    def ensure(self, n, device):
+        count = self.ws.total_edges
+        self.ws.total_edges = self.max_edges
+        self.ws.ensure(n, device)
+        self.ws.total_edges = count
+
+    def begin(self, base: int, count: int, *, carried: bool) -> None:
+        self.base, self.count = base, count
+        self.ws.total_edges = count
+        self.ws.state_loaded = carried
+        self.ws.grad_loaded = False
+
+    def forward(self, edge, *args):
+        return self.ws.forward(edge - self.base, *args)
+
+    def backward(self, edge, read_grad):
+        return self.ws.backward(edge - self.base, read_grad)
+
+
+class SegmentEnter(torch.autograd.Function):
+    """[s, b, 2 + slots, h] -> [s, b, 2, h]: load the carried state into the workspace (or start
+    from zero: the embedding's segment); the backward exports dL/d(state) into the state slots."""
+
+    @staticmethod
+    def forward(ctx, workspace: SegmentedWorkspace, base: int, count: int, carried: bool, streams):
+        s, b, slots, h = streams.shape
+        workspace.ensure(s * b, streams.device)
+        workspace.begin(base, count, carried=carried)
+        if carried:
+            layout, _ = workspace.ws.state_layout()
+            m, p = _unpack_state(streams[:, :, 2:].reshape(s * b, slots - 2, h), layout)
+            workspace.ws.load_state(m, p)
+        ctx.workspace, ctx.cfg = workspace, (base, count, carried, s, b, slots, h)
+        return streams[:, :, :2].clone()
+
+    @staticmethod
+    def backward(ctx, grad):
+        ws = ctx.workspace
+        base, count, carried, s, b, slots, h = ctx.cfg
+        out = grad.new_zeros((s, b, slots, h))
+        out[:, :, :2] = grad
+        if carried:
+            _, glayout = ws.ws.state_layout()
+            grads = [t.to(dtype).reshape(t.shape[0], *shape)
+                     for t, (shape, dtype) in zip(ws.ws.export_grad(), glayout)]
+            out[:, :, 2:] = _pack_state(grads, slots - 2, h, grad).view(s, b, slots - 2, h)
+        return None, None, None, None, out
+
+
+class SegmentExit(torch.autograd.Function):
+    """[s, b, 2, h] -> [s, b, 2 + slots, h]: append the workspace's state after the segment's last
+    edge; the backward loads the incoming dL/d(state) before the segment's steps run backward."""
+
+    @staticmethod
+    def forward(ctx, workspace: SegmentedWorkspace, base: int, count: int, carried: bool,
+                state_slots: int, streams):
+        s, b, _, h = streams.shape
+        m, p = workspace.ws.export_state()
+        packed = _pack_state([m, p], state_slots, h, streams).view(s, b, state_slots, h)
+        ctx.workspace, ctx.cfg = workspace, (base, count, carried, s, b, state_slots, h)
+        return torch.cat((streams, packed), dim=2)
+
+    @staticmethod
+    def backward(ctx, grad):
+        ws = ctx.workspace
+        base, count, carried, s, b, state_slots, h = ctx.cfg
+        ws.begin(base, count, carried=carried)  # (the forward / recompute just ran this segment)
+        _, glayout = ws.ws.state_layout()
+        dm, dp = _unpack_state(grad[:, :, 2:].reshape(s * b, state_slots, h), glayout)
+        ws.ws.load_grad(dm, dp)
+        return None, None, None, None, None, grad[:, :, :2].contiguous()

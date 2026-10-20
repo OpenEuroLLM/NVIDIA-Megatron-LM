@@ -58,6 +58,10 @@ def depth_payload_slots(config) -> int:
     """
     if getattr(config, "mhc", False):
         return config.mhc_expansion_rate
+    if getattr(config, "depth_memory", False) and getattr(config, "depth_memory_segments", False):
+        from megatron.core.transformer.depth_memory_state import state_slots
+
+        return 2 + state_slots(config)  # x, the pending read, the carried state
     if getattr(config, "attn_res", False):
         # b_0 (the embedding) plus one slice per completed block. Mid-block the
         # in-progress partial sum takes the slot of the block it will become, so

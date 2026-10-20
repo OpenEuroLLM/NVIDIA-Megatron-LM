@@ -608,6 +608,9 @@ class HybridStack(MegatronModule):
                 # mHC widens hidden_states to [s, b, n, h] streams; Block AttnRes keeps
                 # its block summaries in a state stashed on every layer.
                 hidden_states, depth_state = self._depth_enter(hidden_states)
+                segmented = getattr(self, "ldm_segmented", False)
+                if segmented:  # depth_memory_segments: the stage is one segment
+                    hidden_states = self.ldm_enter(0, len(self.layers), hidden_states)
                 for layer_index, layer in zip(order, layer_order):
                     if depth_state is not None:
                         layer._depth_state = depth_state
@@ -645,6 +648,8 @@ class HybridStack(MegatronModule):
                             "(it has no depth-memory read / write)"
                         )
                     hidden_states = self._apply_per_layer_embedding(layer_index, hidden_states)
+                if segmented:
+                    hidden_states = self.ldm_exit(0, len(self.layers), hidden_states)
                 hidden_states = self._depth_exit(hidden_states, depth_state)
 
         # Final layer norm.
@@ -728,10 +733,87 @@ class HybridStack(MegatronModule):
         self.ldm_stream_boundary = DepthMemoryStreamBoundary(self.config)
         for param in self.ldm_stream_boundary.parameters():
             param.sequence_parallel = self.config.sequence_parallel
+        self.ldm_segmented = bool(getattr(self.config, "depth_memory_segments", False))
+        if self.ldm_segmented:
+            self._wire_depth_memory_segments(mixers, make_workspace)
+            return
         self.ldm_workspace = make_workspace(self.config, total_edges=len(mixers) + 1)
         self.ldm_stream_boundary.wire(self.ldm_workspace)
         for edge, mixer in enumerate(mixers, start=1):
             mixer.wire(edge, self.ldm_workspace)
+
+    def _wire_depth_memory_segments(self, mixers, make_workspace) -> None:
+        """depth_memory_segments: the steps numbered per stage (edge 0 the embedding on the first
+        stage, then the sublayers), every layer's first / last edge recorded, and ONE workspace
+        sized for the largest segment: a recompute chunk (or, without recompute, the stage)."""
+        from megatron.core.transformer.depth_memory import DepthMemoryMixer
+        from megatron.core.transformer.depth_memory_state import SegmentedWorkspace, state_slots
+
+        first = 1 if self.pre_process else 0  # edge 0: the embedding write (first stage only)
+        edge = first
+        self._ldm_layer_edges = []  # per layer: (first edge, edge count)
+        for layer in self.layers:
+            if isinstance(layer, TransformerLayer):
+                candidates = (
+                    getattr(layer, "mhc_block_mixer", None),
+                    layer.mhc_attn_mixer,
+                    layer.mhc_mlp_mixer,
+                )
+            else:
+                scheme = getattr(layer, "residual_scheme", None)
+                candidates = (scheme.mhc_mixer if scheme is not None else None,)
+            own = [m for m in candidates if isinstance(m, DepthMemoryMixer)]
+            self._ldm_layer_edges.append((edge, len(own)))
+            for mixer in own:
+                mixer._ldm_edge = edge
+                edge += 1
+        largest = max(self.ldm_segment(a, b)[1] for a, b in self._ldm_chunks())
+        ws = SegmentedWorkspace(make_workspace(self.config, total_edges=max(largest, 1)),
+                                max(largest, 1))
+        self.ldm_workspace = ws
+        self.ldm_state_slots = state_slots(self.config)
+        self.ldm_stream_boundary.wire(ws)
+        for mixer in mixers:
+            mixer.wire(mixer._ldm_edge, ws)
+
+    def _ldm_chunks(self):
+        """The layer ranges of this stage's segments: the recompute chunks (as checkpointed_forward
+        cuts them, snapped to mHC blocks) or, without full recompute, the whole stage."""
+        n = len(self.layers)
+        if self.config.recompute_granularity != "full":
+            return [(0, n)]
+        from megatron.core.transformer.mhc_block import is_block_end
+
+        chunks, start = [], 0
+        while start < n:
+            end = min(start + self.config.recompute_num_layers, n)
+            if getattr(self.config, "mhc_per_layer", False):
+                while end < n and not is_block_end(self.layers[end - 1]):
+                    end += 1
+            chunks.append((start, end))
+            start = end
+        return chunks
+
+    def ldm_segment(self, start: int, end: int):
+        """(first edge, edge count) of the segment of layers start .. end - 1."""
+        first, _ = self._ldm_layer_edges[start]
+        last, count = self._ldm_layer_edges[end - 1]
+        return first, last + count - first
+
+    def ldm_enter(self, start: int, end: int, streams):
+        """The segment of layers start .. end - 1 starts: [x, r, state] -> [x, r] (state loaded)."""
+        from megatron.core.transformer.depth_memory_state import SegmentEnter
+
+        base, count = self.ldm_segment(start, end)
+        return SegmentEnter.apply(self.ldm_workspace, base, count, True, streams)
+
+    def ldm_exit(self, start: int, end: int, streams):
+        """... and ends: [x, r] -> [x, r, state]."""
+        from megatron.core.transformer.depth_memory_state import SegmentExit
+
+        base, count = self.ldm_segment(start, end)
+        return SegmentExit.apply(self.ldm_workspace, base, count, True, self.ldm_state_slots,
+                                 streams)
 
     def _wire_attn_res_streams(self) -> None:
         """Block AttnRes, stream form: every mixer's source slice, block slot and seed, from the
@@ -782,6 +864,20 @@ class HybridStack(MegatronModule):
         """
         mhc = getattr(self.config, "mhc", False)
         attn_res = getattr(self.config, "attn_res", False)
+        if self.ldm_stream_boundary is not None and getattr(self, "ldm_segmented", False):
+            # depth_memory_segments: [x, r, state]; the embedding write is the first segment
+            from megatron.core.transformer.depth_memory_state import SegmentExit
+
+            slots = 2 + self.ldm_state_slots
+            if not self.pre_process:
+                s, b, wide = hidden_states.shape
+                return hidden_states.reshape(s, b, slots, wide // slots), None
+            ws = self.ldm_workspace
+            s, b, _ = hidden_states.shape
+            ws.ensure(s * b, hidden_states.device)
+            ws.begin(0, 1, carried=False)
+            streams = self.ldm_stream_boundary.expand(hidden_states)
+            return SegmentExit.apply(ws, 0, 1, False, self.ldm_state_slots, streams), None
         if self.ldm_stream_boundary is not None:
             if not (self.pre_process and self.post_process):
                 raise NotImplementedError("depth_memory needs the whole stack on one stage")
@@ -838,7 +934,12 @@ class HybridStack(MegatronModule):
         from megatron.core.transformer.depth_residual import depth_payload_slots, pack_payload
 
         if self.ldm_stream_boundary is not None and hidden_states.dim() == 4:
-            return self.ldm_stream_boundary.collapse(hidden_states)
+            if self.post_process or not getattr(self, "ldm_segmented", False):
+                return self.ldm_stream_boundary.collapse(hidden_states)
+            s, b, n, h = hidden_states.shape  # segments: [x, r, state] to the next stage
+            return make_viewless_tensor(
+                inp=hidden_states.reshape(s, b, n * h), requires_grad=True, keep_graph=True
+            )
         if self.attnres_stream_boundary is not None and hidden_states.dim() == 4:
             return self.attnres_stream_boundary.collapse(hidden_states)
         if getattr(self.config, "mhc", False) and hidden_states.dim() == 4:

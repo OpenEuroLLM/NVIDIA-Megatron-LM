@@ -2019,6 +2019,13 @@ class TransformerConfig(ModelParallelConfig):
     (attention, linear mixers, Mamba, Engram) or "mlp" (MLP / MoE); the others keep the plain
     residual and pass the pending read on to the next site (ablation of where the gain sits)."""
 
+    depth_memory_segments: bool = False
+    """LDM "torch" / "cute": carry the state (M, P) in the streams ([x, r, state slots]) across
+    recompute chunks and pipeline stages, each chunk (or stage, without recompute) its own sequence
+    of steps -- full activation recompute and pipeline parallelism (depth_memory_state.py,
+    SegmentEnter / SegmentExit). Pipeline parallelism needs full recompute (one workspace per
+    stage holds one segment's tapes)."""
+
     depth_memory_window: int = 4
     """LDM "cute": the window E of deferred writes (the paper: 4)."""
 
@@ -2102,8 +2109,15 @@ class TransformerConfig(ModelParallelConfig):
                     f"depth_memory_groups ({self.depth_memory_groups}) must divide hidden_size "
                     f"({self.hidden_size})"
                 )
-            if self.pipeline_model_parallel_size > 1:
-                raise ValueError("depth_memory does not support pipeline parallelism yet")
+            if self.depth_memory_segments and self.depth_memory_impl not in ("torch", "cute"):
+                raise ValueError("depth_memory_segments needs depth_memory_impl torch or cute")
+            if self.pipeline_model_parallel_size > 1 and not (
+                self.depth_memory_segments and self.recompute_granularity == "full"
+            ):
+                raise ValueError(
+                    "depth_memory with pipeline parallelism needs depth_memory_segments and full "
+                    "activation recompute"
+                )
             if self.depth_memory_sites not in ("all", "mixer", "mlp"):
                 raise ValueError("depth_memory_sites must be all, mixer or mlp")
             if self.depth_memory_sites != "all" and self.mhc_per_layer:
@@ -2117,8 +2131,14 @@ class TransformerConfig(ModelParallelConfig):
                     "depth_memory_impl=reference keeps its state on the layers (not CUDA-graph "
                     "capturable); use depth_memory_impl torch or cute"
                 )
-            if self.recompute_granularity == "full":
-                raise ValueError("depth_memory does not support full activation recompute")
+            if self.recompute_granularity == "full" and not self.depth_memory_segments:
+                raise ValueError(
+                    "depth_memory with full activation recompute needs depth_memory_segments"
+                )
+            if self.depth_memory_segments and self.recompute_granularity == "full" and (
+                self.recompute_method != "uniform"
+            ):
+                raise ValueError("depth_memory_segments: recompute_method must be uniform")
             if not 0 < self.depth_memory_lambda_init < 1:
                 raise ValueError("depth_memory_lambda_init must be in (0, 1)")
         if self.mhc_routed_topk:

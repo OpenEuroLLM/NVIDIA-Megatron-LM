@@ -102,6 +102,9 @@ def checkpointed_forward(
                 else rotary_pos_emb_global
             )
 
+            segmented = getattr(self, "ldm_segmented", False)
+            if segmented:  # depth_memory_segments: every chunk is a segment (depth_memory_state.py)
+                hidden_states = self.ldm_enter(start, end, hidden_states)
             if hidden_states.dim() == 4 and getattr(self.config, "mhc_routed_topk", 0):
                 # Routed residual streams are updated in place (routed_residual.py): a chunk
                 # must not write into its input, which the checkpoint saves and, in the
@@ -156,6 +159,8 @@ def checkpointed_forward(
                 # Some layer paths may still return a tuple (defensive).
                 if isinstance(hidden_states, tuple):
                     hidden_states = hidden_states[0]
+            if segmented:
+                hidden_states = self.ldm_exit(start, end, hidden_states)
             return hidden_states, context
 
         return custom_forward
