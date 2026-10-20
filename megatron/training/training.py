@@ -2970,7 +2970,15 @@ def _maybe_start_mem_trace(iteration):
     torch.cuda.memory._record_memory_history(
         True, trace_alloc_max_entries=2_000_000, trace_alloc_record_context=True
     )
-    return os.path.join(out, f"mem_rank{rank}_iter{iteration}.pickle")
+    path = os.path.join(out, f"mem_rank{rank}_iter{iteration}.pickle")
+
+    def _oom(device, alloc, device_alloc, device_free):
+        # an OOM inside the traced forward-backward: dump what was live there
+        os.makedirs(out, exist_ok=True)
+        torch.cuda.memory._dump_snapshot(path.replace(".pickle", "_oom.pickle"))
+
+    torch._C._cuda_attach_out_of_memory_observer(_oom)
+    return path
 
 
 def _dump_mem_trace(path):
