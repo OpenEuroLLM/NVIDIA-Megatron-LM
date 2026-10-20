@@ -185,9 +185,12 @@ class _MHCWrite(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, streams, sublayer_out, h_post, h_res, link=None):
+    def forward(ctx, streams, sublayer_out, h_post, h_res, link=None, record=None):
         ctx.save_for_backward(streams, sublayer_out, h_post, h_res)
         ctx.link = link
+        ctx.record = record
+        if record is not None:  # the next fused read may run this backward (mhc_fused.py)
+            record.inputs = (streams, sublayer_out, h_post, h_res)
         out = _mhc_write_dispatch(streams, sublayer_out, h_post, h_res)
         _prewarm_backward(out, streams, sublayer_out, h_post, h_res)
         return out
@@ -196,16 +199,31 @@ class _MHCWrite(torch.autograd.Function):
     def backward(ctx, g):
         from megatron.core.transformer.mhc_kernels import write_backward
 
+        from megatron.core.transformer.mhc_fused import is_dummy
+
         streams, sublayer_out, h_post, h_res = ctx.saved_tensors
-        # The kernel indexes as if contiguous; g arrives from whatever produced it.
-        d_streams, d_out, d_post, d_res = write_backward(
-            g.contiguous(), streams, sublayer_out, h_post, h_res
-        )
+        rec, ctx.record = ctx.record, None
+        if rec is not None:
+            rec.inputs = None
+        if rec is not None and rec.grads is not None:
+            # the next sublayer's fused read ran this backward already; g is its placeholder,
+            # plus whatever other consumers of the output contributed
+            (d_streams, d_out, d_post, d_res), rec.grads = rec.grads, None
+            if not is_dummy(g):
+                more = write_backward(g.contiguous(), streams, sublayer_out, h_post, h_res)
+                d_streams, d_out, d_post, d_res = (
+                    a + b for a, b in zip((d_streams, d_out, d_post, d_res), more)
+                )
+        else:
+            # The kernel indexes as if contiguous; g arrives from whatever produced it.
+            d_streams, d_out, d_post, d_res = write_backward(
+                g.contiguous(), streams, sublayer_out, h_post, h_res
+            )
         if ctx.link is not None:
             # the fused read of the same streams adds it inside its own backward kernel
             # (mhc_fused.py), saving autograd's accumulation pass
             ctx.link.grad, d_streams = d_streams, None
-        return d_streams, d_out, d_post, d_res, None
+        return d_streams, d_out, d_post, d_res, None, None
 
 
 _BACKWARD_PREWARMED = False
@@ -679,7 +697,15 @@ class MHCMixer(nn.Module):
             if can_use(streams, n):
                 # Fused Triton backward: one pass over the upstream gradient
                 # instead of the four Inductor derives from the forward.
-                return _MHCWrite.apply(streams, sublayer_out, post, res, link)
+                record = None
+                if link is not None and torch.is_grad_enabled():
+                    from megatron.core.transformer.mhc_fused import FUSE_WRITE_BWD, WriteRecord
+
+                    record = WriteRecord() if FUSE_WRITE_BWD else None
+                out = _MHCWrite.apply(streams, sublayer_out, post, res, link, record)
+                if record is not None:
+                    out._mhc_write_record = record
+                return out
             return _mhc_write_dispatch(streams, sublayer_out, post, res)
         post, res = h_post.to(streams.dtype), h_res.to(streams.dtype)
         try:

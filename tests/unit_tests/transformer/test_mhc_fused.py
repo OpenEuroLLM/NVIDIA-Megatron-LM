@@ -1,7 +1,9 @@
 # Copyright (c) 2026, OpenEuroLLM. All rights reserved.
 
-"""MHC_FUSED_READ (megatron/core/transformer/mhc_fused.py) against the compiled path: two chained
-mHC sublayers (read -> f -> write), outputs and every gradient (streams, sublayer, mixer)."""
+"""MHC_FUSED_READ (megatron/core/transformer/mhc_fused.py) against the compiled path and an fp32
+ground truth: three chained mHC sublayers (read -> f -> write; the second and third reads also run
+the previous write's backward), optionally with a second consumer of the intermediate stream
+states; and a single read with every gradient."""
 
 import pytest
 import torch
@@ -12,10 +14,12 @@ from megatron.core.transformer.mhc import MHCMixer, _sinkhorn_knopp_impl
 N = 4
 
 
-def _fp32_chain(s0, mixers, ws):
+def _fp32_chain(s0, mixers, ws, taps=None):
     """Ground truth: the same chain in fp32, eager."""
     s = s0
-    for mixer, w in zip(mixers, ws):
+    for k, (mixer, w) in enumerate(zip(mixers, ws)):
+        if taps is not None and k > 0:
+            taps.append(s)
         n = s.shape[-2]
         flat = s.flatten(-2)
         r = (flat.norm(dim=-1, keepdim=True) / flat.shape[-1] ** 0.5).clamp(min=mixer.eps)
@@ -32,11 +36,13 @@ def _fp32_chain(s0, mixers, ws):
     return s
 
 
-def _chain(fused, s0, mixers, ws):
+def _chain(fused, s0, mixers, ws, taps=None):
     s = s0
-    for mixer, w in zip(mixers, ws):
+    for k, (mixer, w) in enumerate(zip(mixers, ws)):
         if fused is None:
-            return _fp32_chain(s0, mixers, ws)
+            return _fp32_chain(s0, mixers, ws, taps)
+        if taps is not None and k > 0:
+            taps.append(s)  # a second consumer of the intermediate stream state
         if fused:
             link = mhc_fused.ReadWriteLink()
             x, _, hp, hr = mhc_fused.coeffs_and_read(mixer, s, link)
@@ -53,18 +59,18 @@ def _rel(a, b):
 
 
 @pytest.mark.skipif(not (torch.cuda.is_available() and mhc_fused.HAVE_TRITON), reason="needs Triton")
-@pytest.mark.parametrize("T,C", [(1000, 256), (4096, 2048)])
-def test_fused_matches_compiled(monkeypatch, T, C):
+@pytest.mark.parametrize("T,C,tap", [(1000, 256, False), (4096, 2048, False), (1000, 256, True)])
+def test_fused_matches_compiled(monkeypatch, T, C, tap):
     monkeypatch.setattr(mhc_fused, "ENABLED", True)
     torch.manual_seed(0)
-    mixers = [MHCMixer(C, N).cuda() for _ in range(2)]
+    mixers = [MHCMixer(C, N).cuda() for _ in range(3)]
     for m in mixers:
         with torch.no_grad():
             m.phi.normal_(0, 0.5 / (N * C) ** 0.5)  # input-dependent coefficients of order 1
             m.alpha_pre.fill_(0.5)
             m.alpha_post.fill_(0.5)
             m.alpha_res.fill_(0.5)
-    ws = [(torch.randn(C, C, device="cuda") / C**0.5).bfloat16().requires_grad_() for _ in range(2)]
+    ws = [(torch.randn(C, C, device="cuda") / C**0.5).bfloat16().requires_grad_() for _ in range(3)]
     s0 = torch.randn(T, 1, N, C, device="cuda", dtype=torch.bfloat16)
     g = torch.randn(T, 1, N, C, device="cuda", dtype=torch.bfloat16)
     assert mhc_fused.can_use(s0, N, mixers[0].phi)
@@ -76,12 +82,16 @@ def test_fused_matches_compiled(monkeypatch, T, C):
         dt = torch.float32 if fused is None else torch.bfloat16
         wl = [w.detach().to(dt).requires_grad_() for w in ws]
         s = s0.to(dt).requires_grad_()
-        y = _chain(fused, s, mixers, wl)
-        y.backward(g.to(dt))
+        taps = [] if tap else None
+        y = _chain(fused, s, mixers, wl, taps)
+        loss = (y * g.to(dt)).sum()
+        for x in taps or []:
+            loss = loss + (x.float() * g.float()).sum() * 0.5
+        loss.backward()
         ws_grads = [w.grad for w in wl]
         res[fused] = [y.detach(), s.grad, *ws_grads,
                       *(q.grad.clone() for m in mixers for q in m.parameters())]
-    names = ["out", "d_streams", "d_w0", "d_w1"] + [
+    names = ["out", "d_streams", "d_w0", "d_w1", "d_w2"] + [
         f"m{i}.{n}" for i, m in enumerate(mixers) for n, _ in m.named_parameters()]
     for name, fu, co, gt in zip(names, res[True], res[False], res[None]):
         assert fu is not None and co is not None, name
