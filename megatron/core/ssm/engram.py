@@ -346,7 +346,7 @@ class EngramLayer(MegatronModule):
         rows_all, keys, sizes = [], [], []
         for ids, cu in zip(tokens_list, cu_seqlens_list):
             ids = ids.reshape(1, -1)
-            positions = document_positions(cu.to(ids.device), ids.shape[1]).unsqueeze(0)
+            positions = document_positions(cu.to(ids.device).reshape(-1), ids.shape[1]).unsqueeze(0)
             mapped = ids if self.token_map is None else self.token_map[ids]
             rows = engram_hash(
                 mapped, self.orders, self.num_heads, self.hash_mult, self.sizes, positions=positions

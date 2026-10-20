@@ -294,7 +294,8 @@ def test_step_lookup_matches_per_microbatch():
         ref_outs = run()
         ref_grad = layer.table_grad.clone()
         layer.table_grad.zero_()
-        layer.prefetch_step_lookup([m[0] for m in mbs], [m[1] for m in mbs])
+        # cu_seqlens as training hands them over ([1, docs + 1], maybe_prefetch_cu_seqlens)
+        layer.prefetch_step_lookup([m[0] for m in mbs], [m[1].view(1, -1) for m in mbs])
         outs = run()
         assert layer.table_grad.abs().sum() == 0  # nothing exchanged before the flush
         flush_step_lookups()
