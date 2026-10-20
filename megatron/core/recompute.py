@@ -208,8 +208,13 @@ def checkpointed_forward(
                 while chunk_end < len(order) and not is_block_end(self.layers[order[chunk_end - 1]]):
                     chunk_end += 1
             chunk_runner(layer_idx, chunk_end, True)
-            layer_idx += self.config.recompute_num_layers
+            layer_idx = chunk_end
     elif self.config.recompute_method == 'block':
+        if getattr(self.config, "mhc_per_layer", False):
+            raise NotImplementedError(
+                "mhc_per_layer with recompute_method=block (per-layer checkpoints would split an "
+                "mHC block); use uniform"
+            )
         # Checkpoint the input activation of only a set number of individual
         # layers and skip the rest. Need at least one input tensor with
         # gradient computation for the re-entrant autograd engine, so under
