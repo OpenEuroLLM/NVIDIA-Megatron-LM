@@ -39,6 +39,10 @@ def test_kronlstm_cp_matches_full_sequence(gate):
         cp_group = parallel_state.get_context_parallel_group()
         rank, cp = cp_group.rank(), cp_group.size()
         solo = [torch.distributed.new_group([r]) for r in range(torch.distributed.get_world_size())]
+        # the FLA layer initialises on the CPU from torch's default generator: the same seed on
+        # every rank, as Megatron's _set_random_seed gives CP ranks in training (else each CP
+        # rank holds other weights and the other rank's half of the stream mismatches)
+        torch.manual_seed(1234)
         mixer = fla_hybrid.KronLSTM(config, layer_number=1,
                                     pg_collection=ProcessGroupCollection(tp=tp, cp=cp_group)).cuda()
         ref = fla_hybrid.KronLSTM(config, layer_number=1, pg_collection=ProcessGroupCollection(
