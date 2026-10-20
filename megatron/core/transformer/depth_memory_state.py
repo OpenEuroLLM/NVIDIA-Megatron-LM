@@ -210,14 +210,15 @@ def make_workspace(config, total_edges: int):
 # recompute, every stage) is its own sequence of edges: its start loads the state carried in the
 # streams, its end writes the state back into them, and the backward runs the other way (the
 # workspaces' load_grad / export_grad, the CuTe window fold included). Between segments the streams
-# are [s, b, 2 + state slots, h]: x, the pending read r, then the state (M, P) as raw bits in bf16
-# slots -- a container, never added to (only these functions read it, forward and backward).
+# are [s, b, 2 + state slots, h]: x, the pending read r, then the state (M, P) as raw bytes in slots
+# of the activation dtype -- a container, never added to (only these functions read it, forward and
+# backward).
 
 
-def _bits(t: torch.Tensor) -> torch.Tensor:
-    """``t`` (bf16 / fp32, contiguous) as flat bf16 bit patterns per token: [n, ...] -> [n, w]."""
+def _bytes(t: torch.Tensor) -> torch.Tensor:
+    """``t`` as raw bytes per token: [n, ...] -> [n, nbytes] uint8 (no copy if contiguous)."""
     t = t.contiguous()
-    return t.view(torch.bfloat16).reshape(t.shape[0], -1)
+    return t.reshape(t.shape[0], -1).view(torch.uint8)
 
 
 def state_slots(config) -> int:
@@ -238,20 +239,22 @@ def _numel(shape) -> int:
 
 
 def _pack_state(tensors, slots: int, h: int, like: torch.Tensor) -> torch.Tensor:
-    """State tensors -> [n, slots, h] bf16 bits (zero padded)."""
-    flat = torch.cat([_bits(t) for t in tensors], dim=1)
-    out = like.new_zeros((flat.shape[0], slots * h))
+    """State tensors -> [n, slots, h] of ``like``'s dtype holding their raw bytes (zero padded).
+    A bit container: whatever the activation dtype, the bytes go through unchanged."""
+    flat = torch.cat([_bytes(t) for t in tensors], dim=1)
+    n = flat.shape[0]
+    out = torch.zeros((n, slots * h * like.element_size()), dtype=torch.uint8, device=like.device)
     out[:, : flat.shape[1]] = flat
-    return out.view(flat.shape[0], slots, h)
+    return out.view(like.dtype).view(n, slots, h)
 
 
 def _unpack_state(packed: torch.Tensor, layout) -> list:
-    """[n, slots, h] bf16 bits -> the state tensors (copies)."""
+    """[n, slots, h] container -> the state tensors (copies)."""
     n = packed.shape[0]
-    flat = packed.reshape(n, -1)
+    flat = packed.reshape(n, -1).contiguous().view(torch.uint8)
     out, offset = [], 0
     for shape, dtype in layout:
-        width = _numel(shape) * dtype.itemsize // 2
+        width = _numel(shape) * dtype.itemsize
         out.append(flat[:, offset : offset + width].contiguous().view(dtype).view(n, *shape))
         offset += width
     return out
