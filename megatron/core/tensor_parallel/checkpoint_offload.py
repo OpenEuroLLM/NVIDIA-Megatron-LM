@@ -26,6 +26,11 @@ import os
 import torch
 
 ENABLED = os.environ.get("RECOMPUTE_OFFLOAD", "0") == "1"
+# Also the last chunk of every sequence (once the next sequence starts): its backward comes first,
+# so it is fetched back ahead -- the model chunk's backward runs its micro-batches in forward
+# order, and the start of one sequence's backward fetches the next one's (RECOMPUTE_OFFLOAD_LAST=1;
+# for wide checkpoints, e.g. the LDM state: 16 x 0.7 GB on the first stage at 16k).
+OFFLOAD_LAST = os.environ.get("RECOMPUTE_OFFLOAD_LAST", "0") == "1"
 MIN_BYTES = int(os.environ.get("RECOMPUTE_OFFLOAD_MIN_MB", "16")) << 20
 
 _stream = None
@@ -40,10 +45,32 @@ def _side_stream():
     return _stream
 
 
-def new_sequence():
-    """A new sequence of chunks starts (checkpointed_forward): its first chunk has no previous."""
-    global _last
-    _last = None
+_key = None
+_queues = {}  # sequence key (the model chunk) -> its offloaded last slots, in forward order
+
+
+def new_sequence(key=None):
+    """A new sequence of chunks starts (checkpointed_forward of model chunk ``key``): its first
+    chunk has no previous. With OFFLOAD_LAST the previous sequence's last chunk goes to the host."""
+    global _last, _key
+    if OFFLOAD_LAST and _last is not None and _last.gpu is not None:
+        _last.offload()
+        _last.last_key = _key
+        _queues.setdefault(_key, []).append(_last)
+    _last, _key = None, key
+
+
+def last_fetched(slot):
+    """The backward took ``slot``: if it was a sequence's offloaded last chunk, start copying back
+    the next one of its model chunk (its backward is next in line)."""
+    key = getattr(slot, "last_key", False)
+    if key is False:
+        return
+    queue = _queues.get(key, [])
+    if slot in queue:
+        queue.remove(slot)
+    if queue:
+        queue[0].fetch()
 
 
 def arm():

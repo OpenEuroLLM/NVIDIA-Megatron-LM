@@ -645,8 +645,11 @@ class CheckpointFunction(torch.autograd.Function):
         inputs = ctx.saved_tensors
         slot = ctx.offload_slot
         if slot is not None:
+            from megatron.core.tensor_parallel import checkpoint_offload
+
             ctx.offload_slot = None
             inputs = (slot.get(), *inputs[1:])
+            checkpoint_offload.last_fetched(slot)
             if slot.prev is not None:
                 slot.prev.fetch()  # the next chunk to run backward copies back under this one
             slot.prev = None

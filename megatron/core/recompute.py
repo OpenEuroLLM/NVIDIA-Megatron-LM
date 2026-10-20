@@ -198,7 +198,7 @@ def checkpointed_forward(
             if (start + layer_offset) in extract_layer_indices:
                 intermediate_hidden_states.append(hidden_states)
 
-    checkpoint_offload.new_sequence()
+    checkpoint_offload.new_sequence(id(self))
     if self.config.recompute_method == 'uniform':
         # Uniformly divide the total number of layers and checkpoint
         # the input activation of each divided chunk.
