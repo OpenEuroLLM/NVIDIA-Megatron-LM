@@ -600,6 +600,7 @@ class KronLSTM(_FLALayerWrapper):
                     use_target_gate=config.linear_kronlstm_target_gate,
                     decouple_erase=config.linear_kronlstm_decouple_erase,
                     neg_eigval_init_bias=config.linear_kronlstm_neg_eigval_init_bias,
+                    unit_write=config.linear_kronlstm_unit_write,
                     decay_gate="vector",
                     gate=gate,
                     lower_bound=config.linear_fla_lower_bound,
