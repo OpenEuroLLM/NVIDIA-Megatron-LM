@@ -552,12 +552,14 @@ class KronLSTM(_FLALayerWrapper):
     gates give f in [-1, 1] with Complex KDA's parameterisation and init, applied in the op as a
     sign gauge on q and k. ``linear_fla_allow_neg_eigval`` gives beta in [0, 2]. Packed
     documents reset the recurrence and the short convolution through ``cu_seqlens``. Context
-    parallelism runs the whole gathered sequence on every rank (correct, not split).
+    parallelism splits the token stream (fla_cp.py): the op relays the recurrent state between
+    ranks around its scans (fla/ops/kronlstm/cp.py), the rest of the layer runs in parallel.
     """
 
     _NAME = "kronlstm"
     _NEEDS = "fla.layers.kronlstm (our flash-linear-attention fork)"
     _PACKED = True
+    _FLA_CP = True
 
     @staticmethod
     def _fla_class():
