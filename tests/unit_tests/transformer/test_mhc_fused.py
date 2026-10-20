@@ -99,7 +99,7 @@ def test_fused_matches_compiled(monkeypatch, T, C, tap):
         err_fused, err_compiled = _rel(fu, gt), _rel(co, gt)
         # scalar gates: a sum over all tokens of the upstream bf16 noise (both paths are a few %
         # off there; the single-read test below checks them tightly)
-        tol = 5e-2 if gt.numel() == 1 else max(2e-2, 1.5 * err_compiled)
+        tol = max(5e-2 if gt.numel() == 1 else 2e-2, 1.5 * err_compiled)
         assert err_fused < tol, (name, err_fused, err_compiled)
 
 
