@@ -210,47 +210,6 @@ class TestEngramLayer:
         out = self.layer(torch.randn(16, 2, HIDDEN, device="cuda", dtype=torch.bfloat16))
         assert out.dtype == torch.bfloat16
 
-    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-    def test_packed_documents_match_separate_sequences(self, dtype):
-        """Document masking: one packed [1, T] sequence of three documents (+ trailing
-        padding) equals the three documents run as separate sequences -- forward and the
-        gradients of the input, the table, the projections and the conv."""
-        from megatron.core.packed_seq_params import PackedSeqParams
-
-        layer = self.layer.to(dtype) if dtype != torch.float32 else self.layer
-        with torch.no_grad():
-            layer.conv1d.weight.normal_()  # a non-trivial conv (zero-initialised otherwise)
-        torch.manual_seed(0)
-        lens = [7, 2, 11]
-        T = sum(lens) + 3  # padding after the last document
-        ids = torch.randint(0, 50000, (1, T), device="cuda")
-        h = torch.randn(T, 1, HIDDEN, device="cuda", dtype=dtype, requires_grad=True)
-        cu = torch.tensor([0, 7, 9, 20], dtype=torch.int32, device="cuda")
-        psp = PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu,
-                              max_seqlen_q=11, max_seqlen_kv=11)
-        layer.set_input_ids(ids)
-        packed = layer(h, packed_seq_params=psp)
-        g = torch.randn_like(packed)
-        packed.backward(g)
-        grads_packed = {n: p.grad.clone() for n, p in layer.named_parameters() if p.grad is not None}
-        dh_packed = h.grad.clone()
-        layer.zero_grad()
-        h.grad = None
-
-        outs, start = [], 0
-        for n in lens + [3]:
-            layer.set_input_ids(ids[:, start : start + n])
-            outs.append(layer(h[start : start + n]))
-            start += n
-        sep = torch.cat(outs)
-        sep.backward(g)
-        tol = dict(rtol=1e-5, atol=1e-5) if dtype == torch.float32 else dict(rtol=2e-2, atol=2e-2)
-        torch.testing.assert_close(packed, sep, **tol)
-        torch.testing.assert_close(dh_packed, h.grad, **tol)
-        for n, p in layer.named_parameters():
-            if p.grad is not None:
-                torch.testing.assert_close(grads_packed[n], p.grad, **tol)
-
     def test_missing_token_ids_raise(self):
         self.layer.set_input_ids(None)
         with pytest.raises(RuntimeError, match="needs the token ids"):

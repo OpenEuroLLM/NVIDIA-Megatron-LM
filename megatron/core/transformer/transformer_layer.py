@@ -1112,13 +1112,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             the layer and the enclosing block carry as ``hidden_states``.
         """
         h_post, h_res, *link = pending
+        # the fused read's link (mhc_fused.py) only for the MHCMixer that made it
+        extra = {"link": link[0]} if link else {}
         return mixer.write(
             streams,
             self._sublayer_output(output_with_bias),
             h_post,
             h_res,
             lerp=self._depth_lerp(kind, self.config.mhc_lerp),
-            link=link[0] if link else None,
+            **extra,
         )
 
     # -------------------------------------------------------------- AttnRes

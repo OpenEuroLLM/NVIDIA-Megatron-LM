@@ -110,7 +110,8 @@ def block_forward(layer, inner, args, kwargs):
         # (an fp32 round trip cost ~4 extra passes per block, as much as the saved mHC work)
         update = out - x
         h_post, h_res, *link = pending
-        out = state.mixer.write(streams, update, h_post, h_res, link=link[0] if link else None)
+        extra = {"link": link[0]} if link else {}
+        out = state.mixer.write(streams, update, h_post, h_res, **extra)
     return out, context
 
 
