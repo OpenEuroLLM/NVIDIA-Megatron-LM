@@ -62,12 +62,14 @@ class TorchDepthMemoryWorkspace:
         self.t_s = torch.zeros(L, n, g, **f32)
         self.t_lam = torch.zeros(L, g, **f32)
         self.n = n
+        self.state_loaded = False  # see load_state / load_grad
+        self.grad_loaded = False
 
     @torch.no_grad()
     def forward(self, edge, khat, query, value, scale, forgetting) -> torch.Tensor:
         """Step ``edge``: write (``khat`` [N,G,K], ``value`` [N,G,D], ``scale`` [N,G],
         ``forgetting`` [G]), then read ``query`` [N,G,K]; returns the read [N,G,D] FP32."""
-        if edge == 0:
+        if edge == 0 and not self.state_loaded:
             self.m.zero_()
             self.p.copy_(self.p0)
         m, p = self.m, self.p
@@ -95,7 +97,7 @@ class TorchDepthMemoryWorkspace:
         """The reverse of step ``edge`` (called in strictly decreasing edge order): the
         gradients of (khat, query, value, scale, forgetting [G]), and ``M`` unwound to
         ``M_{edge-1}``."""
-        if edge == self.total_edges - 1:
+        if edge == self.total_edges - 1 and not self.grad_loaded:
             self.dm.zero_()
             self.dp.zero_()
         m = self.m  # holds M_edge here
@@ -132,6 +134,24 @@ class TorchDepthMemoryWorkspace:
             dvalue = du * s.unsqueeze(-1)
             dscale = (dkbar * khat).sum(-1) + (du * value).sum(-1)
         return dkhat, dq, dvalue, dscale, d_lam
+
+    # -- segments (a state carried across recompute chunks / pipeline stages; see the CuTe
+    # workspace for the window fold this E = 1 oracle does not need) ----------------------------
+    def load_state(self, m: torch.Tensor, p: torch.Tensor) -> None:
+        self.m.copy_(m.view_as(self.m))
+        self.p.copy_(p.view_as(self.p))
+        self.state_loaded = True
+
+    def export_state(self):
+        return self.m, self.p
+
+    def load_grad(self, dm: torch.Tensor, dp: torch.Tensor) -> None:
+        self.dm.copy_(dm.view_as(self.dm))
+        self.dp.copy_(dp.view_as(self.dp))
+        self.grad_loaded = True
+
+    def export_grad(self):
+        return self.dm, self.dp
 
 
 class DepthMemoryStep(torch.autograd.Function):
