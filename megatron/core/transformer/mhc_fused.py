@@ -90,6 +90,8 @@ class WriteRecord:
 
 
 FUSE_WRITE_BWD = os.environ.get("MHC_FUSED_WRITE_BWD", "1") == "1"
+# 1: one kernel with d_phi (C-block x token-split tiles); 2: token-major + d_phi by a GEMM
+FUSE_WRITE_BWD_KERNEL = int(os.environ.get("MHC_FUSED_WRITE_BWD_KERNEL", "2"))
 _DUMMY = {}
 
 
@@ -482,6 +484,148 @@ if HAVE_TRITON:
         tl.store(out + 2 * C * M, a2)
         tl.store(out + 3 * C * M, a3)
 
+    _FB2_CONFIGS = [
+        triton.Config({"BC": bc, "BT": bt}, num_warps=w, num_stages=st)
+        for bc in (32, 64, 128)
+        for bt in (16, 32)
+        for w in (4, 8)
+        for st in (1, 2, 3)
+        if bc * bt <= 2048
+    ]
+
+    @triton.autotune(configs=_FB2_CONFIGS, key=["C", "T_BUCKET", "HAS_DSW"])
+    @triton.jit
+    def _fused_bwd2_kernel(sk_ptr, f_ptr, post_ptr, res_ptr, dsw_ptr, dx_ptr, hpre_ptr, dp_ptr,
+                           dsq_ptr, phi_ptr, dsk_ptr, df_ptr, dpr_ptr, T, T_BUCKET,
+                           C: tl.constexpr, M: tl.constexpr, HAS_DSW: tl.constexpr,
+                           BT: tl.constexpr, BC: tl.constexpr):
+        """:func:`_fused_bwd_kernel` token-major: a program owns BT tokens and walks C, so the
+        write's d_post / d_res (sums over C) accumulate in registers; d_phi is left to a GEMM."""
+        t = tl.program_id(0) * BT + tl.arange(0, BT)
+        mt = t < T
+        ms = mt[:, None]
+        row = t[:, None].to(tl.int64)
+        m = tl.arange(0, M)
+        dp = tl.load(dp_ptr + t[:, None] * M + m[None, :], mask=ms, other=0.0)
+        d = 2.0 * tl.load(dsq_ptr + t, mask=mt, other=0.0)[:, None]
+        r00 = _ldv(res_ptr, t, 0, 16, mt)[:, None]
+        r01 = _ldv(res_ptr, t, 1, 16, mt)[:, None]
+        r02 = _ldv(res_ptr, t, 2, 16, mt)[:, None]
+        r03 = _ldv(res_ptr, t, 3, 16, mt)[:, None]
+        r10 = _ldv(res_ptr, t, 4, 16, mt)[:, None]
+        r11 = _ldv(res_ptr, t, 5, 16, mt)[:, None]
+        r12 = _ldv(res_ptr, t, 6, 16, mt)[:, None]
+        r13 = _ldv(res_ptr, t, 7, 16, mt)[:, None]
+        r20 = _ldv(res_ptr, t, 8, 16, mt)[:, None]
+        r21 = _ldv(res_ptr, t, 9, 16, mt)[:, None]
+        r22 = _ldv(res_ptr, t, 10, 16, mt)[:, None]
+        r23 = _ldv(res_ptr, t, 11, 16, mt)[:, None]
+        r30 = _ldv(res_ptr, t, 12, 16, mt)[:, None]
+        r31 = _ldv(res_ptr, t, 13, 16, mt)[:, None]
+        r32 = _ldv(res_ptr, t, 14, 16, mt)[:, None]
+        r33 = _ldv(res_ptr, t, 15, 16, mt)[:, None]
+        p0 = _ldv(post_ptr, t, 0, 4, mt)[:, None]
+        p1 = _ldv(post_ptr, t, 1, 4, mt)[:, None]
+        p2 = _ldv(post_ptr, t, 2, 4, mt)[:, None]
+        p3 = _ldv(post_ptr, t, 3, 4, mt)[:, None]
+        h0 = _ldv(hpre_ptr, t, 0, 4, mt).to(tl.bfloat16).to(tl.float32)[:, None]
+        h1 = _ldv(hpre_ptr, t, 1, 4, mt).to(tl.bfloat16).to(tl.float32)[:, None]
+        h2 = _ldv(hpre_ptr, t, 2, 4, mt).to(tl.bfloat16).to(tl.float32)[:, None]
+        h3 = _ldv(hpre_ptr, t, 3, 4, mt).to(tl.bfloat16).to(tl.float32)[:, None]
+        # d_post[j] (4) and d_res[j, i] (16), summed over C
+        q0 = tl.zeros((BT,), dtype=tl.float32)
+        q1 = tl.zeros((BT,), dtype=tl.float32)
+        q2 = tl.zeros((BT,), dtype=tl.float32)
+        q3 = tl.zeros((BT,), dtype=tl.float32)
+        e00 = tl.zeros((BT,), dtype=tl.float32)
+        e01 = tl.zeros((BT,), dtype=tl.float32)
+        e02 = tl.zeros((BT,), dtype=tl.float32)
+        e03 = tl.zeros((BT,), dtype=tl.float32)
+        e10 = tl.zeros((BT,), dtype=tl.float32)
+        e11 = tl.zeros((BT,), dtype=tl.float32)
+        e12 = tl.zeros((BT,), dtype=tl.float32)
+        e13 = tl.zeros((BT,), dtype=tl.float32)
+        e20 = tl.zeros((BT,), dtype=tl.float32)
+        e21 = tl.zeros((BT,), dtype=tl.float32)
+        e22 = tl.zeros((BT,), dtype=tl.float32)
+        e23 = tl.zeros((BT,), dtype=tl.float32)
+        e30 = tl.zeros((BT,), dtype=tl.float32)
+        e31 = tl.zeros((BT,), dtype=tl.float32)
+        e32 = tl.zeros((BT,), dtype=tl.float32)
+        e33 = tl.zeros((BT,), dtype=tl.float32)
+        for c0 in range(0, C, BC):
+            c = c0 + tl.arange(0, BC)
+            o = row * (4 * C) + c[None, :]
+            of = row * C + c[None, :]
+            sk0 = _ld(sk_ptr, o, mt)
+            sk1 = _ld(sk_ptr, o + C, mt)
+            sk2 = _ld(sk_ptr, o + 2 * C, mt)
+            sk3 = _ld(sk_ptr, o + 3 * C, mt)
+            f = _ld(f_ptr, of, mt)
+            dx = _ld(dx_ptr, of, mt)
+            g0 = (r00 * sk0 + r01 * sk1 + r02 * sk2 + r03 * sk3 + p0 * f).to(tl.bfloat16).to(tl.float32)
+            g0 = h0 * dx + d * g0 + tl.dot(dp, tl.load(phi_ptr + (0 * C + c[None, :]) * M + m[:, None]))
+            g1 = (r10 * sk0 + r11 * sk1 + r12 * sk2 + r13 * sk3 + p1 * f).to(tl.bfloat16).to(tl.float32)
+            g1 = h1 * dx + d * g1 + tl.dot(dp, tl.load(phi_ptr + (1 * C + c[None, :]) * M + m[:, None]))
+            g2 = (r20 * sk0 + r21 * sk1 + r22 * sk2 + r23 * sk3 + p2 * f).to(tl.bfloat16).to(tl.float32)
+            g2 = h2 * dx + d * g2 + tl.dot(dp, tl.load(phi_ptr + (2 * C + c[None, :]) * M + m[:, None]))
+            g3 = (r30 * sk0 + r31 * sk1 + r32 * sk2 + r33 * sk3 + p3 * f).to(tl.bfloat16).to(tl.float32)
+            g3 = h3 * dx + d * g3 + tl.dot(dp, tl.load(phi_ptr + (3 * C + c[None, :]) * M + m[:, None]))
+            if HAS_DSW:
+                g0 += _ld(dsw_ptr, o, mt)
+                g1 += _ld(dsw_ptr, o + C, mt)
+                g2 += _ld(dsw_ptr, o + 2 * C, mt)
+                g3 += _ld(dsw_ptr, o + 3 * C, mt)
+            tl.store(dsk_ptr + o, (r00 * g0 + r10 * g1 + r20 * g2 + r30 * g3).to(tl.bfloat16), mask=ms)
+            tl.store(dsk_ptr + o + C, (r01 * g0 + r11 * g1 + r21 * g2 + r31 * g3).to(tl.bfloat16),
+                     mask=ms)
+            tl.store(dsk_ptr + o + 2 * C, (r02 * g0 + r12 * g1 + r22 * g2 + r32 * g3).to(tl.bfloat16),
+                     mask=ms)
+            tl.store(dsk_ptr + o + 3 * C, (r03 * g0 + r13 * g1 + r23 * g2 + r33 * g3).to(tl.bfloat16),
+                     mask=ms)
+            tl.store(df_ptr + of, (p0 * g0 + p1 * g1 + p2 * g2 + p3 * g3).to(tl.bfloat16), mask=ms)
+            q0 += tl.sum(g0 * f, axis=1)
+            q1 += tl.sum(g1 * f, axis=1)
+            q2 += tl.sum(g2 * f, axis=1)
+            q3 += tl.sum(g3 * f, axis=1)
+            e00 += tl.sum(g0 * sk0, axis=1)
+            e01 += tl.sum(g0 * sk1, axis=1)
+            e02 += tl.sum(g0 * sk2, axis=1)
+            e03 += tl.sum(g0 * sk3, axis=1)
+            e10 += tl.sum(g1 * sk0, axis=1)
+            e11 += tl.sum(g1 * sk1, axis=1)
+            e12 += tl.sum(g1 * sk2, axis=1)
+            e13 += tl.sum(g1 * sk3, axis=1)
+            e20 += tl.sum(g2 * sk0, axis=1)
+            e21 += tl.sum(g2 * sk1, axis=1)
+            e22 += tl.sum(g2 * sk2, axis=1)
+            e23 += tl.sum(g2 * sk3, axis=1)
+            e30 += tl.sum(g3 * sk0, axis=1)
+            e31 += tl.sum(g3 * sk1, axis=1)
+            e32 += tl.sum(g3 * sk2, axis=1)
+            e33 += tl.sum(g3 * sk3, axis=1)
+        q = dpr_ptr + t * 20
+        tl.store(q + 0, q0, mask=mt)
+        tl.store(q + 1, q1, mask=mt)
+        tl.store(q + 2, q2, mask=mt)
+        tl.store(q + 3, q3, mask=mt)
+        tl.store(q + 4, e00, mask=mt)
+        tl.store(q + 5, e01, mask=mt)
+        tl.store(q + 6, e02, mask=mt)
+        tl.store(q + 7, e03, mask=mt)
+        tl.store(q + 8, e10, mask=mt)
+        tl.store(q + 9, e11, mask=mt)
+        tl.store(q + 10, e12, mask=mt)
+        tl.store(q + 11, e13, mask=mt)
+        tl.store(q + 12, e20, mask=mt)
+        tl.store(q + 13, e21, mask=mt)
+        tl.store(q + 14, e22, mask=mt)
+        tl.store(q + 15, e23, mask=mt)
+        tl.store(q + 16, e30, mask=mt)
+        tl.store(q + 17, e31, mask=mt)
+        tl.store(q + 18, e32, mask=mt)
+        tl.store(q + 19, e33, mask=mt)
+
 
 _BT_COEFFS = 32
 
@@ -593,6 +737,19 @@ def _fused_with_write(rec, streams, dsw, d_x, h_pre, d_proj, d_sumsq, phi32, phi
     dev = streams.device
     d_sk = torch.empty_like(sk)
     d_f = torch.empty_like(f)
+    if FUSE_WRITE_BWD_KERNEL == 2:
+        dpr = torch.empty(T, 20, dtype=torch.float32, device=dev)
+        dsw_arg = dsw.contiguous() if dsw is not None else streams
+        dp = d_proj.contiguous()
+        _fused_bwd2_kernel[lambda meta: (triton.cdiv(T, meta["BT"]),)](
+            sk, f, post, res, dsw_arg, d_x, h_pre, dp, d_sumsq.contiguous(), phi32, d_sk, d_f, dpr,
+            T, triton.next_power_of_2(T), C=c, M=_M, HAS_DSW=dsw is not None,
+        )
+        rec.grads = (d_sk, d_f, dpr[:, :4].reshape(post.shape).to(post.dtype),
+                     dpr[:, 4:].reshape(res.shape).to(res.dtype))
+        # d_phi = S_{k+1}^T d_proj over the stream state the read saved (cuBLAS, tf32 off)
+        d_phi = torch.matmul(streams.view(T, K).t(), dp[:, : phi.shape[1]].to(streams.dtype))
+        return (dummy_grad(streams), d_phi.to(phi.dtype), *d_params, None, None, None, None)
     d_phi_parts = torch.empty(32, K, _M, dtype=torch.float32, device=dev)
     # per (C-block, token) partial sums of d_post (4) and d_res (16); at most C / 32 blocks
     dpr = torch.empty(c // 32, T, 20, dtype=torch.float32, device=dev)
