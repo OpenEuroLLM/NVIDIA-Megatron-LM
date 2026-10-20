@@ -772,7 +772,10 @@ class HybridStack(MegatronModule):
                                 max(largest, 1))
         self.ldm_workspace = ws
         self.ldm_state_slots = state_slots(self.config)
-        self.ldm_stream_boundary.wire(ws)
+        # the embedding write (edge 0) is a segment outside the recompute chunks: it is never
+        # replayed before its backward, so its tape must not share the chunks' workspace
+        self.ldm_embed_workspace = SegmentedWorkspace(make_workspace(self.config, total_edges=1), 1)
+        self.ldm_stream_boundary.wire(self.ldm_embed_workspace)
         for mixer in mixers:
             mixer.wire(mixer._ldm_edge, ws)
 
@@ -872,7 +875,7 @@ class HybridStack(MegatronModule):
             if not self.pre_process:
                 s, b, wide = hidden_states.shape
                 return hidden_states.reshape(s, b, slots, wide // slots), None
-            ws = self.ldm_workspace
+            ws = self.ldm_embed_workspace
             s, b, _ = hidden_states.shape
             ws.ensure(s * b, hidden_states.device)
             ws.begin(0, 1, carried=False)
