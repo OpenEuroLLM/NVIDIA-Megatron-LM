@@ -99,6 +99,46 @@ _CU_CACHE = collections.OrderedDict()
 _CU_CACHE_SIZE = 128
 
 
+def fla_cu_seqlens(hidden_states, packed_seq_params, name):
+    """Document boundaries of a packed ``[t, 1, h]`` batch (THD; document masking) as an fla
+    layer's ``cu_seqlens``: its recurrence and short convolutions restart at every document,
+    as attention's varlen mask does."""
+    if hidden_states.shape[1] != 1:
+        raise ValueError(
+            f"packed sequences need batch 1 ([t, 1, h]), got {tuple(hidden_states.shape)}"
+        )
+    cu = packed_seq_params.cu_seqlens_q_padded
+    if cu is None:
+        cu = packed_seq_params.cu_seqlens_q
+    if packed_seq_params.cu_seqlens_kv is not None and not torch.equal(
+        packed_seq_params.cu_seqlens_kv, packed_seq_params.cu_seqlens_q
+    ):
+        raise ValueError(f"{name}: packed self-attention needs cu_seqlens_kv == cu_seqlens_q")
+    # One converted tensor per micro-batch, reused by every layer (forward, recompute and
+    # backward): fla memoizes its varlen index preparation (chunk indices, lengths -- host
+    # syncs) by tensor IDENTITY, so a fresh tensor per call would sync in every layer.
+    total = hidden_states.shape[0]
+    hit = _CU_CACHE.get(id(cu))
+    if hit is not None and hit[0] is cu and hit[1] == total:
+        _CU_CACHE.move_to_end(id(cu))
+        return hit[2]
+    seg = int(os.environ.get("CKDA_BENCH_SEGMENT_ONLY", "0"))
+    if seg > 0:
+        # Benchmark only (measures what document masking costs inside CKDA): restart at every
+        # `seg` tokens -- the packed samples -- instead of at every document.
+        out = torch.arange(0, total + 1, seg, dtype=torch.long, device=cu.device)
+    else:
+        out = cu.to(torch.long)
+    # Padding after the last document (a cu_seqlens shorter than the token count) becomes
+    # its own segment, so it cannot leak into a document (one host sync per micro-batch).
+    if int(out[-1]) != total:
+        out = torch.cat([out, out.new_full((1,), total)])
+    _CU_CACHE[id(cu)] = (cu, total, out)
+    while len(_CU_CACHE) > _CU_CACHE_SIZE:
+        _CU_CACHE.popitem(last=False)
+    return out
+
+
 class _MegatronSelfAttentionAdapter(MegatronModule):
     """Shared plumbing: layout, the ``(output, bias)`` contract, TP replication.
 
@@ -180,48 +220,12 @@ class _MegatronSelfAttentionAdapter(MegatronModule):
         return scatter_replicated_output(y, self.config, self.tp_group), None
 
     def _cu_seqlens(self, hidden_states, packed_seq_params):
-        """Document boundaries of a packed ``[t, 1, h]`` batch (THD; document masking) as the
-        fla layer's ``cu_seqlens``: its recurrence and short convolutions restart at every
-        document, as attention's varlen mask does."""
         if not isinstance(self.layer, ComplexKimiDeltaAttention):
             raise NotImplementedError(
                 f"{type(self.layer).__name__}: packed sequences are only wired for complex_kda "
                 "(use Megatron's attention for the hybrid's attention layers)"
             )
-        if hidden_states.shape[1] != 1:
-            raise ValueError(
-                f"packed sequences need batch 1 ([t, 1, h]), got {tuple(hidden_states.shape)}"
-            )
-        cu = packed_seq_params.cu_seqlens_q_padded
-        if cu is None:
-            cu = packed_seq_params.cu_seqlens_q
-        if packed_seq_params.cu_seqlens_kv is not None and not torch.equal(
-            packed_seq_params.cu_seqlens_kv, packed_seq_params.cu_seqlens_q
-        ):
-            raise ValueError("complex_kda: packed self-attention needs cu_seqlens_kv == cu_seqlens_q")
-        # One converted tensor per micro-batch, reused by every layer (forward, recompute and
-        # backward): fla memoizes its varlen index preparation (chunk indices, lengths -- host
-        # syncs) by tensor IDENTITY, so a fresh tensor per call would sync in every layer.
-        total = hidden_states.shape[0]
-        hit = _CU_CACHE.get(id(cu))
-        if hit is not None and hit[0] is cu and hit[1] == total:
-            _CU_CACHE.move_to_end(id(cu))
-            return hit[2]
-        seg = int(os.environ.get("CKDA_BENCH_SEGMENT_ONLY", "0"))
-        if seg > 0:
-            # Benchmark only (measures what document masking costs inside CKDA): restart at every
-            # `seg` tokens -- the packed samples -- instead of at every document.
-            out = torch.arange(0, total + 1, seg, dtype=torch.long, device=cu.device)
-        else:
-            out = cu.to(torch.long)
-        # Padding after the last document (a cu_seqlens shorter than the token count) becomes
-        # its own segment, so it cannot leak into a document (one host sync per micro-batch).
-        if int(out[-1]) != total:
-            out = torch.cat([out, out.new_full((1,), total)])
-        _CU_CACHE[id(cu)] = (cu, total, out)
-        while len(_CU_CACHE) > _CU_CACHE_SIZE:
-            _CU_CACHE.popitem(last=False)
-        return out
+        return fla_cu_seqlens(hidden_states, packed_seq_params, "complex_kda")
 
     def _forward_cp(self, hidden_states):
         """[s / cp, b, h] in Megatron's CP layout -> the same, through the layer."""

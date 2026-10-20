@@ -69,6 +69,10 @@ try:
     from fla.layers.panini_delta_attention import PaniniDeltaAttention as _FLAPanini
 except ImportError:
     _FLAPanini = None
+try:
+    from fla.layers.kronlstm import KronLSTM as _FLAKronLSTM
+except ImportError:
+    _FLAKronLSTM = None
 
 
 def megatron_init_fla_layer(layer: torch.nn.Module, config: TransformerConfig) -> None:
@@ -167,6 +171,8 @@ class _FLALayerWrapper(MegatronModule):
     _FLA_CP = False
     # Where the layer comes from, for the error when it is missing.
     _NEEDS = "fla.layers.*"
+    # The layer takes ``cu_seqlens`` (document resets for packed THD batches).
+    _PACKED = False
 
     @staticmethod
     def _fla_class():
@@ -285,17 +291,26 @@ class _FLALayerWrapper(MegatronModule):
         **kwargs,
     ):
         """[s, b, h] -> [s, b, h]; returns (output, bias=None)."""
+        kw = {}
         if packed_seq_params is not None:
-            raise NotImplementedError(f"{self._NAME} does not support packed sequences yet.")
+            if not self._PACKED:
+                raise NotImplementedError(f"{self._NAME} does not support packed sequences yet.")
+            from megatron.core.ssm.complex_kda import fla_cu_seqlens
+
+            kw["cu_seqlens"] = fla_cu_seqlens(hidden_states, packed_seq_params, self._NAME)
         hidden_states = gather_replicated_input(hidden_states, self.config, self.tp_group)
         if self.cp_group is not None:
+            if kw:
+                raise NotImplementedError(
+                    f"{self._NAME}: packed sequences with context parallelism are not wired yet"
+                )
             out = self._forward_cp(hidden_states)
             return scatter_replicated_output(out, self.config, self.tp_group), None
         # Megatron is sequence-first, FLA is batch-first.
         x = hidden_states.transpose(0, 1).contiguous()
         # attention_mask is Megatron's causal mask; these layers are causal by
         # construction and expect a [B, T] *padding* mask, so pass None.
-        out, _, _ = self._fla_forward(hidden_states=x, attention_mask=None, use_cache=False)
+        out, _, _ = self._fla_forward(hidden_states=x, attention_mask=None, use_cache=False, **kw)
         out = out.transpose(0, 1).contiguous()
         return scatter_replicated_output(out, self.config, self.tp_group), None
 
@@ -526,4 +541,57 @@ class PowerRetention(_FLALayerWrapper):
             rope=config.linear_power_rope,
             xsa=getattr(config, "linear_xsa", False),
             layer_idx=layer_number,
+        )
+
+
+class KronLSTM(_FLALayerWrapper):
+    """KronLSTM (Kronecker delta rule, github.com/NX-AI/KronLSTM; arXiv 2610.26834) as a
+    Megatron mixer, from the layer vendored in our flash-linear-attention fork.
+
+    The forget gate is ``linear_fla_gate``: "softplus" is KronLSTM's own (0, 1] gate, the signed
+    gates give f in [-1, 1] with Complex KDA's parameterisation and init, applied in the op as a
+    sign gauge on q and k. ``linear_fla_allow_neg_eigval`` gives beta in [0, 2]. Packed
+    documents reset the recurrence and the short convolution through ``cu_seqlens``. Context
+    parallelism runs the whole gathered sequence on every rank (correct, not split).
+    """
+
+    _NAME = "kronlstm"
+    _NEEDS = "fla.layers.kronlstm (our flash-linear-attention fork)"
+    _PACKED = True
+
+    @staticmethod
+    def _fla_class():
+        return _FLAKronLSTM
+
+    def _build(self, config, head_dim, num_heads, layer_number):
+        gate = config.linear_fla_gate
+        if gate not in ("softplus", "signed_sigmoid2", "signed_tanh"):
+            raise ValueError(
+                f"kronlstm: linear_fla_gate must be softplus, signed_sigmoid2 or signed_tanh, got {gate!r}"
+            )
+        v_head_dim = int(head_dim * config.linear_fla_expand_v)
+        return _FLAKronLSTM(
+            **_declared_kwargs(
+                _FLAKronLSTM,
+                dict(
+                    hidden_size=config.hidden_size,
+                    k_head_dim=head_dim,
+                    v_head_dim=v_head_dim,
+                    num_k_heads=num_heads,
+                    num_v_heads=num_heads,
+                    mode="chunk",
+                    use_short_conv=True,
+                    conv_size=config.linear_conv_kernel_dim,
+                    conv_bias=False,
+                    normalize_v=config.linear_kronlstm_normalize_v,
+                    allow_neg_eigval=config.linear_fla_allow_neg_eigval,
+                    use_target_gate=config.linear_kronlstm_target_gate,
+                    decouple_erase=config.linear_kronlstm_decouple_erase,
+                    decay_gate="vector",
+                    gate=gate,
+                    lower_bound=config.linear_fla_lower_bound,
+                    layer_idx=layer_number,
+                    norm_eps=config.layernorm_epsilon,
+                ),
+            )
         )

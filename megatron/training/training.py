@@ -644,6 +644,26 @@ def num_floating_point_operations(
                     + args.hidden_size * v_dim
                 )
             )
+        elif variant == "kronlstm":
+            # fla.layers.kronlstm (megatron/core/ssm/fla_hybrid.py): q, k, v; the low-rank
+            # forget gate (hidden -> v_head_dim -> qk_dim); the dense output gate (hidden x v_dim);
+            # the per-head erase and target gates; the short conv; o_proj. The chunkwise
+            # Kronecker delta rule costs KDA's four state matmuls plus the value Gram (C/2 per
+            # token at chunk 64), which is folded in as a fifth.
+            head_dim = args.linear_key_head_dim
+            num_heads = args.linear_num_key_heads
+            qk_dim = head_dim * num_heads
+            v_dim = int(qk_dim * args.linear_fla_expand_v)
+            v_head_dim = v_dim // num_heads
+            return (
+                args.hidden_size * (2 * qk_dim + v_dim)
+                + args.linear_conv_kernel_dim * (2 * qk_dim + v_dim)
+                + args.hidden_size * v_head_dim + v_head_dim * qk_dim
+                + args.hidden_size * v_dim
+                + args.hidden_size * 2 * num_heads
+                + num_heads * head_dim * v_head_dim * 5
+                + args.hidden_size * v_dim
+            )
         elif variant == "power":
             # megatron/core/ssm/power_retention.py: q, k, v, gate and out projections plus
             # the chunked power-retention core, whose state is binom(d+deg-1, deg) x (d+1)

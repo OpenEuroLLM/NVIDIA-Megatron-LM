@@ -197,3 +197,45 @@ def test_packed_documents_match_separate_with_depth_memory(pattern):
     ldm = [(n, p) for n, p in model.named_parameters() if getattr(p, "is_residual_mixer", False)]
     assert ldm and all(p.grad is not None or getattr(p, "main_grad", None) is not None
                        for _, p in ldm), [n for n, p in ldm if p.grad is None]
+
+
+@pytest.mark.parametrize("gate", ["softplus", "signed_sigmoid2"])
+@pytest.mark.parametrize(
+    "recompute",
+    [{}, dict(recompute_granularity="full", recompute_method="uniform", recompute_num_layers=1)],
+    ids=["no_recompute", "full_recompute"],
+)
+def test_packed_documents_match_separate_with_kronlstm(gate, recompute):
+    """KronLSTM (`kronlstm`, fla_hybrid.KronLSTM) as the `L` mixer: its recurrence, sign
+    parity and short conv restart at every document."""
+    model = _model(experimental_attention_variant="kronlstm", linear_fla_gate=gate,
+                   linear_fla_allow_neg_eigval=True, **recompute)
+    model.train()
+    if gate.startswith("signed"):
+        # a spread of negative forget gates, so the sign gauge matters
+        with torch.no_grad():
+            for layer in model.decoder.layers:
+                mixer = getattr(getattr(layer, "self_attention", None), "layer", None)
+                if mixer is not None and hasattr(mixer, "dt_bias"):
+                    mixer.dt_bias.mul_(torch.where(torch.rand_like(mixer.dt_bias) < 0.5, -1.0, 1.0))
+    docs = [torch.randint(0, VOCAB, (1, n), device="cuda") for n in LENGTHS]
+
+    def run(ids, packed=None):
+        pos = torch.arange(ids.shape[1], device="cuda").unsqueeze(0)
+        return model(ids, position_ids=pos, attention_mask=None, packed_seq_params=packed)
+
+    ref = torch.cat([run(d).float() for d in docs], dim=1)
+    cu = torch.tensor([0, *torch.tensor(LENGTHS).cumsum(0).tolist()], dtype=torch.int32,
+                      device="cuda")
+    packed = PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu,
+                             max_seqlen_q=max(LENGTHS), max_seqlen_kv=max(LENGTHS))
+    together = run(torch.cat(docs, dim=1), packed).float()
+    scale = ref.std()
+    err = (together - ref).abs().max() / scale
+    assert err < 0.05, float(err)
+    leaked = (run(torch.cat(docs, dim=1)).float() - ref)[:, LENGTHS[0]:].abs().max() / scale
+    assert leaked > 4 * err, (float(err), float(leaked))
+    together.logsumexp(-1).mean().backward()
+    kron = [(n, p) for n, p in model.named_parameters() if ".layer." in n and "self_attention" in n]
+    assert kron and all(p.grad is not None or getattr(p, "main_grad", None) is not None
+                        for _, p in kron), [n for n, p in kron if p.grad is None]

@@ -295,7 +295,7 @@ class TransformerConfig(ModelParallelConfig):
     experimental_attention_variant: Optional[
         Literal[
             'gated_delta_net', 'mlstm', 'mamba', 'dsa', 'kda', 'signed_kda', 'panini', 'complex_kda',
-            'triadic', 'power',
+            'triadic', 'power', 'kronlstm',
         ]
     ] = None
     """Type of attention variant to use. Currently support gated_delta_net, mlstm,
@@ -486,6 +486,19 @@ class TransformerConfig(ModelParallelConfig):
     token's own delta-rule write returns, about beta (q . k) v. Native GDN, mLSTM and the
     triadic mixer apply it here; the FLA layers (kda, signed_kda, complex_kda) need the
     ComplexKDA fork's xsa option."""
+
+    linear_kronlstm_target_gate: bool = True
+    """KronLSTM (variant "kronlstm", fla.layers.kronlstm via megatron/core/ssm/fla_hybrid.py):
+    learn the write (target) gate c; the forget gate is linear_fla_gate ("softplus" is KronLSTM's
+    own, the signed gates give f in [-1, 1] through the sign gauge), beta in [0, 2] is
+    linear_fla_allow_neg_eigval."""
+
+    linear_kronlstm_decouple_erase: bool = True
+    """KronLSTM: beta gates the erase only and the target gate alone the write (the paper's
+    default); needs linear_kronlstm_target_gate."""
+
+    linear_kronlstm_normalize_v: bool = True
+    """KronLSTM: L2-normalise v per head (the paper's default)."""
 
     linear_power_deg: int = 2
     """Power retention (variant "power", megatron/core/ssm/power_retention.py): the even degree
