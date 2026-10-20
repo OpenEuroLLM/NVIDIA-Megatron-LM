@@ -965,6 +965,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         This method calls the core computation of a transformer layer, including
         self-attention, cross-attention (if applicable), and feed-forward operations.
         """
+        if getattr(self, "_mhc_block", None) is not None:
+            # mhc_per_layer: one mHC read / write per block of layers (mhc_block.py)
+            from megatron.core.transformer.mhc_block import block_forward
+
+            return block_forward(self, self._forward_layer, args, kwargs)
+        return self._forward_layer(*args, **kwargs)
+
+    def _forward_layer(self, *args, **kwargs):
         hidden_states, context = self._forward_attention(*args, **kwargs)
         output = self._forward_mlp(
             hidden_states,

@@ -272,6 +272,11 @@ class HybridStack(MegatronModule):
         if self.config.cuda_graph_impl == "local":
             annotate_first_last_layer(self.layers)
 
+        if getattr(self.config, "mhc_per_layer", False):
+            from megatron.core.transformer.mhc_block import assign_blocks
+
+            assign_blocks(self)
+
         # Required for activation recomputation
         self.num_layers_per_pipeline_rank = len(self.layers)
 

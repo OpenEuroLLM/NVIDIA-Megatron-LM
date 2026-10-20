@@ -200,6 +200,13 @@ def checkpointed_forward(
         layer_idx = 0
         while layer_idx < len(order):
             chunk_end = min(layer_idx + self.config.recompute_num_layers, len(order))
+            if getattr(self.config, "mhc_per_layer", False):
+                # an mHC block hands its state from its first to its last layer in Python:
+                # a chunk must hold whole blocks (mhc_block.py)
+                from megatron.core.transformer.mhc_block import is_block_end
+
+                while chunk_end < len(order) and not is_block_end(self.layers[order[chunk_end - 1]]):
+                    chunk_end += 1
             chunk_runner(layer_idx, chunk_end, True)
             layer_idx += self.config.recompute_num_layers
     elif self.config.recompute_method == 'block':

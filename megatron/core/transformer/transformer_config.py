@@ -1838,6 +1838,13 @@ class TransformerConfig(ModelParallelConfig):
     what plain Hyper-Connections lose. Mutually exclusive with attn_res. Requires
     pipeline_model_parallel_size == 1 for now."""
 
+    mhc_per_layer: bool = False
+    """mHC per transformer layer instead of per sublayer (HybridStack): the layers up to and
+    including each MLP / MoE layer form one block (e.g. ``L E``) with one stream read at its
+    first layer and one write of the block's update at its last; plain residual inside. Halves
+    the mHC applications of a mixer + MoE pattern. Requires mhc (dense, additive). See
+    megatron/core/transformer/mhc_block.py."""
+
     mhc_expansion_rate: int = 4
     """Number of residual streams n. n=1 degenerates to a standard residual. The paper uses
     n=4, reporting 6.7% training-time overhead at that setting. Costs n-times the residual
@@ -1999,6 +2006,8 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError("moe_zero_expert_num does not support padding to capacity")
             if self.cuda_graph_impl != "none" or self.enable_cuda_graph:
                 raise ValueError("moe_zero_expert_num does not support CUDA graphs yet")
+        if self.mhc_per_layer and (not self.mhc or self.mhc_routed_topk or self.mhc_lerp):
+            raise ValueError("mhc_per_layer requires mhc=True, no routed residual and no mhc_lerp")
         if self.mhc_routed_topk:
             if not self.mhc:
                 raise ValueError("mhc_routed_topk requires mhc=True")
