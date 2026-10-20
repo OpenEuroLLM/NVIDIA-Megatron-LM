@@ -500,6 +500,11 @@ class TransformerConfig(ModelParallelConfig):
     linear_kronlstm_normalize_v: bool = True
     """KronLSTM: L2-normalise v per head (the paper's default)."""
 
+    linear_kronlstm_neg_eigval_init_bias: bool = False
+    """KronLSTM with linear_fla_allow_neg_eigval (s = 2): bias the erase and target gates at init
+    (-ln 3) so s * beta and s * c start at mean 0.5, mostly in [0, 1] -- as with s = 1 -- while the
+    full [0, 2] stays reachable."""
+
     linear_power_deg: int = 2
     """Power retention (variant "power", megatron/core/ssm/power_retention.py): the even degree
     of the (q . k)^deg similarity; the state per head is binom(d+deg-1, deg) x (d+1). The

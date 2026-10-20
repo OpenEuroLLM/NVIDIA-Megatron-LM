@@ -599,6 +599,7 @@ class KronLSTM(_FLALayerWrapper):
                     allow_neg_eigval=config.linear_fla_allow_neg_eigval,
                     use_target_gate=config.linear_kronlstm_target_gate,
                     decouple_erase=config.linear_kronlstm_decouple_erase,
+                    neg_eigval_init_bias=config.linear_kronlstm_neg_eigval_init_bias,
                     decay_gate="vector",
                     gate=gate,
                     lower_bound=config.linear_fla_lower_bound,
