@@ -1079,7 +1079,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         if not arch_metrics.active():
             from megatron.core.transformer import mhc_fused
 
-            if mhc_fused.can_use(streams, streams.shape[-2], mixer.phi):
+            phi = getattr(mixer, "phi", None)  # dense mHC only (not routed / LDM / AttnRes streams)
+            if phi is not None and mhc_fused.can_use(streams, streams.shape[-2], phi):
                 # Triton coefficients + read; the write hands its stream gradient to this
                 # read's backward through the link (megatron/core/transformer/mhc_fused.py)
                 link = mhc_fused.ReadWriteLink()

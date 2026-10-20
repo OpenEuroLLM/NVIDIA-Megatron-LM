@@ -1856,7 +1856,9 @@ class TransformerConfig(ModelParallelConfig):
     """mHC per transformer layer instead of per sublayer (HybridStack): the layers up to and
     including each MLP / MoE layer form one block (e.g. ``L E``) with one stream read at its
     first layer and one write of the block's update at its last; plain residual inside. Halves
-    the mHC applications of a mixer + MoE pattern. Requires mhc (dense, additive). See
+    the mHC applications of a mixer + MoE pattern. Requires mhc (dense, additive), or Linear
+    Depth Memory in its stream form (one read of x + r per block and one fused write of the block's
+    update + next read: the depth-memory steps halve too). See
     megatron/core/transformer/mhc_block.py."""
 
     mhc_expansion_rate: int = 4
@@ -2065,8 +2067,28 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError("moe_zero_expert_num does not support padding to capacity")
             if self.cuda_graph_impl != "none" or self.enable_cuda_graph:
                 raise ValueError("moe_zero_expert_num does not support CUDA graphs yet")
-        if self.mhc_per_layer and (not self.mhc or self.mhc_routed_topk or self.mhc_lerp):
-            raise ValueError("mhc_per_layer requires mhc=True, no routed residual and no mhc_lerp")
+        ldm_streams = self.depth_memory and self.depth_memory_impl in ("torch", "cute")
+        if self.mhc_per_layer and not ldm_streams and (
+            not self.mhc or self.mhc_routed_topk or self.mhc_lerp
+        ):
+            raise ValueError(
+                "mhc_per_layer requires mhc=True (no routed residual, no mhc_lerp) or Linear Depth "
+                "Memory in its stream form (depth_memory_impl torch / cute)"
+            )
+        if self.mhc_per_layer and self.cuda_graph_impl == "local":
+            # the block state (streams, read, coefficients) goes from a block's first layer to its
+            # last through a Python object: a whole-layer graph of the first layer replays without
+            # setting it (stale buffers in the last layer's write). The MoE router / preprocess
+            # graphs run inside the layer's eager forward and are fine.
+            whole = {str(getattr(m, "name", m)) for m in self.cuda_graph_modules or []} - {
+                "moe_router", "moe_preprocess"
+            }
+            if whole:
+                raise ValueError(
+                    "mhc_per_layer supports CUDA graphs of the MoE router / preprocess only, got "
+                    f"cuda_graph_modules {sorted(whole)} (whole-layer graphs would replay a block's "
+                    "first layer without handing its state to the last)"
+                )
         if self.depth_memory:
             if self.mhc or self.attn_res:
                 raise ValueError("depth_memory is mutually exclusive with mhc and attn_res")

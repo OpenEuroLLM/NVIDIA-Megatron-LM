@@ -709,10 +709,16 @@ class HybridStack(MegatronModule):
 
         if self._loop_schedule_requested():
             raise NotImplementedError("depth_memory with looped (weight-tied) depth")
+        # with mhc_per_layer (mhc_block.assign_blocks, run before this) a block's first layer holds
+        # its one mixer as mhc_block_mixer and the others none: one step per block
         mixers = []
         for layer in self.layers:
             if isinstance(layer, TransformerLayer):
-                candidates = (layer.mhc_attn_mixer, layer.mhc_mlp_mixer)
+                candidates = (
+                    getattr(layer, "mhc_block_mixer", None),
+                    layer.mhc_attn_mixer,
+                    layer.mhc_mlp_mixer,
+                )
             else:
                 scheme = getattr(layer, "residual_scheme", None)
                 candidates = (scheme.mhc_mixer if scheme is not None else None,)

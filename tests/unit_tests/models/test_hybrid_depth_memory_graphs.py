@@ -181,3 +181,73 @@ class TestDepthMemoryCuteGraphs(TestDepthMemoryGraphs):
 
     def test_stream_form_matches_reference_model(self):
         pytest.skip("covered by the torch class; cute vs torch in test_depth_memory_cute.py")
+
+
+class TestDepthMemoryPerLayer(TestDepthMemoryGraphs):
+    """LDM per transformer layer (mhc_per_layer): one read and one fused write per block (mixer
+    + MoE), plain residual inside -- the steps halve; graph replay = eager."""
+
+    def test_one_step_per_block(self):
+        model = _model("*E*E*E", "torch", mhc_per_layer=True)
+        stack = model.decoder
+        assert stack.ldm_workspace.total_edges == 3 + 1  # three blocks + the embedding write
+        mixers = [l.mhc_block_mixer for l in stack.layers if getattr(l, "mhc_block_mixer", None)]
+        assert [m.edge for m in mixers] == [1, 2, 3]
+        ids = torch.randint(0, VOCAB, (B, S), device="cuda")
+        out, grads = _fwd_bwd(model, ids)
+        assert torch.isfinite(out).all()
+        ldm = [k for k in grads if "write_site" in k or "next_query" in k or "ldm_" in k]
+        assert ldm and all(grads[k].abs().sum() > 0 for k in ldm if "gate.weight" not in k)
+
+    def test_block_semantics(self):
+        """The block reads x + r once; inside, the plain residual; the write gets the block's
+        update h_end - (x + r) = d_1 + d_2: the stream after the block is x + d_1 + d_2."""
+        from megatron.core.transformer import mhc_block
+
+        model = _model("*E", "torch", mhc_per_layer=True)
+        seen = {}
+        orig = mhc_block.block_forward
+
+        def spy(layer, inner, args, kwargs):
+            out, ctx = orig(layer, inner, args, kwargs)
+            seen[layer.layer_number] = out
+            return out, ctx
+
+        mhc_block.block_forward = spy
+        try:
+            ids = torch.randint(0, VOCAB, (B, S), device="cuda")
+            _fwd_bwd(model, ids)
+        finally:
+            mhc_block.block_forward = orig
+        # layer 1 (attention) returns the in-block [s, b, h]; layer 2 (MoE, last) the streams
+        assert seen[1].dim() == 3 and seen[2].dim() == 4 and seen[2].shape[-2] == 2
+
+    def test_whole_layer_graphs_rejected(self):
+        with pytest.raises(ValueError, match="MoE router / preprocess only"):
+            _model("*E*E", "torch", graphs=["attn", "moe_router"], mhc_per_layer=True)
+
+    @pytest.mark.parametrize("pattern", ["*E*E"])
+    def test_graph_replay_matches_eager(self, pattern):
+        """The MoE router / preprocess graphs (round 5's document-masked setting)."""
+        torch.manual_seed(0)
+        ids = torch.randint(0, VOCAB, (B, S), device="cuda")
+        eager = _model(pattern, "torch", mhc_per_layer=True)
+        with torch.no_grad():
+            for name, p in eager.named_parameters():
+                if getattr(p, "is_residual_mixer", False):
+                    p.add_(torch.randn_like(p) * 0.2)
+        ref_out, ref_grads = _fwd_bwd(eager, ids)
+        graphed = _model(pattern, "torch", graphs=["moe_router", "moe_preprocess"],
+                         mhc_per_layer=True)
+        graphed.load_state_dict(eager.state_dict())
+        _fwd_bwd(graphed, ids)
+        create_cudagraphs()
+        assert _CudagraphGlobalRecord.cudagraph_created, "no cudagraphs were created"
+        for _ in range(2):
+            out, grads = _fwd_bwd(graphed, ids)
+            torch.testing.assert_close(out, ref_out, rtol=0, atol=0)
+            for k, g in ref_grads.items():
+                torch.testing.assert_close(grads[k], g, rtol=0, atol=0, msg=k)
+
+    def test_stream_form_matches_reference_model(self):
+        pytest.skip("per-layer has no per-sublayer reference")
