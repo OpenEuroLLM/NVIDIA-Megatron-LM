@@ -199,7 +199,9 @@ def save_to_expert_utilization_tracker(
     if layer_number is None:
         return
     tracker = get_expert_utilization_tracker()
-    if "selected_values" not in tracker:
+    shape = (num_layers, selected_tokens_per_expert.shape[0])
+    if "selected_values" not in tracker or tuple(tracker["selected_values"].shape) != shape:
+        # (re)allocate: first call, or another model (layers / experts) in the same process
         num_experts = selected_tokens_per_expert.shape[0]
         device = selected_tokens_per_expert.device
         tracker["selected_values"] = torch.zeros(
@@ -241,7 +243,8 @@ def save_to_router_stats_tracker(
     if layer_number is None:
         return
     tracker = get_router_stats_tracker()
-    if "sum_max_score" not in tracker:
+    shape = (num_layers, sum_logits.shape[0])
+    if "sum_logits" not in tracker or tuple(tracker["sum_logits"].shape) != shape:
         num_experts = sum_logits.shape[0]
         device = sum_logits.device
         tracker["sum_max_score"] = torch.zeros(num_layers, device=device, dtype=torch.float32)
@@ -462,9 +465,9 @@ def capture_expert_viability_parameter_stats(model_chunks) -> None:
             grad = expert_rms_statistics(module.experts, module.num_local_experts, gradients=True)
             if weight is None:
                 continue
-            if "weight_sq_sum" not in tracker:
+            shape = (module.config.num_layers, module.config.num_moe_experts)
+            if "weight_sq_sum" not in tracker or tuple(tracker["weight_sq_sum"].shape) != shape:
                 device = weight[0].device
-                shape = (module.config.num_layers, module.config.num_moe_experts)
                 for name in (
                     "weight_sq_sum",
                     "weight_count",
@@ -495,7 +498,7 @@ def save_routed_expert_stat(
     if layer_number is None or is_graph_warmup():
         return
     tracker = _MOE_EXPERT_VIABILITY_TRACKER
-    if "routed_sq_sum" not in tracker:
+    if "routed_sq_sum" not in tracker or tracker["routed_sq_sum"].shape[0] != num_layers:
         device = tensor.device
         for key in ("routed", "input", "output"):
             tracker[f"{key}_sq_sum"] = torch.zeros(num_layers, device=device, dtype=torch.float32)

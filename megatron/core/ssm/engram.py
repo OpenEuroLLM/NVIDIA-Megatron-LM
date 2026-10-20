@@ -22,10 +22,11 @@ GPU at inference. Here they are trained on the GPU: under tensor parallelism the
 rows of the (concatenated) table are sharded like a vocab-parallel embedding (masked
 local lookup, then all-reduce); the small projections, norms and conv are replicated
 across TP ranks (tp_replicated.py) and the layer runs on the whole sequence, so it
-also works with sequence parallelism. Packed sequences (document masking) restart the
-n-gram history and the conv at every document start: positions before it read the
-filler, exactly as at the start of an unpacked sequence. Context parallelism gathers the
-sequence (fla_cp); it is not combined with packed sequences.
+also works with sequence parallelism. Under context parallelism Engram gathers the
+whole sequence (see ``cp_group``); packed sequences with CP are not supported. Packed
+batches (document masking: THD, ``[t, 1, h]``) restart the n-grams and the causal conv at
+every document: a token's history never reaches into the previous document, exactly as
+at the sequence start.
 
 The table parameters carry ``is_engram_table`` so the optimizer can give them their
 own learning-rate multiplier and no weight decay (``engram_lr_mult``).
@@ -63,23 +64,6 @@ _HASH_SEED = 0x5EED_E46A
 _PAD_ID = 0
 
 
-def document_positions(packed_seq_params, total: int, device) -> torch.Tensor:
-    """[total] position of every token in its document, from the packed cu_seqlens (on the
-    device: no host sync). Tokens after the last document form their own segment."""
-    cu = packed_seq_params.cu_seqlens_q_padded
-    if cu is None:
-        cu = packed_seq_params.cu_seqlens_q
-    return positions_from_cu(cu, total, device)
-
-
-def positions_from_cu(cu: torch.Tensor, total: int, device) -> torch.Tensor:
-    """:func:`document_positions` from a cu_seqlens tensor."""
-    cu = cu.to(device=device, dtype=torch.int64).reshape(-1)
-    t = torch.arange(total, device=device, dtype=torch.int64)
-    doc = torch.searchsorted(cu[1:], t, right=True).clamp_max(cu.numel() - 1)
-    return t - cu[doc]
-
-
 def _is_prime(n: int) -> bool:
     if n < 2:
         return False
@@ -104,12 +88,30 @@ def engram_table_sizes(config: TransformerConfig) -> list[int]:
     return sizes
 
 
-def engram_hash_multipliers(config: TransformerConfig) -> torch.Tensor:
-    """[orders * heads, max_order] odd int64 multipliers (< 2**31), deterministic."""
-    rng = np.random.default_rng(_HASH_SEED)
+def engram_hash_multipliers(
+    config: TransformerConfig, layer_number: Optional[int] = None
+) -> torch.Tensor:
+    """[orders * heads, max_order] odd int64 multipliers (< 2**31), deterministic; per
+    layer under ``engram_hash_per_layer``."""
+    seed = _HASH_SEED
+    if config.engram_hash_per_layer:
+        seed += 10007 * int(layer_number or 0)
+    rng = np.random.default_rng(seed)
     n_lookups = len(config.engram_ngram_orders) * config.engram_num_heads
     mult = rng.integers(1 << 20, 1 << 31, size=(n_lookups, max(config.engram_ngram_orders)))
     return torch.from_numpy(mult | 1).to(torch.int64)
+
+
+def document_positions(cu_seqlens: torch.Tensor, total: int) -> torch.Tensor:
+    """Position of every token of a packed sequence within its document: ``[total]``.
+
+    ``cu_seqlens`` are the document boundaries (``[docs + 1]``, starting at 0); tokens past
+    the last boundary (padding) continue the last document. On the device, no host sync.
+    """
+    cu = cu_seqlens.to(torch.int64)
+    idx = torch.arange(total, device=cu.device)
+    doc = torch.searchsorted(cu[1:], idx, right=True).clamp_(max=cu.numel() - 2)
+    return idx - cu[doc]
 
 
 def engram_hash(
@@ -123,9 +125,9 @@ def engram_hash(
     """Row index per (order, head) of every suffix n-gram: [b, s] -> [b, s, orders*heads].
 
     ``h = XOR_i (x_{t-i} + 1) * a_i`` over the last n tokens, then ``h mod M``. Positions
-    before the sequence start contribute the filler 0. Products stay below 2**52, so
-    the int64 arithmetic never overflows. ``positions`` ([b, s], packed sequences): each
-    token's position in its document; history before the document start is the filler.
+    before the sequence start -- or, with ``positions`` (``[b, s]``, the position within the
+    document, see :func:`document_positions`), before the document start -- contribute the
+    filler 0. Products stay below 2**52, so the int64 arithmetic never overflows.
     """
     b, s = token_ids.shape
     shifted = token_ids.to(torch.int64) + 1
@@ -134,8 +136,7 @@ def engram_hash(
         F.pad(shifted, (i, 0), value=_PAD_ID)[:, :s] for i in range(1, max(orders))
     ]
     if positions is not None:
-        history = [hist if i == 0 else hist.masked_fill(positions < i, _PAD_ID)
-                   for i, hist in enumerate(history)]
+        history = [hist.masked_fill(positions < i, _PAD_ID) for i, hist in enumerate(history)]
     out = []
     lookup = 0
     for n in orders:
@@ -194,7 +195,9 @@ class EngramLayer(MegatronModule):
         self.register_buffer(
             "row_offsets", torch.tensor(offsets, dtype=torch.int64), persistent=False
         )
-        self.register_buffer("hash_mult", engram_hash_multipliers(config), persistent=False)
+        self.register_buffer(
+            "hash_mult", engram_hash_multipliers(config, layer_number), persistent=False
+        )
         token_map = None
         if config.engram_token_map is not None:
             token_map = torch.from_numpy(np.load(config.engram_token_map).astype(np.int64))
@@ -253,6 +256,9 @@ class EngramLayer(MegatronModule):
         )
         self.hidden_norm = _RMSNorm(h, config.layernorm_epsilon).to(device)
         self.key_norm = _RMSNorm(h, config.layernorm_epsilon).to(device)
+        self.conv_norm = (
+            _RMSNorm(h, config.layernorm_epsilon).to(device) if config.engram_conv_prenorm else None
+        )
         self.kernel_size = config.engram_conv_kernel_size
         self.dilation = max(self.orders)
         self.conv1d = nn.Conv1d(
@@ -273,6 +279,7 @@ class EngramLayer(MegatronModule):
             self.hidden_norm,
             self.key_norm,
             self.conv1d,
+            *([self.conv_norm] if self.conv_norm is not None else []),
         ):
             replicate_across_tp(module, self.tp_group)
         self._input_ids = None
@@ -339,7 +346,7 @@ class EngramLayer(MegatronModule):
         rows_all, keys, sizes = [], [], []
         for ids, cu in zip(tokens_list, cu_seqlens_list):
             ids = ids.reshape(1, -1)
-            positions = positions_from_cu(cu, ids.shape[1], ids.device).unsqueeze(0)
+            positions = document_positions(cu.to(ids.device), ids.shape[1]).unsqueeze(0)
             mapped = ids if self.token_map is None else self.token_map[ids]
             rows = engram_hash(
                 mapped, self.orders, self.num_heads, self.hash_mult, self.sizes, positions=positions
@@ -371,8 +378,11 @@ class EngramLayer(MegatronModule):
         """Token ids [b, s] of the current micro-batch (set by HybridStack)."""
         self._input_ids = input_ids
 
-    def _memory(self, input_ids: torch.Tensor, positions=None) -> torch.Tensor:
-        """e_t for every position: [b, s] -> [s, b, lookups * embed_dim], full on every rank."""
+    def _memory(
+        self, input_ids: torch.Tensor, positions: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """e_t for every position: [b, s] -> [s, b, lookups * embed_dim], full on every rank.
+        ``positions`` ([b, s], within the document) restart the n-grams at documents."""
         step = self._step_lookup
         if step is not None:
             inverse = step["inverse"].get((input_ids.data_ptr(), input_ids.numel()))
@@ -426,24 +436,6 @@ class EngramLayer(MegatronModule):
             )
         return emb
 
-    def _document_conv(self, v: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        """The depthwise causal conv tap by tap ([s, b, h]), each tap masked at the document
-        starts: output t sums w_k v_{t - (K-1-k) d} only over taps inside t's document --
-        Conv1d's left-padded result on every document of a packed sequence."""
-        s = v.shape[0]
-        w = self.conv1d.weight[:, 0, :]  # [h, K]
-        out = None
-        for k in range(self.kernel_size):
-            off = (self.kernel_size - 1 - k) * self.dilation
-            if off >= s:
-                continue
-            tap = v if off == 0 else F.pad(v, (0, 0, 0, 0, off, 0))[:s]
-            if off:
-                tap = tap * (positions >= off).to(v.dtype).view(s, 1, 1)
-            term = tap * w[:, k]
-            out = term if out is None else out + term
-        return out
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -459,20 +451,14 @@ class EngramLayer(MegatronModule):
                 "EngramLayer needs the token ids; HybridStack passes them on the pipeline "
                 "stages that hold `N` layers."
             )
+        positions = None
+        if packed_seq_params is not None:
+            positions = self._document_positions(packed_seq_params)
         ctx = None
         if self.residual_scheme is not None:
             hidden_states, ctx = self.residual_scheme.read(hidden_states, self._depth_state)
         h = gather_replicated_input(hidden_states, self.config, self.tp_group)  # [s, b, h]
         input_ids = self._input_ids
-        positions = None
-        if packed_seq_params is not None:
-            if self.cp_group is not None:
-                raise NotImplementedError(
-                    "Engram: packed sequences with context parallelism are not supported"
-                )
-            if input_ids.shape[0] != 1:
-                raise ValueError(f"packed sequences need batch 1, got {tuple(input_ids.shape)}")
-            positions = document_positions(packed_seq_params, input_ids.shape[1], h.device)
         if self.cp_group is not None:
             from megatron.core.ssm import fla_cp
 
@@ -486,7 +472,10 @@ class EngramLayer(MegatronModule):
         k = self.key_proj(e)
         v = self.value_proj(e)
         gate = (self.hidden_norm(h).float() * self.key_norm(k).float()).sum(-1, keepdim=True)
-        alpha = torch.sigmoid(gate / math.sqrt(h.shape[-1])).to(h.dtype)
+        gate = gate / math.sqrt(h.shape[-1])
+        if self.config.engram_gate_signed_sqrt:
+            gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
+        alpha = torch.sigmoid(gate).to(h.dtype)
         from megatron.core.transformer import arch_metrics
 
         if arch_metrics.active():
@@ -495,11 +484,12 @@ class EngramLayer(MegatronModule):
             arch_metrics.record_mean("engram/gate_closed", self.layer_number, n, alpha < 0.05)
             arch_metrics.record_mean("engram/gate_open", self.layer_number, n, alpha > 0.95)
         v = alpha * v
+        conv_in = v if self.conv_norm is None else self.conv_norm(v)
         if positions is None:
             pad = (self.kernel_size - 1) * self.dilation
-            conv = self.conv1d(F.pad(v.permute(1, 2, 0), (pad, 0))).permute(2, 0, 1)
+            conv = self.conv1d(F.pad(conv_in.permute(1, 2, 0), (pad, 0))).permute(2, 0, 1)
         else:
-            conv = self._document_conv(v, positions)
+            conv = self._document_conv(conv_in, positions)
         y = F.silu(conv) + v
         if self.cp_group is not None:
             y = fla_cp.local_sequence(y, self.cp_group)
@@ -507,6 +497,36 @@ class EngramLayer(MegatronModule):
         if self.residual_scheme is not None:
             return self.residual_scheme.write(y, ctx, self._depth_state, self.layer_number)
         return hidden_states + y
+
+    def _document_positions(self, packed_seq_params) -> torch.Tensor:
+        """Position within its document of every token of a packed ``[1, t]`` batch."""
+        if self.cp_group is not None:
+            raise NotImplementedError("Engram: packed sequences with context parallelism")
+        input_ids = self._input_ids
+        if input_ids.shape[0] != 1:
+            raise ValueError(
+                f"Engram: packed sequences need batch 1 ([1, t] ids), got {tuple(input_ids.shape)}"
+            )
+        cu = packed_seq_params.cu_seqlens_q_padded
+        if cu is None:
+            cu = packed_seq_params.cu_seqlens_q
+        return document_positions(cu, input_ids.shape[1])
+
+    def _document_conv(self, v: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        """The depthwise causal conv of ``forward`` ([s, b, h], b = 1), tap by tap, without
+        the taps that reach before the token's document start."""
+        weight = self.conv1d.weight[:, 0, :]  # [h, kernel]
+        out = None
+        for k in range(self.kernel_size):
+            lag = (self.kernel_size - 1 - k) * self.dilation
+            if lag == 0:
+                tap = v
+            else:
+                tap = F.pad(v, (0, 0, 0, 0, lag, 0))[: v.shape[0]]
+                tap = tap.masked_fill((positions < lag).view(-1, 1, 1), 0.0)
+            term = tap * weight[:, k]
+            out = term if out is None else out + term
+        return out
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """The table is sharded on rows (over TP, or every rank of the stage under

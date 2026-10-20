@@ -556,6 +556,7 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
         sequence_parallel_size=args.tensor_model_parallel_size * args.sequence_parallel,
         hybrid_context_parallel=args.hybrid_context_parallel,
         inter_document_masking=args.dataloader_inter_document_masking,
+        add_bos=getattr(args, "dataloader_add_bos", False),
         document_segment_length=getattr(args, "dataloader_document_segment_length", None),
     )
 

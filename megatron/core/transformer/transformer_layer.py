@@ -526,8 +526,16 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         self.attnres_attn = None
         self.attnres_mlp = None
         self._depth_state = None
-        if getattr(self.config, "mhc", False):
-            # Dense mHC, or routed residual streams with mhc_routed_topk.
+        from megatron.core.transformer.attn_res import attn_res_streams
+        from megatron.core.transformer.depth_memory import ldm_streams
+
+        if (
+            getattr(self.config, "mhc", False)
+            or ldm_streams(self.config)
+            or attn_res_streams(self.config)
+        ):
+            # Dense mHC, routed residual streams with mhc_routed_topk, or the stream form of
+            # Linear Depth Memory.
             from megatron.core.transformer.routed_residual import build_stream_mixer
 
             self.mhc_attn_mixer = build_stream_mixer(self.config) if has_attn else None
@@ -544,6 +552,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
             self.attnres_attn = _make_attnres() if has_attn else None
             self.attnres_mlp = _make_attnres() if has_mlp else None
+        # Linear Depth Memory: a read before and an RLS write after every sublayer, on the
+        # matrix memory the HybridStack stashes on `_depth_state` (as Block AttnRes').
+        self.ldm_attn = None
+        self.ldm_mlp = None
+        if getattr(self.config, "depth_memory", False) and not ldm_streams(self.config):
+            from megatron.core.transformer.depth_memory import DepthMemorySite
+
+            self.ldm_attn = DepthMemorySite(self.config) if has_attn else None
+            self.ldm_mlp = DepthMemorySite(self.config) if has_mlp else None
         from megatron.core.transformer import arch_metrics
 
         for kind, module in (
@@ -555,6 +572,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             ("mlp", self.attnres_mlp),
         ):
             arch_metrics.tag(module, kind, self.layer_number, self.config)
+        for kind, site in (("attn", self.ldm_attn), ("mlp", self.ldm_mlp)):
+            if site is not None:
+                arch_metrics.tag(site.read, kind, self.layer_number, self.config)
+                arch_metrics.tag(site.write, kind, self.layer_number, self.config)
         # These act per token, so each TP rank sees only its own tokens under
         # sequence parallelism: their gradients are summed over TP like a norm's.
         for module in (
@@ -564,6 +585,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             self.mhc_mlp_mixer,
             self.attnres_attn,
             self.attnres_mlp,
+            self.ldm_attn,
+            self.ldm_mlp,
         ):
             if module is not None:
                 for param in module.parameters():
@@ -988,6 +1011,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         mHC does not go through :attr:`_depth_state` -- see :meth:`_mhc_read`.
         """
+        ldm = self.ldm_attn if kind == "attn" else self.ldm_mlp
+        if ldm is not None:
+            if self._depth_state is None:
+                raise RuntimeError(
+                    "depth_memory: the layer has no depth state (only the HybridStack builds it)"
+                )
+            return True
         module = self.attnres_attn if kind == "attn" else self.attnres_mlp
         return self._depth_state is not None and module is not None
 
@@ -1101,6 +1131,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         Returns:
             A ``[s, b, h]`` tensor to feed into the sublayer's input norm.
         """
+        ldm = self.ldm_attn if kind == "attn" else self.ldm_mlp
+        if ldm is not None:
+            return ldm.read_input(self._depth_state)
         module = self.attnres_attn if kind == "attn" else self.attnres_mlp
         return module(self._depth_state.sources())
 
@@ -1119,6 +1152,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         state = self._depth_state
         out = self._sublayer_output(output_with_bias)
+        ldm = self.ldm_attn if kind == "attn" else self.ldm_mlp
+        if ldm is not None:
+            return ldm.write_output(state, out)
         accumulate_block(state, out, lerp=self._depth_lerp(kind, self.config.attn_res_lerp))
         # Seal after the layer's last real sublayer (a HybridStack attention-slot
         # layer has no MLP sublayer).

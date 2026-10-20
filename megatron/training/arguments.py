@@ -2774,6 +2774,14 @@ def _add_regularization_args(parser):
     group.add_argument('--engram-lr-mult', type=float, default=5.0,
                        help='Learning-rate multiplier of the Engram (N-layer) tables, which '
                        'also get no weight decay.')
+    group.add_argument('--engram-table-rowwise-v', action='store_true',
+                       help='Sharded Engram / product-key tables (engram_table_parallel="dp"): '
+                       'one Adam second moment per table row instead of per entry (saves 4 B '
+                       'per table parameter).')
+    group.add_argument('--engram-table-momentum-dtype', type=str, default='fp32',
+                       choices=['fp32', 'bf16'],
+                       help='Storage dtype of the sharded tables\' Adam first moment (the update '
+                       'arithmetic stays fp32); bf16 saves 2 B per table parameter.')
     group.add_argument('--residual-mixer-lr-mult', type=float, default=1.0,
                        help='Learning-rate multiplier of the residual-stream mixers (mHC, routed '
                        'residual, block attention residuals). Under Muon-family optimizers these '
@@ -3637,6 +3645,9 @@ def _add_data_args(parser):
     group.add_argument('--reset-attention-mask', action='store_true',
                        help='Reset self attention mask after '
                        'end-of-document token.')
+    group.add_argument('--dataloader-add-bos', action='store_true',
+                       help='Prepend the tokenizer BOS token to every document at load time '
+                       '(the tokenized data carries only an EOD at each document end).')
     group.add_argument('--dataloader-inter-document-masking', action='store_true',
                        help='Return cu_seqlens marking document boundaries '
                        'within each sample so that attention is restricted '

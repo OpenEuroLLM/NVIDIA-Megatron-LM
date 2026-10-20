@@ -13,14 +13,22 @@ into the main optimizer (:func:`attach_engram_table_optimizer`), so
   so the norm is a sum of squares over all ranks;
 * it checkpoints in the param-keyed format: the moments are ShardedTensors of the table
   shard they belong to, so they reshard with it.
+
+Memory per table parameter: the fp32 table (4 B), its fp32 gradient buffer (4 B) and the
+Adam moments -- 8 B with fp32 moments, 2 B + ~0 with ``engram_table_momentum_dtype="bf16"``
+and ``engram_table_rowwise_v`` (one second moment per row, as row-wise Adagrad for
+recommender embeddings): 16 -> 10 B. The update runs over row chunks, so its temporaries stay
+a few MB instead of table-sized (torch's foreach Adam allocates several table-sized ones).
 """
 
 import logging
 import math
+from dataclasses import replace
 from typing import List, Optional
 
 import torch
 
+from ..dist_checkpointing.mapping import ShardedTensor
 from ..dist_checkpointing.optimizer import make_sharded_optimizer_tensor
 from .optimizer import ChainedOptimizer, MegatronOptimizer
 from .optimizer_config import OptimizerConfig
@@ -36,6 +44,57 @@ def engram_sharded_tables(model_chunks) -> List[torch.nn.Parameter]:
         for p in chunk.parameters()
         if getattr(p, "engram_sharded_table", False)
     ]
+
+
+_CHUNK_ELEMENTS = 1 << 24  # elements per update chunk (64 MB of fp32 temporaries)
+
+
+class TableAdam(torch.optim.Optimizer):
+    """Adam for the sharded tables, updated in row chunks.
+
+    ``rowwise_v``: the second moment is one value per row (the mean square of the row's
+    gradient), ``[rows, 1]``. ``momentum_dtype``: storage dtype of the first moment (the
+    arithmetic is fp32). With the defaults this is torch.optim.Adam (no weight decay).
+    """
+
+    def __init__(self, params, lr, betas, eps, rowwise_v=False, momentum_dtype=torch.float32):
+        super().__init__(params, dict(lr=lr, betas=betas, eps=eps))
+        self.rowwise_v = rowwise_v
+        self.momentum_dtype = momentum_dtype
+
+    def init_state(self, p):
+        state = self.state[p]
+        if not state:
+            state['step'] = torch.zeros((), dtype=torch.float32)
+            state['exp_avg'] = torch.zeros_like(p, dtype=self.momentum_dtype)
+            v_shape = (*p.shape[:-1], 1) if self.rowwise_v else p.shape
+            state['exp_avg_sq'] = torch.zeros(v_shape, dtype=torch.float32, device=p.device)
+        return state
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        for group in self.param_groups:
+            beta1, beta2 = group['betas']
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                state = self.init_state(p)
+                state['step'] += 1
+                t = float(state['step'])
+                step_size = group['lr'] / (1 - beta1**t)
+                bc2_sqrt = math.sqrt(1 - beta2**t)
+                rows = max(1, _CHUNK_ELEMENTS // max(1, p.shape[-1]))
+                for lo in range(0, p.shape[0], rows):
+                    w, g = p.data[lo : lo + rows], p.grad[lo : lo + rows].float()
+                    m, v = state['exp_avg'][lo : lo + rows], state['exp_avg_sq'][lo : lo + rows]
+                    m32 = m.float().mul_(beta1).add_(g, alpha=1 - beta1)
+                    sq = g.square_()  # g is a chunk copy (float()) or the grad: reused below
+                    if self.rowwise_v:
+                        sq = sq.mean(-1, keepdim=True)
+                    v.mul_(beta2).add_(sq, alpha=1 - beta2)
+                    w.addcdiv_(m32, v.sqrt().div_(bc2_sqrt).add_(group['eps']), value=-step_size)
+                    m.copy_(m32)
+        return None
 
 
 class EngramTableOptimizer(MegatronOptimizer):
@@ -64,8 +123,16 @@ class EngramTableOptimizer(MegatronOptimizer):
             )
             for mult, group_params in sorted(by_mult.items())
         ] or [dict(params=[], lr=0.0, max_lr=0.0, min_lr=0.0, wd_mult=0.0, weight_decay=0.0)]
-        optimizer = torch.optim.Adam(
-            groups, betas=(config.adam_beta1, config.adam_beta2), eps=config.adam_eps
+        momentum_dtype = {"fp32": torch.float32, "bf16": torch.bfloat16}[
+            config.engram_table_momentum_dtype
+        ]
+        optimizer = TableAdam(
+            groups,
+            lr=lr,
+            betas=(config.adam_beta1, config.adam_beta2),
+            eps=config.adam_eps,
+            rowwise_v=config.engram_table_rowwise_v,
+            momentum_dtype=momentum_dtype,
         )
         super().__init__(optimizer, config, init_state_fn=lambda opt, cfg=None: None)
         self.params = [p for g in optimizer.param_groups for p in g["params"]]
@@ -148,11 +215,7 @@ class EngramTableOptimizer(MegatronOptimizer):
         }
         if is_loading:  # make sure the moments exist so the template has their shapes
             for p in self.params:
-                state = self.optimizer.state[p]
-                if not state:
-                    state['step'] = torch.zeros((), dtype=torch.float32)
-                    state['exp_avg'] = torch.zeros_like(p, dtype=torch.float32)
-                    state['exp_avg_sq'] = torch.zeros_like(p, dtype=torch.float32)
+                self.optimizer.init_state(p)
         param_state = {}
         steps = []
         for i, p in enumerate(self.params):
@@ -161,7 +224,7 @@ class EngramTableOptimizer(MegatronOptimizer):
             entry = {}
             for name in ('exp_avg', 'exp_avg_sq'):
                 if name in state:
-                    entry[name] = make_sharded_optimizer_tensor(
+                    entry[name] = _moment_sharded_tensor(
                         sharded, state[name], prefix=f'optimizer.state.{name}'
                     )
             if 'step' in state:
@@ -194,6 +257,25 @@ class EngramTableOptimizer(MegatronOptimizer):
                 else:
                     state[name] = value.clone()
             state['step'] = torch.tensor(float(step), dtype=torch.float32)
+
+
+def _moment_sharded_tensor(table: ShardedTensor, moment: torch.Tensor, prefix: str):
+    """A moment of a table shard: the table's ShardedTensor, or for a row-wise moment
+    ``[rows, 1]`` the same rows with the last axis collapsed (the tables are sharded on rows
+    only)."""
+    if moment.shape == table.local_shape or moment.shape[-1] != 1:
+        return make_sharded_optimizer_tensor(table, moment, prefix=prefix)
+    sh = replace(
+        table,
+        key=f'{prefix}.{table.key}',
+        data=moment,
+        dtype=moment.dtype,
+        local_shape=(*table.local_shape[:-1], 1),
+        global_shape=(*table.global_shape[:-1], 1),
+        global_offset=(*table.global_offset[:-1], 0),
+    )
+    sh.validate_metadata_integrity()
+    return sh
 
 
 def attach_engram_table_optimizer(optimizer, model_chunks, config: OptimizerConfig):

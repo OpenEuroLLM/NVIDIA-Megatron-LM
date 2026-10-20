@@ -187,6 +187,15 @@ class OptimizerConfig:
     megatron/core/ssm/engram.py); the tables also get no weight decay, as in the paper.
     Applies to max_lr and min_lr alike."""
 
+    engram_table_rowwise_v: bool = False
+    """Engram / product-key tables sharded with engram_table_parallel="dp": one Adam second
+    moment per table row (the mean square of the row's gradient) instead of one per entry, as
+    row-wise Adagrad / Adam for recommender embeddings. Saves 4 B per table parameter."""
+
+    engram_table_momentum_dtype: str = "fp32"
+    """Storage dtype of the sharded tables' Adam first moment: "fp32" or "bf16" (the update
+    arithmetic stays fp32). "bf16" saves 2 B per table parameter."""
+
     residual_mixer_lr_mult: float = 1.0
     """Learning-rate multiplier of the residual-stream mixers' parameters (mHC, routed residual,
     block attention residuals; marked `is_residual_mixer`). Under the Muon-family optimizers these
