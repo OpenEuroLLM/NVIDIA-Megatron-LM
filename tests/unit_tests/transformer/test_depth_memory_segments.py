@@ -47,8 +47,10 @@ def _run(ws, per_edge, cot):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
-@pytest.mark.parametrize("impl", ["torch", "cute"])
-def test_two_segments_equal_one_chain(impl):
+@pytest.mark.parametrize("impl,fold", [("torch", True), ("cute", True), ("cute", False)])
+def test_two_segments_equal_one_chain(impl, fold):
+    """``fold=False`` (CuTe): without the window fold the first segment's gradients are wrong --
+    the check that the test sees it."""
     if impl == "cute" and torch.cuda.get_device_capability()[0] < 9:
         pytest.skip("cute_ldm needs Hopper / Blackwell")
     per_edge, cot = _inputs(0)
@@ -63,12 +65,16 @@ def test_two_segments_equal_one_chain(impl):
     grads = [None] * EDGES
     for e in reversed(range(EDGES - SPLIT)):
         grads[SPLIT + e] = [t.float().clone() for t in second.backward(e, cot[SPLIT + e])]
-    dm, dp = (t.clone() for t in second.export_grad())
+    dm, dp = (t.clone() for t in (second.export_grad() if fold else second.export_grad(fold=False)))
     first.load_grad(dm, dp)
     for e in reversed(range(SPLIT)):
         grads[e] = [t.float().clone() for t in first.backward(e, cot[e])]
 
     tol = dict(rtol=1e-4, atol=1e-5) if impl == "torch" else dict(rtol=2e-2, atol=2e-3)
+    if not fold:
+        with pytest.raises(AssertionError):
+            torch.testing.assert_close(grads[0][2], whole_grads[0][2], **tol)  # d value, edge 0
+        return
     for e in range(EDGES):
         torch.testing.assert_close(reads[e], whole_reads[e], **tol, msg=f"read {e}")
         for name, a, b in zip(("khat", "query", "value", "scale", "forgetting"), grads[e],
