@@ -31,7 +31,8 @@ the sublayer's :class:`ReadWriteLink` instead of returning it, so autograd's acc
 two -- one more full pass over the widest tensor -- disappears into the kernel.
 
 The previous sublayer's write produced this stream state; its backward needs exactly ``d_s``.
-With a :class:`WriteRecord` on the stream state (MHC_FUSED_WRITE_BWD=1, the default), the read's
+With a :class:`WriteRecord` on the stream state (MHC_FUSED_WRITE_BWD=1; off by default, see
+FUSE_WRITE_BWD), the read's
 backward runs that write's backward too (:func:`_fused_bwd_kernel`): ``d_s`` never goes to
 memory, and the stream state is recomputed from the write's inputs instead of read -- about 30 C
 bytes per token instead of 54 C for the pair. Where the record is missing (the first sublayer of a
@@ -89,7 +90,11 @@ class WriteRecord:
         self.grads = None  # (d_streams, d_sublayer_out, d_h_post, d_h_res) from the fused read
 
 
-FUSE_WRITE_BWD = os.environ.get("MHC_FUSED_WRITE_BWD", "1") == "1"
+# Off by default: correct (tests), but slower than the two kernels it replaces on H100 -- per
+# sublayer in a 4-sublayer chain at 8k: separate 1.57 ms, v1 1.76 (255 registers, ~130 spilled),
+# v2 1.63 (the d_phi GEMM and the register pressure of 4 gradient tiles + 20 sums eat the saved
+# traffic). Kept for a better kernel (e.g. CuTe with the sums in shared memory).
+FUSE_WRITE_BWD = os.environ.get("MHC_FUSED_WRITE_BWD", "0") == "1"
 # 1: one kernel with d_phi (C-block x token-split tiles); 2: token-major + d_phi by a GEMM
 FUSE_WRITE_BWD_KERNEL = int(os.environ.get("MHC_FUSED_WRITE_BWD_KERNEL", "2"))
 _DUMMY = {}
