@@ -256,7 +256,10 @@ def create_group(
             # So need to unset timeout here if caller doesn't set value. Otherwise there is
             # type error.
             kwargs.pop("timeout")
-    group = torch.distributed.new_group(**kwargs)
+    from megatron.core import mem_breakdown
+
+    with mem_breakdown.measure(f"nccl:{group_desc or 'group'}"):
+        group = torch.distributed.new_group(**kwargs)
     global _global_process_group_list
     if _global_process_group_list is None:
         # None stands for the default process group
