@@ -520,6 +520,10 @@ class TransformerConfig(ModelParallelConfig):
     linear_kronlstm_signed_write: bool = False
     """KronLSTM write gate c = 2 sigmoid(.) - 1 in [-1, 1] (mean 0.5 at init)."""
 
+    linear_kronlstm_forget_offset: float = 0.0
+    """KronLSTM: a fixed extra decay per step on every forget channel (log|f| - offset); 0.012 is
+    the polar forget gate's init cap without its angle."""
+
     linear_kronlstm_unit_write: bool = False
     """KronLSTM with linear_fla_allow_neg_eigval (s = 2): keep the write c in [0, 1] by construction.
     The op's s scales the write cap as well as the erase, so without this the write is s * c in
@@ -756,6 +760,10 @@ class TransformerConfig(ModelParallelConfig):
     """Lower bound on the decay gate's pre-activation, for complex_kda.
 
     Clamps how fast a channel may forget within one step."""
+
+    linear_gate_forget_offset: float = 0.0
+    """complex_kda: a fixed extra decay per step on every channel (log|alpha| - offset, clamped at
+    linear_gate_lower_bound): shorter memory horizons."""
 
     linear_output_gate: Literal['lowrank', 'linear'] = 'lowrank'
     """Shape of the output gate, for complex_kda.

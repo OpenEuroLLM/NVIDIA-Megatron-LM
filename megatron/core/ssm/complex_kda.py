@@ -283,6 +283,8 @@ class ComplexKDA(_MegatronSelfAttentionAdapter):
             gate=config.linear_gate_activation,
             gate_init_style=config.linear_gate_init_style,
             lower_bound=config.linear_gate_lower_bound,
+            **({"forget_offset": config.linear_gate_forget_offset}
+               if getattr(config, "linear_gate_forget_offset", 0.0) else {}),
             output_gate=config.linear_output_gate,
             drop_silu=config.linear_drop_qkv_silu,
             conv_size=config.linear_conv_kernel_dim,
