@@ -13,7 +13,8 @@ Metrics per task: "mc" questions -> acc (argmax of the sum) and acc_norm (sum / 
 "greedy" (LAMBADA) -> acc (every continuation token is the argmax) and the continuation's mean NLL.
 Questions are spread over all ranks (each rank runs one item per forward; ranks run equally
 many forwards, padded with repeats, since expert parallelism exchanges tokens every layer).
-Results: printed by rank 0 as "[downstream_eval] {json}" and written to DOWNSTREAM_EVAL_OUT if set.
+Results: printed by rank 0 as "[downstream_eval] {json}" and written to DOWNSTREAM_EVAL_OUT, by
+default <save>/downstream.json.
 Only TP = PP = CP = 1 (data and expert parallelism).
 """
 
@@ -119,6 +120,15 @@ def maybe_run_downstream_eval(model) -> None:
     out = {t: {k: (v / m["n"] if k != "n" else int(v)) for k, v in m.items()} for t, m in agg.items()}
     print("[downstream_eval] " + json.dumps(out, sort_keys=True), flush=True)
     dest = os.environ.get("DOWNSTREAM_EVAL_OUT")
+    if not dest:  # default: next to the run's checkpoints (one env for every arm of an array job)
+        try:
+            from megatron.training import get_args
+
+            save = getattr(get_args(), "save", None)
+        except Exception:  # noqa: BLE001 - no global args (tests)
+            save = None
+        dest = os.path.join(save, "downstream.json") if save else None
     if dest:
+        os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
         with open(dest, "w") as f:
             json.dump(out, f, indent=1, sort_keys=True)
