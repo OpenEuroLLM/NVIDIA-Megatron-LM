@@ -999,6 +999,12 @@ class TensorParallelAngularMuown(TensorParallelMuon):
             return 1.0
         return (1.0 + self._u_decay_scale * steps_after_warmup) ** (-self._u_decay_p)
 
+    def _u_step_size(self, group: dict, step: int) -> float:
+        """Return the ordinary LR times the internal directional multiplier."""
+        multiplier = self._u_lr_multiplier(step)
+        group["u_lr_multiplier"] = multiplier
+        return group["lr"] * multiplier
+
     def _tp_row_reduce_group(
         self, p: torch.Tensor
     ) -> Optional["torch.distributed.ProcessGroup"]:
@@ -1133,9 +1139,7 @@ class TensorParallelAngularMuown(TensorParallelMuon):
 
             # Original AngularMuown evaluated the schedule before incrementing its
             # global step counter, hence `step - 1`.
-            u_multiplier = self._u_lr_multiplier(step - 1)
-            group["u_lr_multiplier"] = u_multiplier
-            u_step = u.add(direction, alpha=-lr * u_multiplier)
+            u_step = u.add(direction, alpha=-self._u_step_size(group, step - 1))
 
             # Adam update on the row magnitudes g, with sign-preserving
             # projection away from zero.
@@ -1260,9 +1264,7 @@ class TensorParallelAngularMuown(TensorParallelMuon):
         with eopt_utils.fp32_matmul_precision(self.fp32_matmul_prec):
             direction = self._orthogonalize_batched(update, batch)
 
-        u_multiplier = self._u_lr_multiplier(step - 1)
-        group["u_lr_multiplier"] = u_multiplier
-        u_step = u.add(direction, alpha=-lr * u_multiplier)
+        u_step = u.add(direction, alpha=-self._u_step_size(group, step - 1))
 
         m_g_b.mul_(beta1).add_(grad_g, alpha=1 - beta1)
         v_g_b.mul_(beta2).addcmul_(grad_g, grad_g, value=1 - beta2)
@@ -1350,6 +1352,65 @@ class TensorParallelAngularMuown(TensorParallelMuon):
         super().load_state_dict(state_dict)
 
 
+class TensorParallelAngularMuownSimplified(TensorParallelAngularMuown):
+    """AngularMuown with independent directional and radial learning rates.
+
+    The training scheduler supplies ``u_lr`` using C/t with warmup and cooldown.
+    All tensor updates, parallelism and row-state checkpoint conversion are
+    inherited. Direction scaling is selected by ``scale_mode`` (shape_scaling
+    by default), with no additional scalar factor or internal decay.
+
+    Args:
+        params: Iterable of 2D parameters or parameter-group dictionaries.
+        u_lr: Absolute directional rate, before the selected shape-dependent scaling.
+        lr: Adam learning rate for row magnitudes. Remaining arguments have the
+            same meaning as in :class:`TensorParallelAngularMuown`.
+    """
+
+    def __init__(
+        self,
+        params: ParamsT,
+        *,
+        u_lr: float,
+        lr: float = 1e-2,
+        momentum: float = 0.95,
+        nesterov: bool = True,
+        betas: tuple[float, float] = (0.9, 0.95),
+        adam_eps: float = 1e-8,
+        split_qkv: bool = False,
+        is_qkv_fn: Callable[[torch.Tensor], bool] | None = None,
+        qkv_split_shapes: list[int] | None = None,
+        fp32_matmul_prec: str = "medium",
+        coefficient_type: str = "simple",
+        num_ns_steps: int = 5,
+        scale_mode: str = "shape_scaling",
+        pg_collection: ProcessGroupCollection | None = None,
+        tp_mode: Literal["duplicated", "distributed"] = "duplicated",
+        batched_step: bool = True,
+    ) -> None:
+        if not math.isfinite(u_lr) or u_lr < 0.0:
+            raise ValueError("u_lr must be finite and nonnegative")
+        super().__init__(
+            params, lr=lr, momentum=momentum, nesterov=nesterov, betas=betas,
+            adam_eps=adam_eps, split_qkv=split_qkv, is_qkv_fn=is_qkv_fn,
+            qkv_split_shapes=qkv_split_shapes, fp32_matmul_prec=fp32_matmul_prec,
+            coefficient_type=coefficient_type, num_ns_steps=num_ns_steps,
+            scale_mode=scale_mode, extra_scale_factor=1.0,
+            pg_collection=pg_collection, tp_mode=tp_mode, batched_step=batched_step,
+        )
+        self.defaults["u_lr"] = u_lr
+        for group in self.param_groups:
+            group.setdefault("u_lr", u_lr)
+            group.pop("u_lr_multiplier", None)
+
+    def _u_step_size(self, group: dict, step: int) -> float:
+        """Return only the independently scheduled directional rate."""
+        u_lr = group["u_lr"]
+        if not math.isfinite(u_lr) or u_lr < 0.0:
+            raise ValueError("u_lr must be finite and nonnegative")
+        return u_lr
+
+
 def _kwargs_from_config(optimizer_cls: type, prefix: str, config) -> Dict[str, Any]:
     """Match ``optimizer_cls.__init__`` parameters to config attributes.
 
@@ -1389,13 +1450,25 @@ def _adaptive_muon_config_to_kwargs(config, model_chunks, pg_collection) -> Dict
     return kwargs
 
 
-def _angular_muown_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any]:
-    """Convert OptimizerConfig to TensorParallelAngularMuown constructor kwargs."""
-    kwargs = _kwargs_from_config(TensorParallelAngularMuown, "angular_muown", config)
+def _angular_muown_config_to_kwargs(
+    config, model_chunks, pg_collection, optimizer_cls=TensorParallelAngularMuown
+) -> Dict[str, Any]:
+    """Convert shared AngularMuown settings to the selected constructor kwargs."""
+    kwargs = _kwargs_from_config(optimizer_cls, "angular_muown", config)
     kwargs["betas"] = (config.angular_muown_beta1, config.angular_muown_beta2)
     kwargs["is_qkv_fn"] = lambda p: getattr(p, "is_qkv", False)
     kwargs["qkv_split_shapes"] = _get_qkv_split_shapes(model_chunks[0].config)
     kwargs["pg_collection"] = pg_collection
+    return kwargs
+
+
+def _angular_muown_simplified_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any]:
+    """Build the C/t variant using only its supported constructor settings."""
+    kwargs = _angular_muown_config_to_kwargs(
+        config, model_chunks, pg_collection, TensorParallelAngularMuownSimplified
+    )
+    # The training scheduler supplies the initial angular rate before the first update.
+    kwargs["u_lr"] = 0.0
     return kwargs
 
 
@@ -1452,6 +1525,13 @@ _EMERGING_OPTIMIZERS.update(
             },
         ),
     }
+)
+
+_EMERGING_OPTIMIZERS["angular_muown_simplified"] = EmergingOptimizerEntry(
+    optimizer_cls=TensorParallelAngularMuownSimplified,
+    config_to_kwargs=_angular_muown_simplified_config_to_kwargs,
+    # The optimizer factory copies these overrides before applying them.
+    default_param_overrides=_EMERGING_OPTIMIZERS["angular_muown"].default_param_overrides,
 )
 
 # Register soap with default config

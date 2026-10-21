@@ -505,6 +505,29 @@ def _validate_packed_doc_attention(args):
 
 
 def validate_args(args, defaults={}):
+    if args.optimizer == 'angular_muown_simplified':
+        assert args.angular_muown_c is not None, 'angular_muown_simplified requires --angular-muown-c'
+        assert (
+            args.rampup_batch_size is None
+            and args.step_batch_size_schedule is None
+            and not args.decrease_batch_size_if_needed
+        ), 'C/t requires a fixed global batch, without schedules or automatic batch reduction'
+        assert 0 <= args.angular_muown_c < float('inf'), 'C must be finite and nonnegative'
+        assert 0 <= args.angular_muown_cooldown_fraction < 1, 'Cooldown fraction must be in [0, 1)'
+        assert 0 <= args.angular_muown_cooldown_end_ratio <= 1, 'Cooldown end ratio must be in [0, 1]'
+        unsupported = [
+            name for name in vars(args)
+            if name.startswith('angular_muown_u_decay_')
+            or name == 'angular_muown_extra_scale_factor'
+        ]
+        assert not unsupported, (
+            'These options apply only to angular_muown: '
+            + ', '.join('--' + name.replace('_', '-') for name in unsupported)
+        )
+    else:
+        assert getattr(args, 'angular_muown_c', None) is None, (
+            '--angular-muown-c requires --optimizer angular_muown_simplified'
+        )
 
     # Prep for checkpoint conversion.
     if args.ckpt_convert_format is not None:
@@ -2763,6 +2786,15 @@ def _add_regularization_args(parser):
                        choices=['adam', 'lion'],
                        help='Optimizer for scalar parameters (embeddings, biases, norms) '
                        'when using muon. Defaults to adam.')
+    group.add_argument('--angular-muown-c', type=float, default=None,
+                       help='Independent angular C/(1 + updates since warmup), before matrix '
+                       'scaling, with extra factor fixed to 1. '
+                       'Required for angular_muown_simplified; fixed batch only.')
+    group.add_argument('--angular-muown-cooldown-fraction', type=float, default=0.2,
+                       help='Final fraction of the LR horizon for linear angular cooldown. '
+                       'Zero continues inverse-time decay; used only with --angular-muown-c.')
+    group.add_argument('--angular-muown-cooldown-end-ratio', type=float, default=0.05,
+                       help='Final angular rate / rate at cooldown start, in C/t mode.')
     group.add_argument(
         '--angular-muown-momentum',
         type=float,
@@ -2795,21 +2827,22 @@ def _add_regularization_args(parser):
         dest='angular_muown_split_qkv',
         help='Whether to split fused QKV parameters for AngularMuown orthogonalization',
     )
+    # Absent scale mode uses the selected optimizer's training default.
     group.add_argument(
         '--angular-muown-scale-mode',
         type=str,
-        default='spectral',
+        default=argparse.SUPPRESS,
         choices=['spectral', 'unit_rms_norm', 'shape_scaling'],
-        help='Shape-dependent scale for the AngularMuown U direction. spectral '
-        '(default, with --angular-muown-extra-scale-factor 0.2) matches the Muon '
-        'recipe convention so Adam-tuned learning rates transfer; shape_scaling '
-        '(with extra scale factor 1.0) reproduces the original AngularMuown ratio scaling.',
+        help='Shape-dependent scaling. Defaults to shape_scaling for angular_muown_simplified '
+        'and spectral for angular_muown. The C/t variant always uses extra factor 1.',
     )
+    # Original-only settings use OptimizerConfig defaults when absent. Suppressing
+    # their CLI defaults lets angular_muown_simplified reject explicit unused options.
     group.add_argument(
         '--angular-muown-extra-scale-factor',
         type=float,
-        default=0.2,
-        help='Additional scale factor for the AngularMuown U direction. The default '
+        default=argparse.SUPPRESS,
+        help='Extra factor for angular_muown only; angular_muown_simplified fixes 1. The default '
         '0.2 pairs with spectral scaling to give the standard Muon 0.2 * sqrt(max(m, n)).',
     )
     group.add_argument(
@@ -2843,40 +2876,40 @@ def _add_regularization_args(parser):
     group.add_argument(
         '--angular-muown-u-decay-schedule',
         type=str,
-        default='poly',
+        default=argparse.SUPPRESS,
         choices=['poly', 'cosine'],
-        help='Internal decay schedule for the AngularMuown directional step multiplier',
+        help='Internal directional decay for angular_muown only',
     )
     group.add_argument(
         '--angular-muown-u-decay-scale',
         type=float,
-        default=0.001,
+        default=argparse.SUPPRESS,
         help='Scale for the poly U-decay schedule. Set --angular-muown-u-decay-p 0 '
         'to disable decay.',
     )
     group.add_argument(
         '--angular-muown-u-decay-p',
         type=float,
-        default=1.0,
+        default=argparse.SUPPRESS,
         help='Exponent for the poly U-decay schedule',
     )
     group.add_argument(
         '--angular-muown-u-decay-warmup-steps',
         type=int,
-        default=0,
+        default=argparse.SUPPRESS,
         help='Steps before the AngularMuown U-decay schedule begins',
     )
     group.add_argument(
         '--angular-muown-u-decay-steps',
         type=int,
-        default=None,
+        default=argparse.SUPPRESS,
         help='Post-warmup steps over which the cosine schedule decays to '
         '--angular-muown-u-decay-min-multiplier (required for cosine)',
     )
     group.add_argument(
         '--angular-muown-u-decay-min-multiplier',
         type=float,
-        default=0.0,
+        default=argparse.SUPPRESS,
         help='Floor of the cosine U-decay schedule',
     )
     group.add_argument(
@@ -3115,7 +3148,7 @@ def _add_training_args(parser):
                        'https://arxiv.org/abs/2205.14135')
     group.add_argument('--optimizer', type=str, default='adam',
                        choices=['adam', 'sgd', 'muon', 'dist_muon', 'lion', 'soap',
-                                'adaptive_muon', 'angular_muown'],
+                                'adaptive_muon', 'angular_muown', 'angular_muown_simplified'],
                        help='Optimizer function. '
                             'Note: dist_muon is deprecated; use --optimizer muon '
                             'with --use-distributed-optimizer instead.')

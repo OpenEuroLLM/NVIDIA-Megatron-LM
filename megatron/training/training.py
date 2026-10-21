@@ -2036,6 +2036,24 @@ def get_optimizer_param_scheduler(optimizer):
     else:
         raise Exception('either train-iters or train-samples should be provided.')
 
+    angular_schedule = None
+    if args.optimizer == 'angular_muown_simplified':
+        if args.angular_muown_c is None:
+            raise ValueError("angular_muown_simplified requires --angular-muown-c")
+        if (
+            args.rampup_batch_size is not None or args.step_batch_size_schedule is not None
+            or args.decrease_batch_size_if_needed
+        ):
+            raise ValueError("angular_muown_simplified requires a fixed global batch without automatic reduction")
+        angular_schedule = dict(
+            c=args.angular_muown_c,
+            global_batch_size=args.global_batch_size,
+            warmup_samples=lr_warmup_steps,
+            total_samples=lr_decay_steps,
+            cooldown_fraction=args.angular_muown_cooldown_fraction,
+            cooldown_end_ratio=args.angular_muown_cooldown_end_ratio,
+        )
+
     opt_param_scheduler = OptimizerParamScheduler(
         optimizer,
         init_lr=args.lr_warmup_init,
@@ -2052,6 +2070,7 @@ def get_optimizer_param_scheduler(optimizer):
         override_opt_param_scheduler=args.override_opt_param_scheduler,
         wsd_decay_steps=wsd_decay_steps,
         lr_wsd_decay_style=args.lr_wsd_decay_style,
+        angular_muown_schedule=angular_schedule,
     )
 
     return opt_param_scheduler
@@ -2064,6 +2083,8 @@ def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
     for f in dataclasses.fields(OptimizerConfig):
         if hasattr(args, f.name):
             kwargs[f.name] = getattr(args, f.name)
+    if args.optimizer == 'angular_muown_simplified':
+        kwargs.setdefault('angular_muown_scale_mode', 'shape_scaling')
     config = OptimizerConfig(**kwargs)
 
     # Construct the appropriate config_overrides object. This default handles many cases, but
