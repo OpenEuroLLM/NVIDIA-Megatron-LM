@@ -840,10 +840,10 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         slots = depth_payload_slots(self.config)
 
         if mhc:
-            from megatron.core.transformer.mhc import expand_to_streams
+            from megatron.core.transformer.internal_attention import expand_streams
 
             if self.pre_process:
-                return expand_to_streams(hidden_states, slots), None
+                return expand_streams(hidden_states, slots, self.config), None
             # Already widened by an earlier stage; restore the stream axis.
             from megatron.core.transformer.routed_residual import own_streams
 
@@ -906,10 +906,10 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
         mhc = getattr(self.config, "mhc", False)
         if mhc and hidden_states.dim() == 4:
-            from megatron.core.transformer.mhc import collapse_streams
+            from megatron.core.transformer.internal_attention import collapse_streams
 
             if self.post_process:
-                return collapse_streams(hidden_states)
+                return collapse_streams(hidden_states, self.config)
             s, b, n, h = hidden_states.shape
             # reshape returns a view, and the pipeline schedule refuses to free a
             # view of another tensor when it deallocates a stage output.

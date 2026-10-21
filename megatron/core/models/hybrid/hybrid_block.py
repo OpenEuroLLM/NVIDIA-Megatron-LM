@@ -902,10 +902,10 @@ class HybridStack(MegatronModule):
 
         slots = depth_payload_slots(self.config)
         if mhc:
-            from megatron.core.transformer.mhc import expand_to_streams
+            from megatron.core.transformer.internal_attention import expand_streams
 
             if self.pre_process:
-                return expand_to_streams(hidden_states, slots), None
+                return expand_streams(hidden_states, slots, self.config), None
             from megatron.core.transformer.routed_residual import own_streams
 
             s, b, wide = hidden_states.shape
@@ -946,10 +946,10 @@ class HybridStack(MegatronModule):
         if self.attnres_stream_boundary is not None and hidden_states.dim() == 4:
             return self.attnres_stream_boundary.collapse(hidden_states)
         if getattr(self.config, "mhc", False) and hidden_states.dim() == 4:
-            from megatron.core.transformer.mhc import collapse_streams
+            from megatron.core.transformer.internal_attention import collapse_streams
 
             if self.post_process:
-                return collapse_streams(hidden_states)
+                return collapse_streams(hidden_states, self.config)
             s, b, n, h = hidden_states.shape
             return make_viewless_tensor(
                 inp=hidden_states.reshape(s, b, n * h), requires_grad=True, keep_graph=True

@@ -2006,6 +2006,22 @@ class TransformerConfig(ModelParallelConfig):
     read weights are constant. Balancing then covers all n streams. Not with
     mhc_routed_reversible."""
 
+    mhc_internal_attention: str = "none"
+    """Internal attention over the mHC streams (Internal Attention Transformer, ICLR 2027
+    submission "Internal Attention: Growing Token Representations Without Growing the FFN or the
+    KV Cache"; internal_attention.py): after every mixer sublayer, the token's n streams of width
+    h attend to each other (bidirectional, per token: no KV cache) with shared h x h Q / K / V /
+    O maps and a learned position vector per stream, as a pre-norm residual over all n * h.
+    'compute': the paper's x = (x_c, x_m) with every sublayer (mixer and MLP / MoE) reading and
+    writing stream 0 only -- the compute part x_c, d = hidden_size -- the memory streams starting
+    at zero and the head reading stream 0 (the paper's appendix-B variant: temporal mixing on x_c
+    only). 'mhc': dense mHC (read / write / stream mixer) with the internal attention after each
+    mixer sublayer's write. 'none' disables. Requires mhc (dense: no routed residual, no
+    mhc_lerp, no mhc_per_layer)."""
+
+    mhc_internal_attention_heads: int = 0
+    """Heads of the internal attention (over the h-wide stream tokens); 0 = num_attention_heads."""
+
     ####################
     # Block Attention Residuals
     ####################
@@ -2236,6 +2252,23 @@ class TransformerConfig(ModelParallelConfig):
                 "mhc_routed_mix / _balance_rate / _reversible / _key_dim / _free need "
                 "mhc_routed_topk > 0"
             )
+        if self.mhc_internal_attention not in ("none", "compute", "mhc"):
+            raise ValueError(
+                f"mhc_internal_attention must be none / compute / mhc, got "
+                f"{self.mhc_internal_attention!r}"
+            )
+        if self.mhc_internal_attention != "none":
+            if not self.mhc or self.mhc_routed_topk or self.mhc_lerp or self.mhc_per_layer:
+                raise ValueError(
+                    "mhc_internal_attention requires dense mhc (no mhc_routed_topk, mhc_lerp, "
+                    "mhc_per_layer)"
+                )
+            heads = self.mhc_internal_attention_heads or self.num_attention_heads
+            if self.hidden_size % heads:
+                raise ValueError(
+                    f"mhc_internal_attention_heads {heads} does not divide hidden_size "
+                    f"{self.hidden_size}"
+                )
         if self.mhc_routed_free and self.mhc_routed_reversible:
             raise ValueError("mhc_routed_free does not combine with mhc_routed_reversible yet")
         if self.mhc_routed_topk:

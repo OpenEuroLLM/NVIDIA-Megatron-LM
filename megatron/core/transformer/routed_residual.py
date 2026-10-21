@@ -348,6 +348,10 @@ def build_stream_mixer(config, kind: str = "mixer") -> nn.Module:
 
     if attn_res_streams(config):
         return AttnResStreamMixer(config)
+    from megatron.core.transformer.internal_attention import IATStreamMixer, iat_mode
+
+    if iat_mode(config) != "none":
+        return IATStreamMixer(config, kind)
     topk = getattr(config, "mhc_routed_topk", 0)
     if topk:
         return RoutedStreamMixer(
