@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import math
 import inspect
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -395,6 +396,19 @@ class Attention(MegatronModule, ABC):
             pg_collection=self.pg_collection,
         )
 
+        # Length-dependent attention temperature (attention_length_scaling): "ssmax" learns one
+        # s per head (Scalable-Softmax: logits * s log n), initialised to 1 / log(base) -- scale 1
+        # at the base length
+        self.length_scaling = getattr(self.config, "attention_length_scaling", "none")
+        if self.length_scaling == "ssmax":
+            base = float(self.config.attention_length_scaling_base)
+            self.ssmax_s = torch.nn.Parameter(torch.full(
+                (self.num_attention_heads_per_partition,), 1.0 / math.log(base), dtype=torch.float32,
+                device=torch.cuda.current_device() if torch.cuda.is_available() else "cpu"))
+            setattr(self.ssmax_s, "tensor_model_parallel", True)
+            setattr(self.ssmax_s, "partition_dim", 0)
+            setattr(self.ssmax_s, "partition_stride", 1)
+
         self.checkpoint_core_attention = (
             self.config.recompute_granularity == 'selective'
             and "core_attn" in self.config.recompute_modules
@@ -505,6 +519,43 @@ class Attention(MegatronModule, ABC):
         hidden_states = tensor_parallel.checkpoint(custom_forward, False, *checkpoint_inputs)
 
         return hidden_states
+
+    def _length_scale_query(self, query, packed_seq_params, inference_context):
+        """Scale query i by a function of n_i, the number of keys it attends to (its position in its
+        document + 1): equivalent to scaling its attention logits, so any attention kernel applies.
+
+        "logn": max(1, log n / log base) -- no parameters (log-n scaling for evaluation beyond the
+        training length); "ssmax": s_h log n with a learnt s per head (Scalable-Softmax, Nakanishi
+        2025). Positions restart at every packed document (cu_seqlens). Context parallelism and
+        inference (KV cache offsets) are not supported.
+        """
+        if inference_context is not None:
+            raise NotImplementedError("attention_length_scaling: inference contexts are not wired")
+        if self.pg_collection.cp is not None and self.pg_collection.cp.size() > 1:
+            raise NotImplementedError("attention_length_scaling: context parallelism is not wired")
+        thd = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+        n_tok = query.shape[0]
+        if thd:
+            cu = packed_seq_params.cu_seqlens_q_padded
+            if cu is None:
+                cu = packed_seq_params.cu_seqlens_q
+            cu = cu.to(device=query.device, dtype=torch.long)
+            starts = torch.repeat_interleave(cu[:-1], cu[1:] - cu[:-1], output_size=n_tok)
+            n = torch.arange(n_tok, device=query.device) - starts + 1  # [t]
+            shape = (n_tok, 1, 1)  # query [t, h, d]
+        else:
+            n = torch.arange(1, n_tok + 1, device=query.device)  # query [s, b, h, d]
+            shape = (n_tok, 1, 1, 1)
+        log_n = torch.log(n.float()).view(shape)
+        if self.length_scaling == "logn":
+            base = math.log(float(self.config.attention_length_scaling_base))
+            factor = torch.clamp(log_n / base, min=1.0)
+        elif self.length_scaling == "ssmax":
+            s = self.ssmax_s.view(*([1] * (len(shape) - 2)), -1, 1)  # per head
+            factor = s * log_n
+        else:
+            raise ValueError(f"unknown attention_length_scaling {self.length_scaling!r}")
+        return (query.float() * factor).to(query.dtype)
 
     def _run_core_attention(
         self,
@@ -1616,6 +1667,9 @@ class Attention(MegatronModule, ABC):
             # otherwise, only relative positional embedding takes effect
             # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
         nvtx_range_pop(suffix="rotary_pos_emb")
+
+        if self.length_scaling != "none":
+            query = self._length_scale_query(query, packed_seq_params, inference_context)
 
         # ==================================
         # core attention computation
