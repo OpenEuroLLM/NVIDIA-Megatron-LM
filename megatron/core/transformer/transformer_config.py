@@ -2015,7 +2015,10 @@ class TransformerConfig(ModelParallelConfig):
     'compute': the paper's x = (x_c, x_m) with every sublayer (mixer and MLP / MoE) reading and
     writing stream 0 only -- the compute part x_c, d = hidden_size -- the memory streams starting
     at zero and the head reading stream 0 (the paper's appendix-B variant: temporal mixing on x_c
-    only). 'mhc': dense mHC (read / write / stream mixer) with the internal attention after each
+    only). 'full': the paper's low-rank temporal mixing -- each mixer sublayer reads all n * h
+    dims through a latent down-projection n h -> h and writes through an up-projection
+    h -> n h (8 h^2 parameters per mixer; the mixer keeps width h), MLP / MoE on x_c as in
+    'compute'. 'mhc': dense mHC (read / write / stream mixer) with the internal attention after each
     mixer sublayer's write. 'none' disables. Requires mhc (dense: no routed residual, no
     mhc_lerp, no mhc_per_layer)."""
 
@@ -2252,9 +2255,9 @@ class TransformerConfig(ModelParallelConfig):
                 "mhc_routed_mix / _balance_rate / _reversible / _key_dim / _free need "
                 "mhc_routed_topk > 0"
             )
-        if self.mhc_internal_attention not in ("none", "compute", "mhc"):
+        if self.mhc_internal_attention not in ("none", "compute", "full", "mhc"):
             raise ValueError(
-                f"mhc_internal_attention must be none / compute / mhc, got "
+                f"mhc_internal_attention must be none / compute / full / mhc, got "
                 f"{self.mhc_internal_attention!r}"
             )
         if self.mhc_internal_attention != "none":

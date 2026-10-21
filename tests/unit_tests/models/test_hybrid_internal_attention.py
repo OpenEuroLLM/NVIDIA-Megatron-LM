@@ -118,6 +118,17 @@ def test_mixer_and_mlp_sublayers():
     torch.testing.assert_close(w[..., 0, :], s[..., 0, :] + out)
     torch.testing.assert_close(w[..., 1:, :], s[..., 1:, :])
     assert IATStreamMixer(_config(mhc_internal_attention="mhc"), "mixer").mhc is not None
+    # full: the mixer reads a latent of all n h dims and writes back to all of them
+    full = IATStreamMixer(_config(mhc_internal_attention="full"), "mixer")
+    assert full.down.shape == (128, 512) and full.up.shape == (512, 128)
+    assert IATStreamMixer(_config(mhc_internal_attention="full"), "mlp").down is None
+    x = torch.zeros_like(s)
+    x[..., 3, :] = 1.0
+    assert full.read(x).abs().max() > 0  # a memory stream reaches the mixer directly
+    with torch.no_grad():
+        full.iattn.w_o.zero_()
+    w = full.write(s, out)
+    assert (w - s)[..., 1:, :].abs().max() > 0  # and its output reaches the memory
 
 
 def test_compute_mode_extends_the_plain_residual():
@@ -140,7 +151,7 @@ def test_compute_mode_extends_the_plain_residual():
     torch.testing.assert_close(b, a, atol=1e-4, rtol=1e-4)
 
 
-@pytest.mark.parametrize("mode", ["compute", "mhc"])
+@pytest.mark.parametrize("mode", ["compute", "full", "mhc"])
 @pytest.mark.parametrize(
     "recompute",
     [{}, dict(recompute_granularity="full", recompute_method="uniform", recompute_num_layers=1)],

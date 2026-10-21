@@ -18,10 +18,14 @@ residual, the pipeline payload and activation recompute are the mHC ones:
   writes stream 0 (``x_c``); the memory streams start at zero and the head reads stream 0. The
   mixers keep width d -- the paper's appendix-B variant (temporal attention on ``x_c`` only),
   not its low-rank temporal attention over ``d + m``.
+* ``mhc_internal_attention = "full"``: the paper's low-rank temporal mixing -- each mixer reads
+  all ``n h`` dims through a latent down-projection ``n h -> h`` (its own pre-norm then acts on
+  the latent) and writes through an up-projection ``h -> n h``; MLP / MoE on ``x_c`` as in
+  compute mode. The mixer itself keeps width d (the KV cache and recurrent state unchanged).
 * ``mhc_internal_attention = "mhc"``: dense mHC read / write / stream mixer, plus the internal
   attention after each mixer sublayer's write.
 
-In both, the internal attention follows each mixer sublayer (the paper's TAttn -> IAttn -> FFN
+In all three, the internal attention follows each mixer sublayer (the paper's TAttn -> IAttn -> FFN
 order); MLP / MoE sublayers have none.
 """
 
@@ -33,14 +37,14 @@ from torch import nn
 
 
 def iat_mode(config) -> str:
-    """``"none"``, ``"compute"`` or ``"mhc"``."""
+    """``"none"``, ``"compute"``, ``"full"`` or ``"mhc"``."""
     return getattr(config, "mhc_internal_attention", "none") or "none"
 
 
 def expand_streams(hidden_states: torch.Tensor, n: int, config) -> torch.Tensor:
     """The embedding into ``[s, b, n, h]`` streams: copies (mHC) or ``(x, 0, ..., 0)`` (IAT
-    compute mode: the memory part starts at zero)."""
-    if iat_mode(config) == "compute":
+    compute / full: the memory part starts at zero)."""
+    if iat_mode(config) in ("compute", "full"):
         empty = hidden_states.new_zeros(*hidden_states.shape[:-1], n - 1, hidden_states.shape[-1])
         return torch.cat((hidden_states.unsqueeze(-2), empty), dim=-2)
     from megatron.core.transformer.mhc import expand_to_streams
@@ -49,8 +53,8 @@ def expand_streams(hidden_states: torch.Tensor, n: int, config) -> torch.Tensor:
 
 
 def collapse_streams(streams: torch.Tensor, config) -> torch.Tensor:
-    """The streams into the head's ``[s, b, h]``: the mean (mHC) or ``x_c`` (IAT compute)."""
-    if iat_mode(config) == "compute":
+    """The streams into the head's ``[s, b, h]``: the mean (mHC) or ``x_c`` (IAT compute / full)."""
+    if iat_mode(config) in ("compute", "full"):
         return streams[..., 0, :]
     from megatron.core.transformer.mhc import collapse_streams as mean_streams
 
@@ -142,6 +146,16 @@ class IATStreamMixer(nn.Module):
                 eps=config.layernorm_epsilon,
             )
         self.iattn = InternalAttention(config, n) if kind == "mixer" else None
+        self.down = self.up = None
+        if self.mode == "full" and kind == "mixer":
+            h = config.hidden_size
+            # isometric at init (unit rows): the latent read keeps the stream scale, and the
+            # factorized write (mixer output proj, then up) the mixer's usual output scale
+            self.down = nn.Parameter(torch.empty(h, n * h))
+            self.up = nn.Parameter(torch.empty(n * h, h))
+            with torch.no_grad():
+                self.down.normal_(0.0, (n * h) ** -0.5)
+                self.up.normal_(0.0, h**-0.5)
 
     def _tag_inner(self) -> None:
         # the stack tags this module; the inner mHC mixer records its metrics under that tag
@@ -160,6 +174,8 @@ class IATStreamMixer(nn.Module):
     def read(self, streams: torch.Tensor, h_pre=None) -> torch.Tensor:
         if self.mhc is not None:
             return self.mhc.read(streams, h_pre)
+        if self.down is not None:
+            return F.linear(streams.flatten(-2), self.down)
         return streams[..., 0, :]
 
     def write(self, streams, sublayer_out, h_post=None, h_res=None, lerp=None, link=None):
@@ -167,6 +183,8 @@ class IATStreamMixer(nn.Module):
             raise NotImplementedError("mhc_internal_attention with the nGPT LERP residual")
         if self.mhc is not None:
             streams = self.mhc.write(streams, sublayer_out, h_post, h_res)
+        elif self.up is not None:
+            streams = streams + F.linear(sublayer_out, self.up).view_as(streams)
         else:
             streams = torch.cat(
                 ((streams[..., 0, :] + sublayer_out).unsqueeze(-2), streams[..., 1:, :]), dim=-2
