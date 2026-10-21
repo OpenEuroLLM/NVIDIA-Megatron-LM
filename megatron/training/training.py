@@ -3674,6 +3674,17 @@ def training_log(
         # Decoupled_learning_rate should be not None only on first and last pipeline stage.
         if learning_rate is not None:
             log_string += f' learning rate: {learning_rate:.6E} |'
+        # AngularMuown's adaptive direction multiplier (radius / hyper schedules), if any
+        try:
+            from megatron.core.optimizer.emerging_optimizers import ANGULAR_MUOWN_KAPPA
+        except ImportError:  # pragma: no cover
+            ANGULAR_MUOWN_KAPPA = {}
+        if "kappa" in ANGULAR_MUOWN_KAPPA:
+            log_string += f' angular kappa: {ANGULAR_MUOWN_KAPPA["kappa"]:.4E} |'
+            if "hyper_corr" in ANGULAR_MUOWN_KAPPA:
+                log_string += f' angular hyper corr: {ANGULAR_MUOWN_KAPPA["hyper_corr"]:+.3E} |'
+            if writer:
+                writer.add_scalar('angular-muown-kappa', ANGULAR_MUOWN_KAPPA["kappa"], iteration)
         log_string += f' global batch size: {batch_size:5d} |'
         for key in total_loss_dict:
             if key not in [advanced_iters_key, skipped_iters_key, nan_iters_key]:
