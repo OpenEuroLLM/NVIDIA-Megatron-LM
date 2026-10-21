@@ -505,6 +505,10 @@ class TransformerConfig(ModelParallelConfig):
     s * beta starts at mean 0.5, mostly in [0, 1] -- as with s = 1 -- while the full [0, 2] stays
     reachable."""
 
+    linear_kronlstm_output_gate: str = "linear"
+    """KronLSTM's output gate: "linear" (the paper's dense hidden x value_dim projection) or
+    "lowrank" (complex_kda's hidden -> head_dim -> value_dim, its parameter count)."""
+
     linear_kronlstm_unit_write: bool = False
     """KronLSTM with linear_fla_allow_neg_eigval (s = 2): keep the write c in [0, 1] by construction.
     The op's s scales the write cap as well as the erase, so without this the write is s * c in
