@@ -167,6 +167,22 @@ def _mhc_write(streams, sublayer_out, h_post, h_res):
 _mhc_write_compiled = None
 
 
+def _canonical(t):
+    """``t`` with the strides of a contiguous tensor if it is contiguous (a view of the same
+    memory): contiguity ignores size-1 dims, Dynamo's stride guards do not. With document
+    masking the micro-batch is [1, t] (b = 1), and an [s, 1, n, C] stream state arrives with
+    stride n * C or s * n * C at the batch dim depending on the producer (the Engram memory is
+    transposed from [b, s]) -- each a recompile, until the recompile limit runs the rest eager."""
+    if not isinstance(t, torch.Tensor) or t.dim() < 2 or not t.is_contiguous():
+        return t
+    want, acc = [], 1
+    for size in reversed(t.shape):
+        want.append(acc)
+        acc *= max(size, 1)
+    want = tuple(reversed(want))
+    return t if t.stride() == want else t.as_strided(t.shape, want)
+
+
 class _MHCWrite(torch.autograd.Function):
     """The mHC write, with the backward routed through a fused Triton kernel.
 
@@ -263,6 +279,7 @@ def _mhc_write_dispatch(streams, sublayer_out, h_post, h_res):
             _mhc_write_compiled = torch.compile(_mhc_write, dynamic=False)
         except Exception:  # pragma: no cover
             _mhc_write_compiled = _mhc_write
+    streams, sublayer_out, h_post, h_res = map(_canonical, (streams, sublayer_out, h_post, h_res))
     try:
         return _mhc_write_compiled(streams, sublayer_out, h_post, h_res)
     except Exception:  # pragma: no cover - Inductor unavailable at runtime
@@ -352,9 +369,13 @@ def _compiled(fn):
     cached = _COMPILED.get(fn)
     if cached is None:
         try:
-            cached = torch.compile(fn, dynamic=False)
+            compiled = torch.compile(fn, dynamic=False)
         except Exception:  # pragma: no cover - depends on the runtime
-            cached = fn
+            compiled = fn
+
+        def cached(*args, **kwargs):
+            return compiled(*map(_canonical, args), **kwargs)
+
         _COMPILED[fn] = cached
     return cached
 
@@ -434,6 +455,7 @@ def sinkhorn_knopp(logits: torch.Tensor, num_iters: int = 20, eps: float = 1e-8)
             _sinkhorn_compiled = torch.compile(_sinkhorn_knopp_impl, dynamic=False)
         except Exception:  # pragma: no cover - depends on the runtime
             _sinkhorn_compiled = _sinkhorn_knopp_impl
+    logits = _canonical(logits)
     try:
         return _sinkhorn_compiled(logits, num_iters, eps)
     except Exception:  # pragma: no cover - Inductor/Triton unavailable at runtime
@@ -556,7 +578,7 @@ class MHCMixer(nn.Module):
             except Exception:  # pragma: no cover
                 _mhc_coeffs_compiled = _mhc_coeffs
         s, b, n, c = streams.shape
-        flat = streams.reshape(s, b, n * c)
+        flat = _canonical(streams.reshape(s, b, n * c))
         try:
             return _mhc_coeffs_compiled(
                 flat,
@@ -632,7 +654,7 @@ class MHCMixer(nn.Module):
             return None
         try:
             return _mhc_coeffs_read_compiled(
-                streams,
+                _canonical(streams),
                 self.phi,
                 self.b_pre,
                 self.b_post,
@@ -657,7 +679,7 @@ class MHCMixer(nn.Module):
             except Exception:  # pragma: no cover
                 _mhc_read_compiled = _mhc_read
         try:
-            return _mhc_read_compiled(streams, h_pre.to(streams.dtype))
+            return _mhc_read_compiled(_canonical(streams), _canonical(h_pre.to(streams.dtype)))
         except Exception:  # pragma: no cover - Inductor unavailable
             _mhc_read_compiled = _mhc_read
             return _mhc_read(streams, h_pre.to(streams.dtype))
