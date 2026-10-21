@@ -148,6 +148,95 @@ def sharded_lookup_unique(layer, rows: torch.Tensor, dtype: torch.dtype):
     return _ShardedUniqueRows.apply(anchor, layer, uniq, dtype), inverse
 
 
+# ---- sparse row gradients (ENGRAM_SPARSE_GRAD=1) ---------------------------------------------
+class SparseRowGrad:
+    """The fp32 gradient of a table shard, kept for the rows the step touched only.
+
+    A drop-in for the dense ``[rows, dim]`` fp32 buffer (4 B per table parameter): the lookups'
+    backwards call ``index_add_(0, local_rows, grads)`` on it as on the dense one; the pairs are
+    appended and coalesced (sorted unique rows, summed in fp32) when they pass
+    ``coalesce_bytes`` and before the norm / clip / update. A step touches at most its lookups'
+    rows (<= ~20 % of a large table), so this costs a fraction of the dense buffer. The update
+    stays exact dense Adam: TableAdam scatters each chunk's rows into a zero chunk, so the rows
+    without a gradient still move by their momentum, as with the dense buffer.
+    """
+
+    def __init__(self, num_rows: int, dim: int, device, coalesce_bytes: int = 256 << 20):
+        self.num_rows, self.dim, self.device = num_rows, dim, device
+        self.coalesce_bytes = coalesce_bytes
+        self.rows = None  # sorted unique local rows (int64) after coalesce()
+        self.values = None  # [len(rows), dim] fp32
+        self._idx, self._val, self._pending = [], [], 0
+
+    def index_add_(self, dim: int, index: torch.Tensor, source: torch.Tensor):
+        if dim != 0:
+            raise ValueError("SparseRowGrad accumulates rows (dim 0) only")
+        if index.numel():
+            self._idx.append(index.to(torch.int64))
+            self._val.append(source.float())
+            self._pending += source.numel() * 4
+            if self._pending >= self.coalesce_bytes:
+                self.coalesce()
+        return self
+
+    def coalesce(self) -> "SparseRowGrad":
+        if not self._idx:
+            return self
+        idx, val = self._idx, self._val
+        if self.rows is not None:
+            idx, val = [self.rows, *idx], [self.values, *val]
+        idx, val = torch.cat(idx), torch.cat(val)
+        self._idx, self._val, self._pending = [], [], 0
+        rows, inverse = torch.unique(idx, return_inverse=True)
+        values = torch.zeros(rows.numel(), self.dim, dtype=torch.float32, device=val.device)
+        values.index_add_(0, inverse, val)
+        self.rows, self.values = rows, values
+        return self
+
+    def zero_(self) -> "SparseRowGrad":
+        self.rows = self.values = None
+        self._idx, self._val, self._pending = [], [], 0
+        return self
+
+    def coalesced_values(self) -> torch.Tensor:
+        """The touched rows' gradients ``[n, dim]`` (empty if none)."""
+        self.coalesce()
+        if self.values is None:
+            return torch.zeros(0, self.dim, dtype=torch.float32, device=self.device)
+        return self.values
+
+    def mul_(self, scale) -> "SparseRowGrad":
+        self.coalesce()
+        if self.values is not None:
+            self.values.mul_(scale)
+        return self
+
+    def chunk_bounds(self, starts):
+        """For row chunks starting at ``starts`` (ascending, Python ints): the [a, b) slices of
+        the coalesced rows falling in each chunk (one host sync)."""
+        self.coalesce()
+        if self.rows is None:
+            return [(0, 0)] * len(starts)
+        edges = torch.tensor([*starts, self.num_rows], dtype=torch.int64, device=self.rows.device)
+        cut = torch.searchsorted(self.rows, edges).tolist()
+        return list(zip(cut[:-1], cut[1:]))
+
+    def to_dense(self) -> torch.Tensor:
+        """The full ``[rows, dim]`` fp32 gradient (tests, debugging)."""
+        self.coalesce()
+        out = torch.zeros(self.num_rows, self.dim, dtype=torch.float32, device=self.device)
+        if self.rows is not None:
+            out.index_copy_(0, self.rows, self.values)
+        return out
+
+    def dense_chunk(self, lo: int, hi: int, a: int, b: int) -> torch.Tensor:
+        """Rows [lo, hi) as a dense fp32 chunk (zeros where untouched)."""
+        g = torch.zeros(hi - lo, self.dim, dtype=torch.float32, device=self.device)
+        if b > a:
+            g.index_copy_(0, self.rows[a:b] - lo, self.values[a:b])
+        return g
+
+
 # ---- step-level lookup (ENGRAM_STEP_LOOKUP=1) ------------------------------------------------
 # The rows a micro-batch looks up depend on its token ids alone, and with document masking the
 # whole step's micro-batches are fetched before the schedule runs (packed_doc_attention). So a

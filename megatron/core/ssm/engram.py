@@ -232,7 +232,13 @@ class EngramLayer(MegatronModule):
                 torch.empty(self.rows_per_rank, self.embed_dim, device=device), requires_grad=False
             )
             # A plain attribute, not a buffer: Float16Module's cast must not touch it.
-            self.table_grad = torch.zeros_like(self.table, dtype=torch.float32)
+            if os.environ.get("ENGRAM_SPARSE_GRAD", "0") == "1":
+                # only the touched rows' gradients (4 B per table parameter less)
+                from megatron.core.ssm.engram_sharded import SparseRowGrad
+
+                self.table_grad = SparseRowGrad(self.rows_per_rank, self.embed_dim, device)
+            else:
+                self.table_grad = torch.zeros_like(self.table, dtype=torch.float32)
             self.table.engram_sharded_table = True
             self.table.engram_grad = self.table_grad
         else:

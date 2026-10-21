@@ -2232,6 +2232,8 @@ class ChainedOptimizer(MegatronOptimizer):
                         total_norm=grad_norm,
                         use_decoupled_grad=use_decoupled_grad,
                     )
+                if hasattr(optimizer, "clip_sparse_grads"):  # EngramTableOptimizer
+                    optimizer.clip_sparse_grads(optimizer.config.clip_grad, grad_norm)
                 for grad_norm_group, grouped_params in params_by_grad_norm_group.items():
                     group_grad_norm = self.grad_norms_by_group.get(grad_norm_group)
                     if group_grad_norm is None:

@@ -76,7 +76,8 @@ class TableAdam(torch.optim.Optimizer):
         for group in self.param_groups:
             beta1, beta2 = group['betas']
             for p in group['params']:
-                if p.grad is None:
+                sparse = _sparse_grad(p)
+                if p.grad is None and sparse is None:
                     continue
                 state = self.init_state(p)
                 state['step'] += 1
@@ -84,8 +85,14 @@ class TableAdam(torch.optim.Optimizer):
                 step_size = group['lr'] / (1 - beta1**t)
                 bc2_sqrt = math.sqrt(1 - beta2**t)
                 rows = max(1, _CHUNK_ELEMENTS // max(1, p.shape[-1]))
-                for lo in range(0, p.shape[0], rows):
-                    w, g = p.data[lo : lo + rows], p.grad[lo : lo + rows].float()
+                starts = list(range(0, p.shape[0], rows))
+                bounds = sparse.chunk_bounds(starts) if sparse is not None else None
+                for i, lo in enumerate(starts):
+                    w = p.data[lo : lo + rows]
+                    if sparse is not None:  # zeros where the step left the row untouched
+                        g = sparse.dense_chunk(lo, lo + w.shape[0], *bounds[i])
+                    else:
+                        g = p.grad[lo : lo + rows].float()
                     m, v = state['exp_avg'][lo : lo + rows], state['exp_avg_sq'][lo : lo + rows]
                     m32 = m.float().mul_(beta1).add_(g, alpha=1 - beta1)
                     sq = g.square_()  # g is a chunk copy (float()) or the grad: reused below
@@ -95,6 +102,20 @@ class TableAdam(torch.optim.Optimizer):
                     w.addcdiv_(m32, v.sqrt().div_(bc2_sqrt).add_(group['eps']), value=-step_size)
                     m.copy_(m32)
         return None
+
+
+def _sparse_grad(p):
+    """The parameter's SparseRowGrad (ENGRAM_SPARSE_GRAD=1), or None."""
+    from megatron.core.ssm.engram_sharded import SparseRowGrad
+
+    grad = getattr(p, "engram_grad", None)
+    return grad if isinstance(grad, SparseRowGrad) else None
+
+
+def _grad_tensor(p) -> torch.Tensor:
+    """What the norm reads: the dense buffer, or the touched rows' gradients (same norm)."""
+    sparse = _sparse_grad(p)
+    return sparse.coalesced_values() if sparse is not None else p.engram_grad
 
 
 class EngramTableOptimizer(MegatronOptimizer):
@@ -148,8 +169,23 @@ class EngramTableOptimizer(MegatronOptimizer):
 
         flush_step_lookups()
         for p in self.params:
-            p.grad = p.engram_grad
+            sparse = _sparse_grad(p)
+            if sparse is not None:
+                # p.grad stays None: the generic clip skips it, clip_sparse_grads scales it
+                sparse.coalesce()
+                p.grad = None
+            else:
+                p.grad = p.engram_grad
         return False
+
+    def clip_sparse_grads(self, max_norm: float, total_norm: float) -> None:
+        """The chained clip for the sparse gradients (clip_grad_by_total_norm_fp32's rule)."""
+        clip_coeff = max_norm / (total_norm + 1.0e-6)
+        if clip_coeff < 1.0:
+            for p in self.params:
+                sparse = _sparse_grad(p)
+                if sparse is not None:
+                    sparse.mul_(clip_coeff)
 
     def get_grad_stats_parallel_group(self):
         # Rows are owned once across the whole job (different stages hold different
@@ -157,14 +193,16 @@ class EngramTableOptimizer(MegatronOptimizer):
         return torch.distributed.group.WORLD
 
     def get_grads_for_grad_norm(self, grad_norm_group: Optional[str] = None):
-        return [p.engram_grad for p in self.params] if grad_norm_group is None else []
+        if grad_norm_group is not None:
+            return []
+        return [_grad_tensor(p) for p in self.params]
 
     @torch.no_grad()
     def get_grad_norm(self):
         device = torch.cuda.current_device()
         sq = torch.zeros((), dtype=torch.float32, device=device)
         for p in self.params:
-            sq += p.engram_grad.float().square().sum()
+            sq += _grad_tensor(p).float().square().sum()
         torch.distributed.all_reduce(sq, group=self.get_grad_stats_parallel_group())
         return math.sqrt(sq.item())
 
@@ -195,7 +233,9 @@ class EngramTableOptimizer(MegatronOptimizer):
         grad_norm = self.get_grad_norm()
         if self.config.clip_grad > 0.0 and grad_norm > self.config.clip_grad:
             for p in self.params:
-                p.grad.mul_(self.config.clip_grad / (grad_norm + 1e-6))
+                if p.grad is not None:
+                    p.grad.mul_(self.config.clip_grad / (grad_norm + 1e-6))
+            self.clip_sparse_grads(self.config.clip_grad, grad_norm)
         return self.step_with_ready_grads(), grad_norm, None
 
     # ---- checkpointing ---------------------------------------------------------
