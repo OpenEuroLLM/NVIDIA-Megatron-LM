@@ -2764,6 +2764,9 @@ def setup_model_and_optimizer(
         from megatron.training.quant_eval import maybe_quantize_for_eval
 
         maybe_quantize_for_eval(model)
+        from megatron.training.downstream_eval import maybe_run_downstream_eval
+
+        maybe_run_downstream_eval(model)
         timers('load-checkpoint').stop(barrier=True)
         timers.log(['load-checkpoint'])
         one_logger and one_logger.log_metrics(
