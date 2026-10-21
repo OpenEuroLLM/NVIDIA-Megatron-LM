@@ -199,7 +199,12 @@ def test_packed_documents_match_separate_with_depth_memory(pattern):
                        for _, p in ldm), [n for n, p in ldm if p.grad is None]
 
 
-@pytest.mark.parametrize("gate", ["softplus", "signed_sigmoid2"])
+POLAR = dict(linear_fla_gate="softplus", linear_kronlstm_forget_angle=True,
+             linear_kronlstm_erase_angle=True, linear_kronlstm_signed_write=True,
+             linear_kronlstm_output_gate="lowrank")
+
+
+@pytest.mark.parametrize("gate", ["softplus", "signed_sigmoid2", "polar"])
 @pytest.mark.parametrize(
     "recompute",
     [{}, dict(recompute_granularity="full", recompute_method="uniform", recompute_num_layers=1)],
@@ -207,10 +212,23 @@ def test_packed_documents_match_separate_with_depth_memory(pattern):
 )
 def test_packed_documents_match_separate_with_kronlstm(gate, recompute):
     """KronLSTM (`kronlstm`, fla_hybrid.KronLSTM) as the `L` mixer: its recurrence, sign
-    parity and short conv restart at every document."""
-    model = _model(experimental_attention_variant="kronlstm", linear_fla_gate=gate,
-                   linear_fla_allow_neg_eigval=True, **recompute)
+    parity and short conv restart at every document (polar: the angle gates and the signed
+    write, low-rank output gate). In fp32 and with plain mHC (no routed stream picks): in bf16 the
+    routed residual's discrete picks flip on rounding between the packed and the separate run
+    (max error up to ~0.4 of the logit spread on a few tokens, any mixer)."""
+    gates = POLAR if gate == "polar" else dict(linear_fla_gate=gate, linear_fla_allow_neg_eigval=True)
+    model = _model(experimental_attention_variant="kronlstm", mhc_routed_topk=0, **gates,
+                   **recompute).float()
     model.train()
+    if gate == "polar":
+        # flipped forget channels and reflecting erase heads, so the signs matter
+        with torch.no_grad():
+            for layer in model.decoder.layers:
+                mixer = getattr(getattr(layer, "self_attention", None), "layer", None)
+                if mixer is not None and hasattr(mixer, "f_angle_proj"):
+                    b = mixer.f_angle_proj[-1].bias
+                    b.copy_(torch.where(torch.rand_like(b) < 0.5, 4.0, -3.0))
+                    mixer.b_angle_proj.bias.fill_(2.0)
     if gate.startswith("signed"):
         # a spread of negative forget gates, so the sign gauge matters
         with torch.no_grad():
@@ -232,7 +250,7 @@ def test_packed_documents_match_separate_with_kronlstm(gate, recompute):
     together = run(torch.cat(docs, dim=1), packed).float()
     scale = ref.std()
     err = (together - ref).abs().max() / scale
-    assert err < 0.05, float(err)
+    assert err < 1e-2, float(err)  # fp32; the kernels' fp32 dots run in tf32
     leaked = (run(torch.cat(docs, dim=1)).float() - ref)[:, LENGTHS[0]:].abs().max() / scale
     assert leaked > 4 * err, (float(err), float(leaked))
     together.logsumexp(-1).mean().backward()
