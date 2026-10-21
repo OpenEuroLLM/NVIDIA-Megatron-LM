@@ -44,6 +44,14 @@ def report(tag: str) -> None:
     )
 
 
+def baseline(name: str) -> None:
+    """Record the non-PyTorch memory in use now as ``name`` (first call: the CUDA context, which
+    this very query creates if it does not exist yet)."""
+    if ENABLED:
+        torch.cuda.synchronize()
+        _totals[name] = non_torch_bytes()
+
+
 @contextlib.contextmanager
 def measure(name: str):
     """Add the non-PyTorch memory the block allocates to ``name``'s total."""
