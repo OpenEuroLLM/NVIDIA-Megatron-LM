@@ -18,7 +18,11 @@ pipelined schedule runs long after its forward, so they can wait on the host:
 
 Only non-leaf inputs are offloaded (the outputs of the previous chunk, the embedding): a leaf
 input -- a pipeline receive buffer -- is also held by the schedule, so the copy would free
-nothing. Stays inside one pipeline stage; the tensors the schedule sends are untouched.
+nothing. With RECOMPUTE_OFFLOAD_LEAF=1 it is offloaded too: the schedule only reads the leaf's
+.grad after the backward, so its .data goes to the host (like deallocate_output_tensor does for
+the outputs) and comes back into the same tensor object before the recompute -- the receive
+buffers of every micro-batch in flight, 10 x 0.5 GB on the middle stages of the mHC-4 hybrid at
+16k. Stays inside one pipeline stage; the tensors the schedule sends are untouched.
 """
 
 import os
@@ -46,6 +50,7 @@ def _offload_last_here() -> bool:
     return parallel_state.get_pipeline_model_parallel_rank() in {
         int(r) for r in _OFFLOAD_LAST_SPEC.split(",")
     }
+OFFLOAD_LEAF = os.environ.get("RECOMPUTE_OFFLOAD_LEAF", "0") == "1"
 MIN_BYTES = int(os.environ.get("RECOMPUTE_OFFLOAD_MIN_MB", "16")) << 20
 
 # One stream per direction: PCIe is full duplex, and on one stream the backward's fetches queue
@@ -110,6 +115,9 @@ class Slot:
         self.gpu, self.host, self.event, self.prev = tensor, None, None, prev
         self.offloaded = None  # the D2H copy's event: the H2D copy back reads the host buffer
         self.requires_grad = tensor.requires_grad
+        # a leaf (pipeline receive buffer): the object stays (the schedule reads its .grad), its
+        # .data moves
+        self.leaf = tensor if tensor.grad_fn is None else None
 
     def offload(self):
         t, side = self.gpu, _side_stream("d2h")
@@ -119,6 +127,8 @@ class Slot:
             self.host.copy_(t, non_blocking=True)
             self.offloaded = side.record_event()
         t.record_stream(side)  # the allocator keeps the block until the copy is done
+        if self.leaf is not None:
+            self.leaf.data = torch.empty(0, dtype=t.dtype, device=t.device)
         self.gpu = None
 
     def fetch(self):
@@ -141,6 +151,10 @@ class Slot:
         if self.event is not None:
             torch.cuda.current_stream().wait_event(self.event)
         g, self.gpu, self.event = self.gpu, None, None
+        if self.leaf is not None:
+            if g is not self.leaf:
+                self.leaf.data = g
+            g, self.leaf = self.leaf, None
         if g.is_leaf and g.requires_grad != self.requires_grad:
             g.requires_grad_(self.requires_grad)
         return g
@@ -153,7 +167,7 @@ def register(tensor):
     if (
         not isinstance(tensor, torch.Tensor)
         or not tensor.is_cuda
-        or tensor.grad_fn is None
+        or (tensor.grad_fn is None and not (OFFLOAD_LEAF and tensor.is_leaf))
         or tensor.numel() * tensor.element_size() < MIN_BYTES
     ):
         _last = None
