@@ -56,3 +56,14 @@ def test_factory_weight_gets_expanded_row_state():
     chunks = opt.build()
     assert [c.local_shape for c in chunks] == [(16, 64), (32, 64)]
     assert torch.equal(chunks[1].data[:, :1], g[16:])
+
+
+def test_factory_weight_legacy_layout(monkeypatch):
+    """ANGULAR_MUOWN_LEGACY_FACTORY_ROWS=1: the compact (rows, 1) state goes to the factory as is
+    (the layout before the expansion; round 5's s2 checkpoints), so those checkpoints load."""
+    monkeypatch.setenv("ANGULAR_MUOWN_LEGACY_FACTORY_ROWS", "1")
+    w = ShardedTensor.from_rank_offsets("decoder.linear_fc1.weight", torch.zeros(48, 64))
+    fac = _split_tensor_factory(w, [24, 24], ["a", "b"], 0)
+    g = torch.arange(48.0).reshape(48, 1)
+    opt = make_sharded_optimizer_tensor(fac, g, prefix="optimizer.state.g")
+    assert opt.data.shape == (48, 1) and torch.equal(opt.data, g)

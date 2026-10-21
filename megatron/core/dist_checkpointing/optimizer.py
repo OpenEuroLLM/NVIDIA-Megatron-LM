@@ -5,6 +5,7 @@ for model parameters.
 """
 
 import logging
+import os
 from copy import deepcopy
 from dataclasses import replace
 from typing import Dict, Iterable, Optional, Tuple, Union
@@ -131,6 +132,11 @@ def make_sharded_optimizer_tensor(
             and optim_param.shape[-1] == 1
             and weight.shape[-1] > 1
             and tuple(optim_param.shape[:-1]) == tuple(weight.shape[:-1])
+            # ANGULAR_MUOWN_LEGACY_FACTORY_ROWS=1: the layout before 1bbeb2b55 -- the (rows, 1)
+            # state handed to the factory as is -- to load (and keep writing) checkpoints of that
+            # time, e.g. round 5's s2 runs (the GLU linear_fc1 split narrows rows, which (rows, 1)
+            # survives; the split GDN / Mamba in_proj needed the expansion)
+            and os.environ.get("ANGULAR_MUOWN_LEGACY_FACTORY_ROWS", "0") != "1"
         ):
             # a per-row state (..., 1) of a factory-built weight (e.g. the split GDN / Mamba
             # in_proj): the factory narrows along the weight's own axes, so give it the weight
