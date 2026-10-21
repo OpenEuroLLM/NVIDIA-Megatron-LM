@@ -191,8 +191,8 @@ class StepRowGather(torch.autograd.Function):
     gradient buffer (no exchange). ``anchor`` gives the result a backward (values is no leaf)."""
 
     @staticmethod
-    def forward(ctx, anchor, values, grad_buffer, inverse):
-        ctx.grad_buffer = grad_buffer
+    def forward(ctx, anchor, values, grad_buffer, inverse, on_backward=None):
+        ctx.grad_buffer, ctx.on_backward = grad_buffer, on_backward
         ctx.save_for_backward(inverse)
         return values.index_select(0, inverse)
 
@@ -200,7 +200,9 @@ class StepRowGather(torch.autograd.Function):
     def backward(ctx, grad):
         (inverse,) = ctx.saved_tensors
         ctx.grad_buffer.index_add_(0, inverse, grad.float())
-        return grad.new_zeros(()), None, None, None
+        if ctx.on_backward is not None:  # ENGRAM_STEP_GROUP: the group's last backward flushes
+            ctx.on_backward()
+        return grad.new_zeros(()), None, None, None, None
 
 
 # Layers holding a step lookup whose gradients still have to go to their owners, in the order

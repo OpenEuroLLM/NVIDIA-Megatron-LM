@@ -3092,6 +3092,10 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             prefetch_engram_step_lookups(model, packed_doc_attention)
         pipeline_seq_length, pipeline_micro_batch_size = get_pipeline_tensor_shapes(args)
         _mem_trace = _maybe_start_mem_trace(iteration)
+        from megatron.core import mem_breakdown
+
+        if iteration is not None and iteration < 3:
+            mem_breakdown.report(f"iteration {iteration} start")
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step_func,
             data_iterator=data_iterator,
@@ -3108,6 +3112,8 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         )
         if _mem_trace is not None:
             _dump_mem_trace(_mem_trace)
+        if iteration is not None and iteration < 3:
+            mem_breakdown.report(f"iteration {iteration} after forward-backward")
         if save_activations_in_this_iteration:
             save_activations(iteration + 1)
             disable_activation_logging()

@@ -36,6 +36,8 @@ import math
 from typing import Optional
 
 import numpy as np
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -284,6 +286,7 @@ class EngramLayer(MegatronModule):
             replicate_across_tp(module, self.tp_group)
         self._input_ids = None
         self._step_lookup = None  # see prefetch_step_lookup
+        self._step_groups = None  # ENGRAM_STEP_GROUP: see stash_step_groups
         # mHC / Block AttnRes / nGPT replace `h + Engram(h)` (residual_scheme_adapter.py).
         from megatron.core.transformer.residual_scheme_adapter import (
             ResidualSchemeAdapter,
@@ -336,6 +339,78 @@ class EngramLayer(MegatronModule):
         """The step-level lookup (engram_sharded.py): sharded tables, TP 1, no CP."""
         return self.sharded and self.tp_group.size() == 1 and self.cp_group is None
 
+    def _hashed_rows(self, ids, cu):
+        ids = ids.reshape(1, -1)
+        positions = document_positions(cu.to(ids.device).reshape(-1), ids.shape[1]).unsqueeze(0)
+        mapped = ids if self.token_map is None else self.token_map[ids]
+        rows = engram_hash(
+            mapped, self.orders, self.num_heads, self.hash_mult, self.sizes, positions=positions
+        )
+        return (rows + self.row_offsets).reshape(-1), (ids.data_ptr(), ids.numel())
+
+    def stash_step_groups(self, tokens_list, cu_seqlens_list, group_size: int) -> None:
+        """ENGRAM_STEP_GROUP=G: the step lookup in groups of G micro-batches (the whole-step
+        lookup holds every row + fp32 gradient of the step: ~6 GiB at 32 x 32k tokens). A group's
+        rows are exchanged at the first forward that needs them; its row gradients go to their
+        owners after the last of its micro-batches' backwards. The DP ranks of a stage run the
+        same schedule, so the exchanges match."""
+        groups = []
+        for start in range(0, len(tokens_list), group_size):
+            groups.append(
+                {
+                    "batches": list(
+                        zip(
+                            tokens_list[start : start + group_size],
+                            cu_seqlens_list[start : start + group_size],
+                        )
+                    ),
+                    "lookup": None,
+                    "remaining": None,
+                }
+            )
+        key_to_group = {}
+        for g in groups:
+            for ids, _ in g["batches"]:
+                key_to_group[(ids.reshape(1, -1).data_ptr(), ids.numel())] = g
+        self._step_groups = key_to_group
+        from megatron.core.ssm.engram_sharded import PENDING_STEP_LOOKUPS
+
+        PENDING_STEP_LOOKUPS.append(self)
+
+    def _group_lookup(self, group):
+        """Exchange a stashed group's rows (once)."""
+        from megatron.core.ssm.engram_sharded import exchange_rows
+
+        rows_all, keys, sizes = [], [], []
+        for ids, cu in group["batches"]:
+            rows, key = self._hashed_rows(ids, cu)
+            rows_all.append(rows)
+            sizes.append(rows.numel())
+            keys.append(key)
+        uniq, inverse = torch.unique(torch.cat(rows_all), return_inverse=True)
+        values, state = exchange_rows(self, uniq, self.config.params_dtype)
+        grad = torch.zeros(uniq.numel(), self.embed_dim, dtype=torch.float32, device=values.device)
+        group["lookup"] = {
+            "values": values,
+            "grad": grad,
+            "state": state,
+            "inverse": dict(zip(keys, inverse.split(sizes))),
+        }
+        group["remaining"] = len(group["batches"])
+
+    def _group_backward_done(self, group):
+        group["remaining"] -= 1
+        if group["remaining"] == 0:
+            self._flush_group(group)
+
+    def _flush_group(self, group):
+        from megatron.core.ssm.engram_sharded import exchange_grads
+
+        lookup, group["lookup"] = group["lookup"], None
+        if lookup is not None:
+            exchange_grads(self, lookup["state"], lookup["grad"], self.config.params_dtype)
+        group["batches"] = []  # done: nothing of it is looked up again this step
+
     def prefetch_step_lookup(self, tokens_list, cu_seqlens_list) -> None:
         """Fetch every row this step's micro-batches look up (packed ``[1, T]`` token tensors and
         their cu_seqlens), deduplicated, in one exchange; each micro-batch's forward then gathers
@@ -373,6 +448,11 @@ class EngramLayer(MegatronModule):
         step, self._step_lookup = self._step_lookup, None
         if step is not None:
             exchange_grads(self, step["state"], step["grad"], self.config.params_dtype)
+        groups, self._step_groups = self._step_groups, None
+        if groups:  # a group whose backwards did not all run (none expected): flush it now
+            for group in {id(g): g for g in groups.values()}.values():
+                if group["lookup"] is not None:
+                    self._flush_group(group)
 
     def set_input_ids(self, input_ids: Optional[torch.Tensor]) -> None:
         """Token ids [b, s] of the current micro-batch (set by HybridStack)."""
@@ -383,6 +463,26 @@ class EngramLayer(MegatronModule):
     ) -> torch.Tensor:
         """e_t for every position: [b, s] -> [s, b, lookups * embed_dim], full on every rank.
         ``positions`` ([b, s], within the document) restart the n-grams at documents."""
+        groups = self._step_groups
+        if groups is not None:
+            group = groups.get((input_ids.data_ptr(), input_ids.numel()))
+            if group is not None and group["batches"]:
+                if group["lookup"] is None:
+                    self._group_lookup(group)
+                from megatron.core.ssm.engram_sharded import StepRowGather
+
+                lookup = group["lookup"]
+                grad_on = torch.is_grad_enabled()
+                anchor = torch.zeros((), device=input_ids.device, requires_grad=grad_on)
+                emb = StepRowGather.apply(
+                    anchor,
+                    lookup["values"],
+                    lookup["grad"],
+                    lookup["inverse"][(input_ids.data_ptr(), input_ids.numel())],
+                    (lambda g=group: self._group_backward_done(g)) if grad_on else None,
+                )
+                b, s = input_ids.shape
+                return emb.reshape(b, s, -1).transpose(0, 1)
         step = self._step_lookup
         if step is not None:
             inverse = step["inverse"].get((input_ids.data_ptr(), input_ids.numel()))
@@ -591,5 +691,9 @@ def prefetch_engram_step_lookups(model_chunks, packed_doc_attention) -> None:
             continue
         tokens = [b["tokens"] for b in batches]
         cus = [m.cu_seqlens for m in metadata]
+        group_size = int(os.environ.get("ENGRAM_STEP_GROUP", "0"))
         for layer in layers:
-            layer.prefetch_step_lookup(tokens, cus)
+            if 0 < group_size < len(tokens):
+                layer.stash_step_groups(tokens, cus, group_size)
+            else:
+                layer.prefetch_step_lookup(tokens, cus)

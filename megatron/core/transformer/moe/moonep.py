@@ -77,11 +77,14 @@ class _MoonEPState:
         self.rank = group.rank()
         self.S, self.H, self.K, self.E = S, H, K, E
         self.epn = E // self.R
-        self.buffer = moonep.Buffer(
-            S, H, K, E, self.R, num_sms=num_sms, token_padding=token_padding, group=group,
-            # MOONEP_PDL=0: no programmatic dependent launch between MoonEP's kernels
-            enable_pdl=os.environ.get("MOONEP_PDL", "1") != "0",
-        )
+        from megatron.core import mem_breakdown
+
+        with mem_breakdown.measure("moonep_buffer"):
+            self.buffer = moonep.Buffer(
+                S, H, K, E, self.R, num_sms=num_sms, token_padding=token_padding, group=group,
+                # MOONEP_PDL=0: no programmatic dependent launch between MoonEP's kernels
+                enable_pdl=os.environ.get("MOONEP_PDL", "1") != "0",
+            )
         self.pools = {}
         self._last_prefetch = None  # (experts module, plan) whose weights the pools hold
 
@@ -102,8 +105,11 @@ class _MoonEPState:
         """[R, epn, *inner] all-rank NVLink view (rank chunks padded to VMM granularity)."""
         key = (name, tuple(inner), dtype)
         if key not in self.pools:
+            from megatron.core import mem_breakdown
+
             padded = pad_dim0_for_alignment([self.epn, *inner], dtype)
-            t = create_nvl_dist_tensor([padded, *inner], dtype, self.rank, self.R, self.group)
+            with mem_breakdown.measure("moonep_pools"):
+                t = create_nvl_dist_tensor([padded, *inner], dtype, self.rank, self.R, self.group)
             t = t.view(self.R, padded, *inner)[:, : self.epn]
             t[self.rank].zero_()
             torch.cuda.synchronize()

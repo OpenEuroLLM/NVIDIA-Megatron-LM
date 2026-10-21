@@ -305,3 +305,76 @@ def test_step_lookup_matches_per_microbatch():
         assert layer._step_lookup is None
     finally:
         Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(Utils.world_size < 2, reason="needs 2+ GPUs")
+def test_step_lookup_groups_match_per_microbatch():
+    """ENGRAM_STEP_GROUP: the step lookup in groups of 2 of 5 micro-batches, under a pipelined,
+    fully recomputed order (no-grad forwards running ahead, recompute + backward later): the
+    per-micro-batch path's outputs and table gradients; a group's gradients reach their owners
+    once its last backward ran."""
+    from megatron.core.packed_seq_params import PackedSeqParams
+    from megatron.core.ssm.engram_sharded import PENDING_STEP_LOOKUPS, flush_step_lookups
+
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        layer = EngramLayer(
+            _config(engram_table_parallel="dp"), layer_number=1, pg_collection=_pg()
+        ).cuda()
+        with torch.no_grad():
+            gen = torch.Generator(device="cuda").manual_seed(5)
+            layer.conv1d.weight.copy_(
+                torch.randn(layer.conv1d.weight.shape, generator=gen, device="cuda")
+            )
+        dp_rank = parallel_state.get_data_parallel_rank()
+        gen = torch.Generator(device="cuda").manual_seed(200 + dp_rank)
+        T = 3 * SEQ
+        mbs = []
+        for k in range(5):
+            ids = torch.randint(0, 5000, (1, T), device="cuda", generator=gen)
+            cu = torch.tensor([0, 11 + k, 40, 77, T - 2], dtype=torch.int32, device="cuda")
+            psp = PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu,
+                                  max_seqlen_q=40, max_seqlen_kv=40)
+            h = torch.randn(T, 1, HIDDEN, device="cuda", generator=gen)
+            g = torch.randn(T, 1, HIDDEN, device="cuda", generator=gen)
+            mbs.append((ids, cu, psp, h, g))
+
+        def fwd(k, grad):
+            ids, _, psp, h, _ = mbs[k]
+            layer.set_input_ids(ids)
+            with torch.set_grad_enabled(grad):
+                return layer(h, packed_seq_params=psp)
+
+        layer.table_grad.zero_()
+        ref_outs = []
+        for k in range(5):
+            out = fwd(k, True)
+            out.backward(mbs[k][4])
+            ref_outs.append(out.detach())
+        ref_grad = layer.table_grad.clone()
+
+        layer.table_grad.zero_()
+        layer.stash_step_groups([m[0] for m in mbs], [m[1].view(1, -1) for m in mbs], 2)
+        outs = {}
+        # forwards (no grad, as under full recompute) run ahead of the backwards
+        order = [("f", 0), ("f", 1), ("f", 2), ("b", 0), ("f", 3), ("b", 1), ("f", 4),
+                 ("b", 2), ("b", 3), ("b", 4)]
+        for what, k in order:
+            if what == "f":
+                fwd(k, False)
+                continue
+            out = fwd(k, True)  # the recompute, then its backward
+            out.backward(mbs[k][4])
+            outs[k] = out.detach()
+            if k == 0:
+                assert layer.table_grad.abs().sum() == 0  # group {0, 1} still open
+            if k == 1:
+                assert layer.table_grad.abs().sum() > 0  # ... flushed after its last backward
+        flush_step_lookups()  # the last group ({4}) flushed already; nothing left
+        assert not PENDING_STEP_LOOKUPS and layer._step_groups is None
+        for k in range(5):
+            torch.testing.assert_close(outs[k], ref_outs[k])
+        torch.testing.assert_close(layer.table_grad, ref_grad, rtol=1e-4, atol=1e-5)
+    finally:
+        Utils.destroy_model_parallel()
