@@ -13,7 +13,7 @@ from tests.unit_tests.test_utilities import Utils
 T, H, CHUNKS, SEQS = 4096, 2048, 6, 3  # 16 MB chunk inputs (bf16)
 
 
-def _run(offload, monkeypatch, last=False, leaf=False, offload_leaf=False):
+def _run(offload, monkeypatch, last=False, leaf=False, offload_leaf=False, view=False):
     monkeypatch.setattr(checkpoint_offload, "ENABLED", offload)
     monkeypatch.setattr(checkpoint_offload, "OFFLOAD_LAST", last)
     monkeypatch.setattr(checkpoint_offload, "OFFLOAD_LEAF", offload_leaf)
@@ -26,7 +26,7 @@ def _run(offload, monkeypatch, last=False, leaf=False, offload_leaf=False):
     x0 = torch.randn(T, H, device="cuda", dtype=torch.bfloat16, requires_grad=True)
 
     def chunk(w):
-        return lambda h: torch.tanh(h @ w) + h
+        return lambda h: torch.tanh(h.reshape(T, H) @ w) + h.reshape(T, H)
 
     outs, recv, peak_fwd = [], [], 0
     torch.cuda.synchronize()
@@ -36,6 +36,8 @@ def _run(offload, monkeypatch, last=False, leaf=False, offload_leaf=False):
         if leaf:  # a pipeline receive buffer: a leaf the schedule keeps for its .grad
             h = (x0.detach() * (s + 1)).requires_grad_()
             recv.append(h)
+            if view:  # ... reshaped, like the mHC streams off the first stage
+                h = h.view(T, 2, H // 2)
         else:
             h = x0 * (s + 1)  # non-leaf: the first chunk's input is offloadable too
         for w in weights:
@@ -104,4 +106,25 @@ def test_offload_leaf_same_grads_less_memory(monkeypatch):
         for a, b in zip(gw_none, gw):
             assert torch.equal(a, b)
     # the leaf of every sequence leaves the GPU
+    assert mem_leaf <= mem_keep - SEQS * T * H * 2, (mem_keep, mem_leaf)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_offload_leaf_view_same_grads_less_memory(monkeypatch):
+    """RECOMPUTE_OFFLOAD_LEAF with the chunk input a reshaped view of the receive buffer."""
+    Utils.initialize_model_parallel()
+    model_parallel_cuda_manual_seed(123)
+    try:
+        mem_keep, gx_ref, gw_ref = _run(True, monkeypatch, leaf=True, view=True)
+        mem_leaf, gx_off, gw_off = _run(True, monkeypatch, leaf=True, offload_leaf=True, view=True)
+        _, gx_last, gw_last = _run(
+            True, monkeypatch, last=True, leaf=True, offload_leaf=True, view=True
+        )
+        _, gx_none, gw_none = _run(False, monkeypatch, leaf=True, view=True)
+    finally:
+        Utils.destroy_model_parallel()
+    for gx, gw in ((gx_ref, gw_ref), (gx_off, gw_off), (gx_last, gw_last)):
+        assert torch.equal(gx_none, gx)
+        for a, b in zip(gw_none, gw):
+            assert torch.equal(a, b)
     assert mem_leaf <= mem_keep - SEQS * T * H * 2, (mem_keep, mem_leaf)

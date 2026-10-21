@@ -116,8 +116,13 @@ class Slot:
         self.offloaded = None  # the D2H copy's event: the H2D copy back reads the host buffer
         self.requires_grad = tensor.requires_grad
         # a leaf (pipeline receive buffer): the object stays (the schedule reads its .grad), its
-        # .data moves
-        self.leaf = tensor if tensor.grad_fn is None else None
+        # .data moves. Also a full contiguous view of one: off the first stage the mHC streams are
+        # the [s, b, n * h] receive buffer reshaped to [s, b, n, h] (HybridStack._depth_enter)
+        self.leaf, self.leaf_shape = None, None
+        if tensor.grad_fn is None:
+            self.leaf = tensor
+        elif OFFLOAD_LEAF and _leaf_base(tensor) is not None:
+            self.leaf, self.leaf_shape = tensor._base, tensor._base.shape
 
     def offload(self):
         t, side = self.gpu, _side_stream("d2h")
@@ -151,13 +156,30 @@ class Slot:
         if self.event is not None:
             torch.cuda.current_stream().wait_event(self.event)
         g, self.gpu, self.event = self.gpu, None, None
-        if self.leaf is not None:
+        if self.leaf is not None and self.leaf_shape is not None:
+            # the view's base gets its data back (its AccumulateGrad sees the right shape); the
+            # recompute runs on the fetched copy, whose gradient flows into the view's grad_fn
+            self.leaf.data = g.view(self.leaf_shape)
+            self.leaf = None
+        elif self.leaf is not None:
             if g is not self.leaf:
                 self.leaf.data = g
             g, self.leaf = self.leaf, None
         if g.is_leaf and g.requires_grad != self.requires_grad:
             g.requires_grad_(self.requires_grad)
         return g
+
+
+def _leaf_base(tensor):
+    """The leaf ``tensor`` is a full contiguous view of, or None."""
+    base = tensor._base
+    if base is None or not base.is_leaf or base.numel() != tensor.numel():
+        return None
+    if not (tensor.is_contiguous() and base.is_contiguous()):
+        return None
+    if tensor.data_ptr() != base.data_ptr():
+        return None
+    return base
 
 
 def register(tensor):
