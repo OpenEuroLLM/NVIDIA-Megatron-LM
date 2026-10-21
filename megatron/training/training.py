@@ -2761,6 +2761,9 @@ def setup_model_and_optimizer(
             expt_dp_group=ckpt_pgc.expt_dp if ckpt_pgc is not None else None,
             rng_state_key_prefix=getattr(unwrapped_model[0], "rng_state_key_prefix", ""),
         )
+        from megatron.training.quant_eval import maybe_quantize_for_eval
+
+        maybe_quantize_for_eval(model)
         timers('load-checkpoint').stop(barrier=True)
         timers.log(['load-checkpoint'])
         one_logger and one_logger.log_metrics(
