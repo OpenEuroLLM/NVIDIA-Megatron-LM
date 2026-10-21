@@ -57,8 +57,11 @@ def test_table_adam_sparse_is_dense(monkeypatch, rowwise_v, momentum):
         # step 3 touches nothing: the momentum alone moves the rows, in both
         contrib = _contributions(10 + step) if step != 3 else []
         for idx, val in contrib:
-            p_dense.engram_grad.index_add_(0, idx, val)
             p_sparse.engram_grad.index_add_(0, idx, val)
+        # the dense path gets the same summed gradient: the two buffers' atomic summation
+        # orders differ in the last bits (test_sparse_matches_dense_buffer), which Adam amplifies
+        # for elements whose gradient nearly cancels -- here only the update is compared
+        p_dense.engram_grad.copy_(p_sparse.engram_grad.to_dense())
         p_dense.grad = p_dense.engram_grad
         p_sparse.grad = None  # as EngramTableOptimizer.prepare_grads leaves a sparse one
         opt_d.step()
