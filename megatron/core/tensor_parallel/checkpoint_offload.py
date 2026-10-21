@@ -48,16 +48,18 @@ def _offload_last_here() -> bool:
     }
 MIN_BYTES = int(os.environ.get("RECOMPUTE_OFFLOAD_MIN_MB", "16")) << 20
 
-_stream = None
+# One stream per direction: PCIe is full duplex, and on one stream the backward's fetches queue
+# behind the forward's offloads (mHC-4 at 16k, PP4 x VPP2: ~0.3 TB each way per step, the offloads
+# finishing a median 130-180 ms after their Python free, 4 GB of pending blocks at the peak)
+_streams = {}
 _last = None  # the running sequence's newest slot (its input still on the GPU)
 _armed = False
 
 
-def _side_stream():
-    global _stream
-    if _stream is None:
-        _stream = torch.cuda.Stream()
-    return _stream
+def _side_stream(direction):
+    if direction not in _streams:
+        _streams[direction] = torch.cuda.Stream()
+    return _streams[direction]
 
 
 _key = None
@@ -106,14 +108,16 @@ class Slot:
 
     def __init__(self, tensor, prev):
         self.gpu, self.host, self.event, self.prev = tensor, None, None, prev
+        self.offloaded = None  # the D2H copy's event: the H2D copy back reads the host buffer
         self.requires_grad = tensor.requires_grad
 
     def offload(self):
-        t, side = self.gpu, _side_stream()
+        t, side = self.gpu, _side_stream("d2h")
         side.wait_stream(torch.cuda.current_stream())
         self.host = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
         with torch.cuda.stream(side):
             self.host.copy_(t, non_blocking=True)
+            self.offloaded = side.record_event()
         t.record_stream(side)  # the allocator keeps the block until the copy is done
         self.gpu = None
 
@@ -121,9 +125,10 @@ class Slot:
         """Start copying the input back (side stream); no-op if it is on the GPU."""
         if self.gpu is not None or self.host is None:
             return
-        side = _side_stream()
+        side = _side_stream("h2d")
         g = torch.empty(self.host.shape, dtype=self.host.dtype, device="cuda")
         side.wait_stream(torch.cuda.current_stream())  # g's block is free for the side stream
+        side.wait_event(self.offloaded)
         with torch.cuda.stream(side):
             g.copy_(self.host, non_blocking=True)
             self.event = side.record_event()
