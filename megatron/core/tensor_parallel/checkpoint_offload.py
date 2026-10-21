@@ -30,7 +30,22 @@ ENABLED = os.environ.get("RECOMPUTE_OFFLOAD", "0") == "1"
 # so it is fetched back ahead -- the model chunk's backward runs its micro-batches in forward
 # order, and the start of one sequence's backward fetches the next one's (RECOMPUTE_OFFLOAD_LAST=1;
 # for wide checkpoints, e.g. the LDM state: 16 x 0.7 GB on the first stage at 16k).
-OFFLOAD_LAST = os.environ.get("RECOMPUTE_OFFLOAD_LAST", "0") == "1"
+# "1": every stage; a comma list of pipeline ranks ("0,1"): only those (the first stages hold the
+# most micro-batches in flight; later ones can keep their last chunks on the GPU)
+_OFFLOAD_LAST_SPEC = os.environ.get("RECOMPUTE_OFFLOAD_LAST", "0")
+OFFLOAD_LAST = _OFFLOAD_LAST_SPEC not in ("", "0")
+
+
+def _offload_last_here() -> bool:
+    if not OFFLOAD_LAST:
+        return False
+    if _OFFLOAD_LAST_SPEC == "1":
+        return True
+    from megatron.core import parallel_state
+
+    return parallel_state.get_pipeline_model_parallel_rank() in {
+        int(r) for r in _OFFLOAD_LAST_SPEC.split(",")
+    }
 MIN_BYTES = int(os.environ.get("RECOMPUTE_OFFLOAD_MIN_MB", "16")) << 20
 
 _stream = None
@@ -53,7 +68,7 @@ def new_sequence(key=None):
     """A new sequence of chunks starts (checkpointed_forward of model chunk ``key``): its first
     chunk has no previous. With OFFLOAD_LAST the previous sequence's last chunk goes to the host."""
     global _last, _key
-    if OFFLOAD_LAST and _last is not None and _last.gpu is not None:
+    if OFFLOAD_LAST and _last is not None and _last.gpu is not None and _offload_last_here():
         _last.offload()
         _last.last_key = _key
         _queues.setdefault(_key, []).append(_last)

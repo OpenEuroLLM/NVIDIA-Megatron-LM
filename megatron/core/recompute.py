@@ -19,6 +19,20 @@ else:
     te_checkpoint = None
 
 
+def _skip_chunks() -> int:
+    """RECOMPUTE_SKIP_CHUNKS for this pipeline rank (0 when unset)."""
+    import os
+
+    spec = os.environ.get("RECOMPUTE_SKIP_CHUNKS", "")
+    if not spec:
+        return 0
+    from megatron.core import parallel_state
+
+    counts = [int(c) for c in spec.split(",")]
+    rank = parallel_state.get_pipeline_model_parallel_rank()
+    return counts[rank] if rank < len(counts) else 0
+
+
 def checkpointed_forward(
     self: MegatronModule,
     hidden_states: Tensor,
@@ -202,6 +216,13 @@ def checkpointed_forward(
     if self.config.recompute_method == 'uniform':
         # Uniformly divide the total number of layers and checkpoint
         # the input activation of each divided chunk.
+        # RECOMPUTE_SKIP_CHUNKS ("0,0,1,2": per pipeline rank): the last N chunks of this model
+        # chunk run without a checkpoint -- their activations are kept, which only the later
+        # stages (few micro-batches in flight) can afford.
+        skip = _skip_chunks()
+        if skip and getattr(self, "ldm_segmented", False):
+            raise NotImplementedError("RECOMPUTE_SKIP_CHUNKS with depth_memory_segments")
+        bounds = []
         layer_idx = 0
         while layer_idx < len(order):
             chunk_end = min(layer_idx + self.config.recompute_num_layers, len(order))
@@ -212,8 +233,10 @@ def checkpointed_forward(
 
                 while chunk_end < len(order) and not is_block_end(self.layers[order[chunk_end - 1]]):
                     chunk_end += 1
-            chunk_runner(layer_idx, chunk_end, True)
+            bounds.append((layer_idx, chunk_end))
             layer_idx = chunk_end
+        for i, (start, end) in enumerate(bounds):
+            chunk_runner(start, end, i < len(bounds) - skip)
     elif self.config.recompute_method == 'block':
         if getattr(self.config, "mhc_per_layer", False):
             raise NotImplementedError(
