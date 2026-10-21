@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import math
 import os
 
 import pytest
@@ -2414,3 +2415,85 @@ class TestAngularMuownOptimizerColumnParallel:
         w = torch.nn.Parameter(torch.randn(48, 40, dtype=torch.float32, device='cuda'))
         with pytest.raises(ValueError, match="blockwise"):
             self._make_optimizer([w], "blockwise", pg_collection)
+
+
+def _amuown(params, **kw):
+    return TensorParallelAngularMuown(params=params, lr=kw.pop("lr", 0.01), pg_collection=None,
+                                      tp_mode="duplicated", **kw)
+
+
+@pytest.mark.parametrize("batched", [True, False])
+def test_angular_muown_radius_lambda0_is_poly_half(batched):
+    """radius at lambda = 0 and a constant lr is the poly schedule at p = 1/2, step for step."""
+    torch.manual_seed(0)
+    w0 = torch.randn(16, 32, device='cuda') * 0.02
+    grads = [torch.randn(16, 32, device='cuda') for _ in range(6)]
+    out = []
+    for kw in (dict(u_decay_schedule="poly", u_decay_scale=0.3, u_decay_p=0.5),
+               dict(u_decay_schedule="radius", u_decay_scale=0.3, u_radius_lambda=0.0)):
+        p = torch.nn.Parameter(w0.clone())
+        opt = _amuown([p], batched_step=batched, **kw)
+        mults = []
+        for gr in grads:
+            p.grad = gr.clone()
+            opt.step()
+            mults.append(opt.param_groups[0]["u_lr_multiplier"])
+        out.append((p.detach().clone(), mults))
+    assert out[1][1] == pytest.approx(out[0][1])
+    torch.testing.assert_close(out[1][0], out[0][0])
+
+
+def test_angular_muown_radius_equilibrium_and_cooldown():
+    """lambda > 0: kappa settles at sqrt(2 lr lambda / c); a smaller lr (cooldown) slows the
+    radius instead of decaying the step a second time."""
+    p = torch.nn.Parameter(torch.randn(8, 16, device='cuda') * 0.02)
+    lr, lam, c = 0.01, 1.0, 0.1
+    opt = _amuown([p], lr=lr, u_decay_schedule="radius", u_decay_scale=c, u_radius_lambda=lam)
+    for _ in range(800):  # time constant 1 / (2 lr lambda) = 50 steps
+        p.grad = torch.randn_like(p)
+        opt.step()
+    k_eq = opt.param_groups[0]["u_lr_multiplier"]
+    assert k_eq == pytest.approx(math.sqrt(2 * lr * lam / c), rel=1e-3)
+    # max_lr stays at lr, the scheduled lr falls 10x: growth falls 100x, shrink 10x -> kappa rises
+    opt.param_groups[0]["max_lr"] = lr
+    opt.param_groups[0]["lr"] = lr / 10
+    for _ in range(50):
+        p.grad = torch.randn_like(p)
+        opt.step()
+    assert opt.param_groups[0]["u_lr_multiplier"] > k_eq
+
+
+def test_angular_muown_hyper_follows_the_gradient_correlation():
+    """hyper: a gradient that keeps its direction keeps kappa at its ceiling 1; one that flips
+    every step (overshooting) lowers it, down to the floor."""
+    p = torch.nn.Parameter(torch.randn(8, 16, device='cuda') * 0.02)
+    opt = _amuown([p], u_decay_schedule="hyper", u_hyper_lr=0.5, u_hyper_min_multiplier=0.05)
+    g = torch.randn_like(p)
+    for _ in range(10):
+        p.grad = g.clone()
+        opt.step()
+    assert opt.param_groups[0]["u_log_kappa"] == 0.0
+    for i in range(200):
+        p.grad = g.clone() * (-1) ** i
+        opt.step()
+    assert opt.param_groups[0]["u_log_kappa"] == pytest.approx(math.log(0.05))
+    assert opt.param_groups[0]["u_lr_multiplier"] < 0.1
+
+
+@pytest.mark.parametrize("schedule", ["radius", "hyper"])
+def test_angular_muown_adaptive_state_checkpoints(schedule):
+    """The adaptive state lives in the param groups: a state_dict round trip restores it."""
+    torch.manual_seed(0)
+    p = torch.nn.Parameter(torch.randn(8, 16, device='cuda') * 0.02)
+    kw = dict(u_decay_schedule=schedule, u_decay_scale=0.1, u_radius_lambda=0.5)
+    opt = _amuown([p], **kw)
+    g = torch.randn_like(p)
+    for i in range(20):
+        p.grad = g * (-1) ** i
+        opt.step()
+    sd = opt.state_dict()
+    q = torch.nn.Parameter(p.detach().clone())
+    opt2 = _amuown([q], **kw)
+    opt2.load_state_dict(sd)
+    for key in ("u_radius_sq", "u_log_kappa"):
+        assert opt2.param_groups[0][key] == opt.param_groups[0][key]

@@ -436,8 +436,12 @@ class OptimizerConfig:
     supported for AngularMuown because it changes the per-row geometry."""
 
     angular_muown_u_decay_schedule: str = "poly"
-    """Internal decay schedule for the AngularMuown directional step multiplier
-    (one of "poly" or "cosine")."""
+    """Internal decay schedule for the AngularMuown directional step multiplier: "poly",
+    "cosine", or the adaptive "radius" (kappa = 1 / rho, one radius state for the whole model:
+    rho^2 <- (1 - 2 lr lambda) rho^2 + u_decay_scale (lr / max_lr)^2 -- a normal network's weight
+    norm, growing with the steps and shrinking with a weight-decay term; lambda = 0 and a constant
+    lr give poly at p = 1/2) or "hyper" (log kappa learnt from the correlation of the gradient
+    with the previous momentum, summed over the model)."""
 
     angular_muown_u_decay_scale: Optional[float] = 0.001
     """Scale for the "poly" schedule (1 + scale * steps_after_warmup) ** (-p).
@@ -455,6 +459,16 @@ class OptimizerConfig:
 
     angular_muown_u_decay_min_multiplier: float = 0.0
     """Floor of the cosine U-decay schedule."""
+
+    angular_muown_u_radius_lambda: float = 0.0
+    """The "radius" schedule's shrink rate (a weight decay on the shared radius): the multiplier
+    settles at sqrt(2 lr lambda / u_decay_scale); 0: no shrink (kappa ~ t^-1/2)."""
+
+    angular_muown_u_hyper_lr: float = 0.02
+    """The "hyper" schedule's step on log kappa per unit gradient / momentum correlation."""
+
+    angular_muown_u_hyper_min_multiplier: float = 0.02
+    """The "hyper" schedule's floor on kappa (its ceiling is 1)."""
 
     angular_muown_batched_step: bool = True
     """Stack same-shape parameters and run the AngularMuown update on the whole stack."""

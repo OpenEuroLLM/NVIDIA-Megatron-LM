@@ -624,6 +624,10 @@ ANGULAR_MUOWN_ROW_STATE_KEYS = ("g", "m_g", "v_g")
 # throughout (expanded checkpoints do not load into compact templates and vice versa).
 _COMPACT_ROW_STATES = os.environ.get("ANGULAR_MUOWN_COMPACT_CKPT", "0") == "1"
 
+# The adaptive schedules' current direction multiplier (and the hypergradient signal), for
+# training_log; written by every TensorParallelAngularMuown step (identical across ranks).
+ANGULAR_MUOWN_KAPPA: Dict[str, float] = {}
+
 
 @torch.compile
 def _angular_muown_u_and_grad_g(
@@ -904,6 +908,9 @@ class TensorParallelAngularMuown(TensorParallelMuon):
         u_decay_warmup_steps: int = 0,
         u_decay_steps: int | None = None,
         u_decay_min_multiplier: float = 0.0,
+        u_radius_lambda: float = 0.0,
+        u_hyper_lr: float = 0.02,
+        u_hyper_min_multiplier: float = 0.02,
         batched_step: bool = True,
     ) -> None:
         if not 0.0 <= betas[0] < 1.0:
@@ -927,6 +934,12 @@ class TensorParallelAngularMuown(TensorParallelMuon):
             u_decay_steps,
             u_decay_min_multiplier,
         )
+        if not math.isfinite(u_radius_lambda) or u_radius_lambda < 0.0:
+            raise ValueError(f"Invalid u_radius_lambda: {u_radius_lambda}")
+        if not math.isfinite(u_hyper_lr) or u_hyper_lr < 0.0:
+            raise ValueError(f"Invalid u_hyper_lr: {u_hyper_lr}")
+        if not 0.0 < u_hyper_min_multiplier <= 1.0:
+            raise ValueError(f"Invalid u_hyper_min_multiplier: {u_hyper_min_multiplier}")
 
         TensorParallelMuon.__init__(
             self,
@@ -956,6 +969,11 @@ class TensorParallelAngularMuown(TensorParallelMuon):
         self._u_decay_warmup_steps = int(u_decay_warmup_steps)
         self._u_decay_steps = None if u_decay_steps is None else int(u_decay_steps)
         self._u_decay_min_multiplier = float(u_decay_min_multiplier)
+        self._u_radius_lambda = float(u_radius_lambda)
+        self._u_hyper_lr = float(u_hyper_lr)
+        self._u_hyper_log_min = math.log(float(u_hyper_min_multiplier))
+        # hypergradient sums of the current step: <grad_u, m_u_prev>, |grad_u|^2, |m_u_prev|^2
+        self._hyper_acc: Optional[torch.Tensor] = None
 
         # Scratch buffers for the batched step, keyed by (batch key, batch
         # size). Pure scratch — fully overwritten every step, never
@@ -966,6 +984,10 @@ class TensorParallelAngularMuown(TensorParallelMuon):
             group.setdefault("betas", betas)
             group.setdefault("adam_eps", adam_eps)
             group.setdefault("u_lr_multiplier", 1.0)
+            # the adaptive schedules' state, checkpointed with the param groups:
+            # radius: rho^2 (kappa = 1 / rho); hyper: log kappa
+            group.setdefault("u_radius_sq", 1.0)
+            group.setdefault("u_log_kappa", 0.0)
             for p in group["params"]:
                 if p.ndim != 2:
                     raise ValueError(
@@ -976,17 +998,20 @@ class TensorParallelAngularMuown(TensorParallelMuon):
     @staticmethod
     def _validate_u_decay(schedule, scale, p, warmup_steps, decay_steps, min_multiplier) -> None:
         """Validate the internal U-direction decay schedule arguments."""
-        if schedule not in ("poly", "cosine"):
+        if schedule not in ("poly", "cosine", "radius", "hyper"):
             raise ValueError(
-                f"Invalid u_decay_schedule: {schedule!r}. Choose from 'poly' or 'cosine'."
+                f"Invalid u_decay_schedule: {schedule!r}. Choose from 'poly', 'cosine', "
+                "'radius' or 'hyper'."
             )
         if not math.isfinite(p) or p < 0.0:
             raise ValueError(f"Invalid u_decay_p: {p}")
         if int(warmup_steps) != warmup_steps or warmup_steps < 0:
             raise ValueError(f"Invalid u_decay_warmup_steps: {warmup_steps}")
-        if schedule == "poly":
+        if schedule in ("poly", "radius"):
             if scale is not None and (not math.isfinite(scale) or scale <= 0.0):
                 raise ValueError(f"Invalid u_decay_scale: {scale}")
+        elif schedule == "hyper":
+            pass
         else:  # "cosine"
             if decay_steps is None:
                 raise ValueError("u_decay_schedule='cosine' requires u_decay_steps")
@@ -994,6 +1019,79 @@ class TensorParallelAngularMuown(TensorParallelMuon):
                 raise ValueError(f"Invalid u_decay_steps: {decay_steps}")
             if not math.isfinite(min_multiplier) or not 0.0 <= min_multiplier <= 1.0:
                 raise ValueError(f"Invalid u_decay_min_multiplier: {min_multiplier}")
+
+    @property
+    def _adaptive_u(self) -> bool:
+        """The radius / hyper schedules keep a state per step instead of a function of the step."""
+        return self._u_decay_schedule in ("radius", "hyper")
+
+    def _u_multiplier_for(self, group: dict, step: int) -> float:
+        """The directional-step multiplier of this step: the adaptive schedules' current value
+        (set once per optimizer step in :meth:`step`), else the step schedule."""
+        if self._adaptive_u:
+            return group["u_lr_multiplier"]
+        return self._u_lr_multiplier(step)
+
+    def _adaptive_u_before_step(self) -> None:
+        """Set each group's multiplier from the adaptive state, before its parameters update.
+
+        radius: kappa = 1 / rho with rho^2 the shared "radius" of the direction rows, as a
+        normal network's weight norm: it grows with every step and shrinks with a weight-decay
+        term (see :meth:`_adaptive_u_after_step`) -- one value for the whole model.
+        hyper: kappa = exp(log_kappa), learnt from the gradient / previous-update correlation.
+        """
+        for group in self.param_groups:
+            if self._u_decay_schedule == "radius":
+                group["u_lr_multiplier"] = float(group["u_radius_sq"]) ** -0.5
+            else:
+                group["u_lr_multiplier"] = math.exp(float(group["u_log_kappa"]))
+        if self._u_decay_schedule == "hyper":
+            self._hyper_acc = None
+
+    def _hyper_accumulate(self, grad_u: torch.Tensor, m_u_prev: torch.Tensor) -> None:
+        """Add one parameter's (or batch's) <grad_u, m_u_prev>, |grad_u|^2, |m_u_prev|^2."""
+        g, m = grad_u.float(), m_u_prev.float()
+        sums = torch.stack([(g * m).sum(), (g * g).sum(), (m * m).sum()])
+        self._hyper_acc = sums if self._hyper_acc is None else self._hyper_acc + sums
+
+    def _adaptive_u_after_step(self) -> None:
+        """Advance the adaptive state for the next step.
+
+        radius: rho^2 <- (1 - 2 lr lambda) rho^2 + c (lr / max_lr)^2 with c = u_decay_scale.
+        Driven by the step actually taken (lr from the external schedule): at lambda = 0 and a
+        constant lr it is exactly the poly schedule at p = 1/2; with lambda > 0 it settles where
+        growth and shrink balance, kappa* = sqrt(2 lr lambda / c), as a normal network's weight
+        norm under weight decay; a cooldown (falling lr) slows both, so it does not decay twice.
+        hyper: log kappa += hyper_lr * <grad_u, m_u_prev> / (|grad_u| |m_u_prev|), the sums over
+        every matrix on every rank (one all-reduce of 3 numbers): updates that keep pointing the
+        same way ask for larger steps, overshooting ones for smaller; clamped to
+        [log u_hyper_min_multiplier, 0].
+        """
+        if self._u_decay_schedule == "radius":
+            c = self._u_decay_scale if self._u_decay_scale is not None else 0.0
+            for group in self.param_groups:
+                lr = float(group["lr"])
+                max_lr = float(group.get("max_lr") or lr or 1.0)
+                rho_sq = float(group["u_radius_sq"])
+                rho_sq = (1.0 - 2.0 * lr * self._u_radius_lambda) * rho_sq + c * (lr / max_lr) ** 2
+                group["u_radius_sq"] = max(rho_sq, 1e-12)
+            kappa = float(self.param_groups[0]["u_radius_sq"]) ** -0.5 if self.param_groups else 1.0
+            ANGULAR_MUOWN_KAPPA["kappa"] = kappa
+            return
+        acc = self._hyper_acc
+        if acc is None:
+            acc = torch.zeros(3, device=torch.cuda.current_device() if torch.cuda.is_available()
+                              else "cpu")
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(acc, op=torch.distributed.ReduceOp.SUM)
+        dot, gg, mm = acc.tolist()
+        h = dot / math.sqrt(gg * mm) if gg > 0 and mm > 0 else 0.0
+        for group in self.param_groups:
+            log_k = float(group["u_log_kappa"]) + self._u_hyper_lr * h
+            group["u_log_kappa"] = min(0.0, max(self._u_hyper_log_min, log_k))
+        if self.param_groups:
+            ANGULAR_MUOWN_KAPPA["kappa"] = math.exp(float(self.param_groups[0]["u_log_kappa"]))
+        ANGULAR_MUOWN_KAPPA["hyper_corr"] = h
 
     def _u_lr_multiplier(self, step: int) -> float:
         """Return the directional-step multiplier for the given schedule step."""
@@ -1076,6 +1174,8 @@ class TensorParallelAngularMuown(TensorParallelMuon):
         if closure is not None:
             raise ValueError("closure is not supported")
 
+        if self._adaptive_u:
+            self._adaptive_u_before_step()
         for group in self.param_groups:
             self._init_group(group)
             has_gtp_remat = any(
@@ -1087,6 +1187,8 @@ class TensorParallelAngularMuown(TensorParallelMuon):
                 # Preserve the v0.19 LUMI GTP-remat gather/slice path.
                 self._step_group(group)
 
+        if self._adaptive_u:
+            self._adaptive_u_after_step()
         return None
 
     def _step_group(self, group: dict) -> None:
@@ -1124,6 +1226,8 @@ class TensorParallelAngularMuown(TensorParallelMuon):
 
             # Momentum on the Riemannian U gradient (sum convention, as in
             # the original AngularMuown, not the EMA convention of the base class).
+            if self._u_decay_schedule == "hyper":
+                self._hyper_accumulate(grad_u, m_u)  # m_u: the previous step's momentum
             m_u.mul_(momentum).add_(grad_u)
             if self.nesterov:
                 update = grad_u.add(m_u, alpha=momentum)
@@ -1136,7 +1240,7 @@ class TensorParallelAngularMuown(TensorParallelMuon):
 
             # Original AngularMuown evaluated the schedule before incrementing its
             # global step counter, hence `step - 1`.
-            u_multiplier = self._u_lr_multiplier(step - 1)
+            u_multiplier = self._u_multiplier_for(group, step - 1)
             group["u_lr_multiplier"] = u_multiplier
             u_step = u.add(direction, alpha=-lr * u_multiplier)
 
@@ -1263,6 +1367,8 @@ class TensorParallelAngularMuown(TensorParallelMuon):
             )
         grad_u = _angular_muown_grad_u(u, g_b, grad_b, grad_g)
 
+        if self._u_decay_schedule == "hyper":
+            self._hyper_accumulate(grad_u, m_u_b)  # m_u_b: the previous step's momentum
         m_u_b.mul_(momentum).add_(grad_u)
         if self.nesterov:
             update = grad_u.add(m_u_b, alpha=momentum)
@@ -1274,7 +1380,7 @@ class TensorParallelAngularMuown(TensorParallelMuon):
         with eopt_utils.fp32_matmul_precision(self.fp32_matmul_prec):
             direction = self._orthogonalize_batched(update, batch)
 
-        u_multiplier = self._u_lr_multiplier(step - 1)
+        u_multiplier = self._u_multiplier_for(group, step - 1)
         group["u_lr_multiplier"] = u_multiplier
         u_step = u.add(direction, alpha=-lr * u_multiplier)
 

@@ -2927,8 +2927,11 @@ def _add_regularization_args(parser):
         '--angular-muown-u-decay-schedule',
         type=str,
         default='poly',
-        choices=['poly', 'cosine'],
-        help='Internal decay schedule for the AngularMuown directional step multiplier',
+        choices=['poly', 'cosine', 'radius', 'hyper'],
+        help='Internal decay schedule for the AngularMuown directional step multiplier: poly, '
+        'cosine, or the adaptive radius (one shared radius state, growing with the steps and '
+        'shrinking with --angular-muown-u-radius-lambda) or hyper (log multiplier learnt from '
+        'the gradient / previous-momentum correlation)',
     )
     group.add_argument(
         '--angular-muown-u-decay-scale',
@@ -2961,6 +2964,24 @@ def _add_regularization_args(parser):
         type=float,
         default=0.0,
         help='Floor of the cosine U-decay schedule',
+    )
+    group.add_argument(
+        '--angular-muown-u-radius-lambda',
+        type=float,
+        default=0.0,
+        help='radius schedule: shrink rate of the shared radius (a weight decay on it)',
+    )
+    group.add_argument(
+        '--angular-muown-u-hyper-lr',
+        type=float,
+        default=0.02,
+        help='hyper schedule: step on log kappa per unit gradient / momentum correlation',
+    )
+    group.add_argument(
+        '--angular-muown-u-hyper-min-multiplier',
+        type=float,
+        default=0.02,
+        help='hyper schedule: floor on the direction multiplier',
     )
     group.add_argument(
         '--angular-muown-no-batched-step',
