@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 try:
@@ -23,6 +25,15 @@ except ImportError:
     amp_custom_fwd = lambda fn: fn
     amp_custom_bwd = lambda fn: fn
     HAVE_LIGER = False
+
+
+# LIGER_WGRAD_ADDMM=1: accumulate each chunk's output-weight gradient with one in-place GEMM
+# (beta = 1) instead of mm -> .float() -> add into the weight-dtype buffer. At a 262k vocabulary
+# and 2048-token chunks that path moves ~4 GB per chunk on top of the GEMM (the bf16 product,
+# its fp32 copy, the fp32 add): ~0.55 s per step on the last pipeline stage of the 3B-active
+# hybrid at 16k (torch profile). The GEMM's accumulation is in fp32 and rounds once (the default
+# path rounds the product to the weight dtype first): not bitwise identical, so opt-in.
+_WGRAD_ADDMM = os.environ.get("LIGER_WGRAD_ADDMM", "0") == "1"
 
 
 class _LigerFixedChunkLinearCrossEntropy(torch.autograd.Function):
@@ -101,7 +112,10 @@ class _LigerFixedChunkLinearCrossEntropy(torch.autograd.Function):
             )
             if input_.requires_grad:
                 grad_input[start_idx:end_idx] = logits_chunk @ weight
-                if grad_weight is not None:
+                if grad_weight is not None and _WGRAD_ADDMM:
+                    # one GEMM accumulating into grad_weight (fp32 compute, one rounding)
+                    torch.addmm(grad_weight, logits_chunk.t(), input_chunk, out=grad_weight)
+                elif grad_weight is not None:
                     # Preserve Liger's original-dtype accumulation semantics.
                     grad_weight += torch.mm(logits_chunk.t(), input_chunk).float()
 
