@@ -513,6 +513,11 @@ class TransformerConfig(ModelParallelConfig):
     """KronLSTM polar forget gate f = m cos(theta): magnitude m the softplus gate (linear_fla_gate
     softplus), angle theta = pi sigmoid(.) per key dimension, starting near 0 (f in [-m, m])."""
 
+    linear_kronlstm_forget_angle_init: str = "narrow"
+    """KronLSTM polar forget gate's initial angle: "narrow" (theta 0.157 on every channel: the softplus
+    gate's start) or "broad" (the angle bias drawn per channel over [logit 0.05, logit 0.95]: cos(theta)
+    in (-0.988, 0.988), both signs and a spread of magnitudes from step 0)."""
+
     linear_kronlstm_erase_angle: bool = False
     """KronLSTM polar erase gate: kept eigenvalue 1 - beta = r cos(phi) per head (beta in [0, 2],
     the write kept in [0, 1]), starting at the s = 1 beta."""

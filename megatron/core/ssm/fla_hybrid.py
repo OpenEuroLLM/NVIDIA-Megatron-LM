@@ -603,6 +603,7 @@ class KronLSTM(_FLALayerWrapper):
                     unit_write=config.linear_kronlstm_unit_write,
                     forget_offset=config.linear_kronlstm_forget_offset,
                     forget_angle=config.linear_kronlstm_forget_angle,
+                    forget_angle_init=config.linear_kronlstm_forget_angle_init,
                     erase_angle=config.linear_kronlstm_erase_angle,
                     signed_write=config.linear_kronlstm_signed_write,
                     output_gate_rank={"linear": "full", "lowrank": "lowrank"}[
