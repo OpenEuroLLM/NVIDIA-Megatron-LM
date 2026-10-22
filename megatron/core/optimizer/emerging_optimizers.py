@@ -873,6 +873,8 @@ class TensorParallelAngularMuown(TensorParallelMuon):
         https://arxiv.org/abs/2605.10797
     """
 
+    _row_state_keys = ANGULAR_MUOWN_ROW_STATE_KEYS
+
     def __init__(
         self,
         params: ParamsT,
@@ -999,6 +1001,12 @@ class TensorParallelAngularMuown(TensorParallelMuon):
             return 1.0
         return (1.0 + self._u_decay_scale * steps_after_warmup) ** (-self._u_decay_p)
 
+    def _u_step_size(self, group: dict, step: int) -> float:
+        """Return the ordinary LR times the internal directional multiplier."""
+        multiplier = self._u_lr_multiplier(step)
+        group["u_lr_multiplier"] = multiplier
+        return group["lr"] * multiplier
+
     def _tp_row_reduce_group(
         self, p: torch.Tensor
     ) -> Optional["torch.distributed.ProcessGroup"]:
@@ -1118,6 +1126,10 @@ class TensorParallelAngularMuown(TensorParallelMuon):
                     grad_g, op=torch.distributed.ReduceOp.SUM, group=reduce_group
                 )
             grad_u = _angular_muown_grad_u(u, g, p.grad, grad_g)
+            v_norm = state.get("v_norm")
+            if v_norm is not None:
+                grad_u.div_(v_norm)
+                u.mul_(v_norm)
 
             # Momentum on the Riemannian U gradient (sum convention, as in
             # the original AngularMuown, not the EMA convention of the base class).
@@ -1133,9 +1145,7 @@ class TensorParallelAngularMuown(TensorParallelMuon):
 
             # Original AngularMuown evaluated the schedule before incrementing its
             # global step counter, hence `step - 1`.
-            u_multiplier = self._u_lr_multiplier(step - 1)
-            group["u_lr_multiplier"] = u_multiplier
-            u_step = u.add(direction, alpha=-lr * u_multiplier)
+            u_step = u.add(direction, alpha=-self._u_step_size(group, step - 1))
 
             # Adam update on the row magnitudes g, with sign-preserving
             # projection away from zero.
@@ -1156,6 +1166,8 @@ class TensorParallelAngularMuown(TensorParallelMuon):
                     u_step_norm_sq, op=torch.distributed.ReduceOp.SUM, group=reduce_group
                 )
             _angular_muown_u_recompose(p, g, u_step, u_step_norm_sq)
+            if v_norm is not None:
+                v_norm.copy_(u_step_norm_sq.sqrt().clamp_min(ANGULAR_MUOWN_EPS))
 
     # ------------------------------------------------------------------
     # Batched step
@@ -1249,6 +1261,13 @@ class TensorParallelAngularMuown(TensorParallelMuon):
             )
         grad_u = _angular_muown_grad_u(u, g_b, grad_b, grad_g)
 
+        # Muown retains ||v||: reconstruct v and apply the weight-normalization Jacobian.
+        v_norm = bufs.get("v_norm")
+        if v_norm is not None:
+            torch._foreach_copy_(bufs["v_norm_views"], [state["v_norm"] for state in states])
+            grad_u.div_(v_norm)
+            u.mul_(v_norm)
+
         m_u_b.mul_(momentum).add_(grad_u)
         if self.nesterov:
             update = grad_u.add(m_u_b, alpha=momentum)
@@ -1260,9 +1279,7 @@ class TensorParallelAngularMuown(TensorParallelMuon):
         with eopt_utils.fp32_matmul_precision(self.fp32_matmul_prec):
             direction = self._orthogonalize_batched(update, batch)
 
-        u_multiplier = self._u_lr_multiplier(step - 1)
-        group["u_lr_multiplier"] = u_multiplier
-        u_step = u.add(direction, alpha=-lr * u_multiplier)
+        u_step = u.add(direction, alpha=-self._u_step_size(group, step - 1))
 
         m_g_b.mul_(beta1).add_(grad_g, alpha=1 - beta1)
         v_g_b.mul_(beta2).addcmul_(grad_g, grad_g, value=1 - beta2)
@@ -1278,6 +1295,9 @@ class TensorParallelAngularMuown(TensorParallelMuon):
                 u_step_norm_sq, op=torch.distributed.ReduceOp.SUM, group=reduce_group
             )
         _angular_muown_u_recompose(w_b, g_b, u_step, u_step_norm_sq)
+        if v_norm is not None:
+            v_norm.copy_(u_step_norm_sq.sqrt().clamp_min(ANGULAR_MUOWN_EPS))
+            torch._foreach_copy_([state["v_norm"] for state in states], bufs["v_norm_views"])
 
         # Scatter updated weights and state back to the per-param tensors.
         torch._foreach_copy_([p.detach() for p in params], bufs["w_views"])
@@ -1316,7 +1336,7 @@ class TensorParallelAngularMuown(TensorParallelMuon):
             m_u = param_state.get("m_u")
             if m_u is not None and m_u.dim() == 2 and m_u.shape[1] > 1:
                 cols = m_u.shape[1]
-                for key in ANGULAR_MUOWN_ROW_STATE_KEYS:
+                for key in self._row_state_keys:
                     tensor = param_state.get(key)
                     if tensor is not None and tensor.dim() == 2 and tensor.shape[1] == 1:
                         new_param_state[key] = tensor.expand(-1, cols).contiguous()
@@ -1336,10 +1356,13 @@ class TensorParallelAngularMuown(TensorParallelMuon):
         """
         packed_state = state_dict.get("state")
         if packed_state:
+            retains_norm = "v_norm" in self._row_state_keys
+            if any(("v_norm" in state) != retains_norm for state in packed_state.values() if state):
+                raise ValueError("Muown and AngularMuown optimizer states are incompatible")
             collapsed_state = {}
             for param_id, param_state in packed_state.items():
                 new_param_state = dict(param_state)
-                for key in ANGULAR_MUOWN_ROW_STATE_KEYS:
+                for key in self._row_state_keys:
                     tensor = param_state.get(key)
                     if tensor is not None and tensor.dim() == 2 and tensor.shape[1] > 1:
                         new_param_state[key] = tensor[:, :1].contiguous()
@@ -1348,6 +1371,117 @@ class TensorParallelAngularMuown(TensorParallelMuon):
             state_dict["state"] = collapsed_state
 
         super().load_state_dict(state_dict)
+
+
+class TensorParallelAngularMuownSimplified(TensorParallelAngularMuown):
+    """AngularMuown with independent directional and radial learning rates.
+
+    The training scheduler supplies ``u_lr`` using C/t with warmup and cooldown.
+    All tensor updates, parallelism and row-state checkpoint conversion are
+    inherited. Direction scaling is selected by ``scale_mode`` (shape_scaling
+    by default), with no additional scalar factor or internal decay.
+
+    Args:
+        params: Iterable of 2D parameters or parameter-group dictionaries.
+        u_lr: Absolute directional rate, before the selected shape-dependent scaling.
+        lr: Adam learning rate for row magnitudes. Remaining arguments have the
+            same meaning as in :class:`TensorParallelAngularMuown`.
+    """
+
+    def __init__(
+        self,
+        params: ParamsT,
+        *,
+        u_lr: float,
+        lr: float = 1e-2,
+        momentum: float = 0.95,
+        nesterov: bool = True,
+        betas: tuple[float, float] = (0.9, 0.95),
+        adam_eps: float = 1e-8,
+        split_qkv: bool = False,
+        is_qkv_fn: Callable[[torch.Tensor], bool] | None = None,
+        qkv_split_shapes: list[int] | None = None,
+        fp32_matmul_prec: str = "medium",
+        coefficient_type: str = "simple",
+        num_ns_steps: int = 5,
+        scale_mode: str = "shape_scaling",
+        pg_collection: ProcessGroupCollection | None = None,
+        tp_mode: Literal["duplicated", "distributed"] = "duplicated",
+        batched_step: bool = True,
+    ) -> None:
+        if not math.isfinite(u_lr) or u_lr < 0.0:
+            raise ValueError("u_lr must be finite and nonnegative")
+        super().__init__(
+            params,
+            lr=lr,
+            momentum=momentum,
+            nesterov=nesterov,
+            betas=betas,
+            adam_eps=adam_eps,
+            split_qkv=split_qkv,
+            is_qkv_fn=is_qkv_fn,
+            qkv_split_shapes=qkv_split_shapes,
+            fp32_matmul_prec=fp32_matmul_prec,
+            coefficient_type=coefficient_type,
+            num_ns_steps=num_ns_steps,
+            scale_mode=scale_mode,
+            extra_scale_factor=1.0,
+            pg_collection=pg_collection,
+            tp_mode=tp_mode,
+            batched_step=batched_step,
+        )
+        self.defaults["u_lr"] = u_lr
+        for group in self.param_groups:
+            group.setdefault("u_lr", u_lr)
+            group.pop("u_lr_multiplier", None)
+
+    def _u_step_size(self, group: dict, step: int) -> float:
+        """Return only the independently scheduled directional rate."""
+        u_lr = group["u_lr"]
+        if not math.isfinite(u_lr) or u_lr < 0.0:
+            raise ValueError("u_lr must be finite and nonnegative")
+        return u_lr
+
+
+class TensorParallelMuown(TensorParallelAngularMuown):
+    """Classical Muown in W = g * v / ||v|| coordinates, initially v = W.
+
+    Retain ||v|| instead of retracting v to unit norm. Reconstruct v from W/g
+    and its saved row norm; its gradient is grad_v = grad_U / ||v||. Adam
+    updates g, while a Muon-style update steps v using the ordinary LR, with
+    no additional angular schedule. Matrix weight decay remains disabled.
+    Shared direction, magnitude and parallelism settings are inherited from AngularMuown.
+    """
+
+    _row_state_keys = (*ANGULAR_MUOWN_ROW_STATE_KEYS, "v_norm")
+
+    def __init__(self, params: ParamsT, **kwargs) -> None:
+        for name in kwargs:
+            if name.startswith("u_") or name in {"weight_decay", "use_decoupled_weight_decay"}:
+                raise ValueError(f"Muown does not support {name}")
+        super().__init__(params, **kwargs)
+        for group in self.param_groups:
+            if "u_lr" in group:
+                raise ValueError("Muown uses the ordinary lr, not u_lr")
+            group.pop("u_lr_multiplier", None)
+
+    @torch.no_grad()
+    def _init_group(self, group: dict, skip_non_grad_params: bool = True) -> None:
+        fresh = [p for p in group["params"] if not self.state[p]]
+        super()._init_group(group, skip_non_grad_params)
+        for p in fresh:
+            if self.state[p]:
+                self.state[p]["v_norm"] = self.state[p]["g"].clone()
+
+    def _get_batch_buffers(self, key: tuple, batch_size: int, ref: torch.Tensor) -> dict:
+        bufs = super()._get_batch_buffers(key, batch_size, ref)
+        if "v_norm" not in bufs:
+            bufs["v_norm"] = torch.empty_like(bufs["g"])
+            bufs["v_norm_views"] = list(bufs["v_norm"].unbind(0))
+        return bufs
+
+    def _u_step_size(self, group: dict, step: int) -> float:
+        return group["lr"]
 
 
 def _kwargs_from_config(optimizer_cls: type, prefix: str, config) -> Dict[str, Any]:
@@ -1389,14 +1523,34 @@ def _adaptive_muon_config_to_kwargs(config, model_chunks, pg_collection) -> Dict
     return kwargs
 
 
-def _angular_muown_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any]:
-    """Convert OptimizerConfig to TensorParallelAngularMuown constructor kwargs."""
-    kwargs = _kwargs_from_config(TensorParallelAngularMuown, "angular_muown", config)
+def _angular_muown_config_to_kwargs(
+    config, model_chunks, pg_collection, optimizer_cls=TensorParallelAngularMuown
+) -> Dict[str, Any]:
+    """Convert shared AngularMuown settings to the selected constructor kwargs."""
+    kwargs = _kwargs_from_config(optimizer_cls, "angular_muown", config)
     kwargs["betas"] = (config.angular_muown_beta1, config.angular_muown_beta2)
     kwargs["is_qkv_fn"] = lambda p: getattr(p, "is_qkv", False)
     kwargs["qkv_split_shapes"] = _get_qkv_split_shapes(model_chunks[0].config)
     kwargs["pg_collection"] = pg_collection
     return kwargs
+
+
+def _angular_muown_simplified_config_to_kwargs(
+    config, model_chunks, pg_collection
+) -> Dict[str, Any]:
+    """Build the C/t variant using only its supported constructor settings."""
+    kwargs = _angular_muown_config_to_kwargs(
+        config, model_chunks, pg_collection, TensorParallelAngularMuownSimplified
+    )
+    # The training scheduler supplies the initial angular rate before the first update.
+    kwargs["u_lr"] = 0.0
+    return kwargs
+
+
+def _muown_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any]:
+    """Reuse AngularMuown settings without its internal angular decay."""
+    kwargs = _angular_muown_config_to_kwargs(config, model_chunks, pg_collection)
+    return {name: value for name, value in kwargs.items() if not name.startswith("u_decay_")}
 
 
 def _default_adam_based_eopt_config_to_kwargs(
@@ -1452,6 +1606,19 @@ _EMERGING_OPTIMIZERS.update(
             },
         ),
     }
+)
+
+_EMERGING_OPTIMIZERS["angular_muown_simplified"] = EmergingOptimizerEntry(
+    optimizer_cls=TensorParallelAngularMuownSimplified,
+    config_to_kwargs=_angular_muown_simplified_config_to_kwargs,
+    # The optimizer factory copies these overrides before applying them.
+    default_param_overrides=_EMERGING_OPTIMIZERS["angular_muown"].default_param_overrides,
+)
+
+_EMERGING_OPTIMIZERS["muown"] = EmergingOptimizerEntry(
+    optimizer_cls=TensorParallelMuown,
+    config_to_kwargs=_muown_config_to_kwargs,
+    default_param_overrides=_EMERGING_OPTIMIZERS["angular_muown"].default_param_overrides,
 )
 
 # Register soap with default config

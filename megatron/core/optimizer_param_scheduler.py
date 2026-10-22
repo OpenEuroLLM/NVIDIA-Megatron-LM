@@ -119,6 +119,8 @@ class OptimizerParamScheduler:
         wsd_decay_steps (int, optional): number of weight decay decay steps
         lr_wsd_decay_style (str, optional): decay style for learning rate during weight decay decay
             steps
+        angular_muown_schedule (dict, optional): C/t coefficient, fixed batch, warmup,
+            horizon and cooldown settings; times are measured in training samples.
 
     """
 
@@ -139,10 +141,18 @@ class OptimizerParamScheduler:
         override_opt_param_scheduler: Optional[bool] = False,
         wsd_decay_steps: Optional[int] = None,
         lr_wsd_decay_style: Optional[str] = None,
+        angular_muown_schedule: dict | None = None,
     ) -> None:
 
         # Class values.
         self.optimizer = optimizer
+        self.angular_muown_schedule = (
+            {"cooldown_fraction": 0.2, "cooldown_end_ratio": 0.05, **angular_muown_schedule}
+            if angular_muown_schedule is not None
+            else None
+        )
+        if self.angular_muown_schedule is not None:
+            self._validate_angular_schedule(self.angular_muown_schedule)
 
         self.init_lr = init_lr
         self.max_lr = float(max_lr)
@@ -180,6 +190,43 @@ class OptimizerParamScheduler:
         # Set the learning rate
         self.step(0)
         log_single_rank(logger, logging.INFO, f"> learning rate decay style: {self.lr_decay_style}")
+
+    @staticmethod
+    def _validate_angular_schedule(schedule: dict) -> None:
+        c, batch = schedule['c'], schedule['global_batch_size']
+        warmup, horizon = schedule['warmup_samples'], schedule['total_samples']
+        fraction, ratio = schedule['cooldown_fraction'], schedule['cooldown_end_ratio']
+        if not all(math.isfinite(x) for x in (c, batch, warmup, horizon, fraction, ratio)):
+            raise ValueError("AngularMuown C/t settings must be finite")
+        if c < 0 or batch <= 0 or batch != int(batch) or not 0 <= warmup < horizon:
+            raise ValueError("Require C >= 0, positive integer batch and 0 <= warmup < horizon")
+        if not 0 <= fraction < 1 or not 0 <= ratio <= 1:
+            raise ValueError("Require cooldown fraction in [0, 1) and end ratio in [0, 1]")
+        if fraction and (1 - fraction) * horizon <= warmup:
+            raise ValueError("Angular cooldown must start after warmup")
+
+    def get_angular_lr(self) -> float | None:
+        """Return C/(1 + updates since warmup), independently of the ordinary LR.
+
+        Warm up linearly to C. During cooldown, replace the reciprocal tail with
+        a line ending at cooldown_end_ratio times the rate at the branch point.
+        """
+        schedule = self.angular_muown_schedule
+        if schedule is None:
+            return None
+        c, warmup = schedule['c'], schedule['warmup_samples']
+        if warmup and self.num_steps <= warmup:
+            return c * self.num_steps / warmup
+        horizon, fraction = schedule['total_samples'], schedule['cooldown_fraction']
+        start = (1 - fraction) * horizon
+        samples = min(self.num_steps, start) if fraction else self.num_steps
+        rate = c / (1 + (samples - warmup) / schedule['global_batch_size'])
+        if fraction and self.num_steps > start:
+            ratio = schedule['cooldown_end_ratio']
+            if self.num_steps >= horizon:
+                return rate * ratio
+            rate *= 1 - (1 - ratio) * (self.num_steps - start) / (horizon - start)
+        return rate
 
     def get_wd(self, param_group: Optional[dict] = None) -> float:
         """Weight decay incr functions
@@ -288,6 +335,7 @@ class OptimizerParamScheduler:
             increment (int): number of steps to increment
         """
         self.num_steps += increment
+        angular_lr = self.get_angular_lr()
         # Do not skip empty param groups: get_canonical_lr_for_logging reads lr
         # from default_config groups regardless of whether they hold parameters.
         # This is important for logging under model parallelism that may leave
@@ -298,6 +346,8 @@ class OptimizerParamScheduler:
             else:
                 param_group['lr'] = self.get_lr(param_group)
             param_group['weight_decay'] = self.get_wd(param_group) * param_group.get('wd_mult', 1.0)
+            if angular_lr is not None and 'u_lr' in param_group:
+                param_group['u_lr'] = angular_lr
 
     def state_dict(self) -> dict:
         """Return the state dict."""
@@ -313,15 +363,17 @@ class OptimizerParamScheduler:
             'wd_incr_style': self.wd_incr_style,
             'wd_incr_steps': self.wd_incr_steps,
         }
+        if self.angular_muown_schedule is not None:
+            state_dict['angular_muown_schedule'] = dict(self.angular_muown_schedule)
         return state_dict
 
-    def _check_and_set(self, cls_value: float, sd_value: float, name: str) -> float:
+    def _check_and_set(self, cls_value: Any, sd_value: Any, name: str) -> Any:
         """Auxiliary function for checking the values in the checkpoint and
         setting them.
 
         Args:
-            cls_value (float): class value
-            sd_value (float): checkpoint value
+            cls_value (Any): class value
+            sd_value (Any): checkpoint value
             name (str): name of the parameter
         """
 
@@ -344,6 +396,19 @@ class OptimizerParamScheduler:
         Args:
             state_dict (dict): state dict to be load
         """
+
+        saved = state_dict.get('angular_muown_schedule')
+        if (self.angular_muown_schedule is None) != (saved is None):
+            raise ValueError(
+                "Cannot switch to or from angular_muown_simplified when resuming optimizer state"
+            )
+        if saved is not None:
+            self._validate_angular_schedule(saved)
+            if saved['global_batch_size'] != self.angular_muown_schedule['global_batch_size']:
+                raise ValueError("Cannot change the AngularMuown C/t global batch size on resume")
+            self.angular_muown_schedule = dict(
+                self._check_and_set(self.angular_muown_schedule, saved, 'angular schedule')
+            )
 
         if 'start_lr' in state_dict:
             max_lr_ = state_dict['start_lr']
@@ -387,7 +452,6 @@ class OptimizerParamScheduler:
             num_steps = state_dict['num_iters']
         else:
             num_steps = state_dict['num_steps']
-        self.step(increment=num_steps)
 
         if 'start_wd' in state_dict:
             self.start_wd = self._check_and_set(
@@ -402,3 +466,7 @@ class OptimizerParamScheduler:
             self.wd_incr_style = self._check_and_set(
                 self.wd_incr_style, state_dict['wd_incr_style'], "weight decay incr style"
             )
+
+        # Apply restored settings at the saved clock before the next optimizer update.
+        self.num_steps = num_steps
+        self.step(increment=0)
