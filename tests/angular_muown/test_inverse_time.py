@@ -338,7 +338,7 @@ def test_simplified_rejects_unused_arguments(option, value):
             str(value),
         ]
     )
-    with pytest.raises(AssertionError, match="apply only to angular_muown"):
+    with pytest.raises(AssertionError, match="not supported by angular_muown_simplified"):
         validate_args(args)
 
 

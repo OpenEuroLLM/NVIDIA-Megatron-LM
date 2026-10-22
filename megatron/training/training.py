@@ -2053,8 +2053,8 @@ def get_optimizer_param_scheduler(optimizer):
             global_batch_size=args.global_batch_size,
             warmup_samples=lr_warmup_steps,
             total_samples=lr_decay_steps,
-            cooldown_fraction=args.angular_muown_cooldown_fraction,
-            cooldown_end_ratio=args.angular_muown_cooldown_end_ratio,
+            cooldown_fraction=getattr(args, "angular_muown_cooldown_fraction", 0.2),
+            cooldown_end_ratio=getattr(args, "angular_muown_cooldown_end_ratio", 0.05),
         )
 
     opt_param_scheduler = OptimizerParamScheduler(

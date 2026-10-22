@@ -505,14 +505,10 @@ def _validate_packed_doc_attention(args):
 
 def validate_args(args, defaults={}):
     if args.optimizer == 'muown':
-        assert (
-            args.muon_tp_mode != 'blockwise'
-        ), 'Muown requires --muon-tp-mode duplicated or distributed for global row norms'
         assert not any(
-            name.startswith('angular_muown_u_decay_')
-            or name in {'angular_muown_extra_scale_factor', 'angular_muown_scale_mode'}
+            name.startswith(('angular_muown_u_decay_', 'angular_muown_cooldown_'))
             for name in vars(args)
-        ), 'Muown uses --muon-* direction settings and has no angular decay'
+        ), 'Muown uses the ordinary LR schedule and has no angular decay or cooldown'
     if args.optimizer == 'angular_muown_simplified':
         assert (
             args.angular_muown_c is not None
@@ -523,9 +519,11 @@ def validate_args(args, defaults={}):
             and not args.decrease_batch_size_if_needed
         ), 'C/t requires a fixed global batch, without schedules or automatic batch reduction'
         assert 0 <= args.angular_muown_c < float('inf'), 'C must be finite and nonnegative'
-        assert 0 <= args.angular_muown_cooldown_fraction < 1, 'Cooldown fraction must be in [0, 1)'
         assert (
-            0 <= args.angular_muown_cooldown_end_ratio <= 1
+            0 <= getattr(args, 'angular_muown_cooldown_fraction', 0.2) < 1
+        ), 'Cooldown fraction must be in [0, 1)'
+        assert (
+            0 <= getattr(args, 'angular_muown_cooldown_end_ratio', 0.05) <= 1
         ), 'Cooldown end ratio must be in [0, 1]'
         unsupported = [
             name
@@ -533,7 +531,9 @@ def validate_args(args, defaults={}):
             if name.startswith('angular_muown_u_decay_')
             or name == 'angular_muown_extra_scale_factor'
         ]
-        assert not unsupported, 'These options apply only to angular_muown: ' + ', '.join(
+        assert (
+            not unsupported
+        ), 'These options are not supported by angular_muown_simplified: ' + ', '.join(
             '--' + name.replace('_', '-') for name in unsupported
         )
     else:
@@ -2807,15 +2807,15 @@ def _add_regularization_args(parser):
     group.add_argument(
         '--angular-muown-cooldown-fraction',
         type=float,
-        default=0.2,
+        default=argparse.SUPPRESS,
         help='Final fraction of the LR horizon for linear angular cooldown. '
-        'Zero continues inverse-time decay; used only with --angular-muown-c.',
+        'Zero continues inverse-time decay. Default: 0.2, used only with --angular-muown-c.',
     )
     group.add_argument(
         '--angular-muown-cooldown-end-ratio',
         type=float,
-        default=0.05,
-        help='Final angular rate / rate at cooldown start, in C/t mode.',
+        default=argparse.SUPPRESS,
+        help='Final angular rate / rate at cooldown start, in C/t mode. Default: 0.05.',
     )
     group.add_argument(
         '--angular-muown-momentum',
@@ -2856,15 +2856,15 @@ def _add_regularization_args(parser):
         default=argparse.SUPPRESS,
         choices=['spectral', 'unit_rms_norm', 'shape_scaling'],
         help='Shape-dependent scaling. Defaults to shape_scaling for angular_muown_simplified '
-        'and spectral for angular_muown. The C/t variant always uses extra factor 1.',
+        'and spectral for angular_muown and muown. The C/t variant always uses extra factor 1.',
     )
-    # Original-only settings use OptimizerConfig defaults when absent. Suppressing
-    # their CLI defaults lets angular_muown_simplified reject explicit unused options.
+    # Suppressed defaults let validation reject explicitly supplied unused options.
+    # Supported settings use OptimizerConfig defaults when absent.
     group.add_argument(
         '--angular-muown-extra-scale-factor',
         type=float,
         default=argparse.SUPPRESS,
-        help='Extra factor for angular_muown only; angular_muown_simplified fixes 1. The default '
+        help='Extra factor for angular_muown and muown. angular_muown_simplified fixes 1. The default '
         '0.2 pairs with spectral scaling to give the standard Muon 0.2 * sqrt(max(m, n)).',
     )
     group.add_argument(
@@ -2893,7 +2893,7 @@ def _add_regularization_args(parser):
         default='duplicated',
         choices=['duplicated', 'distributed'],
         help='How to perform NS calculation for tensor parallel weights. Blockwise '
-        'mode is not supported for AngularMuown.',
+        'mode is not supported for AngularMuown or Muown.',
     )
     group.add_argument(
         '--angular-muown-u-decay-schedule',
