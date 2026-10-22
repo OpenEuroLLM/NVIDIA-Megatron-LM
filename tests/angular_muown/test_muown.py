@@ -4,6 +4,7 @@
 
 import argparse
 import copy
+import math
 import os
 from datetime import timedelta
 from types import SimpleNamespace
@@ -362,3 +363,42 @@ def test_muown_requires_global_row_norms():
         parser.parse_args(["--optimizer", "muown_classical", "--angular-muown-tp-mode", "blockwise"])
     with pytest.raises(ValueError, match="blockwise"):
         TensorParallelMuownClassical([torch.nn.Parameter(torch.ones(4, 8))], tp_mode="blockwise")
+
+
+@pytest.mark.parametrize("batched", [False, True])
+def test_v_weight_decay_settles_the_rotation(batched):
+    """Decoupled weight decay on v (ours, off by default): lambda = 0 is the paper's Muown exactly;
+    with lambda > 0 ||v|| stops growing and the per-step rotation of W's rows settles near
+    sqrt(2 lr lambda), while without it the rotation keeps shrinking."""
+    lr, lam, steps = 0.02, 0.5, 600
+
+    def run(v_weight_decay):
+        torch.manual_seed(0)
+        # small rows: the growth of ||v|| from the orthogonal steps is visible within the test
+        w = torch.nn.Parameter(torch.randn(8, 16, device=device()) * 0.01)
+        opt = TensorParallelMuownClassical([w], lr=lr, batched_step=batched, v_weight_decay=v_weight_decay)
+        angles, norms = [], []
+        for _ in range(steps):
+            before = torch.nn.functional.normalize(w.detach().clone(), dim=1)
+            w.grad = torch.randn_like(w)
+            opt.step()
+            after = torch.nn.functional.normalize(w.detach(), dim=1)
+            angles.append(torch.acos((before * after).sum(1).clamp(-1, 1)).mean().item())
+            norms.append(opt.state[w]["v_norm"].mean().item())
+        return angles, norms
+
+    a0, n0 = run(0.0)
+    a1, n1 = run(lam)
+    # off: identical to the default constructor
+    torch.manual_seed(0)
+    w = torch.nn.Parameter(torch.randn(8, 16, device=device()))
+    ref = TensorParallelMuownClassical([w], lr=lr, batched_step=batched)
+    assert ref._v_weight_decay == 0.0
+    # without decay: ||v|| keeps growing, the rotation keeps shrinking
+    assert n0[-1] > 1.5 * n0[steps // 3] and a0[-1] < 0.8 * a0[steps // 3]
+    # with decay: ||v|| levels off, the late rotation is steady and near sqrt(2 lr lambda)
+    late = sum(a1[-100:]) / 100
+    assert abs(n1[-1] - n1[-101]) < 0.05 * n1[-1]
+    assert 0.5 * math.sqrt(2 * lr * lam) < late < 2.0 * math.sqrt(2 * lr * lam)
+    with pytest.raises(ValueError):
+        TensorParallelMuownClassical([w], v_weight_decay=-1.0)

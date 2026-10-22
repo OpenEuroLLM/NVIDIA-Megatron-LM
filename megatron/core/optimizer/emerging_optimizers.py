@@ -885,6 +885,8 @@ class TensorParallelAngularMuown(TensorParallelMuon):
     """
 
     _row_state_keys = ANGULAR_MUOWN_ROW_STATE_KEYS
+    # decoupled weight decay on Muown's unnormalized v (TensorParallelMuownClassical only)
+    _v_weight_decay = 0.0
 
     def __init__(
         self,
@@ -1235,6 +1237,8 @@ class TensorParallelAngularMuown(TensorParallelMuon):
             if v_norm is not None:
                 grad_u.div_(v_norm)
                 u.mul_(v_norm)
+                if self._v_weight_decay:  # decoupled decay of v: only its norm (the rotation rate)
+                    u.mul_(1.0 - group["lr"] * self._v_weight_decay)
 
             # Momentum on the Riemannian U gradient (sum convention, as in
             # the original AngularMuown, not the EMA convention of the base class).
@@ -1385,6 +1389,8 @@ class TensorParallelAngularMuown(TensorParallelMuon):
             torch._foreach_copy_(bufs["v_norm_views"], [state["v_norm"] for state in states])
             grad_u.div_(v_norm)
             u.mul_(v_norm)
+            if self._v_weight_decay:
+                u.mul_(1.0 - group["lr"] * self._v_weight_decay)
 
         if self._u_decay_schedule == "hyper":
             self._hyper_accumulate(grad_u, m_u_b)  # m_u_b: the previous step's momentum
@@ -1583,11 +1589,19 @@ class TensorParallelMuownClassical(TensorParallelAngularMuown):
 
     _row_state_keys = (*ANGULAR_MUOWN_ROW_STATE_KEYS, "v_norm")
 
-    def __init__(self, params: ParamsT, **kwargs) -> None:
+    def __init__(self, params: ParamsT, v_weight_decay: float = 0.0, **kwargs) -> None:
+        """``v_weight_decay`` (not in the Muown paper, default off): decoupled weight decay on v,
+        v <- v - lr (update + lambda v). v / ||v|| does not depend on ||v||, so it only shrinks the
+        norm and so raises the rotation per step: instead of the endless ~t^-1/2 annealing, the
+        rate settles at ~sqrt(2 lr lambda) (the equilibrium of Muon / AdamW with weight decay) after
+        ~1 / (2 lr lambda) steps. Directions and magnitudes are otherwise updated as without it."""
         for name in kwargs:
             if name.startswith("u_") or name in {"weight_decay", "use_decoupled_weight_decay"}:
                 raise ValueError(f"Muown does not support {name}")
+        if not (math.isfinite(v_weight_decay) and v_weight_decay >= 0.0):
+            raise ValueError("v_weight_decay must be finite and nonnegative")
         super().__init__(params, **kwargs)
+        self._v_weight_decay = float(v_weight_decay)
         for group in self.param_groups:
             if "u_lr" in group:
                 raise ValueError("Muown uses the ordinary lr, not u_lr")
@@ -1769,7 +1783,9 @@ def _muown_classical_config_to_kwargs(config, model_chunks, pg_collection) -> Di
     """Reuse AngularMuown settings without its internal angular decay (every u_* schedule option:
     the poly / cosine decay and our radius / hyper schedules)."""
     kwargs = _angular_muown_config_to_kwargs(config, model_chunks, pg_collection)
-    return {name: value for name, value in kwargs.items() if not name.startswith("u_")}
+    kwargs = {name: value for name, value in kwargs.items() if not name.startswith("u_")}
+    kwargs["v_weight_decay"] = getattr(config, "muown_classical_v_weight_decay", 0.0)
+    return kwargs
 
 
 def _default_adam_based_eopt_config_to_kwargs(

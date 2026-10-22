@@ -415,6 +415,10 @@ class OptimizerConfig:
     transfer; "shape_scaling" (sqrt(max(1, m/n))) with extra scale factor 1.0 reproduces
     the original AngularMuown ratio scaling."""
 
+    muown_classical_v_weight_decay: float = 0.0
+    """muown_classical: decoupled weight decay on the unnormalized direction vectors v (not in the
+    Muown paper): the rotation rate settles at ~sqrt(2 lr lambda) instead of annealing as t^-1/2."""
+
     angular_muown_extra_scale_factor: float = 0.2
     """Additional scale factor for the AngularMuown U direction. Defaults to 0.2 to
     pair with "spectral" scaling (Muon convention)."""
