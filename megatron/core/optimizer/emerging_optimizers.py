@@ -1766,9 +1766,10 @@ def _angular_muown_simplified_config_to_kwargs(
 
 
 def _muown_classical_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any]:
-    """Reuse AngularMuown settings without its internal angular decay."""
+    """Reuse AngularMuown settings without its internal angular decay (every u_* schedule option:
+    the poly / cosine decay and our radius / hyper schedules)."""
     kwargs = _angular_muown_config_to_kwargs(config, model_chunks, pg_collection)
-    return {name: value for name, value in kwargs.items() if not name.startswith("u_decay_")}
+    return {name: value for name, value in kwargs.items() if not name.startswith("u_")}
 
 
 def _default_adam_based_eopt_config_to_kwargs(

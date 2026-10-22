@@ -18,7 +18,7 @@ from megatron.core.optimizer.emerging_optimizers import (
     TensorParallelAngularMuown,
     TensorParallelMuownClassical,
     _create_emerging_optimizer,
-    _muown_config_to_kwargs,
+    _muown_classical_config_to_kwargs,
 )
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.training.arguments import add_megatron_arguments, validate_args
@@ -141,7 +141,7 @@ def test_registry_and_config_routing():
     model = SimpleNamespace(
         config=SimpleNamespace(num_attention_heads=12, num_query_groups=12, kv_channels=64)
     )
-    kwargs = _muown_config_to_kwargs(config, [model], None)
+    kwargs = _muown_classical_config_to_kwargs(config, [model], None)
     assert kwargs["betas"] == (config.angular_muown_beta1, config.angular_muown_beta2)
     assert not any(key.startswith("u_") for key in kwargs)
     optimizer, init = (
@@ -155,7 +155,7 @@ def test_registry_and_config_routing():
     # As in AngularMuown, global WD may apply to auxiliary Adam parameters,
     # while direction and magnitude updates have no weight decay.
     config.weight_decay = 0.1
-    assert "weight_decay" not in _muown_config_to_kwargs(config, [model], None)
+    assert "weight_decay" not in _muown_classical_config_to_kwargs(config, [model], None)
     assert _EMERGING_OPTIMIZERS["muown_classical"].default_param_overrides == (
         _EMERGING_OPTIMIZERS["angular_muown"].default_param_overrides
     )
