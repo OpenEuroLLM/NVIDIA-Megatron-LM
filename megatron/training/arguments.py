@@ -512,6 +512,15 @@ def _validate_packed_doc_attention(args):
 
 
 def validate_args(args, defaults={}):
+    if args.optimizer == 'muown':
+        assert (
+            args.muon_tp_mode != 'blockwise'
+        ), 'Muown requires --muon-tp-mode duplicated or distributed for global row norms'
+        assert not any(
+            name.startswith('angular_muown_u_decay_')
+            or name in {'angular_muown_extra_scale_factor', 'angular_muown_scale_mode'}
+            for name in vars(args)
+        ), 'Muown uses --muon-* direction settings and has no angular decay'
     if args.optimizer == 'angular_muown_simplified':
         assert (
             args.angular_muown_c is not None
@@ -3268,7 +3277,7 @@ def _add_training_args(parser):
     group.add_argument('--optimizer', type=str, default='adam',
                        choices=['adam', 'sgd', 'muon', 'dist_muon', 'lion', 'soap',
                                 'adaptive_muon', 'angular_muown', 'muown',
-                                'angular_muown_simplified'],
+                                'angular_muown_simplified', 'muown_classical'],
                        help='Optimizer function. '
                             'Note: dist_muon is deprecated; use --optimizer muon '
                             'with --use-distributed-optimizer instead. '
