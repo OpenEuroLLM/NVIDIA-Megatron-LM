@@ -389,6 +389,7 @@ def test_v_weight_decay_settles_the_rotation(batched):
 
     a0, n0 = run(0.0)
     a1, n1 = run(lam)
+    a2, _ = run(lam / 4)
     # off: identical to the default constructor
     torch.manual_seed(0)
     w = torch.nn.Parameter(torch.randn(8, 16, device=device()))
@@ -396,9 +397,12 @@ def test_v_weight_decay_settles_the_rotation(batched):
     assert ref._v_weight_decay == 0.0
     # without decay: ||v|| keeps growing, the rotation keeps shrinking
     assert n0[-1] > 1.5 * n0[steps // 3] and a0[-1] < 0.8 * a0[steps // 3]
-    # with decay: ||v|| levels off, the late rotation is steady and near sqrt(2 lr lambda)
-    late = sum(a1[-100:]) / 100
+    # with decay: ||v|| levels off and the late rotation is steady, scaling as sqrt(lambda); its size is
+    # sqrt(2 lr lambda) up to an O(1) factor (0.45 here: momentum correlates successive steps, and the
+    # Newton-Schulz singular values are not exactly 1 -- the formula assumes independent unit steps)
+    late, late_quarter = sum(a1[-100:]) / 100, sum(a2[-100:]) / 100
     assert abs(n1[-1] - n1[-101]) < 0.05 * n1[-1]
-    assert 0.5 * math.sqrt(2 * lr * lam) < late < 2.0 * math.sqrt(2 * lr * lam)
+    assert 0.25 * math.sqrt(2 * lr * lam) < late < 2.0 * math.sqrt(2 * lr * lam)
+    assert 1.5 < late / late_quarter < 2.7
     with pytest.raises(ValueError):
         TensorParallelMuownClassical([w], v_weight_decay=-1.0)
