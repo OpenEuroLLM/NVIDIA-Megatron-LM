@@ -524,7 +524,9 @@ class TransformerConfig(ModelParallelConfig):
     """Length-dependent attention temperature: query i scaled by f(n_i), n_i its keys (position in
     its document + 1). "logn": max(1, log n / log base), parameter-free (evaluation beyond the
     training length); "ssmax": s_h log n with a learnt s per head (Scalable-Softmax, init
-    1 / log base). Not with context parallelism or inference contexts."""
+    1 / log base). Self-attention layers only (in the hybrid: the `*` layers). Positions follow
+    context parallelism's sharding and continue from the KV cache at inference (static, flash
+    decode and dynamic batching); not yet for inference under context parallelism."""
 
     attention_length_scaling_base: int = 8192
     """The length where the scaling is 1 (the training sequence length)."""

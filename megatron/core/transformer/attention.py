@@ -293,6 +293,37 @@ class CrossAttentionSubmodules:
     linear_proj: LinearProjBuilder
 
 
+
+def length_scaling_positions(
+    n_tok: int, device, cu_seqlens=None, cp_rank: int = 0, cp_size: int = 1
+) -> torch.Tensor:
+    """0-based position of each local token in its sequence (attention_length_scaling).
+
+    Without ``cu_seqlens`` the local tokens are one sequence ([s, b, ...] layouts); with it, packed
+    documents (thd; ``cu_seqlens`` are the global, padded offsets), positions restarting per
+    document. Under context parallelism every sequence / document is split into 2 cp chunks and
+    rank r holds chunks r and 2 cp - 1 - r (Megatron's load-balanced sharding, as the rotary
+    embedding's get_pos_emb_on_this_cp_rank / _get_thd_freqs_on_this_cp_rank).
+    """
+    k = torch.arange(n_tok, device=device)
+    if cu_seqlens is None:
+        local = torch.full((1,), n_tok, device=device, dtype=torch.long)
+        k_doc, doc_len = k, local.expand(n_tok)
+    else:
+        cu = cu_seqlens.to(device=device, dtype=torch.long)
+        local = (cu[1:] - cu[:-1]) // cp_size
+        starts = torch.cumsum(local, 0) - local
+        doc = torch.repeat_interleave(torch.arange(local.numel(), device=device), local,
+                                      output_size=n_tok)
+        k_doc, doc_len = k - starts[doc], local[doc]
+    if cp_size == 1:
+        return k_doc
+    half = doc_len // 2
+    front = cp_rank * half + k_doc
+    back = (2 * cp_size - 1 - cp_rank) * half + (k_doc - half)
+    return torch.where(k_doc < half, front, back)
+
+
 class Attention(MegatronModule, ABC):
     """Attention layer abstract class.
 
@@ -520,39 +551,55 @@ class Attention(MegatronModule, ABC):
 
         return hidden_states
 
-    def _length_scale_query(self, query, packed_seq_params, inference_context):
+    def _length_scale_query(
+        self, query, packed_seq_params, inference_context, sequence_len_offset=None
+    ):
         """Scale query i by a function of n_i, the number of keys it attends to (its position in its
         document + 1): equivalent to scaling its attention logits, so any attention kernel applies.
 
         "logn": max(1, log n / log base) -- no parameters (log-n scaling for evaluation beyond the
         training length); "ssmax": s_h log n with a learnt s per head (Scalable-Softmax, Nakanishi
-        2025). Positions restart at every packed document (cu_seqlens). Context parallelism and
-        inference (KV cache offsets) are not supported.
+        2025). Positions restart at every packed document (cu_seqlens), follow context
+        parallelism's load-balanced sharding (chunks r and 2 cp - 1 - r of every sequence /
+        document), and continue from the KV cache at inference (static batching: the sequence
+        offset, or per batch entry under flash decode; dynamic batching: each token's position in
+        its request). See :func:`length_scaling_positions`.
         """
-        if inference_context is not None:
-            raise NotImplementedError("attention_length_scaling: inference contexts are not wired")
-        if self.pg_collection.cp is not None and self.pg_collection.cp.size() > 1:
-            raise NotImplementedError("attention_length_scaling: context parallelism is not wired")
-        thd = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+        cp = self.pg_collection.cp
+        cp_size = cp.size() if cp is not None else 1
+        cp_rank = cp.rank() if cp_size > 1 else 0
         n_tok = query.shape[0]
-        if thd:
-            cu = packed_seq_params.cu_seqlens_q_padded
-            if cu is None:
-                cu = packed_seq_params.cu_seqlens_q
-            cu = cu.to(device=query.device, dtype=torch.long)
-            starts = torch.repeat_interleave(cu[:-1], cu[1:] - cu[:-1], output_size=n_tok)
-            n = torch.arange(n_tok, device=query.device) - starts + 1  # [t]
-            shape = (n_tok, 1, 1)  # query [t, h, d]
+        lead = 1  # leading dims of the factor ([t] or [s]; [s, b] under flash decode)
+        if inference_context is not None:
+            if cp_size > 1:
+                raise NotImplementedError(
+                    "attention_length_scaling: inference with context parallelism"
+                )
+            if inference_context.is_static_batching():
+                offset = sequence_len_offset
+                if offset is None:
+                    offset = inference_context.sequence_len_offset or 0
+                if torch.is_tensor(offset):  # flash decode: one offset per batch entry
+                    pos = (offset.to(query.device).view(1, -1)
+                           + torch.arange(n_tok, device=query.device).view(-1, 1))
+                    lead = 2
+                else:
+                    pos = torch.arange(n_tok, device=query.device) + int(offset)
+            else:
+                pos = inference_context.gpu_view.token_to_pos_ids[:n_tok].to(query.device)
         else:
-            n = torch.arange(1, n_tok + 1, device=query.device)  # query [s, b, h, d]
-            shape = (n_tok, 1, 1, 1)
-        log_n = torch.log(n.float()).view(shape)
+            cu = None
+            if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+                cu = packed_seq_params.cu_seqlens_q_padded
+                if cu is None:
+                    cu = packed_seq_params.cu_seqlens_q
+            pos = length_scaling_positions(n_tok, query.device, cu, cp_rank, cp_size)
+        log_n = torch.log(pos.float() + 1).view(*pos.shape, *([1] * (query.dim() - lead)))
         if self.length_scaling == "logn":
             base = math.log(float(self.config.attention_length_scaling_base))
             factor = torch.clamp(log_n / base, min=1.0)
         elif self.length_scaling == "ssmax":
-            s = self.ssmax_s.view(*([1] * (len(shape) - 2)), -1, 1)  # per head
-            factor = s * log_n
+            factor = self.ssmax_s.view(-1, 1) * log_n  # per head ([..., h, d])
         else:
             raise ValueError(f"unknown attention_length_scaling {self.length_scaling!r}")
         return (query.float() * factor).to(query.dtype)
@@ -1562,6 +1609,10 @@ class Attention(MegatronModule, ABC):
             inference_key_memory, inference_value_memory = inference_context.key_value_memory_dict[
                 self.layer_number
             ]
+            if self.length_scaling != "none":
+                query = self._length_scale_query(
+                    query, None, inference_context, sequence_len_offset=sequence_len_offset
+                )
             output = self.flash_decode(
                 sequence_len_offset=sequence_len_offset,
                 query_layer=query,
