@@ -1571,14 +1571,14 @@ class TensorParallelAngularMuownSimplified(TensorParallelAngularMuown):
         return u_lr
 
 
-class TensorParallelMuown(TensorParallelAngularMuown):
+class TensorParallelMuownClassical(TensorParallelAngularMuown):
     """Classical Muown in W = g * v / ||v|| coordinates, initially v = W.
 
     Retain ||v|| instead of retracting v to unit norm. Reconstruct v from W/g
     and its saved row norm; its gradient is grad_v = grad_U / ||v||. Adam
     updates g, while a Muon-style update steps v using the ordinary LR, with
     no additional angular schedule. Matrix weight decay remains disabled.
-    Shared direction/parallelism settings have the same meaning as in Muon.
+    Shared direction, magnitude and parallelism settings are inherited from AngularMuown.
     """
 
     _row_state_keys = (*ANGULAR_MUOWN_ROW_STATE_KEYS, "v_norm")
@@ -1765,18 +1765,10 @@ def _angular_muown_simplified_config_to_kwargs(
     return kwargs
 
 
-def _muown_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any]:
-    """Reuse Muon direction settings and Adam magnitude settings for Muown."""
-    if config.muon_tp_mode == "blockwise":
-        raise ValueError(
-            "Muown requires --muon-tp-mode duplicated or distributed for global row norms"
-        )
-    kwargs = _muon_config_to_kwargs(config, model_chunks, pg_collection)
-    kwargs.pop("weight_decay", None)
-    kwargs.pop("use_decoupled_weight_decay", None)
-    kwargs["betas"] = (config.adam_beta1, config.adam_beta2)
-    kwargs["adam_eps"] = config.adam_eps
-    return kwargs
+def _muown_classical_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any]:
+    """Reuse AngularMuown settings without its internal angular decay."""
+    kwargs = _angular_muown_config_to_kwargs(config, model_chunks, pg_collection)
+    return {name: value for name, value in kwargs.items() if not name.startswith("u_decay_")}
 
 
 def _default_adam_based_eopt_config_to_kwargs(
@@ -1856,9 +1848,9 @@ _EMERGING_OPTIMIZERS["angular_muown_simplified"] = EmergingOptimizerEntry(
     default_param_overrides=_EMERGING_OPTIMIZERS["angular_muown"].default_param_overrides,
 )
 
-_EMERGING_OPTIMIZERS["muown"] = EmergingOptimizerEntry(
-    optimizer_cls=TensorParallelMuown,
-    config_to_kwargs=_muown_config_to_kwargs,
+_EMERGING_OPTIMIZERS["muown_classical"] = EmergingOptimizerEntry(
+    optimizer_cls=TensorParallelMuownClassical,
+    config_to_kwargs=_muown_classical_config_to_kwargs,
     default_param_overrides=_EMERGING_OPTIMIZERS["angular_muown"].default_param_overrides,
 )
 

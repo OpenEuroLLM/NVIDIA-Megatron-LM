@@ -136,13 +136,13 @@ def test_checkpoint_resume_and_batched_equivalence(optimizer_cls):
 
 
 def test_registry_and_config_routing():
-    """Reuse Muon's direction options and Adam's row and auxiliary settings."""
-    config = OptimizerConfig(optimizer="muown", weight_decay=0, muon_tp_mode="duplicated")
+    """Reuse AngularMuown settings while retaining auxiliary Adam routing."""
+    config = OptimizerConfig(optimizer="muown", weight_decay=0)
     model = SimpleNamespace(
         config=SimpleNamespace(num_attention_heads=12, num_query_groups=12, kv_channels=64)
     )
     kwargs = _muown_config_to_kwargs(config, [model], None)
-    assert kwargs["betas"] == (config.adam_beta1, config.adam_beta2)
+    assert kwargs["betas"] == (config.angular_muown_beta1, config.angular_muown_beta2)
     assert not any(key.startswith("u_") for key in kwargs)
     optimizer, init = (
         _EMERGING_OPTIMIZERS["muown"].optimizer_cls,
@@ -270,27 +270,39 @@ def test_checkpoint_variants_cannot_be_switched():
         angular.load_state_dict(classical.state_dict())
 
 
-def test_cli_factory_and_unused_flags():
-    """Build Muown from actual CLI settings and reject conflicting schedules."""
+@pytest.mark.parametrize("scale_mode", [None, "shape_scaling", "unit_rms_norm"])
+def test_cli_factory_and_shared_settings(scale_mode):
+    """Build Muown through the CLI with shared defaults and explicit overrides."""
     parser = add_megatron_arguments(argparse.ArgumentParser(allow_abbrev=False))
-    flags = [
-        "--optimizer",
-        "muown",
-        "--muon-tp-mode",
-        "duplicated",
-        "--lr",
-        "0.008",
-        "--muon-momentum",
-        "0.95",
-        "--muon-nesterov",
-        "--muon-batched-step",
-        "--muon-scale-mode",
-        "shape_scaling",
-        "--muon-coefficient-type",
-        "simple",
-        "--adam-beta2",
-        "0.95",
-    ]
+    flags = ["--optimizer", "muown", "--lr", "0.008"]
+    if scale_mode:
+        flags += [
+            "--angular-muown-scale-mode",
+            scale_mode,
+            "--angular-muown-extra-scale-factor",
+            "0.7",
+            "--angular-muown-momentum",
+            "0.8",
+            "--angular-muown-no-nesterov",
+            "--angular-muown-no-batched-step",
+            "--angular-muown-no-split-qkv",
+            "--angular-muown-beta1",
+            "0.7",
+            "--angular-muown-beta2",
+            "0.8",
+            "--angular-muown-num-ns-steps",
+            "4",
+            "--angular-muown-coefficient-type",
+            "quintic",
+            "--angular-muown-fp32-matmul-prec",
+            "high",
+            "--angular-muown-tp-mode",
+            "distributed",
+            "--adam-beta2",
+            "0.97",
+            "--adam-eps",
+            "1e-7",
+        ]
     args = parser.parse_args(flags)
     for field in ("main_grads_dtype", "main_params_dtype", "exp_avg_dtype", "exp_avg_sq_dtype"):
         setattr(args, field, torch.float32)
@@ -303,16 +315,49 @@ def test_cli_factory_and_unused_flags():
     init(optimizer)
     assert isinstance(optimizer, TensorParallelMuown)
     assert "v_norm" in optimizer.state[weight]
-    assert optimizer._scale_mode == "shape_scaling"
-    assert optimizer.param_groups[0]["momentum"] == 0.95
-    assert optimizer.param_groups[0]["betas"] == (0.9, 0.95)
-    assert optimizer.nesterov and optimizer.batched_step
+    assert optimizer._scale_mode == (scale_mode or "spectral")
+    assert optimizer._extra_scale_factor == (0.7 if scale_mode else 0.2)
+    assert optimizer.param_groups[0]["lr"] == 0.008
+    assert optimizer.param_groups[0]["momentum"] == (0.8 if scale_mode else 0.95)
+    assert optimizer.param_groups[0]["betas"] == ((0.7, 0.8) if scale_mode else (0.9, 0.95))
+    assert optimizer.param_groups[0]["adam_eps"] == (1e-7 if scale_mode else 1e-8)
+    assert optimizer.nesterov == optimizer.batched_step == optimizer.split_qkv == (not scale_mode)
+    assert optimizer._num_ns_steps == (4 if scale_mode else 5)
+    assert optimizer._coefficient_type == ("quintic" if scale_mode else "simple")
+    assert optimizer.fp32_matmul_prec == ("high" if scale_mode else "medium")
+    assert optimizer.tp_mode == ("distributed" if scale_mode else "duplicated")
     assert "u_lr" not in optimizer.param_groups[0]
-    for extra, message in (
-        (["--angular-muown-c", "2"], "requires --optimizer"),
-        (["--angular-muown-u-decay-scale", "0.001"], "no angular decay"),
-        (["--angular-muown-extra-scale-factor", "1"], "no angular decay"),
-        (["--muon-tp-mode", "blockwise"], "global row norms"),
-    ):
-        with pytest.raises(AssertionError, match=message):
-            validate_args(parser.parse_args(flags + extra))
+    # Row-magnitude betas must not overwrite the auxiliary Adam configuration.
+    assert config.adam_beta2 == (0.97 if scale_mode else args.adam_beta2)
+
+
+@pytest.mark.parametrize(
+    "option,value",
+    [
+        ("c", 2),
+        ("u-decay-schedule", "poly"),
+        ("u-decay-scale", 0.001),
+        ("u-decay-p", 0),
+        ("u-decay-warmup-steps", 0),
+        ("u-decay-steps", 10),
+        ("u-decay-min-multiplier", 0),
+        ("cooldown-fraction", 0.2),
+        ("cooldown-end-ratio", 0.05),
+    ],
+)
+def test_muown_rejects_angular_schedules(option, value):
+    """Reject explicitly supplied angular-only flags, even at their default values."""
+    parser = add_megatron_arguments(argparse.ArgumentParser(allow_abbrev=False))
+    args = parser.parse_args(["--optimizer", "muown", "--angular-muown-" + option, str(value)])
+    message = "requires --optimizer" if option == "c" else "no angular decay or cooldown"
+    with pytest.raises(AssertionError, match=message):
+        validate_args(args)
+
+
+def test_muown_requires_global_row_norms():
+    """The shared TP flag and constructor both reject blockwise geometry."""
+    parser = add_megatron_arguments(argparse.ArgumentParser(allow_abbrev=False))
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--optimizer", "muown", "--angular-muown-tp-mode", "blockwise"])
+    with pytest.raises(ValueError, match="blockwise"):
+        TensorParallelMuown([torch.nn.Parameter(torch.ones(4, 8))], tp_mode="blockwise")
