@@ -313,18 +313,19 @@ def test_cli_config_and_scheduler_wiring(monkeypatch, sample_based, name, scale_
 @pytest.mark.parametrize(
     "option,value",
     [
-        ("u_decay_schedule", "poly"),
+        ("u_decay_schedule", "cosine"),
         ("u_decay_scale", 0.002),
         ("u_decay_p", 2.0),
         ("u_decay_warmup_steps", 1),
         ("u_decay_steps", 10),
         ("u_decay_min_multiplier", 0.1),
-        ("extra_scale_factor", 1.0),
+        ("extra_scale_factor", 0.7),
         ("extra_scale_factor", 0.2),
     ],
 )
 def test_simplified_rejects_unused_arguments(option, value):
-    """Reject original-only options instead of silently ignoring them."""
+    """Reject original-only options set away from their defaults instead of silently ignoring them
+    (launchers omit default values; the fixed extra factor 1 is accepted)."""
     with pytest.raises(TypeError, match=option):
         _optimizer(**{option: value})
     parser = add_megatron_arguments(argparse.ArgumentParser(allow_abbrev=False))

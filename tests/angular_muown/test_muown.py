@@ -16,7 +16,7 @@ from megatron.core.optimizer import OptimizerConfig
 from megatron.core.optimizer.emerging_optimizers import (
     _EMERGING_OPTIMIZERS,
     TensorParallelAngularMuown,
-    TensorParallelMuown,
+    TensorParallelMuownClassical,
     _create_emerging_optimizer,
     _muown_config_to_kwargs,
 )
@@ -52,7 +52,7 @@ def test_explicit_weight_normalization_reference(batched, nesterov, shape, split
     vectors = [torch.nn.Parameter(w.detach().clone()) for w in weights]
     gains = [torch.nn.Parameter(v.detach().norm(dim=1, keepdim=True)) for v in vectors]
     moments = [torch.zeros_like(v) for v in vectors]
-    optimizer = TensorParallelMuown(
+    optimizer = TensorParallelMuownClassical(
         weights,
         lr=0.008,
         scale_mode="spectral",
@@ -103,7 +103,7 @@ def test_explicit_weight_normalization_reference(batched, nesterov, shape, split
     )
 
 
-@pytest.mark.parametrize("optimizer_cls", [TensorParallelMuown, TensorParallelAngularMuown])
+@pytest.mark.parametrize("optimizer_cls", [TensorParallelMuownClassical, TensorParallelAngularMuown])
 def test_checkpoint_resume_and_batched_equivalence(optimizer_cls):
     """Check packed row-state resume and parity between both update paths."""
     torch.manual_seed(12)
@@ -113,7 +113,7 @@ def test_checkpoint_resume_and_batched_equivalence(optimizer_cls):
         w.grad = torch.randn_like(w)
     optimizer.step()
     saved = copy.deepcopy(optimizer.state_dict())
-    if optimizer_cls is TensorParallelMuown:
+    if optimizer_cls is TensorParallelMuownClassical:
         assert all(s["v_norm"].shape == (4, 8) for s in saved["state"].values())
         incompatible = copy.deepcopy(saved)
         for state in incompatible["state"].values():
@@ -137,7 +137,7 @@ def test_checkpoint_resume_and_batched_equivalence(optimizer_cls):
 
 def test_registry_and_config_routing():
     """Reuse AngularMuown settings while retaining auxiliary Adam routing."""
-    config = OptimizerConfig(optimizer="muown", weight_decay=0)
+    config = OptimizerConfig(optimizer="muown_classical", weight_decay=0)
     model = SimpleNamespace(
         config=SimpleNamespace(num_attention_heads=12, num_query_groups=12, kv_channels=64)
     )
@@ -145,8 +145,8 @@ def test_registry_and_config_routing():
     assert kwargs["betas"] == (config.angular_muown_beta1, config.angular_muown_beta2)
     assert not any(key.startswith("u_") for key in kwargs)
     optimizer, init = (
-        _EMERGING_OPTIMIZERS["muown"].optimizer_cls,
-        _EMERGING_OPTIMIZERS["muown"].init_state_fn,
+        _EMERGING_OPTIMIZERS["muown_classical"].optimizer_cls,
+        _EMERGING_OPTIMIZERS["muown_classical"].init_state_fn,
     )
     weight = torch.nn.Parameter(torch.ones(4, 8, device=device()))
     instance = optimizer([weight], **kwargs)
@@ -156,7 +156,7 @@ def test_registry_and_config_routing():
     # while direction and magnitude updates have no weight decay.
     config.weight_decay = 0.1
     assert "weight_decay" not in _muown_config_to_kwargs(config, [model], None)
-    assert _EMERGING_OPTIMIZERS["muown"].default_param_overrides == (
+    assert _EMERGING_OPTIMIZERS["muown_classical"].default_param_overrides == (
         _EMERGING_OPTIMIZERS["angular_muown"].default_param_overrides
     )
     with pytest.raises(ValueError, match="u_decay_scale"):
@@ -187,8 +187,8 @@ def test_tensor_parallel_row_states(partition_dim, tp_mode, batched, tp_group):
     shard = torch.nn.Parameter(full.detach().chunk(size, dim=partition_dim)[rank].clone())
     shard.partition_dim = partition_dim
     options = dict(lr=0.008, split_qkv=False, fp32_matmul_prec="highest", batched_step=batched)
-    reference = TensorParallelMuown([full], **options)
-    parallel = TensorParallelMuown(
+    reference = TensorParallelMuownClassical([full], **options)
+    parallel = TensorParallelMuownClassical(
         [shard],
         tp_mode=tp_mode,
         pg_collection=SimpleNamespace(tp=tp_group, gtp_remat=None),
@@ -212,7 +212,7 @@ def test_ordinary_scheduler_and_exact_resume(batched):
     torch.manual_seed(14)
     weight = torch.nn.Parameter(torch.randn(4, 8))
     options = dict(lr=0.02, split_qkv=False, batched_step=batched, fp32_matmul_prec="highest")
-    optimizer = TensorParallelMuown([weight], **options)
+    optimizer = TensorParallelMuownClassical([weight], **options)
 
     def schedule(opt):
         return OptimizerParamScheduler(
@@ -236,7 +236,7 @@ def test_ordinary_scheduler_and_exact_resume(batched):
         scheduler.step(8)
     saved = copy.deepcopy(optimizer.state_dict())
     other = torch.nn.Parameter(weight.detach().clone())
-    resumed = TensorParallelMuown([other], **options)
+    resumed = TensorParallelMuownClassical([other], **options)
     resumed_scheduler = schedule(resumed)
     resumed.load_state_dict(saved)
     resumed_scheduler.load_state_dict(scheduler.state_dict())
@@ -260,7 +260,7 @@ def test_checkpoint_variants_cannot_be_switched():
     """Reject both directions of a Muown/AngularMuown checkpoint mismatch."""
     weight = torch.nn.Parameter(torch.ones(3, 4))
     weight.grad = torch.ones_like(weight)
-    classical = TensorParallelMuown([weight], split_qkv=False, fp32_matmul_prec="highest")
+    classical = TensorParallelMuownClassical([weight], split_qkv=False, fp32_matmul_prec="highest")
     angular = TensorParallelAngularMuown([weight], split_qkv=False, fp32_matmul_prec="highest")
     classical._init_group(classical.param_groups[0])
     angular._init_group(angular.param_groups[0])
@@ -274,7 +274,7 @@ def test_checkpoint_variants_cannot_be_switched():
 def test_cli_factory_and_shared_settings(scale_mode):
     """Build Muown through the CLI with shared defaults and explicit overrides."""
     parser = add_megatron_arguments(argparse.ArgumentParser(allow_abbrev=False))
-    flags = ["--optimizer", "muown", "--lr", "0.008"]
+    flags = ["--optimizer", "muown_classical", "--lr", "0.008"]
     if scale_mode:
         flags += [
             "--angular-muown-scale-mode",
@@ -311,9 +311,9 @@ def test_cli_factory_and_shared_settings(scale_mode):
     model = SimpleNamespace(
         config=SimpleNamespace(num_attention_heads=1, num_query_groups=1, kv_channels=4)
     )
-    optimizer, init = _create_emerging_optimizer(config, [weight], "muown", [model], None)
+    optimizer, init = _create_emerging_optimizer(config, [weight], "muown_classical", [model], None)
     init(optimizer)
-    assert isinstance(optimizer, TensorParallelMuown)
+    assert isinstance(optimizer, TensorParallelMuownClassical)
     assert "v_norm" in optimizer.state[weight]
     assert optimizer._scale_mode == (scale_mode or "spectral")
     assert optimizer._extra_scale_factor == (0.7 if scale_mode else 0.2)
@@ -335,20 +335,21 @@ def test_cli_factory_and_shared_settings(scale_mode):
     "option,value",
     [
         ("c", 2),
-        ("u-decay-schedule", "poly"),
-        ("u-decay-scale", 0.001),
+        ("u-decay-schedule", "cosine"),
+        ("u-decay-scale", 0.002),
         ("u-decay-p", 0),
-        ("u-decay-warmup-steps", 0),
+        ("u-decay-warmup-steps", 5),
         ("u-decay-steps", 10),
-        ("u-decay-min-multiplier", 0),
-        ("cooldown-fraction", 0.2),
-        ("cooldown-end-ratio", 0.05),
+        ("u-decay-min-multiplier", 0.1),
+        ("cooldown-fraction", 0.3),
+        ("cooldown-end-ratio", 0.1),
     ],
 )
 def test_muown_rejects_angular_schedules(option, value):
-    """Reject explicitly supplied angular-only flags, even at their default values."""
+    """Reject angular-only flags set away from their defaults (launchers omit default values,
+    so an explicit default cannot be told apart from an absent flag)."""
     parser = add_megatron_arguments(argparse.ArgumentParser(allow_abbrev=False))
-    args = parser.parse_args(["--optimizer", "muown", "--angular-muown-" + option, str(value)])
+    args = parser.parse_args(["--optimizer", "muown_classical", "--angular-muown-" + option, str(value)])
     message = "requires --optimizer" if option == "c" else "no angular decay or cooldown"
     with pytest.raises(AssertionError, match=message):
         validate_args(args)
@@ -358,6 +359,6 @@ def test_muown_requires_global_row_norms():
     """The shared TP flag and constructor both reject blockwise geometry."""
     parser = add_megatron_arguments(argparse.ArgumentParser(allow_abbrev=False))
     with pytest.raises(SystemExit):
-        parser.parse_args(["--optimizer", "muown", "--angular-muown-tp-mode", "blockwise"])
+        parser.parse_args(["--optimizer", "muown_classical", "--angular-muown-tp-mode", "blockwise"])
     with pytest.raises(ValueError, match="blockwise"):
-        TensorParallelMuown([torch.nn.Parameter(torch.ones(4, 8))], tp_mode="blockwise")
+        TensorParallelMuownClassical([torch.nn.Parameter(torch.ones(4, 8))], tp_mode="blockwise")

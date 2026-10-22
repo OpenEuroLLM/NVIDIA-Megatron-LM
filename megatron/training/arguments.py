@@ -522,8 +522,13 @@ def validate_args(args, defaults={}):
             if name.startswith('angular_muown_u_decay_')
             and hasattr(ref, name) and value != getattr(ref, name)
         ]
+        changed += [
+            name for name, default in (('angular_muown_cooldown_fraction', 0.2),
+                                       ('angular_muown_cooldown_end_ratio', 0.05))
+            if getattr(args, name, default) != default
+        ]
         assert not changed, (
-            'muown_classical uses the ordinary LR schedule and has no angular decay: '
+            'muown_classical uses the ordinary LR schedule and has no angular decay or cooldown: '
             + ', '.join('--' + name.replace('_', '-') for name in changed)
         )
     if args.optimizer == 'angular_muown_simplified':
@@ -550,7 +555,7 @@ def validate_args(args, defaults={}):
         if getattr(args, 'angular_muown_extra_scale_factor', None) not in (None, 1.0):
             unsupported.append('angular_muown_extra_scale_factor')
         assert not unsupported, (
-            'These options apply only to angular_muown: '
+            'These options are not supported by angular_muown_simplified: '
             + ', '.join('--' + name.replace('_', '-') for name in unsupported)
         )
     else:
