@@ -41,7 +41,6 @@ from megatron.core.msc_utils import MultiStorageClientFeature
 from megatron.training.argument_utils import ArgumentGroupFactory, core_transformer_config_from_args  # noqa: F401 # pylint: disable=unused-import
 
 
-
 def add_megatron_arguments(parser: argparse.ArgumentParser):
     """"Add Megatron-LM arguments to the given parser."""
 
@@ -506,7 +505,9 @@ def _validate_packed_doc_attention(args):
 
 def validate_args(args, defaults={}):
     if args.optimizer == 'angular_muown_simplified':
-        assert args.angular_muown_c is not None, 'angular_muown_simplified requires --angular-muown-c'
+        assert (
+            args.angular_muown_c is not None
+        ), 'angular_muown_simplified requires --angular-muown-c'
         assert (
             args.rampup_batch_size is None
             and args.step_batch_size_schedule is None
@@ -514,20 +515,22 @@ def validate_args(args, defaults={}):
         ), 'C/t requires a fixed global batch, without schedules or automatic batch reduction'
         assert 0 <= args.angular_muown_c < float('inf'), 'C must be finite and nonnegative'
         assert 0 <= args.angular_muown_cooldown_fraction < 1, 'Cooldown fraction must be in [0, 1)'
-        assert 0 <= args.angular_muown_cooldown_end_ratio <= 1, 'Cooldown end ratio must be in [0, 1]'
+        assert (
+            0 <= args.angular_muown_cooldown_end_ratio <= 1
+        ), 'Cooldown end ratio must be in [0, 1]'
         unsupported = [
-            name for name in vars(args)
+            name
+            for name in vars(args)
             if name.startswith('angular_muown_u_decay_')
             or name == 'angular_muown_extra_scale_factor'
         ]
-        assert not unsupported, (
-            'These options apply only to angular_muown: '
-            + ', '.join('--' + name.replace('_', '-') for name in unsupported)
+        assert not unsupported, 'These options apply only to angular_muown: ' + ', '.join(
+            '--' + name.replace('_', '-') for name in unsupported
         )
     else:
-        assert getattr(args, 'angular_muown_c', None) is None, (
-            '--angular-muown-c requires --optimizer angular_muown_simplified'
-        )
+        assert (
+            getattr(args, 'angular_muown_c', None) is None
+        ), '--angular-muown-c requires --optimizer angular_muown_simplified'
 
     # Prep for checkpoint conversion.
     if args.ckpt_convert_format is not None:
@@ -804,7 +807,7 @@ def validate_args(args, defaults={}):
         for elt in [args.train_data_path, args.valid_data_path, args.test_data_path]) or \
             args.per_split_data_args_path is not None
     if use_per_split_data_path:
-         # Exactly one of the two has to be None if we use it.
+        # Exactly one of the two has to be None if we use it.
         assert any(elt is not None
                    for elt in [args.train_data_path, args.valid_data_path, args.test_data_path]) is False or \
             args.per_split_data_args_path is None
@@ -1601,7 +1604,6 @@ def validate_args(args, defaults={}):
         if args.expert_model_parallel_size  > 1 and 'ep_dp' not in args.high_priority_stream_groups:
             args.high_priority_stream_groups.append('ep_dp')
 
-
     # Derive the internal gtp_weight_remat_size from the user-facing
     # --tensor-parallel-num-weight-shards. gtp_weight_remat_size has no CLI flag (it is excluded
     # from argument generation), so it is set here as a fresh attribute on args before it is
@@ -1855,7 +1857,6 @@ def validate_args(args, defaults={}):
         assert not args.use_torch_fsdp2, "Emerging optimizer does not support Torch-FSDP2 for now."
         assert not args.use_megatron_fsdp, "Emerging optimizer does not support Megatron-FSDP for now."
         assert args.ckpt_format in ["torch", "torch_dist"], "Emerging optimizer supports torch and torch_dist checkpoint format."
-
 
     # Make sure all functionality that requires Gloo process groups is disabled.
     if not args.use_gloo_process_groups:
@@ -2786,15 +2787,27 @@ def _add_regularization_args(parser):
                        choices=['adam', 'lion'],
                        help='Optimizer for scalar parameters (embeddings, biases, norms) '
                        'when using muon. Defaults to adam.')
-    group.add_argument('--angular-muown-c', type=float, default=None,
-                       help='Independent angular C/(1 + updates since warmup), before matrix '
-                       'scaling, with extra factor fixed to 1. '
-                       'Required for angular_muown_simplified; fixed batch only.')
-    group.add_argument('--angular-muown-cooldown-fraction', type=float, default=0.2,
-                       help='Final fraction of the LR horizon for linear angular cooldown. '
-                       'Zero continues inverse-time decay; used only with --angular-muown-c.')
-    group.add_argument('--angular-muown-cooldown-end-ratio', type=float, default=0.05,
-                       help='Final angular rate / rate at cooldown start, in C/t mode.')
+    group.add_argument(
+        '--angular-muown-c',
+        type=float,
+        default=None,
+        help='Independent angular C/(1 + updates since warmup), before matrix '
+        'scaling, with extra factor fixed to 1. '
+        'Required for angular_muown_simplified; fixed batch only.',
+    )
+    group.add_argument(
+        '--angular-muown-cooldown-fraction',
+        type=float,
+        default=0.2,
+        help='Final fraction of the LR horizon for linear angular cooldown. '
+        'Zero continues inverse-time decay; used only with --angular-muown-c.',
+    )
+    group.add_argument(
+        '--angular-muown-cooldown-end-ratio',
+        type=float,
+        default=0.05,
+        help='Final angular rate / rate at cooldown start, in C/t mode.',
+    )
     group.add_argument(
         '--angular-muown-momentum',
         type=float,
@@ -3146,12 +3159,25 @@ def _add_training_args(parser):
     group.add_argument('--use-flash-attn', action='store_true',
                        help='use FlashAttention implementation of attention. '
                        'https://arxiv.org/abs/2205.14135')
-    group.add_argument('--optimizer', type=str, default='adam',
-                       choices=['adam', 'sgd', 'muon', 'dist_muon', 'lion', 'soap',
-                                'adaptive_muon', 'angular_muown', 'angular_muown_simplified'],
-                       help='Optimizer function. '
-                            'Note: dist_muon is deprecated; use --optimizer muon '
-                            'with --use-distributed-optimizer instead.')
+    group.add_argument(
+        '--optimizer',
+        type=str,
+        default='adam',
+        choices=[
+            'adam',
+            'sgd',
+            'muon',
+            'dist_muon',
+            'lion',
+            'soap',
+            'adaptive_muon',
+            'angular_muown',
+            'angular_muown_simplified',
+        ],
+        help='Optimizer function. '
+        'Note: dist_muon is deprecated; use --optimizer muon '
+        'with --use-distributed-optimizer instead.',
+    )
     group.add_argument('--optimizer-cpu-offload', action='store_true',
                        help='Offload optimizer state to CPU')
     group.add_argument('--optimizer-cuda-graph', action='store_true',

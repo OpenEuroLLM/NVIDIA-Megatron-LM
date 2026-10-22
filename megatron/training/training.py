@@ -2041,10 +2041,13 @@ def get_optimizer_param_scheduler(optimizer):
         if args.angular_muown_c is None:
             raise ValueError("angular_muown_simplified requires --angular-muown-c")
         if (
-            args.rampup_batch_size is not None or args.step_batch_size_schedule is not None
+            args.rampup_batch_size is not None
+            or args.step_batch_size_schedule is not None
             or args.decrease_batch_size_if_needed
         ):
-            raise ValueError("angular_muown_simplified requires a fixed global batch without automatic reduction")
+            raise ValueError(
+                "angular_muown_simplified requires a fixed global batch without automatic reduction"
+            )
         angular_schedule = dict(
             c=args.angular_muown_c,
             global_batch_size=args.global_batch_size,

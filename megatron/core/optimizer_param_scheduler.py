@@ -148,7 +148,8 @@ class OptimizerParamScheduler:
         self.optimizer = optimizer
         self.angular_muown_schedule = (
             {"cooldown_fraction": 0.2, "cooldown_end_ratio": 0.05, **angular_muown_schedule}
-            if angular_muown_schedule is not None else None
+            if angular_muown_schedule is not None
+            else None
         )
         if self.angular_muown_schedule is not None:
             self._validate_angular_schedule(self.angular_muown_schedule)
@@ -398,7 +399,9 @@ class OptimizerParamScheduler:
 
         saved = state_dict.get('angular_muown_schedule')
         if (self.angular_muown_schedule is None) != (saved is None):
-            raise ValueError("Cannot switch to or from angular_muown_simplified when resuming optimizer state")
+            raise ValueError(
+                "Cannot switch to or from angular_muown_simplified when resuming optimizer state"
+            )
         if saved is not None:
             self._validate_angular_schedule(saved)
             if saved['global_batch_size'] != self.angular_muown_schedule['global_batch_size']:
