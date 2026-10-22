@@ -1519,12 +1519,23 @@ class TensorParallelAngularMuownSimplified(TensorParallelAngularMuown):
         if not math.isfinite(u_lr) or u_lr < 0.0:
             raise ValueError("u_lr must be finite and nonnegative")
         super().__init__(
-            params, lr=lr, momentum=momentum, nesterov=nesterov, betas=betas,
-            adam_eps=adam_eps, split_qkv=split_qkv, is_qkv_fn=is_qkv_fn,
-            qkv_split_shapes=qkv_split_shapes, fp32_matmul_prec=fp32_matmul_prec,
-            coefficient_type=coefficient_type, num_ns_steps=num_ns_steps,
-            scale_mode=scale_mode, extra_scale_factor=1.0,
-            pg_collection=pg_collection, tp_mode=tp_mode, batched_step=batched_step,
+            params,
+            lr=lr,
+            momentum=momentum,
+            nesterov=nesterov,
+            betas=betas,
+            adam_eps=adam_eps,
+            split_qkv=split_qkv,
+            is_qkv_fn=is_qkv_fn,
+            qkv_split_shapes=qkv_split_shapes,
+            fp32_matmul_prec=fp32_matmul_prec,
+            coefficient_type=coefficient_type,
+            num_ns_steps=num_ns_steps,
+            scale_mode=scale_mode,
+            extra_scale_factor=1.0,
+            pg_collection=pg_collection,
+            tp_mode=tp_mode,
+            batched_step=batched_step,
         )
         self.defaults["u_lr"] = u_lr
         for group in self.param_groups:
@@ -1677,9 +1688,12 @@ def _muown_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, An
 
         kwargs["row_sum_fn"] = _row_sum
         kwargs["tp_shape_fn"] = _tp_shape
+    return kwargs
 
 
-def _angular_muown_simplified_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any]:
+def _angular_muown_simplified_config_to_kwargs(
+    config, model_chunks, pg_collection
+) -> Dict[str, Any]:
     """Build the C/t variant using only its supported constructor settings."""
     kwargs = _angular_muown_config_to_kwargs(
         config, model_chunks, pg_collection, TensorParallelAngularMuownSimplified
