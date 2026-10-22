@@ -379,14 +379,57 @@ class EngramLayer(MegatronModule):
             for ids, _ in g["batches"]:
                 key_to_group[(ids.reshape(1, -1).data_ptr(), ids.numel())] = g
         self._step_groups = key_to_group
+        if os.environ.get("ENGRAM_ASYNC_GROUPS", "0") == "1":
+            # every group's rows now, all exchange plans in one host sync, group 0 in flight
+            from megatron.core.ssm.engram_sharded import plan_group_exchanges
+
+            for g in groups:
+                self._group_rows(g)
+            plans = plan_group_exchanges(self, [g["uniq"] for g in groups])
+            for i, (g, plan) in enumerate(zip(groups, plans)):
+                g["plan"], g["next"] = plan, groups[i + 1] if i + 1 < len(groups) else None
+            self._start_group_exchange(groups[0])
         from megatron.core.ssm.engram_sharded import PENDING_STEP_LOOKUPS
 
         PENDING_STEP_LOOKUPS.append(self)
+
+    def _group_rows(self, group):
+        """A group's sorted unique rows and each micro-batch's inverse index."""
+        rows_all, keys, sizes = [], [], []
+        for ids, cu in group["batches"]:
+            rows, key = self._hashed_rows(ids, cu)
+            rows_all.append(rows)
+            sizes.append(rows.numel())
+            keys.append(key)
+        uniq, inverse = torch.unique(torch.cat(rows_all), return_inverse=True)
+        group["uniq"], group["inverse"] = uniq, dict(zip(keys, inverse.split(sizes)))
+
+    def _start_group_exchange(self, group):
+        from megatron.core.ssm.engram_sharded import GroupExchange
+
+        if group is not None and group.get("exchange") is None and group["batches"]:
+            group["exchange"] = GroupExchange(
+                self, group["uniq"], group["plan"], self.config.params_dtype
+            )
 
     def _group_lookup(self, group):
         """Exchange a stashed group's rows (once)."""
         from megatron.core.ssm.engram_sharded import exchange_rows
 
+        if "plan" in group:  # ENGRAM_ASYNC_GROUPS: in flight since the previous group
+            self._start_group_exchange(group)
+            exchange = group["exchange"]
+            values = exchange.wait()
+            group["lookup"] = {
+                "values": values,
+                "grad": torch.zeros(values.shape[0], self.embed_dim, dtype=torch.float32,
+                                    device=values.device),
+                "exchange": exchange,
+                "inverse": group.pop("inverse"),
+            }
+            group["remaining"] = len(group["batches"])
+            self._start_group_exchange(group["next"])  # one group ahead
+            return
         rows_all, keys, sizes = [], [], []
         for ids, cu in group["batches"]:
             rows, key = self._hashed_rows(ids, cu)
@@ -413,7 +456,10 @@ class EngramLayer(MegatronModule):
         from megatron.core.ssm.engram_sharded import exchange_grads
 
         lookup, group["lookup"] = group["lookup"], None
-        if lookup is not None:
+        if lookup is not None and "exchange" in lookup:
+            lookup["exchange"].flush_grads(lookup["grad"], self.config.params_dtype)
+            group["exchange"] = None
+        elif lookup is not None:
             exchange_grads(self, lookup["state"], lookup["grad"], self.config.params_dtype)
         group["batches"] = []  # done: nothing of it is looked up again this step
 
@@ -459,6 +505,9 @@ class EngramLayer(MegatronModule):
             for group in {id(g): g for g in groups.values()}.values():
                 if group["lookup"] is not None:
                     self._flush_group(group)
+                elif group.get("exchange") is not None:  # issued, never looked up
+                    group["exchange"].wait()
+                    group["exchange"] = None
 
     def set_input_ids(self, input_ids: Optional[torch.Tensor]) -> None:
         """Token ids [b, s] of the current micro-batch (set by HybridStack)."""

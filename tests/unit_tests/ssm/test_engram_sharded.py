@@ -317,7 +317,8 @@ def test_step_lookup_matches_per_microbatch(monkeypatch, sparse):
 
 @pytest.mark.skipif(Utils.world_size < 2, reason="needs 2+ GPUs")
 @pytest.mark.parametrize("sparse", [False, True])
-def test_step_lookup_groups_match_per_microbatch(monkeypatch, sparse):
+@pytest.mark.parametrize("async_groups", [False, True])
+def test_step_lookup_groups_match_per_microbatch(monkeypatch, sparse, async_groups):
     """ENGRAM_STEP_GROUP: the step lookup in groups of 2 of 5 micro-batches, under a pipelined,
     fully recomputed order (no-grad forwards running ahead, recompute + backward later): the
     per-micro-batch path's outputs and table gradients; a group's gradients reach their owners
@@ -326,6 +327,7 @@ def test_step_lookup_groups_match_per_microbatch(monkeypatch, sparse):
     from megatron.core.ssm.engram_sharded import PENDING_STEP_LOOKUPS, flush_step_lookups
 
     monkeypatch.setenv("ENGRAM_SPARSE_GRAD", "1" if sparse else "0")
+    monkeypatch.setenv("ENGRAM_ASYNC_GROUPS", "1" if async_groups else "0")
     Utils.initialize_model_parallel(tensor_model_parallel_size=1)
     try:
         model_parallel_cuda_manual_seed(123)
@@ -380,6 +382,9 @@ def test_step_lookup_groups_match_per_microbatch(monkeypatch, sparse):
             if k == 0:
                 assert _grad(layer).abs().sum() == 0  # group {0, 1} still open
             if k == 1:
+                from megatron.core.ssm.engram_sharded import join_async_flushes
+
+                join_async_flushes()  # (ENGRAM_ASYNC_GROUPS: the flush runs on a side stream)
                 assert _grad(layer).abs().sum() > 0  # ... flushed after its last backward
         flush_step_lookups()  # the last group ({4}) flushed already; nothing left
         assert not PENDING_STEP_LOOKUPS and layer._step_groups is None

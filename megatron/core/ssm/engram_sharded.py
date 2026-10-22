@@ -294,6 +294,104 @@ class StepRowGather(torch.autograd.Function):
         return grad.new_zeros(()), None, None, None, None
 
 
+# ---- asynchronous group exchanges (ENGRAM_ASYNC_GROUPS=1) ---------------------------------------
+# The group lookup's exchanges, issued ahead instead of at the group's first forward: every
+# group's rows are known at the step start (the micro-batches are prefetched), so the per-owner
+# counts of ALL groups are exchanged there in one all-to-all with one host sync; each group's
+# row exchange is then a chain of async all-to-alls (requests, then values gathered by the
+# owners on a side stream) without host syncs, issued one group ahead and waited for on the GPU
+# only. The gradient flush runs the same way on the side stream; prepare_grads joins it. Every
+# rank of a shard group issues the same collectives in the same program order, so they match.
+
+_SIDE_STREAM = None
+_FLUSH_PENDING = []  # side-stream work the optimizer step must wait for
+
+
+def _side_stream():
+    global _SIDE_STREAM
+    if _SIDE_STREAM is None:
+        _SIDE_STREAM = torch.cuda.Stream()
+    return _SIDE_STREAM
+
+
+def plan_group_exchanges(layer, uniqs):
+    """Sorted unique rows of each group -> per group ``(send_splits, recv_splits)`` (None for
+    an unsharded table): one count all-to-all, one host sync for all groups."""
+    group, size = layer.shard_group, layer.shard_size
+    if size == 1:
+        return [None] * len(uniqs)
+    n = len(uniqs)
+    counts = torch.stack([torch.bincount(row_owner(u, layer.total_rows, size), minlength=size)
+                          for u in uniqs])  # [n, P]
+    send = counts.t().contiguous().reshape(-1)  # destination-major: P chunks of n counts
+    recv = torch.empty_like(send)
+    dist.all_to_all_single(recv, send, group=group)
+    both = torch.stack([counts, recv.view(size, n).t()]).tolist()  # the one host sync
+    return [(both[0][g], both[1][g]) for g in range(n)]
+
+
+class GroupExchange:
+    """One group's rows, in flight: requests to the owners, their values back (async)."""
+
+    def __init__(self, layer, uniq, splits, dtype):
+        self.layer, self.uniq, self.splits = layer, uniq, splits
+        if splits is None:
+            self.values = layer.table.index_select(0, uniq - layer.row_start).to(dtype)
+            self.requested, self.work = uniq, None
+            return
+        send_splits, recv_splits = splits
+        group, side = layer.shard_group, _side_stream()
+        self.requested = uniq.new_empty(sum(recv_splits))
+        self.values = torch.empty(sum(send_splits), layer.embed_dim, dtype=dtype,
+                                  device=uniq.device)
+        w1 = dist.all_to_all_single(self.requested, uniq, output_split_sizes=recv_splits,
+                                    input_split_sizes=send_splits, group=group, async_op=True)
+        with torch.cuda.stream(side):
+            w1.wait()  # the side stream waits for the requests, not the host
+            owned = layer.table.index_select(0, self.requested - layer.row_start).to(dtype)
+            self.work = dist.all_to_all_single(self.values, owned, output_split_sizes=send_splits,
+                                               input_split_sizes=recv_splits, group=group,
+                                               async_op=True)
+        self._owned = owned  # alive until the values arrived
+
+    def wait(self) -> torch.Tensor:
+        if self.work is not None:
+            self.work.wait()  # the current stream waits (GPU side)
+            self.work, self._owned = None, None
+        return self.values
+
+    def flush_grads(self, grad_uniq: torch.Tensor, dtype: torch.dtype) -> None:
+        """The group's row gradients -> their owners' table_grad, on the side stream."""
+        layer = self.layer
+        if self.splits is None:
+            layer.table_grad.index_add_(0, self.requested - layer.row_start, grad_uniq)
+            return
+        send_splits, recv_splits = self.splits
+        side, current = _side_stream(), torch.cuda.current_stream()
+        with torch.cuda.stream(side):
+            side.wait_stream(current)  # the gradients are complete
+            sent = grad_uniq.to(dtype)
+            owned = torch.empty(sum(recv_splits), layer.embed_dim, dtype=dtype,
+                                device=grad_uniq.device)
+            dist.all_to_all_single(owned, sent, output_split_sizes=recv_splits,
+                                   input_split_sizes=send_splits, group=layer.shard_group,
+                                   async_op=True).wait()
+            owned32 = owned.float()
+            layer.table_grad.index_add_(0, self.requested - layer.row_start, owned32)
+        for t in (grad_uniq, self.requested):
+            t.record_stream(side)  # used on the side stream, freed on the current one
+        owned32.record_stream(current)  # SparseRowGrad keeps it and coalesces on the current
+        _FLUSH_PENDING.append(side)
+
+
+def join_async_flushes() -> None:
+    """The current stream waits for the side-stream gradient flushes (before the norm / step)."""
+    current = torch.cuda.current_stream()
+    for stream in {id(s): s for s in _FLUSH_PENDING}.values():
+        current.wait_stream(stream)
+    _FLUSH_PENDING.clear()
+
+
 # Layers holding a step lookup whose gradients still have to go to their owners, in the order
 # they prefetched (identical on every rank of a shard group, so the exchanges match).
 PENDING_STEP_LOOKUPS = []
@@ -305,3 +403,4 @@ def flush_step_lookups() -> None:
     for layer in PENDING_STEP_LOOKUPS:
         layer.flush_step_lookup()
     PENDING_STEP_LOOKUPS.clear()
+    join_async_flushes()
