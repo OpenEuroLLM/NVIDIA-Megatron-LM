@@ -10,7 +10,9 @@ pre-hook slices the hidden states), so long contexts (the passkey task at 32k) n
 full-vocabulary logits.
 
 Metrics per task: "mc" questions -> acc (argmax of the sum) and acc_norm (sum / characters);
-"greedy" (LAMBADA) -> acc (every continuation token is the argmax) and the continuation's mean NLL.
+"greedy" (LAMBADA) -> acc (every continuation token is the argmax) and the continuation's mean NLL;
+"ppl" (long documents, one item with an empty continuation) -> the mean next-token NLL per position
+bin (PPL_BINS), token-weighted over the documents.
 Questions are spread over all ranks (each rank runs one item per forward; ranks run equally
 many forwards, padded with repeats, since expert parallelism exchanges tokens every layer).
 Results: printed by rank 0 as "[downstream_eval] {json}" and written to DOWNSTREAM_EVAL_OUT, by
@@ -58,6 +60,51 @@ def score_item(model, base, ctx, cont, device):
     return lp, greedy
 
 
+# position bins of the "ppl" items (long documents): [lo, hi) token positions
+PPL_BINS = (0, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072)
+
+
+@torch.no_grad()
+def score_ppl(model, base, ctx, device, chunk: int = 2048):
+    """Per-bin (sum NLL, count) over every next-token prediction of one long document ``ctx``.
+
+    The output layer's pre-hook keeps the final hidden states and hands the layer one position;
+    the logits are then computed 2k positions at a time, so 64k-token documents never hold the
+    full [s, V] logits."""
+    tokens = torch.tensor([ctx], dtype=torch.long, device=device)
+    seq = tokens.shape[1]
+    kept = {}
+
+    def pre_hook(module, args, kwargs):
+        kept["h"] = args[0]
+        return (args[0][:1],) + tuple(args[1:]), kwargs
+
+    handle = base.output_layer.register_forward_pre_hook(pre_hook, with_kwargs=True)
+    try:
+        pos = torch.arange(seq, device=device).unsqueeze(0)
+        model(tokens, pos, None)
+    finally:
+        handle.remove()
+    h = kept["h"]  # [s, 1, hidden]
+    nll = torch.empty(seq - 1, device=device)
+    weight = base.shared_embedding_or_output_weight() if getattr(base, "share_embeddings_and_output_weights", False) else None
+    for lo in range(0, seq - 1, chunk):
+        hi = min(lo + chunk, seq - 1)
+        out = base.output_layer(h[lo:hi], weight=weight)
+        logits = out[0] if isinstance(out, tuple) else out  # [n, 1, V]
+        if hasattr(base, "_scale_logits"):  # as the model's own head (mup output scaling)
+            logits = base._scale_logits(logits)
+        logp = torch.log_softmax(logits[:, 0].float(), dim=-1)
+        nll[lo:hi] = -logp.gather(-1, tokens[0, lo + 1:hi + 1].unsqueeze(-1)).squeeze(-1)
+    bins = {}
+    for b_lo, b_hi in zip(PPL_BINS[:-1], PPL_BINS[1:]):
+        if b_lo >= seq - 1:
+            break
+        part = nll[b_lo:min(b_hi, seq - 1)]
+        bins[f"{b_lo}-{b_hi}"] = (part.sum().item(), part.numel())
+    return bins
+
+
 def maybe_run_downstream_eval(model) -> None:
     path = os.environ.get("DOWNSTREAM_EVAL_FILE")
     if not path:
@@ -87,7 +134,10 @@ def maybe_run_downstream_eval(model) -> None:
     for step in range(n_steps):
         qi, ii = mine[step] if step < len(mine) else work[0]  # padding: a repeat, discarded
         it = questions[qi]["items"][ii]
-        lp, greedy = score_item(chunks[0], base, it["ctx"], it["cont"], device)
+        if questions[qi]["kind"] == "ppl":
+            lp, greedy = score_ppl(chunks[0], base, it["ctx"], device), None
+        else:
+            lp, greedy = score_item(chunks[0], base, it["ctx"], it["cont"], device)
         if step < len(mine):
             results.append((qi, ii, lp, greedy))
         if rank == 0 and step % 500 == 0:
@@ -108,6 +158,11 @@ def maybe_run_downstream_eval(model) -> None:
         items = per_q[qi]
         t = q["task"]
         agg[t]["n"] += 1
+        if q["kind"] == "ppl":  # mean NLL per position bin, over the documents' tokens
+            for name, (tot, cnt) in items[0][0].items():
+                agg[t][f"nll_sum_{name}"] += tot
+                agg[t][f"count_{name}"] += cnt
+            continue
         if q["kind"] == "greedy":
             lp, greedy = items[0]
             agg[t]["acc"] += greedy
@@ -117,7 +172,17 @@ def maybe_run_downstream_eval(model) -> None:
             norm = [lp / max(1, q["items"][i]["nchars"]) for i, lp in enumerate(lps)]
             agg[t]["acc"] += int(max(range(len(lps)), key=lps.__getitem__) == q["gold"])
             agg[t]["acc_norm"] += int(max(range(len(norm)), key=norm.__getitem__) == q["gold"])
-    out = {t: {k: (v / m["n"] if k != "n" else int(v)) for k, v in m.items()} for t, m in agg.items()}
+    out = {}
+    for t, m in agg.items():
+        if any(k.startswith("nll_sum_") for k in m):  # ppl: token-weighted mean per bin
+            out[t] = {"n": int(m["n"])}
+            for k, v in m.items():
+                if k.startswith("nll_sum_"):
+                    name = k[len("nll_sum_"):]
+                    out[t][f"nll_{name}"] = v / max(1.0, m[f"count_{name}"])
+                    out[t][f"tokens_{name}"] = int(m[f"count_{name}"])
+        else:
+            out[t] = {k: (v / m["n"] if k != "n" else int(v)) for k, v in m.items()}
     print("[downstream_eval] " + json.dumps(out, sort_keys=True), flush=True)
     dest = os.environ.get("DOWNSTREAM_EVAL_OUT")
     if not dest:  # default: next to the run's checkpoints (one env for every arm of an array job)
