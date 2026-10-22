@@ -10,8 +10,7 @@
 # For a resume check, run with --exit-interval 6, then repeat the same command
 # without that flag and add --load "$OUT_DIR/checkpoints" --exit-on-missing-checkpoint.
 # Keep the full 12-update horizon and batch size unchanged; use another OUT_DIR
-# for the uninterrupted comparison. This mock-data script has only been dry-run;
-# ROCm remains unvalidated.
+# for the uninterrupted comparison.
 # GPUS defaults to 1. DRY_RUN=1 prints the command without creating files/running Python.
 set -euo pipefail
 c=${1:?Usage: OUT_DIR=/absolute/local/scratch/run bash run_inverse_time.sh C [Megatron args...]}
