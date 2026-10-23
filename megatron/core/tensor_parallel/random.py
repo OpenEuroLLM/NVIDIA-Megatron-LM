@@ -644,6 +644,9 @@ class CheckpointFunction(torch.autograd.Function):
 
         inputs = ctx.saved_tensors
         slot = ctx.offload_slot
+        # the fetched input is our own copy unless it is a pipeline receive buffer handed back as the
+        # schedule's leaf itself (RECOMPUTE_OFFLOAD_LEAF, direct leaf): only a copy may be released
+        own_copy = slot is not None and (slot.leaf is None or slot.leaf_shape is not None)
         if slot is not None:
             from megatron.core.tensor_parallel import checkpoint_offload
 
@@ -676,6 +679,19 @@ class CheckpointFunction(torch.autograd.Function):
         )
         torch.autograd.backward(outputs, args)
         grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else inp for inp in detached_inputs)
+        # The recompute is done: nothing needs the inputs' gradients on the inputs any more (they are
+        # returned) or the data of an input fetched back from the host (our own copy). Release both:
+        # under Megatron-FSDP the units' backward-hook bookkeeping keeps the module inputs -- the
+        # detached chunk inputs -- referenced until the step's gradient sync, which kept every
+        # chunk's input and input gradient of the micro-batch alive (no pipeline: 48 chunks, ~11 GiB
+        # at 16k mbs 2 PreNorm, 4x with mHC-4; memory trace f6, docs/pp_vs_fsdp.md).
+        for inp in detached_inputs:
+            if isinstance(inp, torch.Tensor):
+                inp.grad = None
+        if own_copy:
+            for t in (detached_inputs[0], inputs[0]):
+                if isinstance(t, torch.Tensor):
+                    t.data = torch.empty(0, dtype=t.dtype, device=t.device)
 
         _unset_checkpointing()
         return (None, None) + grads
