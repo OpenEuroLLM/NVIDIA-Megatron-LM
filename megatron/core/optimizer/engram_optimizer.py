@@ -38,12 +38,21 @@ logger = logging.getLogger(__name__)
 
 def engram_sharded_tables(model_chunks) -> List[torch.nn.Parameter]:
     """The ``engram_table_parallel="dp"`` table shards of this rank."""
-    return [
+    tables = [
         p
         for chunk in model_chunks
         for p in chunk.parameters()
         if getattr(p, "engram_sharded_table", False)
     ]
+    # under Megatron-FSDP the tables are unregistered (mcore_fsdp_adapter.hide_sharded_tables)
+    seen = {id(p) for p in tables}
+    for chunk in model_chunks:
+        for sub in chunk.modules():
+            for p in sub.__dict__.get("_fsdp_hidden_tables", ()):
+                if id(p) not in seen:
+                    tables.append(p)
+                    seen.add(id(p))
+    return tables
 
 
 _CHUNK_ELEMENTS = 1 << 24  # elements per update chunk (64 MB of fp32 temporaries)

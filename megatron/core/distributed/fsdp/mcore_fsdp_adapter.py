@@ -60,6 +60,23 @@ except ImportError as import_megatron_fsdp_error:
 logger = logging.getLogger(__name__)
 
 
+def hide_sharded_tables(module: torch.nn.Module) -> int:
+    """Unregister the ``engram_sharded_table`` parameters of ``module``'s submodules: each stays
+    the same attribute (``layer.table``), but outside ``parameters()``; the submodule lists them
+    in ``_fsdp_hidden_tables``. Returns how many were hidden."""
+    count = 0
+    for sub in module.modules():
+        for name, p in list(sub._parameters.items()):
+            if p is not None and getattr(p, "engram_sharded_table", False):
+                del sub._parameters[name]
+                object.__setattr__(sub, name, p)
+                if "_fsdp_hidden_tables" not in sub.__dict__:
+                    object.__setattr__(sub, "_fsdp_hidden_tables", [])
+                sub._fsdp_hidden_tables.append(p)
+                count += 1
+    return count
+
+
 class FullyShardedDataParallel(_BaseDataParallel):
     """
     Fully Sharded Data Parallel (FSDP) wrapper for the Megatron model.
@@ -190,6 +207,11 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 f"{supported_fsdp_unit_modules}, "
                 f"got {self.fsdp_unit_modules}."
             )
+        # Engram / PKM tables sharded by their own layer (engram_table_parallel="dp"; their
+        # gradients and Adam live in EngramTableOptimizer): FSDP must not shard and gather them
+        # again (it also shards frozen parameters). They become plain attributes of their module
+        # (the same tensors, no longer registered); engram_sharded_tables() finds them there.
+        hide_sharded_tables(module)
         super().__init__(
             config=config,
             module=MegatronFSDP(
