@@ -1427,6 +1427,32 @@ def generate_state_dict(
     return state_dict
 
 
+def _restore_loaded_scalars(raw, loaded):
+    """DCP loads tensors in place but writes non-tensor values (step counters, param-group lr and
+    step) into the dicts it is given, the preprocessed copies, and under ``str`` keys where the
+    dict has int keys (a ChainedOptimizer's ``{0: ..., 1: ...}``: the loaded scalars land in a new
+    ``'0'`` entry). Copy those values back into the raw optimizer state dict; a SwiGLU-split
+    parameter's scalars come from its ``_w`` part."""
+    if isinstance(raw, dict) and isinstance(loaded, dict):
+        for key, value in raw.items():
+            if not isinstance(key, str) and str(key) in loaded:
+                src = loaded[str(key)]
+            else:
+                src = loaded.get(key, loaded.get(f"{key}_w") if isinstance(key, str) else None)
+            if src is None:
+                continue
+            if isinstance(value, (dict, list)):
+                _restore_loaded_scalars(value, src)
+            elif not isinstance(value, torch.Tensor) and not isinstance(src, torch.Tensor):
+                raw[key] = src
+    elif isinstance(raw, list) and isinstance(loaded, list) and len(raw) == len(loaded):
+        for i, (value, src) in enumerate(zip(raw, loaded)):
+            if isinstance(value, (dict, list)):
+                _restore_loaded_scalars(value, src)
+            elif not isinstance(value, torch.Tensor) and not isinstance(src, torch.Tensor):
+                raw[i] = src
+
+
 def preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model):
     state_dict = raw_state_dict.copy()
     handle_fp8_extra_state_case(state_dict['model'])
@@ -1878,6 +1904,7 @@ def _load_base_checkpoint(
         )
 
         if raw_optimizer_state_dict is not None:
+            _restore_loaded_scalars(raw_optimizer_state_dict, state_dict['optimizer'])
             state_dict['optimizer'] = raw_optimizer_state_dict
 
         if raw_model_state_dict is not None:
