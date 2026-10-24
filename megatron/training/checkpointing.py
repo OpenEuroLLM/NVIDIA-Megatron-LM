@@ -591,9 +591,18 @@ def _debug_optimizer_state(optimizer, tag):
         print(f"[opt-state {tag}] " + " ".join(f"{k}={v:.6e}(n{counts.get(k, 1)})"
                                               for k, v in sorted(sums.items())), flush=True)
     if path:  # per rank and parameter (in param-group order): main param, grad, states (sum sq)
-        def sq(v):
+        def sq(v):  # sum of squares and a position-weighted sum (sees permuted rows / halves)
             t = v._local_tensor if hasattr(v, "_local_tensor") else v
-            return float(t.double().pow(2).sum()) if t.numel() else 0.0
+            if not t.numel():
+                return "0"
+            t, n = t.detach().reshape(-1), t.numel()
+            ss = ws = 0.0
+            for lo in range(0, n, 1 << 24):  # chunks: the Engram tables are ~0.3 G elements
+                c = t[lo : lo + (1 << 24)].double()
+                w = torch.arange(lo, lo + c.numel(), device=c.device, dtype=torch.float64)
+                ss += float(c.pow(2).sum())
+                ws += float((c * (1.0 + w / n)).sum())
+            return f"{ss:.9e}/{ws:.9e}"
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         with open(f"{path}.{tag.replace(' ', '_')}.rank{rank}.txt", "w") as f:
             for idx, opt in enumerate(getattr(optimizer, "chained_optimizers", [optimizer])):
@@ -602,8 +611,8 @@ def _debug_optimizer_state(optimizer, tag):
                     for j, p in enumerate(group["params"]):
                         state = inner.state.get(p, {})
                         grad = getattr(p, "grad", None)
-                        vals = [f"param={sq(p.detach()):.9e}"] + (
-                            [f"grad={sq(grad):.9e}"] if isinstance(grad, torch.Tensor) else []
+                        vals = [f"param={sq(p.detach())}"] + (
+                            [f"grad={sq(grad)}"] if isinstance(grad, torch.Tensor) else []
                         ) + [
                             f"{k}={sq(v) if isinstance(v, torch.Tensor) else v}"
                             for k, v in sorted(state.items())
