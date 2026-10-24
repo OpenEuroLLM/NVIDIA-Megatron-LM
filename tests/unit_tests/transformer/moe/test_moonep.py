@@ -272,3 +272,32 @@ def test_moonep_two_steps_and_param_layout(monkeypatch):
     err = ((out.float() - ref).norm() / ref.norm()).item()
     print(f"rank {rank}: after one step rel error {err}", flush=True)
     assert err < 2e-2, err
+
+
+def test_moonep_sharded_state_dict_expert_dp_replicas():
+    """EP 2 x expert-DP 2: the checkpoint's DP replica ids come from the expert-DP group, so
+    every expert has exactly one main replica. With the dense dp_cp rank (4 ranks) only EP
+    rank 0's experts were main and torch_dist saves failed the sharding validation."""
+    from megatron.core.dist_checkpointing.dict_utils import nested_values
+    from megatron.core.dist_checkpointing.state_dict_utils import save_preprocess
+
+    rank, W = _init()
+    if W != 4:
+        pytest.skip("needs 4 ranks (torchrun --nproc-per-node 4)")
+    R, E = 2, 8
+    epn = E // R
+    ep_groups = [dist.new_group([0, 1]), dist.new_group([2, 3])]
+    edp_groups = [dist.new_group([0, 2]), dist.new_group([1, 3])]
+    singles = [dist.new_group([r]) for r in range(W)]
+    cfg = _config(256, 128, E, 2, R)
+    pgc = SimpleNamespace(ep=ep_groups[rank // 2], expt_tp=singles[rank],
+                          tp=singles[rank], expt_dp=edp_groups[rank % 2])
+    experts = MoonEPGroupedMLP(epn, cfg, pgc)
+    sd = experts.sharded_state_dict(
+        prefix="mlp.experts.", metadata={"dp_cp_group": dist.group.WORLD}
+    )
+    sharded, _ = save_preprocess(sd)  # raises CheckpointingException on a bad access pattern
+    tensors = list(nested_values(sharded))
+    assert len(tensors) == 3 * epn  # fc1 split into its gate / up halves, fc2
+    for st in tensors:
+        assert st.replica_id[-1] == rank // 2, (st.key, st.replica_id)
