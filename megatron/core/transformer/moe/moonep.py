@@ -536,6 +536,10 @@ class MoonEPGroupedMLP(MegatronModule):
         )
         self.ep_group = getattr(pg_collection, "ep", None) if pg_collection is not None else None
         self.tp_group = getattr(pg_collection, "expt_tp", None) if pg_collection is not None else None
+        # the experts' replicate group (checkpoint replica ids), as TEGroupedMLP's
+        self.expt_dp_group = (
+            getattr(pg_collection, "expt_dp", None) if pg_collection is not None else None
+        )
         # plain attributes, not buffers: Float16Module would cast an fp32 buffer to bf16, and
         # MoonEP's grad reduce needs the fp32 placeholder grad
         self._dummy_w = torch.zeros(epn, _DUMMY, _DUMMY, device=dev, dtype=torch.bfloat16)
@@ -644,6 +648,13 @@ class MoonEPGroupedMLP(MegatronModule):
                     tp_group=self.tp_group, dp_cp_group=metadata["dp_cp_group"],
                 )
                 st = sub[f"{prefix}experts.{name}.weight"]
+                # The DP replica id over the expert-DP group, as TEGroupedLinear: the dense
+                # dp_cp rank made only EP rank 0's experts main replicas (EP > 1: every
+                # torch_dist save failed the sharding validation).
+                if self.expt_dp_group is not None and not getattr(
+                    st, "is_data_parallel_fully_shard", False
+                ):
+                    st.replica_id = (*st.replica_id[:2], self.expt_dp_group.rank())
                 if name == "linear_fc1":
                     st = apply_swiglu_sharded_factory(
                         st, offs, tp_group=self.tp_group, dp_group=metadata["dp_cp_group"]
