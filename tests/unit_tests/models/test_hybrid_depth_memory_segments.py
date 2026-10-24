@@ -73,10 +73,16 @@ def test_segments_match_one_sequence(impl, variant):
         Utils.destroy_model_parallel()
 
 
+@pytest.mark.parametrize("fused", ["0", "1"])
 @pytest.mark.parametrize("pattern", ["*-*-*-", "*E*E-*"])
-def test_unwind_matches_one_sequence(pattern):
+def test_unwind_matches_one_sequence(pattern, fused, monkeypatch):
     """depth_memory_unwind: full recompute, one layer per chunk, no state in the checkpoints (each
-    layer's recompute reads the unwound state); two micro-batches in a row."""
+    layer's recompute reads the unwound state); two micro-batches in a row. The torch path does
+    the reference's arithmetic (tight); the fused Triton passes compute in true fp32 while the
+    reference's einsums run in TF32 under the NGC container's cuBLAS override (~1e-3)."""
+    monkeypatch.setenv("DEPTH_MEMORY_UNWIND_TRITON", fused)
+    out_tol = dict(rtol=1e-4, atol=1e-5) if fused == "0" else dict(rtol=2e-2, atol=3e-4)
+    grad_tol = dict(rtol=1e-3, atol=1e-5) if fused == "0" else dict(rtol=3e-2, atol=3e-4)
     Utils.initialize_model_parallel(1, 1)
     try:
         kw = dict(num_moe_experts=4, moe_router_topk=2, moe_ffn_hidden_size=64) if "E" in pattern else {}
@@ -87,9 +93,9 @@ def test_unwind_matches_one_sequence(pattern):
         for batch in ids:
             ref_out, ref_grads = _fwd_bwd(ref, batch)
             out, grads = _fwd_bwd(model, batch)
-            torch.testing.assert_close(out, ref_out, rtol=1e-4, atol=1e-5)
+            torch.testing.assert_close(out, ref_out, **out_tol)
             assert set(grads) == set(ref_grads)
             for k in ref_grads:
-                torch.testing.assert_close(grads[k], ref_grads[k], rtol=1e-3, atol=1e-5, msg=k)
+                torch.testing.assert_close(grads[k], ref_grads[k], **grad_tol, msg=k)
     finally:
         Utils.destroy_model_parallel()
