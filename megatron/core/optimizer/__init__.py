@@ -1045,15 +1045,15 @@ def _get_megatron_fsdp_emerging_optimizer(
         parts.append(opt)
         init_fns.append(init_fn)
     composite = _CompositeTorchOptimizer(parts)
-    log_single_rank(
-        logger,
-        logging.INFO,
-        f"Megatron-FSDP {eopt_name}: "
-        + ", ".join(
-            f"{type(part).__name__} {sum(len(g['params']) for g in part.param_groups)} params"
-            for part in parts
-        ),
+    routing = f"Megatron-FSDP {eopt_name}: " + ", ".join(
+        f"{type(part).__name__} {sum(len(g['params']) for g in part.param_groups)} params "
+        f"({sum(p.numel() for g in part.param_groups for p in g['params']) / 1e9:.3f}B)"
+        for part in parts
     )
+    # printed (not logged at INFO, which the default log level filters): the routing is the first
+    # thing to compare against another optimizer path
+    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+        print(routing, flush=True)
 
     def init_state_fn(opt, config=None):
         for part, fn in zip(opt.optimizers, init_fns):
