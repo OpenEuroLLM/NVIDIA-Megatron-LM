@@ -1402,11 +1402,31 @@ def preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model):
     handle_fp8_extra_state_case(state_dict['model'])
     if args.swiglu:
         if 'optimizer' in state_dict:
-            model_state_dict, optimizer_state_dict = handle_swiglu_in_state_dict(
-                model, state_dict['model'], state_dict['optimizer']
-            )
-            state_dict['model'] = model_state_dict
-            state_dict['optimizer'] = optimizer_state_dict
+            optim = state_dict['optimizer']
+            if isinstance(optim, dict) and 'state' not in optim:
+                # a ChainedOptimizer ({idx: sub-optimizer state}, e.g. the FSDP optimizer and the
+                # Engram tables' optimizer): split each sub-optimizer that holds a 'state'
+                optim = dict(optim)
+                model_state_dict = state_dict['model']
+                done = False
+                for idx, sub in optim.items():
+                    if isinstance(sub, dict) and 'state' in sub:
+                        model_state_dict, optim[idx] = handle_swiglu_in_state_dict(
+                            model, state_dict['model'], sub
+                        )
+                        done = True
+                if not done:
+                    model_state_dict, _ = handle_swiglu_in_state_dict(
+                        model, state_dict['model'], None
+                    )
+                state_dict['model'] = model_state_dict
+                state_dict['optimizer'] = optim
+            else:
+                model_state_dict, optimizer_state_dict = handle_swiglu_in_state_dict(
+                    model, state_dict['model'], optim
+                )
+                state_dict['model'] = model_state_dict
+                state_dict['optimizer'] = optimizer_state_dict
         else:
             model_state_dict, _ = handle_swiglu_in_state_dict(model, state_dict['model'], None)
             state_dict['model'] = model_state_dict
