@@ -565,7 +565,9 @@ def _debug_optimizer_state(optimizer, tag):
     state (all sub-optimizers), at a save and after a load -- what a resume does not restore."""
     if os.environ.get("MEGATRON_DEBUG_OPT_STATE", "0") != "1" or optimizer is None:
         return
-    if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    path = os.environ.get("MEGATRON_DEBUG_OPT_STATE_FILE")
+    if rank != 0 and not path:
         return
     sums, counts = {}, {}
     for idx, opt in enumerate(getattr(optimizer, "chained_optimizers", [optimizer])):
@@ -585,15 +587,15 @@ def _debug_optimizer_state(optimizer, tag):
                     val = float(v) if isinstance(v, (int, float)) else 0.0
                 sums[key] = sums.get(key, 0.0) + val
                 counts[key] = counts.get(key, 0) + 1
-    print(f"[opt-state {tag}] " + " ".join(f"{k}={v:.6e}(n{counts.get(k, 1)})"
-                                          for k, v in sorted(sums.items())), flush=True)
-    path = os.environ.get("MEGATRON_DEBUG_OPT_STATE_FILE")
-    if path:  # per parameter (in param-group order): the main param and each state's sum of squares
+    if rank == 0:
+        print(f"[opt-state {tag}] " + " ".join(f"{k}={v:.6e}(n{counts.get(k, 1)})"
+                                              for k, v in sorted(sums.items())), flush=True)
+    if path:  # per rank and parameter (in param-group order): main param, grad, states (sum sq)
         def sq(v):
             t = v._local_tensor if hasattr(v, "_local_tensor") else v
             return float(t.double().pow(2).sum()) if t.numel() else 0.0
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        with open(f"{path}.{tag.replace(' ', '_')}.txt", "w") as f:
+        with open(f"{path}.{tag.replace(' ', '_')}.rank{rank}.txt", "w") as f:
             for idx, opt in enumerate(getattr(optimizer, "chained_optimizers", [optimizer])):
                 inner = getattr(opt, "optimizer", opt)
                 for i, group in enumerate(getattr(inner, "param_groups", [])):
