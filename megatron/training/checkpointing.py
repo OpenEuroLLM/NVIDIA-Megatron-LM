@@ -599,7 +599,10 @@ def _debug_optimizer_state(optimizer, tag):
                 for i, group in enumerate(getattr(inner, "param_groups", [])):
                     for j, p in enumerate(group["params"]):
                         state = inner.state.get(p, {})
-                        vals = [f"param={sq(p.detach()):.9e}"] + [
+                        grad = getattr(p, "grad", None)
+                        vals = [f"param={sq(p.detach()):.9e}"] + (
+                            [f"grad={sq(grad):.9e}"] if isinstance(grad, torch.Tensor) else []
+                        ) + [
                             f"{k}={sq(v) if isinstance(v, torch.Tensor) else v}"
                             for k, v in sorted(state.items())
                         ]

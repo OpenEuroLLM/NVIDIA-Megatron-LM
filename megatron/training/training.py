@@ -3253,7 +3253,17 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     )
     if args.log_num_zeros_in_grad and getattr(args, 'log_params_norm_and_zeros_interval', None):
         _set_count_zeros(optimizer, count_zeros)
+    # MEGATRON_DEBUG_OPT_STATE_STEPS=5,6: the per-parameter dump (checkpointing.
+    # _debug_optimizer_state) before and after these steps' optimizer update
+    _debug_steps = os.environ.get("MEGATRON_DEBUG_OPT_STATE_STEPS", "")
+    _debug_step = iteration is not None and str(iteration + 1) in _debug_steps.split(",")
+    if _debug_step:
+        from megatron.training.checkpointing import _debug_optimizer_state
+
+        _debug_optimizer_state(optimizer, f"before step {iteration + 1}")
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+    if _debug_step:
+        _debug_optimizer_state(optimizer, f"after step {iteration + 1}")
 
     # get max attention logit for logging and run clip_qk()
     # Part of MuonClip Optimizer step
