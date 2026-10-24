@@ -542,6 +542,10 @@ class MoonEPGroupedMLP(MegatronModule):
             mg = []
             for p in mod.weights():
                 g = getattr(p, "main_grad", None)
+                if g is None and hasattr(p, "get_main_grad"):
+                    # Megatron-FSDP: the unsharded main grad is allocated on request (and
+                    # reduce-scattered / freed by FSDP's hooks); `main_grad` is not set before
+                    g = p.get_main_grad()
                 if g is None:  # no Megatron DDP (unit tests): an fp32 grad of our own
                     if getattr(p, "_moonep_grad", None) is None:
                         p._moonep_grad = torch.zeros(p.shape, dtype=torch.float32, device=p.device)
