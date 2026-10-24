@@ -3142,6 +3142,16 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         # OELLM PATCH: cu_seqlens for the whole iteration, published before the schedule
         # starts. Must precede forward_backward_func -- a collective inside it deadlocks.
         maybe_prefetch_cu_seqlens(args, data_iterator, get_num_microbatches())
+        if os.environ.get("MEGATRON_DEBUG_BATCH_HASH") == "1":
+            # the step's micro-batches (token sums and position-weighted sums), every rank
+            for key, batches in sorted(packed_doc_attention._BATCH_STASH.items(), key=str):
+                sums = []
+                for b in batches or []:
+                    t = b["tokens"].long().reshape(-1) if b is not None else None
+                    w = torch.arange(1, t.numel() + 1, device=t.device) if t is not None else None
+                    sums.append("-" if t is None else f"{int(t.sum())}/{int((t * w).sum())}")
+                print(f"[batch-hash rank{torch.distributed.get_rank()} it {iteration + 1} {key}] "
+                      + " ".join(sums), flush=True)
         if os.environ.get("ENGRAM_STEP_LOOKUP") == "1" and packed_doc_attention.is_scattered(args):
             # one Engram row exchange per step and layer (megatron/core/ssm/engram_sharded.py)
             from megatron.core.ssm.engram import prefetch_engram_step_lookups
