@@ -2406,7 +2406,20 @@ def load_checkpoint(
         gen_sd_opt_param_scheduler = None
         gen_sd_rng_state = None
         gen_sd_optim = None
-        if not args.finetune:
+        # The rerun and RNG states are stored per rank: after a change of the world size (or
+        # TP / PP / DP) the new ranks have no entries, so request them only for an unchanged
+        # layout, as torch_dist does (the model and optimizer DTensors reshard).
+        same_layout = (
+            getattr(ckpt_args, 'world_size', 0) == getattr(args, 'world_size', 0)
+            and getattr(ckpt_args, 'data_parallel_size', 0) == getattr(args, 'data_parallel_size', 0)
+            and getattr(ckpt_args, 'tensor_model_parallel_size', 1) == args.tensor_model_parallel_size
+            and getattr(ckpt_args, 'pipeline_model_parallel_size', 1)
+            == args.pipeline_model_parallel_size
+        )
+        if not same_layout:
+            print_rank_0('Job sharding has changed: rerun and RNG states will be ignored')
+            ignore_rng_state = True
+        if not args.finetune and same_layout:
             if 'rerun_state_machine' in state_dict_metadata:
                 gen_sd_rerun_state = get_rerun_state_machine().state_dict(
                     data_iterator=None, ckpt_format=ckpt_format, force=True
