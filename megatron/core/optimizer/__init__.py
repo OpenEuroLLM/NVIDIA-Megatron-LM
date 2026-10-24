@@ -837,6 +837,133 @@ def check_config_overrides_consistency(
     return True
 
 
+def _prepare_emerging_optimizer_params(config, eopt_name, model_chunks, config_overrides) -> None:
+    """Tag the parameters for an emerging optimizer (expert_tp, is_qkv) and add its default
+    parameter overrides (e.g. muon: non-linear -> adam) to ``config_overrides``."""
+    # Tag parameters with optimizer-specific attributes (expert_tp, is_qkv).
+    for model_chunk in model_chunks:
+        qkv_split_shapes = None
+        for name, param in model_chunk.named_parameters():
+            if not param.requires_grad:
+                continue
+            if 'experts' in name and 'shared' not in name:
+                param.expert_tp = True
+            # TODO(deyuf): support MLA
+            if 'linear_qkv.weight' in name and len(param.shape) == 2:
+                if qkv_split_shapes is None:
+                    qkv_split_shapes = _get_qkv_split_shapes(model_chunk.config)
+                if param.shape[0] % sum(qkv_split_shapes) == 0:
+                    param.is_qkv = True
+                    param.qkv_split_shapes = qkv_split_shapes
+                else:
+                    log_single_rank(
+                        logger,
+                        logging.DEBUG,
+                        f"Emerging optimizer QKV split skipped for {name}: "
+                        f"shape={tuple(param.shape)}, split_shapes={qkv_split_shapes}",
+                    )
+
+    # Apply optimizer-specific default param overrides (e.g. muon: non-linear -> adam).
+    # For Muon-family optimizers, the scalar optimizer that handles non-linear/embedding
+    # params is configurable via ``config.muon_scalar_optimizer`` (e.g., 'adam' or 'lion');
+    # deep-copy the registry defaults before rewriting so we never mutate shared state.
+    default_param_overrides = copy.deepcopy(_EMERGING_OPTIMIZERS[eopt_name].default_param_overrides)
+    if eopt_name in ('muon', 'adaptive_muon'):
+        for override in default_param_overrides.values():
+            if override.get('optimizer') in ('adam', 'lion'):
+                override['optimizer'] = config.muon_scalar_optimizer
+    config_overrides.update(default_param_overrides)
+
+
+class _CompositeTorchOptimizer(torch.optim.Optimizer):
+    """Several torch optimizers over disjoint parameter groups behind one: the param groups
+    (the same dicts, so LR schedules reach them) and one shared state. Lets a single
+    Megatron-FSDP DistributedOptimizer (which drives the FSDP buffers once per step) run an
+    emerging optimizer for the matrices and Adam for the rest."""
+
+    def __init__(self, optimizers: List[torch.optim.Optimizer]):
+        self.optimizers = optimizers
+        groups = [group for opt in optimizers for group in opt.param_groups]
+        torch.optim.Optimizer.__init__(self, groups, {})
+        self._relink()
+
+    def _relink(self) -> None:
+        start = 0
+        for opt in self.optimizers:
+            n = len(opt.param_groups)
+            opt.param_groups = self.param_groups[start : start + n]
+            opt.state = self.state
+            start += n
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None if closure is None else closure()
+        for opt in self.optimizers:
+            opt.step()
+        return loss
+
+    def load_state_dict(self, state_dict) -> None:
+        super().load_state_dict(state_dict)  # replaces the groups and the state
+        self._relink()
+
+
+def _get_megatron_fsdp_emerging_optimizer(
+    config: OptimizerConfig,
+    model_chunk: List[MegatronModule],
+    param_groups: List[Dict],
+    pg_collection: Optional[ProcessGroupCollection],
+) -> Tuple[torch.optim.Optimizer, Callable]:
+    """The inner optimizer of an emerging optimizer (Muon / AngularMuown / MuownClassical) on
+    Megatron-FSDP parameters: the emerging optimizer for its groups (row-sharded math, see
+    fsdp_row_exchange), the scalar optimizer (Adam) for the rest, behind one composite."""
+    import os
+
+    eopt_name = config.optimizer
+    if eopt_name.startswith('dist_') or config.use_layer_wise_distributed_optimizer:
+        raise ValueError("Megatron-FSDP shards the optimizer itself: no layer-wise optimizer")
+    if eopt_name in ('angular_muown', 'angular_muown_simplified', 'muown_classical') and (
+        os.environ.get("ANGULAR_MUOWN_COMPACT_CKPT", "0") != "1"
+    ):
+        raise ValueError(
+            "Megatron-FSDP with Muown needs ANGULAR_MUOWN_COMPACT_CKPT=1 (the per-row states are "
+            "checkpointed as [rows, 1] DTensors)"
+        )
+    if pg_collection is None:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    emerging = [g for g in param_groups if g.get('optimizer', eopt_name) == eopt_name]
+    scalar = [g for g in param_groups if g.get('optimizer', eopt_name) != eopt_name]
+    parts, init_fns = [], []
+    if emerging:
+        opt, init_fn = _create_emerging_optimizer(
+            config, emerging, eopt_name, model_chunk, pg_collection
+        )
+        parts.append(opt)
+        init_fns.append(init_fn)
+    by_name = defaultdict(list)
+    for g in scalar:
+        by_name[g['optimizer']].append(g)
+    for opt_name, groups in by_name.items():
+        fallback_config = copy.copy(config)
+        fallback_config.optimizer = opt_name
+        opt, init_fn = _get_megatron_optimizer_based_on_param_groups(
+            config=fallback_config,
+            model_chunks=model_chunk,
+            param_groups=groups,
+            pg_collection=pg_collection,
+            skip_megatron_wrapping=True,
+        )
+        parts.append(opt)
+        init_fns.append(init_fn)
+    composite = _CompositeTorchOptimizer(parts)
+
+    def init_state_fn(opt, config=None):
+        for part, fn in zip(opt.optimizers, init_fns):
+            if fn is not None:
+                fn(part, config)
+
+    return composite, init_state_fn
+
+
 def _get_megatron_emerging_optimizer(
     config: OptimizerConfig,
     model_chunks: List[MegatronModule],
@@ -894,39 +1021,7 @@ def _get_megatron_emerging_optimizer(
 
     log_single_rank(logger, logging.INFO, f'Setting up emerging optimizer with config {config}')
 
-    # Tag parameters with optimizer-specific attributes (expert_tp, is_qkv).
-    for model_chunk in model_chunks:
-        qkv_split_shapes = None
-        for name, param in model_chunk.named_parameters():
-            if not param.requires_grad:
-                continue
-            if 'experts' in name and 'shared' not in name:
-                param.expert_tp = True
-            # TODO(deyuf): support MLA
-            if 'linear_qkv.weight' in name and len(param.shape) == 2:
-                if qkv_split_shapes is None:
-                    qkv_split_shapes = _get_qkv_split_shapes(model_chunk.config)
-                if param.shape[0] % sum(qkv_split_shapes) == 0:
-                    param.is_qkv = True
-                    param.qkv_split_shapes = qkv_split_shapes
-                else:
-                    log_single_rank(
-                        logger,
-                        logging.DEBUG,
-                        f"Emerging optimizer QKV split skipped for {name}: "
-                        f"shape={tuple(param.shape)}, split_shapes={qkv_split_shapes}",
-                    )
-
-    # Apply optimizer-specific default param overrides (e.g. muon: non-linear -> adam).
-    # For Muon-family optimizers, the scalar optimizer that handles non-linear/embedding
-    # params is configurable via ``config.muon_scalar_optimizer`` (e.g., 'adam' or 'lion');
-    # deep-copy the registry defaults before rewriting so we never mutate shared state.
-    default_param_overrides = copy.deepcopy(_EMERGING_OPTIMIZERS[eopt_name].default_param_overrides)
-    if eopt_name in ('muon', 'adaptive_muon'):
-        for override in default_param_overrides.values():
-            if override.get('optimizer') in ('adam', 'lion'):
-                override['optimizer'] = config.muon_scalar_optimizer
-    config_overrides.update(default_param_overrides)
+    _prepare_emerging_optimizer_params(config, eopt_name, model_chunks, config_overrides)
 
     # Build param groups and bucket by (optimizer_name, is_expert_parallel).
     # Layer-wise distributed optimizer handles expert params internally so we skip that split.
@@ -1211,7 +1306,14 @@ def get_megatron_optimizer(
 
     # TODO: the standard and emerging optimizer paths handle pg_collection differently;
     # unify them so both use a single pg_collection-based flow.
-    if config.optimizer not in ('adam', 'sgd'):
+    fsdp_emerging = config.optimizer not in ('adam', 'sgd') and getattr(
+        model_chunks[0].ddp_config, 'use_megatron_fsdp', False
+    )
+    if fsdp_emerging:
+        _prepare_emerging_optimizer_params(
+            config, config.optimizer, model_chunks, config_overrides
+        )
+    if config.optimizer not in ('adam', 'sgd') and not fsdp_emerging:
         return _maybe_attach_weight_normalizer(
             _get_megatron_emerging_optimizer(
                 config=config,
@@ -1280,19 +1382,40 @@ def get_megatron_optimizer(
                 buffer_name='buffers',
             )
 
-            optimizer_part = _get_megatron_optimizer_based_on_param_groups(
-                config=config,
-                model_chunks=model_chunk,
-                param_groups=param_groups,
-                per_model_buffers=buffers,
-                model_parallel_group=mp_group,
-                data_parallel_group=dp_cp_group,
-                data_parallel_group_gloo=intra_dp_cp_group_gloo,
-                data_parallel_group_idx=model_parallel_rank,
-                intra_dist_opt_group=effective_intra_dist_opt_group,
-                distributed_optimizer_instance_id=distributed_optimizer_instance_id,
-                pg_collection=pg_collection,
-            )
+            if fsdp_emerging:
+                inner, init_state_fn = _get_megatron_fsdp_emerging_optimizer(
+                    config, model_chunk, param_groups, pg_collection
+                )
+                optimizer_part = DistributedOptimizer(
+                    inner,
+                    config,
+                    None,
+                    init_state_fn,
+                    model_chunks=model_chunk,
+                    per_model_buffers=buffers,
+                    data_parallel_group=dp_cp_group,
+                    data_parallel_group_gloo=intra_dp_cp_group_gloo,
+                    data_parallel_group_idx=model_parallel_rank,
+                    distributed_optimizer_instance_id=distributed_optimizer_instance_id,
+                )
+                setattr(optimizer_part, 'grad_stats_parallel_group', effective_intra_dist_opt_group)
+                _pgc = pg_collection or ProcessGroupCollection.use_mpu_process_groups()
+                setattr(optimizer_part, 'tp_group', _pgc.tp)
+                setattr(optimizer_part, 'expert_tp_group', getattr(_pgc, 'expt_tp', _pgc.tp))
+            else:
+                optimizer_part = _get_megatron_optimizer_based_on_param_groups(
+                    config=config,
+                    model_chunks=model_chunk,
+                    param_groups=param_groups,
+                    per_model_buffers=buffers,
+                    model_parallel_group=mp_group,
+                    data_parallel_group=dp_cp_group,
+                    data_parallel_group_gloo=intra_dp_cp_group_gloo,
+                    data_parallel_group_idx=model_parallel_rank,
+                    intra_dist_opt_group=effective_intra_dist_opt_group,
+                    distributed_optimizer_instance_id=distributed_optimizer_instance_id,
+                    pg_collection=pg_collection,
+                )
             if (
                 not USING_PYTORCH_OPTIMIZER
                 and config.use_precision_aware_optimizer

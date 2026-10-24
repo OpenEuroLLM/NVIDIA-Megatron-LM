@@ -21,6 +21,7 @@ from torch.optim.optimizer import ParamsT
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import get_pg_rank, get_pg_size, log_single_rank
 
+from .fsdp_row_exchange import is_row_sharded, local, orthogonalize_rows, row_state_like
 from .muown import Muown
 from .optimizer_config import ParamKey, ParamPredicate
 
@@ -458,6 +459,12 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
     @torch.no_grad()  # type: ignore[misc]
     def step(self, closure: Optional[Callable] = None) -> Optional[float]:
         """Perform a Muon update, batching same-shape parameters when enabled."""
+        if any(is_row_sharded(p) for group in self.param_groups for p in group["params"]):
+            loss = None if closure is None else closure()
+            for group in self.param_groups:
+                self._init_group(group, skip_non_grad_params=False)
+                self._step_group_row_sharded(group)
+            return loss
         active_params = (
             p for group in self.param_groups for p in group["params"] if p.grad is not None
         )
@@ -472,6 +479,47 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             self._init_group(group)
             self._step_group_batched(group)
         return loss
+
+    def _step_group_row_sharded(self, group: dict) -> None:
+        """Muon on Megatron-FSDP (row-sharded) parameters: weight decay and momentum on the
+        local rows, the Newton-Schulz on each matrix's owner rank (fsdp_row_exchange)."""
+        if any(self._uses_gtp_remat(p) for p in group["params"]):
+            raise NotImplementedError("GTP remat with Megatron-FSDP")
+        lr = group["lr"]
+        momentum = group["momentum"]
+        weight_decay = group["weight_decay"]
+        # requires_grad, not p.grad: the parameter list must be the same on every rank
+        params = [p for p in group["params"] if p.requires_grad]
+        if not params:
+            return
+        weights = [local(p).detach() for p in params]
+        grads = [_local_grad(p) for p in params]
+        if weight_decay != 0.0:
+            if self.weight_decay_method == "decoupled":
+                torch._foreach_add_(weights, weights, alpha=-weight_decay * lr)
+            elif self.weight_decay_method == "independent":
+                torch._foreach_add_(weights, weights, alpha=-weight_decay)
+            elif self.weight_decay_method == "l2":
+                grads = torch._foreach_add(grads, weights, alpha=weight_decay)
+            else:
+                raise ValueError(f"Invalid weight decay method: {self.weight_decay_method}")
+        momentum_buffers = [local(self.state[p]["momentum_buffer"]) for p in params]
+        torch._foreach_lerp_(momentum_buffers, grads, 1 - momentum)
+        updates = (
+            torch._foreach_lerp(grads, momentum_buffers, momentum)
+            if self.nesterov
+            else momentum_buffers
+        )
+        updates = [u.float() for u in updates]
+
+        def ns(stack, metadata):
+            with eopt_utils.fp32_matmul_precision(self.fp32_matmul_prec):
+                return self._orthogonalize_batched(stack, metadata)
+
+        metas = [self._batch_key_for(p) for p in params]
+        directions = orthogonalize_rows(params, updates, metas, ns)
+        directions = [d.to(w.dtype) for d, w in zip(directions, weights)]
+        torch._foreach_add_(weights, directions, alpha=-lr)
 
     def _step_group_batched(self, group: dict) -> None:
         """Run the base Muon update on stacks of same-shape parameters."""
@@ -630,6 +678,13 @@ ANGULAR_MUOWN_KAPPA: Dict[str, float] = {}
 
 
 @torch.compile
+def _local_grad(p: torch.Tensor) -> torch.Tensor:
+    """The local gradient rows of p; zeros where Megatron-FSDP left none (an empty shard)."""
+    if p.grad is not None:
+        return local(p.grad)
+    return torch.zeros_like(local(p))
+
+
 def _angular_muown_u_and_grad_g(
     w: torch.Tensor, g: torch.Tensor, grad_w: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1154,6 +1209,9 @@ class TensorParallelAngularMuown(TensorParallelMuon):
             state = self.state[p]
             if len(state) != 0:
                 continue
+            if is_row_sharded(p):
+                self._init_row_sharded_state(p, state)
+                continue
             # Zero rows have no direction for U = W / g. Give just those rows the
             # expected row scale of the default linear init so the first U update
             # can create a unit direction without starting Adam's g near zero.
@@ -1178,6 +1236,22 @@ class TensorParallelAngularMuown(TensorParallelMuon):
             state["v_g"] = torch.zeros_like(w_norm)
             state["step"] = 0
 
+    def _init_row_sharded_state(self, p: torch.Tensor, state: dict) -> None:
+        """The state of a Megatron-FSDP (row-sharded) matrix: every row lives on one rank, so the
+        per-row seeds are local; the [rows, 1] states are DTensors with p's row sharding."""
+        w_norm = local(p).detach().float().pow(2).sum(dim=1, keepdim=True).sqrt()
+        zero_rows = w_norm <= ANGULAR_MUOWN_EPS
+        if zero_rows.any():
+            w_norm = torch.where(
+                zero_rows, w_norm.new_full(w_norm.shape, ANGULAR_MUOWN_ZERO_ROW_SCALE), w_norm
+            )
+        w_norm = w_norm.to(local(p).dtype)
+        state["g"] = row_state_like(p, w_norm.clone())
+        state["m_u"] = torch.zeros_like(p)
+        state["m_g"] = row_state_like(p, torch.zeros_like(w_norm))
+        state["v_g"] = row_state_like(p, torch.zeros_like(w_norm))
+        state["step"] = 0
+
     @torch.no_grad()  # type: ignore[misc]
     def step(self, closure: Optional[Callable] = None) -> Optional[float]:
         """Perform one AngularMuown update on all 2D parameters with gradients."""
@@ -1187,6 +1261,12 @@ class TensorParallelAngularMuown(TensorParallelMuon):
         if self._adaptive_u:
             self._adaptive_u_before_step()
         for group in self.param_groups:
+            if any(is_row_sharded(p) for p in group["params"]):
+                # Megatron-FSDP: local rows, Newton-Schulz on owner ranks. A rank whose shard of
+                # a matrix is empty has no grad for it, but still takes part in its exchange.
+                self._init_group(group, skip_non_grad_params=False)
+                self._step_group_row_sharded(group)
+                continue
             self._init_group(group)
             has_gtp_remat = any(
                 p.grad is not None and self._uses_gtp_remat(p) for p in group["params"]
@@ -1298,10 +1378,13 @@ class TensorParallelAngularMuown(TensorParallelMuon):
     # (_orthogonalize_batched / _scaled_ns_batched) are inherited from
     # TensorParallelMuon.
 
-    def _get_batch_buffers(self, key: tuple, batch_size: int, ref: torch.Tensor) -> dict:
-        """Return (allocating once) the stacked scratch buffers for a batch."""
+    def _get_batch_buffers(
+        self, key: tuple, batch_size: int, ref: torch.Tensor, cache: bool = True
+    ) -> dict:
+        """Return (allocating once) the stacked scratch buffers for a batch (``cache=False``:
+        fresh ones, for batches that are alive at the same time)."""
         cache_key = (key, batch_size)
-        bufs = self._batch_buffers.get(cache_key)
+        bufs = self._batch_buffers.get(cache_key) if cache else None
         if bufs is None:
             rows, cols = ref.shape
 
@@ -1319,7 +1402,8 @@ class TensorParallelAngularMuown(TensorParallelMuon):
                 ("v_g", 1),
             ):
                 bufs[name], bufs[name + "_views"] = _mk(c)
-            self._batch_buffers[cache_key] = bufs
+            if cache:
+                self._batch_buffers[cache_key] = bufs
         return bufs
 
     def _step_group_batched(self, group: dict) -> None:
@@ -1355,26 +1439,30 @@ class TensorParallelAngularMuown(TensorParallelMuon):
 
     def _step_batch(self, group: dict, batch: dict) -> None:
         """Run one AngularMuown update on a stack of same-shape parameters."""
+        ctx = self._batch_pre(group, batch)
+        with eopt_utils.fp32_matmul_precision(self.fp32_matmul_prec):
+            direction = self._orthogonalize_batched(ctx["update"], batch)
+        self._batch_post(group, batch, ctx, direction)
+
+    def _batch_pre(self, group: dict, batch: dict, cache: bool = True) -> dict:
+        """The batched update up to the Newton-Schulz input ``ctx["update"]``. Row-sharded
+        (Megatron-FSDP) parameters run on their local rows."""
         params = batch["params"]
         states = [self.state[p] for p in params]
         reduce_group = batch["reduce_group"]
-        lr = group["lr"]
         momentum = group["momentum"]
-        beta1, beta2 = group["betas"]
-        adam_eps = group["adam_eps"]
-        step = batch["step"]
 
-        bufs = self._get_batch_buffers(batch["static_key"], len(params), params[0])
+        bufs = self._get_batch_buffers(batch["static_key"], len(params), local(params[0]), cache)
         w_b, grad_b = bufs["w"], bufs["grad"]
-        g_b, m_u_b, m_g_b, v_g_b = bufs["g"], bufs["m_u"], bufs["m_g"], bufs["v_g"]
+        g_b, m_u_b = bufs["g"], bufs["m_u"]
 
         # Gather params, grads and state into the stacked scratch buffers.
-        torch._foreach_copy_(bufs["w_views"], [p.detach() for p in params])
-        torch._foreach_copy_(bufs["grad_views"], [p.grad for p in params])
-        torch._foreach_copy_(bufs["g_views"], [s["g"] for s in states])
-        torch._foreach_copy_(bufs["m_u_views"], [s["m_u"] for s in states])
-        torch._foreach_copy_(bufs["m_g_views"], [s["m_g"] for s in states])
-        torch._foreach_copy_(bufs["v_g_views"], [s["v_g"] for s in states])
+        torch._foreach_copy_(bufs["w_views"], [local(p).detach() for p in params])
+        torch._foreach_copy_(bufs["grad_views"], [_local_grad(p) for p in params])
+        torch._foreach_copy_(bufs["g_views"], [local(s["g"]) for s in states])
+        torch._foreach_copy_(bufs["m_u_views"], [local(s["m_u"]) for s in states])
+        torch._foreach_copy_(bufs["m_g_views"], [local(s["m_g"]) for s in states])
+        torch._foreach_copy_(bufs["v_g_views"], [local(s["v_g"]) for s in states])
 
         u, grad_g = _angular_muown_u_and_grad_g(w_b, g_b, grad_b)
         if reduce_group is not None:
@@ -1386,7 +1474,7 @@ class TensorParallelAngularMuown(TensorParallelMuon):
         # Muown retains ||v||: reconstruct v and apply the weight-normalization Jacobian.
         v_norm = bufs.get("v_norm")
         if v_norm is not None:
-            torch._foreach_copy_(bufs["v_norm_views"], [state["v_norm"] for state in states])
+            torch._foreach_copy_(bufs["v_norm_views"], [local(state["v_norm"]) for state in states])
             grad_u.div_(v_norm)
             u.mul_(v_norm)
             if self._v_weight_decay:
@@ -1401,9 +1489,20 @@ class TensorParallelAngularMuown(TensorParallelMuon):
             # No aliasing concern: m_u_b is a scratch copy and the NS below
             # does not mutate its input.
             update = m_u_b
+        return {"bufs": bufs, "u": u, "grad_g": grad_g, "update": update}
 
-        with eopt_utils.fp32_matmul_precision(self.fp32_matmul_prec):
-            direction = self._orthogonalize_batched(update, batch)
+    def _batch_post(self, group: dict, batch: dict, ctx: dict, direction: torch.Tensor) -> None:
+        """The batched update from the orthogonalized direction on."""
+        params = batch["params"]
+        states = [self.state[p] for p in params]
+        reduce_group = batch["reduce_group"]
+        lr = group["lr"]
+        beta1, beta2 = group["betas"]
+        adam_eps = group["adam_eps"]
+        step = batch["step"]
+        bufs, u, grad_g = ctx["bufs"], ctx["u"], ctx["grad_g"]
+        w_b, g_b, m_g_b, v_g_b = bufs["w"], bufs["g"], bufs["m_g"], bufs["v_g"]
+        v_norm = bufs.get("v_norm")
 
         u_step = u.add(direction, alpha=-self._u_step_size(group, step - 1))
 
@@ -1423,14 +1522,72 @@ class TensorParallelAngularMuown(TensorParallelMuon):
         _angular_muown_u_recompose(w_b, g_b, u_step, u_step_norm_sq)
         if v_norm is not None:
             v_norm.copy_(u_step_norm_sq.sqrt().clamp_min(ANGULAR_MUOWN_EPS))
-            torch._foreach_copy_([state["v_norm"] for state in states], bufs["v_norm_views"])
+            torch._foreach_copy_([local(state["v_norm"]) for state in states],
+                                 bufs["v_norm_views"])
 
         # Scatter updated weights and state back to the per-param tensors.
-        torch._foreach_copy_([p.detach() for p in params], bufs["w_views"])
-        torch._foreach_copy_([s["g"] for s in states], bufs["g_views"])
-        torch._foreach_copy_([s["m_u"] for s in states], bufs["m_u_views"])
-        torch._foreach_copy_([s["m_g"] for s in states], bufs["m_g_views"])
-        torch._foreach_copy_([s["v_g"] for s in states], bufs["v_g_views"])
+        torch._foreach_copy_([local(p).detach() for p in params], bufs["w_views"])
+        torch._foreach_copy_([local(s["g"]) for s in states], bufs["g_views"])
+        torch._foreach_copy_([local(s["m_u"]) for s in states], bufs["m_u_views"])
+        torch._foreach_copy_([local(s["m_g"]) for s in states], bufs["m_g_views"])
+        torch._foreach_copy_([local(s["v_g"]) for s in states], bufs["v_g_views"])
+
+    # Elements (over all ranks) per row-sharded round: bounds the live scratch of a step.
+    _ROW_SHARDED_ROUND_NUMEL = int(os.environ.get("MUON_FSDP_STEP_ROUND_NUMEL", str(1 << 30)))
+
+    def _step_group_row_sharded(self, group: dict) -> None:
+        """Megatron-FSDP: the batched math on each rank's rows; the Newton-Schulz inputs go to
+        their matrices' owner ranks and come back orthogonalized (fsdp_row_exchange). Rounds of
+        consecutive parameters (in the group's order, the same on every rank) bound the scratch."""
+        if self._uses_gtp_remat_any(group):
+            raise NotImplementedError("GTP remat with Megatron-FSDP")
+        # requires_grad, not p.grad: the parameter list must be the same on every rank
+        params = [p for p in group["params"] if p.requires_grad]
+        start = 0
+        while start < len(params):
+            end, total = start, 0
+            while end < len(params) and (
+                end == start or total + params[end].numel() <= self._ROW_SHARDED_ROUND_NUMEL
+            ):
+                total += params[end].numel()
+                end += 1
+            self._row_sharded_round(group, params[start:end])
+            start = end
+
+    def _uses_gtp_remat_any(self, group: dict) -> bool:
+        return any(p.grad is not None and self._uses_gtp_remat(p) for p in group["params"])
+
+    def _row_sharded_round(self, group: dict, params: list) -> None:
+        batches: Dict[tuple, dict] = {}
+        metas = []
+        for p in params:
+            state = self.state[p]
+            state["step"] += 1
+            static_key, metadata = self._batch_key_for(p)
+            metas.append((static_key, metadata))
+            local_key = static_key + (tuple(local(p).shape),)
+            batch = batches.setdefault(
+                local_key + (state["step"],),
+                {**metadata, "params": [], "static_key": local_key, "step": state["step"]},
+            )
+            batch["params"].append(p)
+        rows_of = {}
+        ctxs = []
+        for batch in batches.values():
+            ctx = self._batch_pre(group, batch, cache=False)
+            ctxs.append((batch, ctx))
+            for j, p in enumerate(batch["params"]):
+                rows_of[id(p)] = ctx["update"][j]
+
+        def ns(stack, metadata):
+            with eopt_utils.fp32_matmul_precision(self.fp32_matmul_prec):
+                return self._orthogonalize_batched(stack, metadata)
+
+        directions = orthogonalize_rows(params, [rows_of[id(p)] for p in params], metas, ns)
+        direction_of = {id(p): d for p, d in zip(params, directions)}
+        for batch, ctx in ctxs:
+            stack = torch.stack([direction_of[id(p)] for p in batch["params"]])
+            self._batch_post(group, batch, ctx, stack)
 
     def state_dict(self) -> dict:
         """Return a checkpoint-friendly state dict with full-shape per-row states.
@@ -1615,8 +1772,10 @@ class TensorParallelMuownClassical(TensorParallelAngularMuown):
             if self.state[p]:
                 self.state[p]["v_norm"] = self.state[p]["g"].clone()
 
-    def _get_batch_buffers(self, key: tuple, batch_size: int, ref: torch.Tensor) -> dict:
-        bufs = super()._get_batch_buffers(key, batch_size, ref)
+    def _get_batch_buffers(
+        self, key: tuple, batch_size: int, ref: torch.Tensor, cache: bool = True
+    ) -> dict:
+        bufs = super()._get_batch_buffers(key, batch_size, ref, cache)
         if "v_norm" not in bufs:
             bufs["v_norm"] = torch.empty_like(bufs["g"])
             bufs["v_norm_views"] = list(bufs["v_norm"].unbind(0))
