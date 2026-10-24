@@ -1300,8 +1300,10 @@ def validate_args(args, defaults={}):
                 "GroupedTensor param buffers."
             )
         # Optimizer compatibility check.
-        assert args.optimizer in ('sgd', 'adam'), \
-            f"Megatron-FSDP does not support the {args.optimizer} optimizer yet."
+        # Muon family: row-sharded Newton-Schulz (megatron/core/optimizer/fsdp_row_exchange.py)
+        assert args.optimizer in (
+            'sgd', 'adam', 'muon', 'angular_muown', 'angular_muown_simplified', 'muown_classical'
+        ), f"Megatron-FSDP does not support the {args.optimizer} optimizer yet."
 
         if (
             args.data_parallel_sharding_strategy in ["optim_grads_params", "optim_grads"]
@@ -1882,13 +1884,18 @@ def validate_args(args, defaults={}):
             args.optimizer = 'muon'
             args.use_layer_wise_distributed_optimizer = True
 
-        if args.use_distributed_optimizer:
-            args.use_layer_wise_distributed_optimizer = True
-            args.use_distributed_optimizer = False
-
         assert not args.use_torch_fsdp2, "Emerging optimizer does not support Torch-FSDP2 for now."
-        assert not args.use_megatron_fsdp, "Emerging optimizer does not support Megatron-FSDP for now."
-        assert args.ckpt_format in ["torch", "torch_dist"], "Emerging optimizer supports torch and torch_dist checkpoint format."
+        if args.use_megatron_fsdp:
+            # Megatron-FSDP shards the optimizer itself (Muon family: row-sharded Newton-Schulz,
+            # megatron/core/optimizer/fsdp_row_exchange.py); checked above for the optimizer
+            assert not args.use_layer_wise_distributed_optimizer, (
+                "Megatron-FSDP shards the optimizer itself: no layer-wise distributed optimizer"
+            )
+        else:
+            if args.use_distributed_optimizer:
+                args.use_layer_wise_distributed_optimizer = True
+                args.use_distributed_optimizer = False
+            assert args.ckpt_format in ["torch", "torch_dist"], "Emerging optimizer supports torch and torch_dist checkpoint format."
 
     # Make sure all functionality that requires Gloo process groups is disabled.
     if not args.use_gloo_process_groups:
