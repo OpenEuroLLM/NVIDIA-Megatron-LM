@@ -227,8 +227,11 @@ class TransformerConfig(ModelParallelConfig):
     used when gated_linear_unit is True"""
 
     activation_func_clamp_value: Optional[float] = None
-    """Clamp the output of the linear_fc1 in the activation function. Only used when activation_func
-    is quick_gelu."""
+    """Clamp the output of the linear_fc1 in the activation function: quick_gelu (GeGLU) and SwiGLU
+    (gpt-oss / DeepSeek-V4.1: the gate half capped at the value, the linear half to +-value; the
+    gradient is zero where a clamp is active). SwiGLU: the unfused path and the fused
+    bias_swiglu / weighted_swiglu kernels; the Triton SwiGLU falls back to the fused kernel, TE's
+    fused ScaledSwiGLU op raises."""
 
     num_moe_experts: Optional[int] = None
     """Number of experts to use for MoE layer. When set, it replaces MLP with MoE layer. Set to None

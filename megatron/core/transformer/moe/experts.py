@@ -483,6 +483,11 @@ class TEGroupedMLP(MegatronModule):
         glu_interleave = self.config.moe_mlp_glu_interleave_size
         activation_recompute_in_mlp = bool(getattr(self, "activation_recompute", False))
         if self.config.activation_func == F.silu and self.config.gated_linear_unit:
+            if self.config.activation_func_clamp_value is not None:
+                raise NotImplementedError(
+                    "activation_func_clamp_value with SwiGLU is not supported by TE's fused "
+                    "ScaledSwiGLU op; disable the TE op fuser for the experts"
+                )
             if (
                 "activation_recompute_in_mlp"
                 in inspect.signature(te.pytorch.ops.ScaledSwiGLU).parameters
@@ -858,6 +863,7 @@ class TEGroupedMLP(MegatronModule):
                         bias_parallel,
                         permuted_probs,
                         self.config.activation_func_fp8_input_store,
+                        limit=self.config.activation_func_clamp_value,
                     )
                 elif self.activation_func == quick_gelu and self.config.gated_linear_unit:
                     intermediate_parallel = weighted_bias_quick_geglu_impl(

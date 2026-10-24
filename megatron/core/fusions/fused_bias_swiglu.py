@@ -97,12 +97,39 @@ def weighted_swiglu_back(g, y, weights):
     return input_grad.to(input_dtype), weights_grad.to(w_dtype)
 
 
+# Clamped SwiGLU (gpt-oss / DeepSeek-V4.1: activation_func_clamp_value): the gate is capped from
+# above, the linear half to [-limit, limit]; the gradient is zero where a clamp is active.
+@jit_fuser
+def clamped_swiglu(y, limit: float):
+    y_1, y_2 = torch.chunk(y, 2, -1)
+    return F.silu(y_1.clamp(max=limit)) * y_2.clamp(min=-limit, max=limit)
+
+
+@jit_fuser
+def clamped_swiglu_back(g, y, limit: float):
+    y_1, y_2 = torch.chunk(y, 2, -1)
+    c_1 = y_1.clamp(max=limit)
+    c_2 = y_2.clamp(min=-limit, max=limit)
+    s_1 = torch.sigmoid(c_1)
+    d_1 = g * s_1 * (1 + c_1 * (1 - s_1)) * c_2 * (y_1 <= limit)
+    d_2 = g * F.silu(c_1) * (y_2.abs() <= limit)
+    return torch.cat((d_1, d_2), -1)
+
+
+def _swiglu_fwd(y, limit):
+    return swiglu(y) if limit is None else clamped_swiglu(y, limit)
+
+
+def _swiglu_bwd(g, y, limit):
+    return swiglu_back(g, y) if limit is None else clamped_swiglu_back(g, y, limit)
+
+
 class BiasSwiGLUFunction(torch.autograd.Function):
     """Custom autograd function for SwiGLU activation with bias support."""
 
     @staticmethod
     @nvtx_decorator()
-    def forward(ctx, input, bias, fp8_input_store, cpu_offload_input):
+    def forward(ctx, input, bias, fp8_input_store, cpu_offload_input, limit=None):
         """Forward pass of biased SwiGLU activation.
 
         Args:
@@ -121,7 +148,8 @@ class BiasSwiGLUFunction(torch.autograd.Function):
         ctx.save_for_backward(input_for_backward, bias)
         ctx.ori_input_dtype = input.dtype
         ctx.fp8_input_store = fp8_input_store
-        return bias_swiglu(input, bias)
+        ctx.limit = limit
+        return bias_swiglu(input, bias) if limit is None else clamped_swiglu(input + bias, limit)
 
     @staticmethod
     @nvtx_decorator()
@@ -140,8 +168,8 @@ class BiasSwiGLUFunction(torch.autograd.Function):
         """
         input, bias = ctx.saved_tensors
         input = input.to(ctx.ori_input_dtype) if ctx.fp8_input_store else input
-        tmp = bias_swiglu_back(grad_output, input, bias)
-        return tmp, tmp, None, None
+        tmp = _swiglu_bwd(grad_output, input + bias, ctx.limit)
+        return tmp, tmp, None, None, None
 
 
 class SwiGLUFunction(torch.autograd.Function):
@@ -149,7 +177,7 @@ class SwiGLUFunction(torch.autograd.Function):
 
     @staticmethod
     @nvtx_decorator()
-    def forward(ctx, input, fp8_input_store, cpu_offload_input):
+    def forward(ctx, input, fp8_input_store, cpu_offload_input, limit=None):
         """Forward pass of SwiGLU activation.
 
         Args:
@@ -166,7 +194,8 @@ class SwiGLUFunction(torch.autograd.Function):
         ctx.save_for_backward(input_for_backward)
         ctx.ori_input_dtype = input.dtype
         ctx.fp8_input_store = fp8_input_store
-        return swiglu(input)
+        ctx.limit = limit
+        return _swiglu_fwd(input, limit)
 
     @staticmethod
     @nvtx_decorator()
@@ -184,29 +213,38 @@ class SwiGLUFunction(torch.autograd.Function):
         """
         input = ctx.saved_tensors[0]
         input = input.to(ctx.ori_input_dtype) if ctx.fp8_input_store else input
-        tmp = swiglu_back(grad_output, input)
-        return tmp, None, None
+        tmp = _swiglu_bwd(grad_output, input, ctx.limit)
+        return tmp, None, None, None
 
 
 class WeightedSwiGLUFunction(torch.autograd.Function):
     @staticmethod
     # bias is an optional argument
-    def forward(ctx, input, weights, fp8_input_store):
+    def forward(ctx, input, weights, fp8_input_store, limit=None):
         input_for_backward = input.to(torch.float8_e4m3fn) if fp8_input_store else input
         ctx.save_for_backward(input_for_backward, weights)
         ctx.ori_input_dtype = input.dtype
         ctx.fp8_input_store = fp8_input_store
-        return weighted_swiglu(input, weights)
+        ctx.limit = limit
+        if limit is None:
+            return weighted_swiglu(input, weights)
+        return (clamped_swiglu(input, limit) * weights).to(input.dtype)
 
     @staticmethod
     def backward(ctx, grad_output):
         input, weights = ctx.saved_tensors
         input = input.to(ctx.ori_input_dtype) if ctx.fp8_input_store else input
-        tmp, wgrad = weighted_swiglu_back(grad_output, input, weights)
-        return tmp, wgrad, None
+        if ctx.limit is None:
+            tmp, wgrad = weighted_swiglu_back(grad_output, input, weights)
+        else:
+            w_dtype = weights.dtype
+            tmp = clamped_swiglu_back(grad_output * weights, input, ctx.limit).to(input.dtype)
+            wgrad = (clamped_swiglu(input, ctx.limit) * grad_output.to(w_dtype)).sum(-1, keepdim=True)
+            wgrad = wgrad.to(w_dtype)
+        return tmp, wgrad, None, None
 
 
-def bias_swiglu_impl(input, bias, fp8_input_store=False, cpu_offload_input=False):
+def bias_swiglu_impl(input, bias, fp8_input_store=False, cpu_offload_input=False, limit=None):
     """Implementation of biased SwiGLU that handles different input shapes.
 
     This function reshapes the input if necessary, applies the SwiGLU activation
@@ -229,14 +267,14 @@ def bias_swiglu_impl(input, bias, fp8_input_store=False, cpu_offload_input=False
     assert len(ori_shape) in [2, 3]
     input = input.view(-1, ori_shape[-1])
     if bias is not None:
-        output = BiasSwiGLUFunction.apply(input, bias, fp8_input_store, cpu_offload_input)
+        output = BiasSwiGLUFunction.apply(input, bias, fp8_input_store, cpu_offload_input, limit)
     else:
-        output = SwiGLUFunction.apply(input, fp8_input_store, cpu_offload_input)
+        output = SwiGLUFunction.apply(input, fp8_input_store, cpu_offload_input, limit)
 
     return output if len(ori_shape) == 2 else output.view(ori_shape[0], ori_shape[1], -1)
 
 
-def weighted_bias_swiglu_impl(input, bias, weights, fp8_input_store=False):
+def weighted_bias_swiglu_impl(input, bias, weights, fp8_input_store=False, limit=None):
     """
     Token-wise-weighted bias swiglu fusion.
     """
@@ -246,7 +284,7 @@ def weighted_bias_swiglu_impl(input, bias, weights, fp8_input_store=False):
     if bias is not None:
         raise NotImplementedError("Bias is not supported for weighted swiglu fusion")
     else:
-        output = WeightedSwiGLUFunction.apply(input, weights, fp8_input_store)
+        output = WeightedSwiGLUFunction.apply(input, weights, fp8_input_store, limit)
 
     return output if len(ori_shape) == 2 else output.view(ori_shape[0], ori_shape[1], -1)
 

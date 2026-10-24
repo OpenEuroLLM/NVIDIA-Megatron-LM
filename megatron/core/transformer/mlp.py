@@ -344,6 +344,7 @@ class MLP(MegatronModule):
                         bias_parallel,
                         per_token_scale.unsqueeze(-1),
                         self.config.activation_func_fp8_input_store,
+                        limit=self.config.activation_func_clamp_value,
                     )
                 elif self.activation_func == quick_gelu and self.config.gated_linear_unit:
                     intermediate_parallel = weighted_bias_quick_geglu_impl(
@@ -372,6 +373,7 @@ class MLP(MegatronModule):
                     and self.config.gated_linear_unit
                     and getattr(self.config, "swiglu_triton", False)
                     and bias_parallel is None
+                    and self.config.activation_func_clamp_value is None
                     and not self.config.activation_func_fp8_input_store
                 ):
                     from megatron.core.fusions.fused_swiglu_triton import swiglu_triton
@@ -385,6 +387,7 @@ class MLP(MegatronModule):
                         self.config.cpu_offloading
                         and self.config.cpu_offloading_activations
                         and HAVE_TE,
+                        limit=self.config.activation_func_clamp_value,
                     )
                 else:
                     raise ValueError("Only support fusion of gelu and swiglu")
