@@ -147,3 +147,42 @@ def test_muown_classical_row_sharded_headwise(mesh):
         torch.testing.assert_close(local(shard).detach(), full.detach()[lo:hi])
         torch.testing.assert_close(local(sharded.state[shard]["v_norm"]),
                                    reference.state[full]["v_norm"][lo:hi])
+
+
+def test_muown_classical_hsdp(mesh):
+    """HSDP: a 2 x 2 mesh, rows sharded over the inner dim (uneven), replicated over the outer."""
+    from torch.distributed.tensor.placement_types import Replicate
+
+    os.environ["ANGULAR_MUOWN_COMPACT_CKPT"] = "1"
+    mesh2 = init_device_mesh("cuda", (2, 2), mesh_dim_names=("outer", "inner"))
+    inner = mesh2.get_local_rank("inner")
+    layouts = [((12, 8), (5, 7)), ((8, 16), (0, 8)), ((6, 4), (4, 2))]
+    torch.manual_seed(13)
+    fulls = [torch.nn.Parameter(torch.randn(shape, device="cuda") * 0.2) for shape, _ in layouts]
+
+    def shard(t, counts):
+        lo = sum(counts[:inner])
+        dt = DTensor.from_local(t[lo:lo + counts[inner]].clone(), device_mesh=mesh2,
+                                placements=[Replicate(), Shard(0)], run_check=False,
+                                shape=t.shape, stride=t.stride())
+        update_uneven_dtensor_chunk_metadata(dt)
+        return dt
+
+    shards = [torch.nn.Parameter(shard(f.detach(), c)) for f, (_, c) in zip(fulls, layouts)]
+    options = dict(lr=0.008, split_qkv=False, fp32_matmul_prec="highest", scale_mode="spectral",
+                   extra_scale_factor=0.2)
+    reference = TensorParallelMuownClassical(fulls, **options)
+    sharded = TensorParallelMuownClassical(shards, **options)
+    for step in range(3):
+        torch.manual_seed(400 + step)
+        for f, s_, (_, c) in zip(fulls, shards, layouts):
+            f.grad = torch.randn_like(f)
+            lo = sum(c[:inner])
+            s_.grad = None if c[inner] == 0 else shard(f.grad, c)
+        reference.step()
+        sharded.step()
+        for f, s_, (_, c) in zip(fulls, shards, layouts):
+            lo = sum(c[:inner])
+            torch.testing.assert_close(local(s_).detach(), f.detach()[lo:lo + c[inner]])
+            torch.testing.assert_close(local(sharded.state[s_]["v_norm"]),
+                                       reference.state[f]["v_norm"][lo:lo + c[inner]])

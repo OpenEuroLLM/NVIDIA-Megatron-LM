@@ -36,12 +36,26 @@ EXCHANGE_DTYPE = {"float32": torch.float32, "bfloat16": torch.bfloat16}[
 ]
 
 
+def _shard_dim(p: torch.Tensor) -> Optional[int]:
+    """The mesh dimension sharding ``p`` on rows, if the others replicate it: Megatron-FSDP's
+    [Shard(0)], or HSDP's [Replicate (outer), Shard(0) (inner)] (every replica group holds the
+    same shards and runs the same exchange within its inner group)."""
+    from torch.distributed.tensor.placement_types import Replicate
+
+    dims = [i for i, pl in enumerate(p.placements) if isinstance(pl, Shard)]
+    if len(dims) != 1 or p.placements[dims[0]].dim != 0:
+        return None
+    if not all(isinstance(pl, Replicate) for i, pl in enumerate(p.placements) if i != dims[0]):
+        return None
+    return dims[0]
+
+
 def is_row_sharded(p: torch.Tensor) -> bool:
-    """A Megatron-FSDP optimizer parameter: a DTensor sharded on dim 0 over one mesh dim."""
+    """A Megatron-FSDP optimizer parameter: a DTensor sharded on dim 0 over one mesh dim (the
+    other mesh dims, if any, replicating it)."""
     if DTensor is None or not isinstance(p, DTensor):
         return False
-    placements = p.placements
-    return len(placements) == 1 and isinstance(placements[0], Shard) and placements[0].dim == 0
+    return _shard_dim(p) is not None
 
 
 def local(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
@@ -52,7 +66,7 @@ def local(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
 
 
 def shard_group(p: torch.Tensor) -> "torch.distributed.ProcessGroup":
-    return p.device_mesh.get_group(0)
+    return p.device_mesh.get_group(_shard_dim(p))
 
 
 def row_state_like(p: torch.Tensor, rows_local: torch.Tensor) -> torch.Tensor:
