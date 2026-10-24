@@ -292,6 +292,11 @@ class ComplexKDA(_MegatronSelfAttentionAdapter):
             layer_idx=layer_number - 1,
         )
         self._replicate()
+        # head-wise Muon-family orthogonalization (muon_qkv_headwise): q / k / v split per head
+        for proj in ("q_proj", "k_proj", "v_proj"):
+            mod = getattr(self.layer, proj, None)
+            if mod is not None and getattr(mod, "weight", None) is not None:
+                mod.weight.headwise_dim = head_dim
 
 
 class ComplexKDAHybridAttention(_MegatronSelfAttentionAdapter):

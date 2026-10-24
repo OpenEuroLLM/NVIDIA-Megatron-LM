@@ -152,8 +152,13 @@ def _is_nonlinear_or_embedding(param):
     )
 
 
-def _get_qkv_split_shapes(model_cfg) -> list[int]:
-    """Compute QKV split shapes from model config."""
+def _get_qkv_split_shapes(model_cfg, headwise: bool = False) -> list[int]:
+    """Compute QKV split shapes from model config (per query group: q [, gate], k, v; headwise:
+    one kv_channels block per head, in the same layout)."""
+    if headwise:
+        heads_per_group = model_cfg.num_attention_heads // model_cfg.num_query_groups
+        gate = 2 if getattr(model_cfg, 'attention_output_gate', False) else 1
+        return [model_cfg.kv_channels] * (gate * heads_per_group + 2)
     query_projection_size = (
         model_cfg.num_attention_heads // model_cfg.num_query_groups * model_cfg.kv_channels
     )

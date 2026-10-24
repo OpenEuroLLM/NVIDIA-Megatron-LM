@@ -2878,6 +2878,9 @@ def _add_regularization_args(parser):
     group.add_argument('--muon-no-split-qkv', action='store_false', default=True,
                        dest='muon_split_qkv',
                        help='Whether to split QKV parameters for Muon optimizer')
+    group.add_argument('--muon-qkv-headwise', action='store_true',
+                       help='Orthogonalize Q / K / V (and the output gate) per attention head, and '
+                       'the linear mixers\' q / k / v projections per head (Muon family).')
     group.add_argument('--muon-nesterov', action='store_true',
                        help='Whether to use Nesterov-style momentum in the internal SGD')
     group.add_argument('--muon-scale-mode', type=str, default='spectral',

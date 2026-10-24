@@ -871,9 +871,16 @@ def _prepare_emerging_optimizer_params(config, eopt_name, model_chunks, config_o
             if 'experts' in name and 'shared' not in name:
                 param.expert_tp = True
             # TODO(deyuf): support MLA
+            headwise = bool(getattr(config, 'muon_qkv_headwise', False))
+            hd = getattr(param, 'headwise_dim', None)
+            if headwise and hd and len(param.shape) == 2 and param.shape[0] % hd == 0:
+                # a linear mixer's q / k / v projection: one block per head
+                param.is_qkv = True
+                param.qkv_split_shapes = [hd] * (param.shape[0] // hd)
+                continue
             if 'linear_qkv.weight' in name and len(param.shape) == 2:
                 if qkv_split_shapes is None:
-                    qkv_split_shapes = _get_qkv_split_shapes(model_chunk.config)
+                    qkv_split_shapes = _get_qkv_split_shapes(model_chunk.config, headwise)
                 if param.shape[0] % sum(qkv_split_shapes) == 0:
                     param.is_qkv = True
                     param.qkv_split_shapes = qkv_split_shapes

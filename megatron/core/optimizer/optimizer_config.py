@@ -352,6 +352,12 @@ class OptimizerConfig:
     muon_split_qkv: bool = True
     """Whether to split QKV parameters for Muon optimizer."""
 
+    muon_qkv_headwise: bool = False
+    """Head-wise orthogonalization (DeepSeek-V4.1, GLM-5, Kimi-K3): split the attention's fused QKV
+    (and output gate) into one block per head (kv_channels rows) instead of q / gate / k / v, and the
+    linear mixers' q / k / v projections (tagged ``headwise_dim``) into their heads, before the
+    Muon-family orthogonalization. Needs muon_split_qkv."""
+
     muon_nesterov: bool = False
     """Whether to use Nesterov-style momentum in the internal SGD."""
 
