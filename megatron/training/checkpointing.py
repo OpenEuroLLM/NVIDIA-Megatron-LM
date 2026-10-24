@@ -559,6 +559,34 @@ def save_grads(save_dir, state_dict, iteration, grad_label):
     )
 
 
+
+def _debug_optimizer_state(optimizer, tag):
+    """MEGATRON_DEBUG_OPT_STATE=1: per state key, the sum of squares of rank 0's local optimizer
+    state (all sub-optimizers), at a save and after a load -- what a resume does not restore."""
+    if os.environ.get("MEGATRON_DEBUG_OPT_STATE", "0") != "1" or optimizer is None:
+        return
+    if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+        return
+    sums, counts = {}, {}
+    for idx, opt in enumerate(getattr(optimizer, "chained_optimizers", [optimizer])):
+        inner = getattr(opt, "optimizer", opt)
+        for i, group in enumerate(getattr(inner, "param_groups", [])):
+            for k in ("step", "lr"):
+                if k in group:
+                    sums[f"{idx}.group{i}.{k}"] = float(group[k])
+        for state in getattr(inner, "state", {}).values():
+            for k, v in state.items():
+                key = f"{idx}.{k}"
+                if isinstance(v, torch.Tensor):
+                    t = v._local_tensor if hasattr(v, "_local_tensor") else v
+                    val = float(t.double().pow(2).sum()) if t.numel() > 1 else float(t)
+                else:
+                    val = float(v) if isinstance(v, (int, float)) else 0.0
+                sums[key] = sums.get(key, 0.0) + val
+                counts[key] = counts.get(key, 0) + 1
+    print(f"[opt-state {tag}] " + " ".join(f"{k}={v:.6e}(n{counts.get(k, 1)})"
+                                          for k, v in sorted(sums.items())), flush=True)
+
 def save_checkpoint(
     iteration,
     model,
@@ -759,6 +787,7 @@ def save_checkpoint(
                 )
         else:
             sharded_sd_metadata = None
+        _debug_optimizer_state(optimizer, f"at save {iteration}")
         state_dict = generate_state_dict(
             args,
             model,
@@ -2626,6 +2655,7 @@ def load_checkpoint(
                 and not optimizer.is_stub_optimizer
             ):
                 optimizer.load_state_dict(state_dict['optimizer'])
+                _debug_optimizer_state(optimizer, "after load")
 
             # Load distributed optimizer's custom parameter state.
             # For distributed checkpoint it's already loaded in load_state_dict above
