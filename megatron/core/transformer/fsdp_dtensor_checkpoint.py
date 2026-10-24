@@ -191,6 +191,61 @@ def expert_param_local_key(key: str, num_experts: int | None = None) -> str:
     return key
 
 
+def _split_optimizer_state(state, dist_param, split_param_shaped, row_sizes, is_expert_param):
+    """Split one parameter's optimizer state the way its weight is split: every tensor of the
+    parameter's shape with ``split_param_shaped`` (Adam's exp_avg / exp_avg_sq, Muon's
+    momentum_buffer, Muown's m_u); the per-row ``[rows, 1]`` states (Muown's g / m_g / v_g / v_norm,
+    row-sharded like the weight) by rows into ``row_sizes`` (None: copied to every part); anything
+    else (step counters) copied. Returns one state dict per part."""
+    parts = None
+    out = {}
+    for subkey, value in state.items():
+        if not isinstance(value, torch.Tensor) or value.dim() == 0:
+            out[subkey] = None
+            continue
+        if tuple(value.shape) == tuple(dist_param.shape):
+            out[subkey] = split_param_shaped(value)
+        elif value.dim() == 2 and value.shape == (dist_param.shape[0], 1) and row_sizes:
+            out[subkey] = _split_row_state(value, dist_param, row_sizes, is_expert_param)
+        else:
+            out[subkey] = None
+        if out[subkey] is not None:
+            parts = len(out[subkey])
+    assert parts is not None, "no splittable optimizer state"
+    result = [dict() for _ in range(parts)]
+    for subkey, value in state.items():
+        for i in range(parts):
+            result[i][subkey] = out[subkey][i] if out[subkey] is not None else value
+    return result
+
+
+def _split_row_state(data, dist_param, row_sizes, is_expert_param):
+    """Split a ``[rows, 1]`` row-sharded optimizer state (the rows a rank holds are the rows of
+    its weight shard) into consecutive row ranges of ``row_sizes``."""
+    cols = dist_param.numel() // dist_param.shape[0]
+    fsdp_slice = dist_param.megatron_fsdp_slice
+    local_first = fsdp_slice.start // cols
+    local = data.to_local().reshape(-1, 1)
+    results, first = [], 0
+    for size in row_sizes:
+        lo = max(first, local_first)
+        hi = min(first + size, local_first + local.shape[0])
+        piece = local[lo - local_first : hi - local_first] if hi > lo else local[:0]
+        meta = torch.empty(size, 1, device="meta")
+        results.append(
+            make_fsdp_dtensor(
+                piece.contiguous(),
+                meta,
+                dist_index=dist_param.megatron_fsdp_dist_index,
+                is_expert_param=is_expert_param,
+                run_check=True,
+                update_uneven_dtensor_chunk_meta=True,
+            )
+        )
+        first += size
+    return results
+
+
 def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
     """
     Handle SWiGLU in model and optimizer state dicts.
@@ -369,20 +424,22 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
                 if not is_swiglu_key(key) or not _key_in_glu_layer(key):
                     new_opt_state_dict[key] = opt_state_dict[key]
                     continue
-                new_opt_state_dict[f"{key}_w"] = opt_state_dict[key].copy()
-                new_opt_state_dict[f"{key}_v"] = opt_state_dict[key].copy()
-                for subkey in ["exp_avg", "exp_avg_sq"]:
-                    dist_param = model.get_parameter(
-                        expert_param_local_key(key[len("module.") :], num_experts)
-                    )
-                    weight_w, weight_v = split_swiglu_linear_fc1(
-                        opt_state_dict[key][subkey],
-                        dist_param,
-                        swiglu_shard_axis=0,
-                        is_expert_param="mlp.experts" in key,
-                    )
-                    new_opt_state_dict[f"{key}_w"][subkey] = weight_w
-                    new_opt_state_dict[f"{key}_v"][subkey] = weight_v
+                dist_param = model.get_parameter(
+                    expert_param_local_key(key[len("module.") :], num_experts)
+                )
+                is_expert = "mlp.experts" in key
+                rows = dist_param.shape[0]
+                part_w, part_v = _split_optimizer_state(
+                    opt_state_dict[key],
+                    dist_param,
+                    lambda t: split_swiglu_linear_fc1(
+                        t, dist_param, swiglu_shard_axis=0, is_expert_param=is_expert
+                    ),
+                    (rows // 2, rows // 2) if dist_param.dim() == 2 else None,
+                    is_expert,
+                )
+                new_opt_state_dict[f"{key}_w"] = part_w
+                new_opt_state_dict[f"{key}_v"] = part_v
             optimizer_state_dict["state"] = new_opt_state_dict
 
     return model_state_dict, optimizer_state_dict
@@ -552,13 +609,22 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
                     new_opt_state[key] = opt_state[key]
                     continue
                 sizes, names, dim = match
-                for sub_name in names:
-                    new_opt_state[f"{key}.{sub_name}"] = opt_state[key].copy()
-                for subkey in ["exp_avg", "exp_avg_sq"]:
-                    dist_param = model.get_parameter(key[len("module.") :])
-                    sub_tensors = split_gdn_fused(opt_state[key][subkey], dist_param, sizes, dim)
-                    for sub_name, tensor in zip(names, sub_tensors):
-                        new_opt_state[f"{key}.{sub_name}"][subkey] = tensor
+                dist_param = model.get_parameter(key[len("module.") :])
+                rows = dist_param.shape[0]
+                row_sizes = (
+                    [rows * s // sum(sizes) for s in sizes]
+                    if dim == 0 and dist_param.dim() == 2
+                    else None
+                )
+                parts = _split_optimizer_state(
+                    opt_state[key],
+                    dist_param,
+                    lambda t: split_gdn_fused(t, dist_param, sizes, dim),
+                    row_sizes,
+                    False,
+                )
+                for sub_name, part in zip(names, parts):
+                    new_opt_state[f"{key}.{sub_name}"] = part
             optimizer_state_dict["state"] = new_opt_state
 
     return model_state_dict, optimizer_state_dict
