@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+import time
 from pathlib import Path
 from typing import Tuple
 
@@ -28,17 +29,27 @@ def on_save_checkpoint_success(checkpoint_path: str, tracker_filename: str, save
 
     wandb_writer = get_wandb_writer()
 
-    if wandb_writer:
+    if not wandb_writer:
+        return
+    # The tracker file is written by rank 0; this runs on the last rank without a barrier, so on a
+    # run's first persistent save the file may not exist (or not be visible on a parallel file
+    # system) yet. Wait for it briefly; the artifact is bookkeeping, never fail the save over it.
+    deadline = time.monotonic() + 60.0
+    while not Path(tracker_filename).is_file() and time.monotonic() < deadline:
+        time.sleep(1.0)
+    try:
         metadata = {"iteration": iteration}
         artifact_name, artifact_version = _get_artifact_name_and_version(Path(save_dir), Path(checkpoint_path))
         artifact = wandb_writer.Artifact(artifact_name, type="model", metadata=metadata)
-        # wandb's artifact.add_reference requires absolute paths
+        # wandb's artifact.add_reference requires absolute paths
         checkpoint_path = str(Path(checkpoint_path).resolve())
         artifact.add_reference(f"file://{checkpoint_path}", checksum=False)
         artifact.add_file(tracker_filename)
         wandb_writer.run.log_artifact(artifact, aliases=[artifact_version])
         wandb_tracker_filename = _get_wandb_artifact_tracker_filename(save_dir)
         wandb_tracker_filename.write_text(f"{wandb_writer.run.entity}/{wandb_writer.run.project}")
+    except Exception as e:  # noqa: BLE001 - the checkpoint itself is saved
+        print_rank_last(f"WARNING: wandb checkpoint artifact for iteration {iteration} not logged: {e}")
 
 
 def on_load_checkpoint_success(checkpoint_path: str, load_dir: str) -> None:

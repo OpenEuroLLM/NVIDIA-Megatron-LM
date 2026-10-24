@@ -4571,9 +4571,18 @@ def train(
             optimizers=[optimizer],
         )
 
+    # A run restarted from the checkpoint its exit interval saved is already done: the exit check
+    # only runs after a step, so it would otherwise train on to train_iters (a scheduler retry of a
+    # job that failed after its final save resumed at 4800 with exit_interval 4800 and ran to 7629).
+    if args.exit_interval and iteration > 0 and iteration % args.exit_interval == 0:
+        print_rank_0(f'resumed at iteration {iteration}, a multiple of --exit-interval '
+                     f'{args.exit_interval}: nothing to train')
+        print_datetime(f'exiting program at iteration {iteration}')
+        should_exit = True
+
     # Run training iterations till done.
     buffered_rollouts = None
-    while iteration < args.train_iters:
+    while iteration < args.train_iters and not should_exit:
         if (args.profile
             and (len(args.profile_ranks) == 0 or
                  torch.distributed.get_rank() in args.profile_ranks)):
