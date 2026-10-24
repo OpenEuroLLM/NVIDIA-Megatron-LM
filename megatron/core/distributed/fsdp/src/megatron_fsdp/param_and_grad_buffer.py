@@ -3317,6 +3317,17 @@ class ParamAndGradBuffer:
                         ]:
                             if hasattr(orig_param, attr_name):
                                 setattr(param, attr_name, getattr(orig_param, attr_name))
+                        # Every other public tag the model put on the parameter (optimizer
+                        # routing / param-group predicates read them: use_adam_with_emerging_
+                        # optimizers, is_residual_mixer, is_engram_table, ...), not FSDP's own
+                        # runtime attributes.
+                        for attr_name, value in vars(orig_param).items():
+                            if (
+                                not attr_name.startswith("_")
+                                and attr_name not in _FSDP_RUNTIME_PARAM_ATTRS
+                                and not hasattr(param, attr_name)
+                            ):
+                                setattr(param, attr_name, value)
 
                     return set_param_attribute
 
@@ -4925,6 +4936,14 @@ def to_local_if_dtensor(tensor):
     if isinstance(tensor, DTensor):
         return tensor._local_tensor
     return tensor
+
+
+# Attributes of the original parameters that belong to Megatron-FSDP / gradient bookkeeping and
+# must not be copied onto the distributed optimizer parameters.
+_FSDP_RUNTIME_PARAM_ATTRS = frozenset({
+    "main_grad", "grad_added_to_main_grad", "orig_param", "reset_attribute",
+    "megatron_fsdp_slice", "megatron_fsdp_dist_index", "get_main_grad", "overwrite_main_grad",
+})
 
 
 def _get_fsdp_tensor_spec(
