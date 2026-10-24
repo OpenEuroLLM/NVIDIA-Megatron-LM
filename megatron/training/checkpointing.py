@@ -592,6 +592,7 @@ def _debug_optimizer_state(optimizer, tag):
         def sq(v):
             t = v._local_tensor if hasattr(v, "_local_tensor") else v
             return float(t.double().pow(2).sum()) if t.numel() else 0.0
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         with open(f"{path}.{tag.replace(' ', '_')}.txt", "w") as f:
             for idx, opt in enumerate(getattr(optimizer, "chained_optimizers", [optimizer])):
                 inner = getattr(opt, "optimizer", opt)
