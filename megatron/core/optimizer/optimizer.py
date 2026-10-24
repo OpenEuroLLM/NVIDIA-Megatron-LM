@@ -1813,12 +1813,13 @@ class ChainedOptimizer(MegatronOptimizer):
 
         def is_leaf_entry(entry):
             # A saved optimizer's common state: DistributedOptimizer ('optimizer'), the
-            # param-keyed Float16Optimizer format ('param_keyed'), or a torch-style state dict
-            # ('state' + 'param_groups': Megatron-FSDP's fsdp_dtensor format).
+            # param-keyed Float16Optimizer format ('param_keyed'), or Megatron-FSDP's
+            # fsdp_dtensor format (a torch-style 'state' with 'param_to_group_meta' or
+            # 'param_groups').
             return isinstance(entry, dict) and (
                 'optimizer' in entry
                 or 'param_keyed' in entry
-                or ('state' in entry and 'param_groups' in entry)
+                or ('state' in entry and ('param_to_group_meta' in entry or 'param_groups' in entry))
             )
 
         def is_saved_entry(entry):
