@@ -751,6 +751,40 @@ def _get_megatron_optimizer_based_on_param_groups(
                         if len(opt.state[p]) == 0:
                             opt.state[p]['exp_avg'] = torch.zeros_like(p.data)
 
+        elif config.optimizer == 'sinkhorn':
+            # embedding / prediction head under a Muon-family optimizer (embedding_head_optimizer)
+            from .sinkhorn import SinkhornMomentum
+
+            tp = pg_collection.tp if pg_collection is not None else None
+
+            def _row_group(p, tp=tp):
+                if (
+                    tp is not None
+                    and get_pg_size(tp) > 1
+                    and getattr(p, 'tensor_model_parallel', False)
+                    and getattr(p, 'partition_dim', None) == 0
+                ):
+                    return tp
+                return None
+
+            optimizer = SinkhornMomentum(
+                param_groups,
+                lr=config.lr,
+                momentum=config.sinkhorn_momentum,
+                nesterov=True,
+                iters=config.sinkhorn_iters,
+                lr_ratio=config.sinkhorn_lr_ratio,
+                row_group_fn=_row_group,
+            )
+
+            def init_state_fn(opt, config=None):
+                for group in opt.param_groups:
+                    for p in group['params']:
+                        if len(opt.state[p]) == 0:
+                            opt.state[p]['momentum_buffer'] = torch.zeros_like(
+                                p.data, dtype=torch.float32
+                            )
+
         elif config.optimizer == 'sgd':
             optimizer = SGD(
                 param_groups,
@@ -901,6 +935,28 @@ def _prepare_emerging_optimizer_params(config, eopt_name, model_chunks, config_o
         for override in default_param_overrides.values():
             if override.get('optimizer') in ('adam', 'lion'):
                 override['optimizer'] = config.muon_scalar_optimizer
+    head_opt = getattr(config, 'embedding_head_optimizer', 'adam')
+    if head_opt != 'adam':
+        # word embedding + prediction head on their own optimizer (DeepSeek-V4.1's Sinkhorn-
+        # balanced momentum); the remaining non-matrix parameters keep the scalar optimizer.
+        # Disjoint keys: the combined override would raise on two 'optimizer' values.
+        from .emerging_optimizers import _is_nonlinear_or_embedding
+
+        def _is_emb(p):
+            return getattr(p, 'is_embedding_or_output_parameter', False) and len(p.shape) == 2
+
+        rewritten = {}
+        for key, override in default_param_overrides.items():
+            pred = key.predicate
+            if isinstance(pred, ParamPredicate) and pred.name == "nonlinear_or_embedding":
+                key = ParamKey(predicate=ParamPredicate(
+                    name="nonlinear_not_embedding",
+                    fn=lambda p: _is_nonlinear_or_embedding(p) and not _is_emb(p)))
+            rewritten[key] = override
+        rewritten[ParamKey(predicate=ParamPredicate(name="embedding_or_output_2d", fn=_is_emb))] = {
+            'optimizer': head_opt
+        }
+        default_param_overrides = rewritten
     config_overrides.update(default_param_overrides)
 
 
@@ -961,6 +1017,11 @@ def _get_megatron_fsdp_emerging_optimizer(
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
     emerging = [g for g in param_groups if g.get('optimizer', eopt_name) == eopt_name]
     scalar = [g for g in param_groups if g.get('optimizer', eopt_name) != eopt_name]
+    if any(g.get('optimizer') == 'sinkhorn' for g in scalar):
+        raise NotImplementedError(
+            "embedding_head_optimizer='sinkhorn' on Megatron-FSDP: the balancing needs whole rows "
+            "and columns of the sharded embedding / head (a row exchange as fsdp_row_exchange's)"
+        )
     parts, init_fns = [], []
     if emerging:
         opt, init_fn = _create_emerging_optimizer(
@@ -1160,6 +1221,11 @@ def _get_megatron_emerging_optimizer(
         else:
             fallback_config = copy.copy(config)
             fallback_config.optimizer = opt_name
+            if opt_name == 'sinkhorn' and use_separate_distributed_optimizer:
+                raise NotImplementedError(
+                    "embedding_head_optimizer='sinkhorn' needs whole rows and columns: not on the "
+                    "byte-sharded DistributedOptimizer of the layer-wise path"
+                )
             if use_separate_distributed_optimizer:
                 # Route non-emerging params (adam/lion) through a real DistributedOptimizer
                 # (byte-level sharding) instead of stuffing them inside LayerWise.

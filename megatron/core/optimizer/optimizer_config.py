@@ -352,6 +352,22 @@ class OptimizerConfig:
     muon_split_qkv: bool = True
     """Whether to split QKV parameters for Muon optimizer."""
 
+    embedding_head_optimizer: str = "adam"
+    """Optimizer of the word embedding and the prediction head under a Muon-family optimizer:
+    "adam" (the scalar optimizer, as every non-matrix parameter) or "sinkhorn" (DeepSeek-V4.1:
+    Nesterov momentum + Sinkhorn row / column balancing, momentum buffer only, no weight decay;
+    megatron/core/optimizer/sinkhorn.py)."""
+
+    sinkhorn_momentum: float = 0.95
+    """Momentum of the Sinkhorn-balanced update."""
+
+    sinkhorn_iters: int = 11
+    """Alternating row / column normalizations of the Sinkhorn-balanced update (odd)."""
+
+    sinkhorn_lr_ratio: float = 0.18
+    """Learning-rate correction of the Sinkhorn-balanced update (its unit-RMS step times lr times
+    this; DeepSeek-V4.1: 0.18, matching Adam's update size)."""
+
     muon_qkv_headwise: bool = False
     """Head-wise orthogonalization (DeepSeek-V4.1, GLM-5, Kimi-K3): split the attention's fused QKV
     (and output gate) into one block per head (kv_channels rows) instead of q / gate / k / v, and the

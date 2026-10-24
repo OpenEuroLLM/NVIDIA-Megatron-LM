@@ -2878,6 +2878,13 @@ def _add_regularization_args(parser):
     group.add_argument('--muon-no-split-qkv', action='store_false', default=True,
                        dest='muon_split_qkv',
                        help='Whether to split QKV parameters for Muon optimizer')
+    group.add_argument('--embedding-head-optimizer', type=str, default='adam',
+                       choices=['adam', 'sinkhorn'],
+                       help='Optimizer of the word embedding and prediction head under a '
+                       'Muon-family optimizer (sinkhorn: DeepSeek-V4.1 Sinkhorn-balanced momentum).')
+    group.add_argument('--sinkhorn-momentum', type=float, default=0.95)
+    group.add_argument('--sinkhorn-iters', type=int, default=11)
+    group.add_argument('--sinkhorn-lr-ratio', type=float, default=0.18)
     group.add_argument('--muon-qkv-headwise', action='store_true',
                        help='Orthogonalize Q / K / V (and the output gate) per attention head, and '
                        'the linear mixers\' q / k / v projections per head (Muon family).')
