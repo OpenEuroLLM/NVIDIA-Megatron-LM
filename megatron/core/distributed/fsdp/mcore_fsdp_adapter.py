@@ -179,10 +179,15 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 # DepthMemoryStreamBoundary: the LDM embedding write reads its address weights
                 # directly in a fused step (not through its submodules' calls), so it is gathered
                 # as a unit
+                from megatron.core.ssm.engram import EngramLayer
                 from megatron.core.transformer.depth_memory import DepthMemoryStreamBoundary
 
+                # EngramLayer: as a non-unit module its parameters (the mHC mixer, conv, gates;
+                # the sharded tables are hidden from FSDP) were gathered per direct parameter, and
+                # the mHC read faulted on them ("misaligned address") -- a unit like the layers
                 self.fsdp_unit_modules = [
-                    TransformerLayer, MoETransformerLayer, MambaLayer, DepthMemoryStreamBoundary
+                    TransformerLayer, MoETransformerLayer, MambaLayer, DepthMemoryStreamBoundary,
+                    EngramLayer,
                 ]
             else:
                 self.fsdp_unit_modules = []
