@@ -385,6 +385,11 @@ class DepthMemoryStreamBoundary(nn.Module):
         self._workspace = [workspace]
 
     def expand(self, embedding: torch.Tensor) -> torch.Tensor:
+        # through __call__: the fused step reads the address weights directly, so Megatron-FSDP
+        # (this module is one of its units) must see the call to gather them
+        return self(embedding)
+
+    def forward(self, embedding: torch.Tensor) -> torch.Tensor:
         read = ldm_fused_step(
             self.embed_write, self.first_query, self._workspace[0], 0, embedding, embedding
         )

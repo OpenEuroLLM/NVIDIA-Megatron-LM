@@ -176,7 +176,14 @@ class FullyShardedDataParallel(_BaseDataParallel):
             self.fsdp_unit_modules = fsdp_unit_modules
         else:
             if self.ddp_config.data_parallel_sharding_strategy == "optim_grads_params":
-                self.fsdp_unit_modules = [TransformerLayer, MoETransformerLayer, MambaLayer]
+                # DepthMemoryStreamBoundary: the LDM embedding write reads its address weights
+                # directly in a fused step (not through its submodules' calls), so it is gathered
+                # as a unit
+                from megatron.core.transformer.depth_memory import DepthMemoryStreamBoundary
+
+                self.fsdp_unit_modules = [
+                    TransformerLayer, MoETransformerLayer, MambaLayer, DepthMemoryStreamBoundary
+                ]
             else:
                 self.fsdp_unit_modules = []
 
