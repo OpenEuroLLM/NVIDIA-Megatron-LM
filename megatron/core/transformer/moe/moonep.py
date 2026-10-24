@@ -39,7 +39,29 @@ from typing import Optional
 import torch
 import torch.distributed as dist
 
-from megatron.core.fusions.fused_bias_swiglu import weighted_swiglu, weighted_swiglu_back
+from megatron.core.fusions.fused_bias_swiglu import (
+    clamped_swiglu,
+    clamped_swiglu_back,
+    weighted_swiglu,
+    weighted_swiglu_back,
+)
+
+
+def _weighted_act(h, probs, limit):
+    """The probability-weighted SwiGLU of the experts, clamped (activation_func_clamp_value) as
+    WeightedSwiGLUFunction."""
+    if limit is None:
+        return weighted_swiglu(h, probs)
+    return (clamped_swiglu(h, limit) * probs).to(h.dtype)
+
+
+def _weighted_act_back(grad_a, h, probs, limit):
+    if limit is None:
+        return weighted_swiglu_back(grad_a, h, probs)
+    w_dtype = probs.dtype
+    grad_h = clamped_swiglu_back(grad_a * probs, h, limit).to(h.dtype)
+    grad_probs = (clamped_swiglu(h, limit) * grad_a.to(w_dtype)).sum(-1, keepdim=True)
+    return grad_h, grad_probs.to(w_dtype)
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.token_dispatcher import MoETokenDispatcher
 
@@ -401,7 +423,7 @@ class _MoonEPExperts(torch.autograd.Function):
         h = torch.empty(x.shape[0], ffn2, dtype=x.dtype, device=x.device)
         _gemm(w1, x, hidden, h, ffn2, splits, offsets, "TN")
         probs = w_nvs.unsqueeze(-1)
-        a = weighted_swiglu(h, probs)
+        a = _weighted_act(h, probs, getattr(module.config, "activation_func_clamp_value", None))
         # zero copy: fc2 writes straight into the NVLink shard the combine reads (the shard is
         # free: the dispatch copied the tokens out; y is not saved for backward)
         y = state.buffer.hidden_nvsh_buffer_view
@@ -435,7 +457,9 @@ class _MoonEPExperts(torch.autograd.Function):
         grad_a = torch.empty(x.shape[0], ffn, dtype=x.dtype, device=x.device)
         _gemm(w2, grad_y, hidden, grad_a, ffn, splits, offsets, "NN")
         _wgrad(main2, gpools[1], a, ffn, grad_y, hidden, splits, offsets, overwrite)
-        grad_h, grad_probs = weighted_swiglu_back(grad_a, h, probs)
+        grad_h, grad_probs = _weighted_act_back(
+            grad_a, h, probs, getattr(module.config, "activation_func_clamp_value", None)
+        )
         # fc1
         # zero copy: the dispatch backward (a combine) reads fc1's dgrad from the shard
         grad_x = state.buffer.hidden_nvsh_buffer_view

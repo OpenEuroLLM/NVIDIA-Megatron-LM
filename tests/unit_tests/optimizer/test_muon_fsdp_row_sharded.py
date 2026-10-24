@@ -118,3 +118,32 @@ def test_muon_row_sharded(mesh):
         for f, s, (_, counts) in zip(fulls, shards, LAYOUTS):
             lo, hi = _rows(counts, rank)
             torch.testing.assert_close(local(s).detach(), f.detach()[lo:hi])
+
+
+def test_muown_classical_row_sharded_headwise(mesh):
+    """QKV / head-wise split (qkv_split_shapes, the owner splits the gathered matrix) with shards
+    that cut through the head blocks."""
+    os.environ["ANGULAR_MUOWN_COMPACT_CKPT"] = "1"
+    rank = mesh.get_rank()
+    shape, counts, split = (24, 8), (5, 0, 11, 8), [4, 4, 4]  # 2 groups of 3 heads of 4 rows
+    torch.manual_seed(5)
+    full = torch.nn.Parameter(torch.randn(shape, device="cuda") * 0.2)
+    shard = _shard(full.detach(), counts, mesh)
+    for p in (full, shard):
+        p.is_qkv, p.qkv_split_shapes = True, split
+    options = dict(lr=0.008, split_qkv=True, is_qkv_fn=lambda p: getattr(p, "is_qkv", False),
+                   fp32_matmul_prec="highest", scale_mode="spectral", extra_scale_factor=0.2)
+    reference = TensorParallelMuownClassical([full], **options)
+    sharded = TensorParallelMuownClassical([shard], **options)
+    lo, hi = _rows(counts, rank)
+    for step in range(3):
+        torch.manual_seed(300 + step)
+        full.grad = torch.randn_like(full)
+        shard.grad = None if hi == lo else DTensor.from_local(
+            full.grad[lo:hi].clone(), device_mesh=mesh, placements=[Shard(0)], run_check=False,
+            shape=full.shape, stride=full.stride())
+        reference.step()
+        sharded.step()
+        torch.testing.assert_close(local(shard).detach(), full.detach()[lo:hi])
+        torch.testing.assert_close(local(sharded.state[shard]["v_norm"]),
+                                   reference.state[full]["v_norm"][lo:hi])
