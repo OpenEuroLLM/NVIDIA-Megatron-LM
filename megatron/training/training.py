@@ -3171,6 +3171,14 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             _dump_mem_trace(_mem_trace)
         if iteration is not None and iteration < 3:
             mem_breakdown.report(f"iteration {iteration} after forward-backward")
+        # EMPTY_CACHE_FIRST_STEPS=N: release the allocator cache after the forward-backward of the
+        # first N steps only -- NCCL allocates its buffers of the optimizer step / grad norm
+        # collectives then, outside PyTorch's cache (OOM "Cuda failure 2" in ncclCuMemAlloc at a
+        # high memory use); later steps reuse them and keep the cache (no per-step cost)
+        if iteration is not None and iteration - args.iteration < int(
+            os.environ.get("EMPTY_CACHE_FIRST_STEPS", "0")
+        ) and iteration >= args.iteration:
+            torch.cuda.empty_cache()
         if save_activations_in_this_iteration:
             save_activations(iteration + 1)
             disable_activation_logging()
