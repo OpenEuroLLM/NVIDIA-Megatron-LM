@@ -285,3 +285,145 @@ def unwind_backward_step(m, dm, q, dr, kappa, kbar, vbar, c):
                                      _rows(kbar, k), _rows(vbar, d), c.reshape(-1).contiguous(),
                                      dq, du, dkappa, dkbar, K=k, D=d, BD=bd, num_warps=4)
     return dq, du, dkappa, dkbar
+
+
+# ---- v2: raw inputs (khat, scale, bf16 value, query), bf16 outputs, R rows per program --------
+# kbar = scale * khat and vbar = scale * value are formed in registers; the read and d value are
+# written in the activation dtype; the backward also returns sum_d du * value (for d scale).
+
+
+@triton.jit
+def _fwd2_kernel(m_ptr, khat_ptr, s_ptr, kappa_ptr, v_ptr, q_ptr, read_ptr, rows,
+                 K: tl.constexpr, D: tl.constexpr, BD: tl.constexpr, R: tl.constexpr):
+    r = tl.program_id(0) * R + tl.arange(0, R)
+    rmask = r < rows
+    r64 = r.to(tl.int64)
+    k = tl.arange(0, K)
+    d = tl.arange(0, BD)
+    dmask = d < D
+    tile = r64[:, None, None] * K * D + k[None, :, None] * D + d[None, None, :]
+    m3 = rmask[:, None, None] & dmask[None, None, :]
+    vec_k = r64[:, None] * K + k[None, :]
+    vec_d = r64[:, None] * D + d[None, :]
+    m2d = rmask[:, None] & dmask[None, :]
+    m = tl.load(m_ptr + tile, mask=m3, other=0.0)
+    s = tl.load(s_ptr + r64, mask=rmask, other=0.0)
+    kbar = tl.load(khat_ptr + vec_k, mask=rmask[:, None], other=0.0) * s[:, None]
+    kappa = tl.load(kappa_ptr + vec_k, mask=rmask[:, None], other=0.0)
+    q = tl.load(q_ptr + vec_k, mask=rmask[:, None], other=0.0)
+    vbar = tl.load(v_ptr + vec_d, mask=m2d, other=0.0).to(tl.float32) * s[:, None]
+    u = vbar - tl.sum(m * kbar[:, :, None], axis=1)
+    m = m + kappa[:, :, None] * u[:, None, :]
+    tl.store(m_ptr + tile, m, mask=m3)
+    read = tl.sum(m * q[:, :, None], axis=1)
+    tl.store(read_ptr + vec_d, read.to(read_ptr.dtype.element_ty), mask=m2d)
+
+
+@triton.jit
+def _bwd2_kernel(m_ptr, dm_ptr, q_ptr, dr_ptr, kappa_ptr, khat_ptr, s_ptr, v_ptr, c_ptr,
+                 dq_ptr, dv_ptr, dkappa_ptr, dkbar_ptr, duv_ptr, rows,
+                 K: tl.constexpr, D: tl.constexpr, BD: tl.constexpr, R: tl.constexpr):
+    r = tl.program_id(0) * R + tl.arange(0, R)
+    rmask = r < rows
+    r64 = r.to(tl.int64)
+    k = tl.arange(0, K)
+    d = tl.arange(0, BD)
+    dmask = d < D
+    tile = r64[:, None, None] * K * D + k[None, :, None] * D + d[None, None, :]
+    m3 = rmask[:, None, None] & dmask[None, None, :]
+    vec_k = r64[:, None] * K + k[None, :]
+    vec_d = r64[:, None] * D + d[None, :]
+    m2d = rmask[:, None] & dmask[None, :]
+    m2k = rmask[:, None]
+    m = tl.load(m_ptr + tile, mask=m3, other=0.0)
+    dm = tl.load(dm_ptr + tile, mask=m3, other=0.0)
+    s = tl.load(s_ptr + r64, mask=rmask, other=1.0)
+    c = tl.load(c_ptr + r64, mask=rmask, other=1.0)
+    q = tl.load(q_ptr + vec_k, mask=m2k, other=0.0)
+    kappa = tl.load(kappa_ptr + vec_k, mask=m2k, other=0.0)
+    kbar = tl.load(khat_ptr + vec_k, mask=m2k, other=0.0) * s[:, None]
+    value = tl.load(v_ptr + vec_d, mask=m2d, other=0.0).to(tl.float32)
+    dr = tl.load(dr_ptr + vec_d, mask=m2d, other=0.0).to(tl.float32)
+    u = (value * s[:, None] - tl.sum(m * kbar[:, :, None], axis=1)) / c[:, None]
+    tl.store(dq_ptr + vec_k, tl.sum(m * dr[:, None, :], axis=2), mask=m2k)
+    dmt = dm + q[:, :, None] * dr[:, None, :]
+    du = tl.sum(dmt * kappa[:, :, None], axis=1)
+    tl.store(dkappa_ptr + vec_k, tl.sum(dmt * u[:, None, :], axis=2), mask=m2k)
+    m = m - kappa[:, :, None] * u[:, None, :]
+    tl.store(m_ptr + tile, m, mask=m3)
+    tl.store(dkbar_ptr + vec_k, -tl.sum(m * du[:, None, :], axis=2), mask=m2k)
+    tl.store(dm_ptr + tile, dmt - kbar[:, :, None] * du[:, None, :], mask=m3)
+    tl.store(dv_ptr + vec_d, (du * s[:, None]).to(dv_ptr.dtype.element_ty), mask=m2d)
+    tl.store(duv_ptr + r64, tl.sum(du * value, axis=1), mask=rmask)
+
+
+@triton.jit
+def _p_fwd2_kernel(p_ptr, khat_ptr, s_ptr, lam_ptr, kappa_ptr, c_ptr, p_prev_ptr, rows, G,
+                   RECOVER: tl.constexpr, K: tl.constexpr, R: tl.constexpr):
+    """RECOVER=0: the forward update of P (kappa out); 1: the recovery at P_e (kappa, c, P_{e-1})."""
+    r = tl.program_id(0) * R + tl.arange(0, R)
+    rmask = r < rows
+    i = tl.arange(0, K)
+    r64 = r.to(tl.int64)
+    tile = r64[:, None, None] * K * K + i[None, :, None] * K + i[None, None, :]
+    m3 = rmask[:, None, None]
+    vec = r64[:, None] * K + i[None, :]
+    p = tl.load(p_ptr + tile, mask=m3, other=0.0)
+    s = tl.load(s_ptr + r64, mask=rmask, other=0.0)
+    kb = tl.load(khat_ptr + vec, mask=rmask[:, None], other=0.0) * s[:, None]
+    lam = tl.load(lam_ptr + (r % G), mask=rmask, other=1.0)
+    if RECOVER:
+        kappa = tl.sum(p * kb[:, None, :], axis=2)
+        c = 1.0 - tl.sum(kappa * kb, axis=1)
+        p_prev = lam[:, None, None] * (p + kappa[:, :, None] * (kappa / c[:, None])[:, None, :])
+        tl.store(c_ptr + r64, c, mask=rmask)
+        tl.store(p_prev_ptr + tile, p_prev, mask=m3)
+    else:
+        a = tl.sum(p * kb[:, None, :], axis=2)
+        b = tl.sum(p * kb[:, :, None], axis=1)
+        kappa = a / (lam + tl.sum(kb * a, axis=1))[:, None]
+        tl.store(p_ptr + tile, (p - kappa[:, :, None] * b[:, None, :]) / lam[:, None, None], mask=m3)
+    tl.store(kappa_ptr + vec, kappa, mask=rmask[:, None])
+
+
+_RM = 4  # rows per program of the M passes
+
+
+def _m_args(m):
+    n, g, k, d = m.shape
+    return n * g, k, d, triton.next_power_of_2(d)
+
+
+def forward2(m, khat, scale, kappa, value, query, read_dtype):
+    rows, k, d, bd = _m_args(m)
+    read = torch.empty(m.shape[0], m.shape[1], d, device=m.device, dtype=read_dtype)
+    _fwd2_kernel[(triton.cdiv(rows, _RM),)](
+        m, khat.contiguous(), scale.contiguous(), kappa, value.contiguous(), query.contiguous(),
+        read, rows, K=k, D=d, BD=bd, R=_RM, num_warps=4)
+    return read
+
+
+def backward2(m, dm, query, read_grad, kappa, khat, scale, value, c):
+    """In place on m (unwound) and dm; returns (dq, d value [value dtype], dkappa_m, dkbar_m,
+    sum_d du * value)."""
+    rows, k, d, bd = _m_args(m)
+    n, g = m.shape[0], m.shape[1]
+    f32 = dict(device=m.device, dtype=torch.float32)
+    dq, dkappa, dkbar = (torch.empty(n, g, k, **f32) for _ in range(3))
+    dv = torch.empty(n, g, d, device=m.device, dtype=value.dtype)
+    duv = torch.empty(n, g, **f32)
+    _bwd2_kernel[(triton.cdiv(rows, _RM),)](
+        m, dm, query.contiguous(), read_grad.contiguous(), kappa, khat.contiguous(),
+        scale.contiguous(), value.contiguous(), c, dq, dv, dkappa, dkbar, duv, rows,
+        K=k, D=d, BD=bd, R=_RM, num_warps=4)
+    return dq, dv, dkappa, dkbar, duv
+
+
+def p_step2(p, khat, scale, lam, kappa_out, recover=False, c_out=None, p_prev_out=None):
+    n, g, k = khat.shape
+    rows = n * g
+    dummy = kappa_out
+    _p_fwd2_kernel[(triton.cdiv(rows, _R),)](
+        p, khat.contiguous(), scale.contiguous(), lam.contiguous(), kappa_out,
+        c_out if recover else dummy, p_prev_out if recover else p, rows, g,
+        RECOVER=recover, K=k, R=_R, num_warps=4)

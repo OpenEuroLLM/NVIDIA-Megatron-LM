@@ -199,6 +199,8 @@ class UnwindingDepthMemoryWorkspace(TorchDepthMemoryWorkspace):
 
     @torch.no_grad()
     def forward(self, edge, khat, query, value, scale, forgetting) -> torch.Tensor:
+        if self._fused:
+            return self._fused_forward(edge, khat, query, value, scale, forgetting)
         if self._phase == "forward" or edge == 0:
             if edge != self._next:
                 raise RuntimeError(
@@ -286,6 +288,8 @@ class UnwindingDepthMemoryWorkspace(TorchDepthMemoryWorkspace):
         return torch.einsum("ngkd,ngk->ngd", m, query)
 
     def backward(self, edge, read_grad):
+        if self._fused:
+            return self._fused_backward2(edge, read_grad)
         if edge == 0:
             out = super().backward(0, read_grad, slot=0)
             self.p.copy_(self.t_p[0])  # the initial P (M is unwound to zero)
@@ -321,6 +325,74 @@ class UnwindingDepthMemoryWorkspace(TorchDepthMemoryWorkspace):
             dvalue = du * s.unsqueeze(-1)
             dscale = (dkbar * khat).sum(-1) + (du * value).sum(-1)
         return dkhat, dq, dvalue, dscale, d_lam
+
+
+    # -- the fused path (depth_memory_triton v2): every edge, edge 0 included ---------------
+    def _fused_forward(self, edge, khat, query, value, scale, forgetting):
+        from megatron.core.transformer.depth_memory_triton import forward2, p_step2
+
+        raw = dict(khat=khat.float(), q=query.float(), s=scale.float(), lam=forgetting.float(),
+                   v=value)
+        if self._phase == "forward" or edge == 0:
+            if edge != self._next:
+                raise RuntimeError(
+                    f"depth_memory_unwind: forward edge {edge}, expected {self._next} (every "
+                    "layer must be in a recompute chunk of its own)"
+                )
+            if edge == 0:
+                self.m.zero_()
+                self.p.copy_(self.p0)
+                self._phase = "forward"
+                self._edge0 = raw  # not recomputed: its inputs stay for its backward
+            kappa = torch.empty_like(raw["khat"])
+            p_step2(self.p, raw["khat"], raw["s"], raw["lam"], kappa)
+            read = forward2(self.m, raw["khat"], raw["s"], kappa, value, raw["q"], value.dtype)
+            self._next = edge + 1
+            if self._next == self.total_edges:
+                self._phase, self._unwind = "backward", self.total_edges - 1
+            return read
+        if edge != self._unwind:
+            raise RuntimeError(
+                f"depth_memory_unwind: recompute of edge {edge}, the state is at {self._unwind}"
+            )
+        self._recovered = raw
+        if os.environ.get("DEPTH_MEMORY_UNWIND_RECOMPUTE_READ", "0") == "1":
+            return torch.einsum("ngkd,ngk->ngd", self.m, raw["q"]).to(value.dtype)
+        # the recomputed layer's output is not consumed by its backward (only the graph)
+        return torch.empty(self.m.shape[0], self.m.shape[1], self.m.shape[3],
+                           device=self.m.device, dtype=value.dtype)
+
+    def _fused_backward2(self, edge, read_grad):
+        from megatron.core.transformer.depth_memory_triton import backward2, p_backward, p_step2
+
+        if edge == 0:
+            raw = self._edge0
+        else:
+            if self._phase != "backward" or edge != self._unwind:
+                raise RuntimeError(f"depth_memory_unwind: backward of edge {edge} out of order")
+            raw = self._recovered
+        if edge == self.total_edges - 1 and not self.grad_loaded:
+            self.dm.zero_()
+            self.dp.zero_()
+        khat, s, lam = raw["khat"], raw["s"], raw["lam"]
+        kappa = torch.empty_like(khat)
+        c = torch.empty_like(s)
+        p_prev = torch.empty_like(self.p)
+        with torch.no_grad():
+            p_step2(self.p, khat, s, lam, kappa, recover=True, c_out=c, p_prev_out=p_prev)
+            dq, dv, dkappa_m, dkbar_m, duv = backward2(
+                self.m, self.dm, raw["q"], read_grad, kappa, khat, s, raw["v"], c
+            )
+            d_kb, d_lam = p_backward(p_prev, khat * s.unsqueeze(-1), lam, dkappa_m, self.dp)
+            dkbar = dkbar_m + d_kb
+            dkhat = dkbar * s.unsqueeze(-1)
+            dscale = (dkbar * khat).sum(-1) + duv
+            self.p.copy_(p_prev)
+        if edge == 0:
+            self._phase, self._next, self._edge0 = "forward", 0, None
+        else:
+            self._unwind, self._recovered = edge - 1, None
+        return dkhat, dq, dv, dscale, d_lam
 
 
 class DepthMemoryStep(torch.autograd.Function):

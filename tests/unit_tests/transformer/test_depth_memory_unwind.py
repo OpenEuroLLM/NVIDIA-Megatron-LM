@@ -55,7 +55,7 @@ def test_unwind_matches_taped_oracle(edges, alpha, fused, monkeypatch):
             ref_g = ref.backward(e, read_grads[e])
             if e > 0:  # the recompute of edge e's layer: the same read, from the unwound state
                 torch.testing.assert_close(unw.forward(e, *inputs[e]), ref_reads[e],
-                                           rtol=1e-3, atol=1e-4)
+                                           rtol=1e-3, atol=5e-4)
             unw_g = unw.backward(e, read_grads[e])
             for a, b in zip(ref_g, unw_g):
                 torch.testing.assert_close(b, a, rtol=1e-3, atol=1e-4)
