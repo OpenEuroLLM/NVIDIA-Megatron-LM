@@ -318,12 +318,15 @@ def _gemm(weights, a, a_dim, out, out_dim, splits, offsets, layout, accumulate=F
             )
 
 
-def _wgrad(main, gpool, a, a_dim, dy, dy_dim, splits, offsets):
+def _wgrad(main, gpool, a, a_dim, dy, dy_dim, splits, offsets, overwrite=False):
     """Weight grads: the local experts accumulate into their fp32 main grads (a list, one per
-    expert); the prefetch slots are written fresh into this rank's reduce slots (cleared after
-    each reduce; mostly empty, and an empty group with accumulate=True still reads + writes its
-    whole fp32 block)."""
+    expert) -- or overwrite them when the owner asks (Megatron-FSDP: ``overwrite_main_grad``, its
+    unsharded grad buckets are fresh, not zeroed, for every backward); the prefetch slots are
+    written fresh into this rank's reduce slots (cleared after each reduce; mostly empty, and an
+    empty group with accumulate=True still reads + writes its whole fp32 block)."""
     epn = len(main)
+    if overwrite:  # zero first: an expert without tokens is an empty group the GEMM leaves alone
+        torch._foreach_zero_(main)
     _gemm(main, a, a_dim, dy, dy_dim, splits[:epn], offsets[: epn + 1], "NT", accumulate=True)
     _gemm([gpool[i].view_as(main[0]) for i in range(epn)], a, a_dim, dy, dy_dim, splits[epn:],
           offsets[epn:], "NT", accumulate=False)
@@ -424,18 +427,20 @@ class _MoonEPExperts(torch.autograd.Function):
         w2 = fc2 + [slots[1][i].view_as(fc2[0]) for i in range(epn)]
         gpools = [p[state.rank] for p in state.grad_pools(module.pool_shapes)]
         main1, main2 = module.main_grads()
+        # Megatron-FSDP: the wgrad overwrites the fresh bucket (the copies' grads are added after)
+        overwrite = all(getattr(w, "overwrite_main_grad", False) for w in weights[: 2 * epn])
 
         probs = w_nvs.unsqueeze(-1)
         # fc2: dgrad + wgrad (into the local main grads and this rank's reduce slots)
         grad_a = torch.empty(x.shape[0], ffn, dtype=x.dtype, device=x.device)
         _gemm(w2, grad_y, hidden, grad_a, ffn, splits, offsets, "NN")
-        _wgrad(main2, gpools[1], a, ffn, grad_y, hidden, splits, offsets)
+        _wgrad(main2, gpools[1], a, ffn, grad_y, hidden, splits, offsets, overwrite)
         grad_h, grad_probs = weighted_swiglu_back(grad_a, h, probs)
         # fc1
         # zero copy: the dispatch backward (a combine) reads fc1's dgrad from the shard
         grad_x = state.buffer.hidden_nvsh_buffer_view
         _gemm(w1, grad_h, ffn2, grad_x, hidden, splits, offsets, "NN")
-        _wgrad(main1, gpools[0], x, hidden, grad_h, ffn2, splits, offsets)
+        _wgrad(main1, gpools[0], x, hidden, grad_h, ffn2, splits, offsets, overwrite)
         # the prefetched copies' grads -> their home ranks' main grads (collective)
         module.reduce_copies_grad(state, plan, main1, main2)
         grad_w = grad_probs.squeeze(-1).to(w_nvs.dtype)
