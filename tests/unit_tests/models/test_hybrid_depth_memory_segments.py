@@ -71,3 +71,25 @@ def test_segments_match_one_sequence(impl, variant):
             torch.testing.assert_close(grads[k], ref_grads[k], **tol, msg=k)
     finally:
         Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("pattern", ["*-*-*-", "*E*E-*"])
+def test_unwind_matches_one_sequence(pattern):
+    """depth_memory_unwind: full recompute, one layer per chunk, no state in the checkpoints (each
+    layer's recompute reads the unwound state); two micro-batches in a row."""
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        kw = dict(num_moe_experts=4, moe_router_topk=2, moe_ffn_hidden_size=64) if "E" in pattern else {}
+        ids = [torch.randint(0, VOCAB, (B, S), device="cuda") for _ in range(2)]
+        ref = _model(pattern, "torch", **kw)
+        model = _model(pattern, "torch", depth_memory_unwind=True, recompute_granularity="full",
+                       recompute_method="uniform", recompute_num_layers=1, **kw)
+        for batch in ids:
+            ref_out, ref_grads = _fwd_bwd(ref, batch)
+            out, grads = _fwd_bwd(model, batch)
+            torch.testing.assert_close(out, ref_out, rtol=1e-4, atol=1e-5)
+            assert set(grads) == set(ref_grads)
+            for k in ref_grads:
+                torch.testing.assert_close(grads[k], ref_grads[k], rtol=1e-3, atol=1e-5, msg=k)
+    finally:
+        Utils.destroy_model_parallel()

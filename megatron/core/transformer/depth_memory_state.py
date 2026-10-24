@@ -93,13 +93,14 @@ class TorchDepthMemoryWorkspace:
         p.sub_(kappa.unsqueeze(-1) * kp.unsqueeze(-2)).div_(lam[:, None, None])
         return torch.einsum("ngkd,ngk->ngd", m, query)
 
-    def backward(self, edge, read_grad):
+    def backward(self, edge, read_grad, slot=None):
         """The reverse of step ``edge`` (called in strictly decreasing edge order): the
         gradients of (khat, query, value, scale, forgetting [G]), and ``M`` unwound to
-        ``M_{edge-1}``."""
+        ``M_{edge-1}``. ``slot``: the tape entry holding the edge (default: the edge)."""
         if edge == self.total_edges - 1 and not self.grad_loaded:
             self.dm.zero_()
             self.dp.zero_()
+        edge = edge if slot is None else slot  # the tape index from here on
         m = self.m  # holds M_edge here
         with torch.no_grad():
             dr = read_grad.float()
@@ -164,6 +165,109 @@ class TorchDepthMemoryWorkspace:
         return both, both
 
 
+class UnwindingDepthMemoryWorkspace(TorchDepthMemoryWorkspace):
+    """``depth_memory_unwind``: the state without a tape across edges (see the config field).
+
+    Phases per micro-batch: the forward runs edges 0 .. L-1 in order and updates (M, P) in place
+    (only edge 0, the embedding write outside the recompute chunks, keeps its tape). After the last
+    edge the workspace is in the backward phase: a ``forward(edge)`` call then is the recompute of
+    that edge's layer, run right before its backward, with the state at ``(M_e, P_e)``; it returns
+    the same read ``M_e' q`` and recovers the edge's tape from the post-update state:
+
+        kappa = P_e kbar,  c = 1 - kappa . kbar,  u = (vbar - M_e' kbar) / c,
+        P_{e-1} = lambda (P_e + kappa kappa' / c)
+
+    (RLS: P_e kbar is the gain; Sherman-Morrison for P). ``backward(edge)`` then runs the
+    oracle's backward on that one-edge tape and unwinds M and P to edge e - 1.
+    """
+
+    def ensure(self, n: int, device) -> None:
+        if self.n == n and self.m.device == device:
+            return
+        total = self.total_edges
+        self.total_edges = 2  # tape slots: 0 the embedding write, 1 the edge being unwound
+        try:
+            super().ensure(n, device)
+        finally:
+            self.total_edges = total
+        self._phase, self._next = "forward", 0
+
+    @torch.no_grad()
+    def forward(self, edge, khat, query, value, scale, forgetting) -> torch.Tensor:
+        if self._phase == "forward" or edge == 0:
+            if edge != self._next:
+                raise RuntimeError(
+                    f"depth_memory_unwind: forward edge {edge}, expected {self._next} (every "
+                    "layer must be in a recompute chunk of its own)"
+                )
+            if edge == 0:
+                self.m.zero_()
+                self.p.copy_(self.p0)
+                self._phase = "forward"
+                read = TorchDepthMemoryWorkspace.forward(self, 0, khat, query, value, scale,
+                                                         forgetting)
+            else:
+                read = self._step(khat, query, value, scale, forgetting)
+            self._next = edge + 1
+            if self._next == self.total_edges:
+                self._phase, self._unwind = "backward", self.total_edges - 1
+            return read
+        if edge != self._unwind:
+            raise RuntimeError(
+                f"depth_memory_unwind: recompute of edge {edge}, the state is at {self._unwind}"
+            )
+        return self._recover(khat, query, value, scale, forgetting)
+
+    def _step(self, khat, query, value, scale, forgetting):
+        """The forward write + read without a tape."""
+        m, p = self.m, self.p
+        lam = forgetting.float()
+        kbar = khat.float() * scale.float().unsqueeze(-1)
+        vbar = value.float() * scale.float().unsqueeze(-1)
+        pk = torch.einsum("ngij,ngj->ngi", p, kbar)
+        kappa = pk / (lam + (kbar * pk).sum(-1)).unsqueeze(-1)
+        u = vbar - torch.einsum("ngkd,ngk->ngd", m, kbar)
+        m.add_(kappa.unsqueeze(-1) * u.unsqueeze(-2))
+        kp = torch.einsum("ngi,ngij->ngj", kbar, p)
+        p.sub_(kappa.unsqueeze(-1) * kp.unsqueeze(-2)).div_(lam[:, None, None])
+        return torch.einsum("ngkd,ngk->ngd", m, query.float())
+
+    def _recover(self, khat, query, value, scale, forgetting):
+        """The recompute of the edge the state is at: its read and its tape (slot 1)."""
+        m, p = self.m, self.p
+        khat, query, scale = khat.float(), query.float(), scale.float()
+        lam = forgetting.float()
+        kbar = khat * scale.unsqueeze(-1)
+        vbar = value.float() * scale.unsqueeze(-1)
+        kappa = torch.einsum("ngij,ngj->ngi", p, kbar)
+        c = (1.0 - (kappa * kbar).sum(-1)).unsqueeze(-1)
+        u = (vbar - torch.einsum("ngkd,ngk->ngd", m, kbar)) / c
+        self.t_p[1].copy_(p + kappa.unsqueeze(-1) * (kappa / c).unsqueeze(-2)).mul_(
+            lam[:, None, None]
+        )
+        self.t_kappa[1].copy_(kappa)
+        self.t_u[1].copy_(u)
+        self.t_kbar[1].copy_(kbar)
+        self.t_khat[1].copy_(khat)
+        self.t_q[1].copy_(query)
+        self.t_s[1].copy_(scale)
+        self.t_lam[1].copy_(lam)
+        return torch.einsum("ngkd,ngk->ngd", m, query)
+
+    def backward(self, edge, read_grad):
+        if edge == 0:
+            out = super().backward(0, read_grad, slot=0)
+            self.p.copy_(self.t_p[0])  # the initial P (M is unwound to zero)
+            self._phase, self._next = "forward", 0
+            return out
+        if self._phase != "backward" or edge != self._unwind:
+            raise RuntimeError(f"depth_memory_unwind: backward of edge {edge} out of order")
+        out = super().backward(edge, read_grad, slot=1)
+        self.p.copy_(self.t_p[1])  # P_{e-1}; M was unwound by the oracle's backward
+        self._unwind = edge - 1
+        return out
+
+
 class DepthMemoryStep(torch.autograd.Function):
     """One edge of a workspace as an autograd node: the read is the output; the state is not."""
 
@@ -201,6 +305,9 @@ def make_workspace(config, total_edges: int):
             span=config.depth_memory_window,
             running_covariance_dtype=config.depth_memory_covariance_dtype,
         )
+    if getattr(config, "depth_memory_unwind", False):
+        return UnwindingDepthMemoryWorkspace(total_edges, groups, key_dim, value_dim,
+                                             config.depth_memory_alpha)
     return TorchDepthMemoryWorkspace(total_edges, groups, key_dim, value_dim,
                                      config.depth_memory_alpha)
 

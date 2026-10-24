@@ -2107,6 +2107,14 @@ class TransformerConfig(ModelParallelConfig):
     SegmentEnter / SegmentExit). Pipeline parallelism needs full recompute (one workspace per
     stage holds one segment's tapes)."""
 
+    depth_memory_unwind: bool = False
+    """LDM "torch" with full activation recompute, one layer per chunk, no pipeline parallelism:
+    nothing of the state is checkpointed. The forward updates (M, P) in place without a tape; a
+    layer's recompute (in the backward, the state then at that layer's edge) reads from the current
+    state and recovers the edge's update in closed form (kappa = P_e kbar, u = (vbar - M_e' kbar) /
+    (1 - kappa . kbar)); the backward unwinds M, P to the previous edge. The checkpoints carry
+    only the [x, r] streams (depth_memory_state.UnwindingDepthMemoryWorkspace)."""
+
     depth_memory_window: int = 4
     """LDM "cute": the window E of deferred writes (the paper: 4)."""
 
@@ -2212,7 +2220,21 @@ class TransformerConfig(ModelParallelConfig):
                     "depth_memory_impl=reference keeps its state on the layers (not CUDA-graph "
                     "capturable); use depth_memory_impl torch or cute"
                 )
-            if self.recompute_granularity == "full" and not self.depth_memory_segments:
+            if self.depth_memory_unwind:
+                if self.depth_memory_impl != "torch" or self.depth_memory_segments:
+                    raise ValueError("depth_memory_unwind needs depth_memory_impl torch, no segments")
+                if not (
+                    self.recompute_granularity == "full"
+                    and self.recompute_method == "uniform"
+                    and self.recompute_num_layers == 1
+                ):
+                    raise ValueError(
+                        "depth_memory_unwind needs full recompute, uniform, one layer per chunk "
+                        "(a layer is one edge: its recompute reads the state at that edge)"
+                    )
+                if self.pipeline_model_parallel_size > 1:
+                    raise ValueError("depth_memory_unwind without pipeline parallelism")
+            elif self.recompute_granularity == "full" and not self.depth_memory_segments:
                 raise ValueError(
                     "depth_memory with full activation recompute needs depth_memory_segments"
                 )

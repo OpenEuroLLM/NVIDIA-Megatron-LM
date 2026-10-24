@@ -727,7 +727,11 @@ class HybridStack(MegatronModule):
             else:
                 scheme = getattr(layer, "residual_scheme", None)
                 candidates = (scheme.mhc_mixer if scheme is not None else None,)
-            mixers += [m for m in candidates if isinstance(m, DepthMemoryMixer)]
+            own = [m for m in candidates if isinstance(m, DepthMemoryMixer)]
+            if len(own) > 1 and getattr(self.config, "depth_memory_unwind", False):
+                # a recomputed layer reads the state at its edge: one edge per recompute chunk
+                raise ValueError("depth_memory_unwind: a layer with more than one LDM site")
+            mixers += own
         if not mixers:
             raise ValueError("depth_memory: no sublayer has a depth-memory mixer")
         self.ldm_stream_boundary = DepthMemoryStreamBoundary(self.config)
