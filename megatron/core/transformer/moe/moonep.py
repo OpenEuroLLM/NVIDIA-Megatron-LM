@@ -40,8 +40,8 @@ import torch
 import torch.distributed as dist
 
 from megatron.core.fusions.fused_bias_swiglu import (
-    clamped_swiglu,
-    clamped_swiglu_back,
+    weighted_clamped_swiglu,
+    weighted_clamped_swiglu_back,
     weighted_swiglu,
     weighted_swiglu_back,
 )
@@ -52,16 +52,13 @@ def _weighted_act(h, probs, limit):
     WeightedSwiGLUFunction."""
     if limit is None:
         return weighted_swiglu(h, probs)
-    return (clamped_swiglu(h, limit) * probs).to(h.dtype)
+    return weighted_clamped_swiglu(h, probs, limit)
 
 
 def _weighted_act_back(grad_a, h, probs, limit):
     if limit is None:
         return weighted_swiglu_back(grad_a, h, probs)
-    w_dtype = probs.dtype
-    grad_h = clamped_swiglu_back(grad_a * probs, h, limit).to(h.dtype)
-    grad_probs = (clamped_swiglu(h, limit) * grad_a.to(w_dtype)).sum(-1, keepdim=True)
-    return grad_h, grad_probs.to(w_dtype)
+    return weighted_clamped_swiglu_back(grad_a, h, probs, limit)
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.token_dispatcher import MoETokenDispatcher
 

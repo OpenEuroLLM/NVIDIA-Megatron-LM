@@ -116,6 +116,33 @@ def clamped_swiglu_back(g, y, limit: float):
     return torch.cat((d_1, d_2), -1)
 
 
+@jit_fuser
+def weighted_clamped_swiglu(y, weights, limit: float):
+    """``clamped_swiglu(y) * weights`` in the dtype of ``y`` -- one fused kernel (the
+    probability-weighted expert activation of TEGroupedMLP / MoonEP with clamping)."""
+    dtype = y.dtype
+    y_1, y_2 = torch.chunk(y, 2, -1)
+    res = F.silu(y_1.clamp(max=limit)) * y_2.clamp(min=-limit, max=limit) * weights
+    return res.to(dtype)
+
+
+@jit_fuser
+def weighted_clamped_swiglu_back(g, y, weights, limit: float):
+    """The gradients of :func:`weighted_clamped_swiglu` w.r.t. ``y`` (dtype of ``y``) and
+    ``weights`` (dtype of ``weights``), fused."""
+    input_dtype, w_dtype = y.dtype, weights.dtype
+    y_1, y_2 = torch.chunk(y, 2, -1)
+    c_1 = y_1.clamp(max=limit)
+    c_2 = y_2.clamp(min=-limit, max=limit)
+    s_1 = torch.sigmoid(c_1)
+    act_1 = c_1 * s_1
+    gw = g * weights
+    d_1 = gw * s_1 * (1 + c_1 * (1 - s_1)) * c_2 * (y_1 <= limit)
+    d_2 = gw * act_1 * (y_2.abs() <= limit)
+    weights_grad = torch.sum(act_1 * c_2 * g.to(w_dtype), dim=-1, keepdim=True)
+    return torch.cat((d_1, d_2), -1).to(input_dtype), weights_grad.to(w_dtype)
+
+
 def _swiglu_fwd(y, limit):
     return swiglu(y) if limit is None else clamped_swiglu(y, limit)
 
@@ -228,7 +255,7 @@ class WeightedSwiGLUFunction(torch.autograd.Function):
         ctx.limit = limit
         if limit is None:
             return weighted_swiglu(input, weights)
-        return (clamped_swiglu(input, limit) * weights).to(input.dtype)
+        return weighted_clamped_swiglu(input, weights, limit)
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -237,10 +264,7 @@ class WeightedSwiGLUFunction(torch.autograd.Function):
         if ctx.limit is None:
             tmp, wgrad = weighted_swiglu_back(grad_output, input, weights)
         else:
-            w_dtype = weights.dtype
-            tmp = clamped_swiglu_back(grad_output * weights, input, ctx.limit).to(input.dtype)
-            wgrad = (clamped_swiglu(input, ctx.limit) * grad_output.to(w_dtype)).sum(-1, keepdim=True)
-            wgrad = wgrad.to(w_dtype)
+            tmp, wgrad = weighted_clamped_swiglu_back(grad_output, input, weights, ctx.limit)
         return tmp, wgrad, None, None
 
 

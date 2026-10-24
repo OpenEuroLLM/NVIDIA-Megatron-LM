@@ -25,3 +25,20 @@ def test_moonep_activation_matches_weighted_swiglu(limit):
     if limit is not None and limit < 1:
         # the clamp is active somewhere (else this would not test it)
         assert not torch.allclose(out, moonep._weighted_act(h.detach(), probs.detach(), None))
+
+
+@pytest.mark.parametrize("limit", [10.0, 0.5])
+def test_fused_weighted_clamped_swiglu_matches_autograd(limit):
+    """The fused weighted clamped SwiGLU (fwd + both grads) against plain torch autograd."""
+    torch.manual_seed(1)
+    h = (torch.randn(64, 2 * 48) * 6).requires_grad_()
+    probs = torch.rand(64, 1).requires_grad_()
+    y1, y2 = torch.chunk(h, 2, -1)
+    ref = torch.nn.functional.silu(y1.clamp(max=limit)) * y2.clamp(min=-limit, max=limit) * probs
+    g = torch.randn_like(ref)
+    dh_ref, dp_ref = torch.autograd.grad(ref, (h, probs), g)
+    out = moonep._weighted_act(h.detach(), probs.detach(), limit)
+    dh, dp = moonep._weighted_act_back(g, h.detach(), probs.detach(), limit)
+    torch.testing.assert_close(out, ref.detach())
+    torch.testing.assert_close(dh, dh_ref)
+    torch.testing.assert_close(dp, dp_ref)
