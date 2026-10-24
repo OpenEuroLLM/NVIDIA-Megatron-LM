@@ -31,9 +31,14 @@ def _inputs(edges, n, g, k, d, seed):
     return out, grads
 
 
+@pytest.mark.parametrize("fused", ["0", "1"])
 @pytest.mark.parametrize("edges", [1, 2, 7, 33, 97])
 @pytest.mark.parametrize("alpha", [1.0, 4.0])
-def test_unwind_matches_taped_oracle(edges, alpha):
+def test_unwind_matches_taped_oracle(edges, alpha, fused, monkeypatch):
+    if fused == "1" and DEV != "cuda":
+        pytest.skip("the fused Triton passes need a GPU")
+    monkeypatch.setenv("DEPTH_MEMORY_UNWIND_TRITON", fused)
+    monkeypatch.setenv("DEPTH_MEMORY_UNWIND_RECOMPUTE_READ", "1")  # compare the recomputed reads
     torch.backends.cuda.matmul.allow_tf32 = False
     n, g, k, d = 24, 4, 8, 16
     inputs, read_grads = _inputs(edges, n, g, k, d, seed=edges)
