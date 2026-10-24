@@ -241,6 +241,8 @@ class EngramLayer(MegatronModule):
                 self.table_grad = torch.zeros_like(self.table, dtype=torch.float32)
             self.table.engram_sharded_table = True
             self.table.engram_grad = self.table_grad
+            # the row layout, for the fsdp_dtensor checkpoint of a table hidden from Megatron-FSDP
+            self.table._engram_rows = (self.total_rows, self.shard_group)
         else:
             # Concatenated table, rows sharded across TP like a vocab-parallel embedding.
             self.total_rows = int(math.ceil(rows / _ROW_ALIGN) * _ROW_ALIGN)
@@ -682,6 +684,32 @@ class EngramLayer(MegatronModule):
             term = tap * weight[:, k]
             out = term if out is None else out + term
         return out
+
+    def _table_hidden(self) -> bool:
+        """The dp-sharded table, unregistered from Megatron-FSDP (hide_sharded_tables)."""
+        return getattr(self, "sharded", False) and "table" not in self._parameters and (
+            getattr(self, "table", None) is not None
+        )
+
+    def _save_to_state_dict(self, destination, prefix, keep_vars):
+        super()._save_to_state_dict(destination, prefix, keep_vars)
+        if self._table_hidden():  # fsdp_dtensor: the table as a row-sharded DTensor
+            from megatron.core.ssm.engram_sharded import row_sharded_dtensor
+
+            destination[prefix + "table"] = row_sharded_dtensor(
+                self.table.data, self.total_rows, self.shard_group
+            )
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys,
+                              unexpected_keys, error_msgs):
+        key = prefix + "table"
+        if self._table_hidden() and key in state_dict:
+            value = state_dict.pop(key)
+            local = value.to_local() if hasattr(value, "to_local") else value
+            if local.data_ptr() != self.table.data_ptr():  # DCP loads in place otherwise
+                self.table.data.copy_(local)
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys,
+                                      unexpected_keys, error_msgs)
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """The table is sharded on rows (over TP, or every rank of the stage under

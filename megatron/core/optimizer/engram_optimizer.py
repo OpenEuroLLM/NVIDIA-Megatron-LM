@@ -257,6 +257,8 @@ class EngramTableOptimizer(MegatronOptimizer):
         self.optimizer.load_state_dict(state_dict)
 
     def sharded_state_dict(self, model_sharded_state_dict, is_loading=False, metadata=None):
+        if (metadata or {}).get('distrib_optim_sharding_type') == 'fsdp_dtensor':
+            return self._fsdp_dtensor_state_dict(is_loading)
         from ..dist_checkpointing.dict_utils import nested_values
 
         by_data = {
@@ -289,6 +291,36 @@ class EngramTableOptimizer(MegatronOptimizer):
         self._param_keys = list(param_state)
         return out
 
+    def _fsdp_dtensor_state_dict(self, is_loading):
+        """The fsdp_dtensor checkpoint (Megatron-FSDP, tables hidden from it): the moments as
+        DTensors with their tables' row layout (row_sharded_dtensor), in place."""
+        from megatron.core.ssm.engram_sharded import row_sharded_dtensor
+
+        if is_loading:
+            for p in self.params:
+                self.optimizer.init_state(p)
+        param_state, steps = {}, []
+        for i, p in enumerate(self.params):
+            total_rows, group = p._engram_rows
+            state = self.optimizer.state.get(p, {})
+            entry = {
+                name: row_sharded_dtensor(state[name], total_rows, group)
+                for name in ('exp_avg', 'exp_avg_sq')
+                if name in state
+            }
+            if 'step' in state:
+                steps.append(float(state['step']))
+            param_state[f"{i}:engram_table"] = entry
+        groups = {
+            str(i): {k: v for k, v in g.items() if k != 'params'}
+            for i, g in enumerate(self.optimizer.param_groups)
+        }
+        out = {'param_keyed': True, 'param_groups': groups, 'param_state': param_state}
+        if steps:
+            out['common_step'] = max(steps)
+        self._param_keys = list(param_state)
+        return out
+
     def _load_param_keyed(self, state_dict):
         saved = {g.get('sharded_table_lr_mult'): g for g in state_dict['param_groups'].values()}
         for live in self.optimizer.param_groups:
@@ -301,6 +333,8 @@ class EngramTableOptimizer(MegatronOptimizer):
             entry = state_dict['param_state'].get(key, {})
             state = self.optimizer.state[p]
             for name, value in entry.items():
+                if hasattr(value, 'to_local'):  # fsdp_dtensor: loaded in place, or a copy
+                    value = value.to_local()
                 if name in state:
                     state[name].copy_(value)
                 else:

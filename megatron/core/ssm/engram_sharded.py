@@ -404,3 +404,30 @@ def flush_step_lookups() -> None:
         layer.flush_step_lookup()
     PENDING_STEP_LOOKUPS.clear()
     join_async_flushes()
+
+
+def row_sharded_dtensor(local: "torch.Tensor", total_rows: int, group) -> "torch.Tensor":
+    """``local`` (this rank's rows of a :func:`balanced_row_range` table or of its per-row state,
+    ``[rows_local, ...]``) as a DTensor of the global ``[total_rows, ...]`` sharded on rows over
+    ``group``: the fsdp_dtensor checkpoint's form of the tables Megatron-FSDP does not manage. It
+    wraps the same storage, so a DCP load writes straight into it."""
+    from torch.distributed.device_mesh import DeviceMesh
+    from torch.distributed.tensor import DTensor
+    from torch.distributed.tensor.placement_types import Shard
+
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
+        update_uneven_dtensor_chunk_metadata,
+    )
+
+    mesh = _MESHES.get(id(group))
+    if mesh is None:
+        mesh = _MESHES[id(group)] = DeviceMesh.from_group(group, "cuda")
+    shape = (total_rows, *local.shape[1:])
+    stride = tuple(int(torch.Size(shape[i + 1:]).numel()) for i in range(len(shape)))
+    out = DTensor.from_local(local, device_mesh=mesh, placements=[Shard(0)], run_check=False,
+                             shape=torch.Size(shape), stride=stride)
+    update_uneven_dtensor_chunk_metadata(out)
+    return out
+
+
+_MESHES: dict = {}
