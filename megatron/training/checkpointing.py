@@ -587,6 +587,22 @@ def _debug_optimizer_state(optimizer, tag):
                 counts[key] = counts.get(key, 0) + 1
     print(f"[opt-state {tag}] " + " ".join(f"{k}={v:.6e}(n{counts.get(k, 1)})"
                                           for k, v in sorted(sums.items())), flush=True)
+    path = os.environ.get("MEGATRON_DEBUG_OPT_STATE_FILE")
+    if path:  # per parameter (in param-group order): the main param and each state's sum of squares
+        def sq(v):
+            t = v._local_tensor if hasattr(v, "_local_tensor") else v
+            return float(t.double().pow(2).sum()) if t.numel() else 0.0
+        with open(f"{path}.{tag.replace(' ', '_')}.txt", "w") as f:
+            for idx, opt in enumerate(getattr(optimizer, "chained_optimizers", [optimizer])):
+                inner = getattr(opt, "optimizer", opt)
+                for i, group in enumerate(getattr(inner, "param_groups", [])):
+                    for j, p in enumerate(group["params"]):
+                        state = inner.state.get(p, {})
+                        vals = [f"param={sq(p.detach()):.9e}"] + [
+                            f"{k}={sq(v) if isinstance(v, torch.Tensor) else v}"
+                            for k, v in sorted(state.items())
+                        ]
+                        f.write(f"{idx}.{i}.{j} {tuple(p.shape)} " + " ".join(vals) + "\n")
 
 def save_checkpoint(
     iteration,
