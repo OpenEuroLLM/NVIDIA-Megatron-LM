@@ -214,6 +214,18 @@ class OptimizerConfig:
     shrinks the rows of rare tokens, which receive few gradient updates, while the Jacobian of the
     following norm scales as 1/||x||. The untied output layer is not affected by this multiplier."""
 
+    embedding_lr_mult: float = 1.0
+    """Learning-rate multiplier of the word-embedding matrix (the 2-D parameter whose name contains
+    `word_embeddings`; Adam under every Muon-family optimizer). Applies to max_lr and min_lr alike.
+    Embedding rows only get gradient when their token occurs, so speedruns / muP give them an lr at
+    or above the shared one. Conflicts with decoupled_lr (both set the embedding's lr)."""
+
+    output_layer_lr_mult: float = 1.0
+    """Learning-rate multiplier of the untied output layer (`output_layer.weight`; Adam under every
+    Muon-family optimizer). Applies to max_lr and min_lr alike. Every row gets a softmax gradient
+    each step, so recipes usually lower it. No effect with tied embeddings (the shared matrix is the
+    word embedding). Conflicts with decoupled_lr."""
+
     allow_new_param_groups_on_load: bool = False
     """When an optimizer checkpoint is loaded whose param_groups contain no group with the
     identifier of a current group (e.g. `embedding_wd_mult` or a norm multiplier enabled mid-run),

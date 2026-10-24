@@ -195,6 +195,28 @@ def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, Par
             max_lr=config.lr * mixer_mult, min_lr=(config.min_lr or 0.0) * mixer_mult
         )
 
+    # Word embedding / untied output layer: their own learning rates (disjoint name predicates;
+    # they combine with embedding_wd_mult's key, which sets wd_mult only).
+    emb_mult = getattr(config, 'embedding_lr_mult', 1.0)
+    out_mult = getattr(config, 'output_layer_lr_mult', 1.0)
+    if (emb_mult != 1.0 or out_mult != 1.0) and config.lr is not None:
+        if config.decoupled_lr is not None:
+            raise ValueError("embedding_lr_mult / output_layer_lr_mult conflict with decoupled_lr")
+        for mult, pred in (
+            (emb_mult, ParamWithNamePredicate(
+                name="word_embedding_lr",
+                fn=lambda param, name: len(param.shape) == 2 and "word_embeddings" in name)),
+            (out_mult, ParamWithNamePredicate(
+                name="output_layer_lr",
+                fn=lambda param, name: len(param.shape) == 2 and name.endswith("output_layer.weight"))),
+        ):
+            if mult != 1.0:
+                if not 0.0 < mult < float("inf"):
+                    raise ValueError("embedding / output layer lr multipliers must be positive")
+                config_overrides[ParamKey(with_name_predicate=pred)] = ParamGroupOverride(
+                    max_lr=config.lr * mult, min_lr=(config.min_lr or 0.0) * mult
+                )
+
     if config.decoupled_lr is not None:
         decoupled_lr_config: ParamGroupOverride = {"max_lr": config.decoupled_lr}
         decoupled_param_key = ParamKey(attr="is_embedding_or_output_parameter")

@@ -2839,6 +2839,12 @@ def _add_regularization_args(parser):
                        'weight. 0.0 excludes the embeddings from weight decay as OLMo 2/3 and '
                        'Levanter/Marin do (decay erodes the rows of rare tokens). The untied '
                        'output layer is not affected.')
+    group.add_argument('--embedding-lr-mult', type=float, default=1.0,
+                       help='Learning-rate multiplier of the word-embedding matrix (max and min lr). '
+                       'Conflicts with --decoupled-lr.')
+    group.add_argument('--output-layer-lr-mult', type=float, default=1.0,
+                       help='Learning-rate multiplier of the untied output layer (max and min lr). '
+                       'No effect with tied embeddings. Conflicts with --decoupled-lr.')
     group.add_argument('--allow-new-param-groups-on-load', action='store_true',
                        help='When the loaded optimizer checkpoint has no param_group matching a '
                        'current group (a multiplier enabled mid-run creates a new group), load '
