@@ -595,6 +595,8 @@ def _debug_optimizer_state(optimizer, tag, model=None):
             t = v._local_tensor if hasattr(v, "_local_tensor") else v
             if not t.numel():
                 return "0"
+            if t.untyped_storage().size() == 0:  # Megatron-FSDP frees unsharded storage
+                return "freed"
             t, n = t.detach().reshape(-1), t.numel()
             ss = ws = 0.0
             for lo in range(0, n, 1 << 24):  # chunks: the Engram tables are ~0.3 G elements
@@ -611,7 +613,7 @@ def _debug_optimizer_state(optimizer, tag, model=None):
             for name, mp in chunk.named_parameters():
                 by_id[id(mp)] = name
                 lt = mp._local_tensor if hasattr(mp, "_local_tensor") else mp
-                if lt.numel():
+                if lt.numel() and lt.untyped_storage().size():
                     by_ptr[lt.data_ptr()] = name
 
         def link(p):
