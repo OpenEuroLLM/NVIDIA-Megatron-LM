@@ -560,7 +560,7 @@ def save_grads(save_dir, state_dict, iteration, grad_label):
 
 
 
-def _debug_optimizer_state(optimizer, tag):
+def _debug_optimizer_state(optimizer, tag, model=None):
     """MEGATRON_DEBUG_OPT_STATE=1: per state key, the sum of squares of rank 0's local optimizer
     state (all sub-optimizers), at a save and after a load -- what a resume does not restore."""
     if os.environ.get("MEGATRON_DEBUG_OPT_STATE", "0") != "1" or optimizer is None:
@@ -604,6 +604,29 @@ def _debug_optimizer_state(optimizer, tag):
                 ws += float((c * (1.0 + w / n)).sum())
             return f"{ss:.9e}/{ws:.9e}"
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        # how each optimizer parameter is tied to the model: the same object, the same storage
+        # (data_ptr of the local shard), or neither (an update that never reaches the model)
+        by_id, by_ptr = {}, {}
+        for chunk in model or []:
+            for name, mp in chunk.named_parameters():
+                by_id[id(mp)] = name
+                lt = mp._local_tensor if hasattr(mp, "_local_tensor") else mp
+                if lt.numel():
+                    by_ptr[lt.data_ptr()] = name
+
+        def link(p):
+            if not by_id:
+                return ""
+            if id(p) in by_id:
+                return " link=obj"
+            lt = p._local_tensor if hasattr(p, "_local_tensor") else p
+            return f" link={'ptr' if lt.numel() and lt.data_ptr() in by_ptr else 'none'}"
+
+        if model:
+            with open(f"{path}.{tag.replace(' ', '_')}.model.rank{rank}.txt", "w") as f:
+                for chunk in model:
+                    for name, mp in chunk.named_parameters():
+                        f.write(f"{name} {tuple(mp.shape)} {sq(mp.detach())}\n")
         with open(f"{path}.{tag.replace(' ', '_')}.rank{rank}.txt", "w") as f:
             for idx, opt in enumerate(getattr(optimizer, "chained_optimizers", [optimizer])):
                 inner = getattr(opt, "optimizer", opt)
@@ -617,7 +640,7 @@ def _debug_optimizer_state(optimizer, tag):
                             f"{k}={sq(v) if isinstance(v, torch.Tensor) else v}"
                             for k, v in sorted(state.items())
                         ]
-                        f.write(f"{idx}.{i}.{j} {tuple(p.shape)} " + " ".join(vals) + "\n")
+                        f.write(f"{idx}.{i}.{j} {tuple(p.shape)} " + " ".join(vals) + link(p) + "\n")
 
 def save_checkpoint(
     iteration,
@@ -819,7 +842,7 @@ def save_checkpoint(
                 )
         else:
             sharded_sd_metadata = None
-        _debug_optimizer_state(optimizer, f"at save {iteration}")
+        _debug_optimizer_state(optimizer, f"at save {iteration}", model)
         state_dict = generate_state_dict(
             args,
             model,
@@ -2714,7 +2737,7 @@ def load_checkpoint(
                 and not optimizer.is_stub_optimizer
             ):
                 optimizer.load_state_dict(state_dict['optimizer'])
-                _debug_optimizer_state(optimizer, "after load")
+                _debug_optimizer_state(optimizer, "after load", model)
 
             # Load distributed optimizer's custom parameter state.
             # For distributed checkpoint it's already loaded in load_state_dict above

@@ -3260,10 +3260,10 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     if _debug_step:
         from megatron.training.checkpointing import _debug_optimizer_state
 
-        _debug_optimizer_state(optimizer, f"before step {iteration + 1}")
+        _debug_optimizer_state(optimizer, f"before step {iteration + 1}", model)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
     if _debug_step:
-        _debug_optimizer_state(optimizer, f"after step {iteration + 1}")
+        _debug_optimizer_state(optimizer, f"after step {iteration + 1}", model)
 
     # get max attention logit for logging and run clip_qk()
     # Part of MuonClip Optimizer step
