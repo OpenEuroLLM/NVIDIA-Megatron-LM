@@ -579,7 +579,8 @@ def _debug_optimizer_state(optimizer, tag):
                 key = f"{idx}.{k}"
                 if isinstance(v, torch.Tensor):
                     t = v._local_tensor if hasattr(v, "_local_tensor") else v
-                    val = float(t.double().pow(2).sum()) if t.numel() > 1 else float(t)
+                    val = (float(t.double().pow(2).sum()) if t.numel() > 1
+                           else float(t) if t.numel() == 1 else 0.0)
                 else:
                     val = float(v) if isinstance(v, (int, float)) else 0.0
                 sums[key] = sums.get(key, 0.0) + val
