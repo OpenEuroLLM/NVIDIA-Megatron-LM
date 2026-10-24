@@ -229,6 +229,35 @@ def update_pg_timeout(
             raise e
 
 
+# MEGATRON_LAZY_SINGLETON_GROUPS=1: no eager NCCL communicator for single-rank groups. With the
+# device bound at init_process_group (device_id), every new group initializes its communicator
+# eagerly, and a single-rank one costs ~0.38 GiB of device memory (NCCL 2.31, MEM_BREAKDOWN=1) --
+# against 0.03-0.19 GiB for the real groups. At TP = CP = ETP = 1 that is six or seven of them
+# (TP, CP, TP x CP, ETP, the two GTP-remat groups, position embedding): ~2.5 GiB per GPU for
+# communicators that never move data. Such a group is created unbound (lazily initialized at a
+# first collective, if any) and then bound to the device, so a lazy init still picks the right
+# GPU (the multi-node device-guess bug the binding fixes). Every rank takes the same path: the
+# group sizes are the same on all ranks.
+_LAZY_SINGLETON_GROUPS = os.environ.get("MEGATRON_LAZY_SINGLETON_GROUPS", "0") == "1"
+
+
+def _new_group(ranks, kwargs):
+    default_pg = None
+    if _LAZY_SINGLETON_GROUPS and ranks is not None and len(ranks) == 1:
+        default_pg = torch.distributed.distributed_c10d._get_default_group()
+    bound = getattr(default_pg, "bound_device_id", None)
+    if bound is None:
+        return torch.distributed.new_group(**kwargs)
+    default_pg.bound_device_id = None
+    try:
+        group = torch.distributed.new_group(**kwargs)
+    finally:
+        default_pg.bound_device_id = bound
+    if torch.distributed.get_rank() in ranks:
+        group.bound_device_id = bound
+    return group
+
+
 def create_group(
     ranks=None,
     timeout=None,
@@ -256,7 +285,10 @@ def create_group(
             # So need to unset timeout here if caller doesn't set value. Otherwise there is
             # type error.
             kwargs.pop("timeout")
-    group = torch.distributed.new_group(**kwargs)
+    from megatron.core import mem_breakdown
+
+    with mem_breakdown.measure(f"nccl:{group_desc or 'group'}"):
+        group = _new_group(ranks, kwargs)
     global _global_process_group_list
     if _global_process_group_list is None:
         # None stands for the default process group

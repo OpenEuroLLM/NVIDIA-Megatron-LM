@@ -153,6 +153,10 @@ class TorchDepthMemoryWorkspace:
     def export_grad(self):
         return self.dm, self.dp
 
+    def grad_buffers(self):
+        """The buffers the backward starts from (load_grad's targets)."""
+        return self.dm, self.dp
+
     def state_layout(self):
         """(per-token shape, dtype) of the carried state (M, P) and of its gradient (dM, dP)."""
         g, k, d = self.groups, self.key_dim, self.value_dim
@@ -238,26 +242,28 @@ def _numel(shape) -> int:
     return count
 
 
-def _pack_state(tensors, slots: int, h: int, like: torch.Tensor) -> torch.Tensor:
-    """State tensors -> [n, slots, h] of ``like``'s dtype holding their raw bytes (zero padded).
-    A bit container: whatever the activation dtype, the bytes go through unchanged."""
-    flat = torch.cat([_bytes(t) for t in tensors], dim=1)
-    n = flat.shape[0]
-    out = torch.zeros((n, slots * h * like.element_size()), dtype=torch.uint8, device=like.device)
-    out[:, : flat.shape[1]] = flat
-    return out.view(like.dtype).view(n, slots, h)
+def _state_region(full: torch.Tensor) -> torch.Tensor:
+    """The state slots of [s, b, 2 + slots, h] streams as raw bytes per token, [n, bytes] -- a
+    strided view, no copy (the streams must be contiguous)."""
+    s_, b_, slots, h = full.shape
+    rows = full.view(s_ * b_, slots * h).view(torch.uint8)
+    return rows[:, 2 * h * full.element_size():]
 
 
-def _unpack_state(packed: torch.Tensor, layout) -> list:
-    """[n, slots, h] container -> the state tensors (copies)."""
-    n = packed.shape[0]
-    flat = packed.reshape(n, -1).contiguous().view(torch.uint8)
-    out, offset = [], 0
-    for shape, dtype in layout:
-        width = _numel(shape) * dtype.itemsize
-        out.append(flat[:, offset : offset + width].contiguous().view(dtype).view(n, *shape))
+def _copy_bytes(dst_tensors, region: torch.Tensor, *, into_region: bool) -> None:
+    """Copy the tensors' bytes to (``into_region``) or from the state region, back to back; the
+    region's tail is zeroed when written. No intermediate copies."""
+    offset = 0
+    for t in dst_tensors:
+        flat = t.view(t.shape[0], -1).view(torch.uint8)
+        width = flat.shape[1]
+        if into_region:
+            region[:, offset : offset + width].copy_(flat)
+        else:
+            flat.copy_(region[:, offset : offset + width])
         offset += width
-    return out
+    if into_region:
+        region[:, offset:].zero_()
 
 
 class SegmentedWorkspace:
@@ -297,10 +303,10 @@ class SegmentEnter(torch.autograd.Function):
         s, b, slots, h = streams.shape
         workspace.ensure(s * b, streams.device)
         workspace.begin(base, count, carried=carried)
-        if carried:
-            layout, _ = workspace.ws.state_layout()
-            m, p = _unpack_state(streams[:, :, 2:].reshape(s * b, slots - 2, h), layout)
-            workspace.ws.load_state(m, p)
+        if carried:  # straight into the workspace's state buffers
+            _copy_bytes(workspace.ws.export_state(), _state_region(streams.contiguous()),
+                        into_region=False)
+            workspace.ws.state_loaded = True
         ctx.workspace, ctx.cfg = workspace, (base, count, carried, s, b, slots, h)
         return streams[:, :, :2].clone()
 
@@ -308,13 +314,15 @@ class SegmentEnter(torch.autograd.Function):
     def backward(ctx, grad):
         ws = ctx.workspace
         base, count, carried, s, b, slots, h = ctx.cfg
-        out = grad.new_zeros((s, b, slots, h))
+        out = grad.new_empty((s, b, slots, h))
         out[:, :, :2] = grad
         if carried:
             _, glayout = ws.ws.state_layout()
             grads = [t.to(dtype).reshape(t.shape[0], *shape)
                      for t, (shape, dtype) in zip(ws.ws.export_grad(), glayout)]
-            out[:, :, 2:] = _pack_state(grads, slots - 2, h, grad).view(s, b, slots - 2, h)
+            _copy_bytes(grads, _state_region(out), into_region=True)
+        else:
+            out[:, :, 2:].zero_()
         return None, None, None, None, out
 
 
@@ -326,17 +334,17 @@ class SegmentExit(torch.autograd.Function):
     def forward(ctx, workspace: SegmentedWorkspace, base: int, count: int, carried: bool,
                 state_slots: int, streams):
         s, b, _, h = streams.shape
-        m, p = workspace.ws.export_state()
-        packed = _pack_state([m, p], state_slots, h, streams).view(s, b, state_slots, h)
+        out = streams.new_empty((s, b, 2 + state_slots, h))
+        out[:, :, :2] = streams
+        _copy_bytes(workspace.ws.export_state(), _state_region(out), into_region=True)
         ctx.workspace, ctx.cfg = workspace, (base, count, carried, s, b, state_slots, h)
-        return torch.cat((streams, packed), dim=2)
+        return out
 
     @staticmethod
     def backward(ctx, grad):
         ws = ctx.workspace
         base, count, carried, s, b, state_slots, h = ctx.cfg
         ws.begin(base, count, carried=carried)  # (the forward / recompute just ran this segment)
-        _, glayout = ws.ws.state_layout()
-        dm, dp = _unpack_state(grad[:, :, 2:].reshape(s * b, state_slots, h), glayout)
-        ws.ws.load_grad(dm, dp)
+        _copy_bytes(ws.ws.grad_buffers(), _state_region(grad.contiguous()), into_region=False)
+        ws.ws.grad_loaded = True
         return None, None, None, None, None, grad[:, :, :2].contiguous()

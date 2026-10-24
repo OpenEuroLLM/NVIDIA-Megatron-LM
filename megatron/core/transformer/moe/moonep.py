@@ -77,11 +77,14 @@ class _MoonEPState:
         self.rank = group.rank()
         self.S, self.H, self.K, self.E = S, H, K, E
         self.epn = E // self.R
-        self.buffer = moonep.Buffer(
-            S, H, K, E, self.R, num_sms=num_sms, token_padding=token_padding, group=group,
-            # MOONEP_PDL=0: no programmatic dependent launch between MoonEP's kernels
-            enable_pdl=os.environ.get("MOONEP_PDL", "1") != "0",
-        )
+        from megatron.core import mem_breakdown
+
+        with mem_breakdown.measure("moonep_buffer"):
+            self.buffer = moonep.Buffer(
+                S, H, K, E, self.R, num_sms=num_sms, token_padding=token_padding, group=group,
+                # MOONEP_PDL=0: no programmatic dependent launch between MoonEP's kernels
+                enable_pdl=os.environ.get("MOONEP_PDL", "1") != "0",
+            )
         self.pools = {}
         self._last_prefetch = None  # (experts module, plan) whose weights the pools hold
 
@@ -102,8 +105,11 @@ class _MoonEPState:
         """[R, epn, *inner] all-rank NVLink view (rank chunks padded to VMM granularity)."""
         key = (name, tuple(inner), dtype)
         if key not in self.pools:
+            from megatron.core import mem_breakdown
+
             padded = pad_dim0_for_alignment([self.epn, *inner], dtype)
-            t = create_nvl_dist_tensor([padded, *inner], dtype, self.rank, self.R, self.group)
+            with mem_breakdown.measure("moonep_pools"):
+                t = create_nvl_dist_tensor([padded, *inner], dtype, self.rank, self.R, self.group)
             t = t.view(self.R, padded, *inner)[:, : self.epn]
             t[self.rank].zero_()
             torch.cuda.synchronize()
@@ -312,12 +318,15 @@ def _gemm(weights, a, a_dim, out, out_dim, splits, offsets, layout, accumulate=F
             )
 
 
-def _wgrad(main, gpool, a, a_dim, dy, dy_dim, splits, offsets):
+def _wgrad(main, gpool, a, a_dim, dy, dy_dim, splits, offsets, overwrite=False):
     """Weight grads: the local experts accumulate into their fp32 main grads (a list, one per
-    expert); the prefetch slots are written fresh into this rank's reduce slots (cleared after
-    each reduce; mostly empty, and an empty group with accumulate=True still reads + writes its
-    whole fp32 block)."""
+    expert) -- or overwrite them when the owner asks (Megatron-FSDP: ``overwrite_main_grad``, its
+    unsharded grad buckets are fresh, not zeroed, for every backward); the prefetch slots are
+    written fresh into this rank's reduce slots (cleared after each reduce; mostly empty, and an
+    empty group with accumulate=True still reads + writes its whole fp32 block)."""
     epn = len(main)
+    if overwrite:  # zero first: an expert without tokens is an empty group the GEMM leaves alone
+        torch._foreach_zero_(main)
     _gemm(main, a, a_dim, dy, dy_dim, splits[:epn], offsets[: epn + 1], "NT", accumulate=True)
     _gemm([gpool[i].view_as(main[0]) for i in range(epn)], a, a_dim, dy, dy_dim, splits[epn:],
           offsets[epn:], "NT", accumulate=False)
@@ -418,18 +427,20 @@ class _MoonEPExperts(torch.autograd.Function):
         w2 = fc2 + [slots[1][i].view_as(fc2[0]) for i in range(epn)]
         gpools = [p[state.rank] for p in state.grad_pools(module.pool_shapes)]
         main1, main2 = module.main_grads()
+        # Megatron-FSDP: the wgrad overwrites the fresh bucket (the copies' grads are added after)
+        overwrite = all(getattr(w, "overwrite_main_grad", False) for w in weights[: 2 * epn])
 
         probs = w_nvs.unsqueeze(-1)
         # fc2: dgrad + wgrad (into the local main grads and this rank's reduce slots)
         grad_a = torch.empty(x.shape[0], ffn, dtype=x.dtype, device=x.device)
         _gemm(w2, grad_y, hidden, grad_a, ffn, splits, offsets, "NN")
-        _wgrad(main2, gpools[1], a, ffn, grad_y, hidden, splits, offsets)
+        _wgrad(main2, gpools[1], a, ffn, grad_y, hidden, splits, offsets, overwrite)
         grad_h, grad_probs = weighted_swiglu_back(grad_a, h, probs)
         # fc1
         # zero copy: the dispatch backward (a combine) reads fc1's dgrad from the shard
         grad_x = state.buffer.hidden_nvsh_buffer_view
         _gemm(w1, grad_h, ffn2, grad_x, hidden, splits, offsets, "NN")
-        _wgrad(main1, gpools[0], x, hidden, grad_h, ffn2, splits, offsets)
+        _wgrad(main1, gpools[0], x, hidden, grad_h, ffn2, splits, offsets, overwrite)
         # the prefetched copies' grads -> their home ranks' main grads (collective)
         module.reduce_copies_grad(state, plan, main1, main2)
         grad_w = grad_probs.squeeze(-1).to(w_nvs.dtype)
@@ -536,6 +547,10 @@ class MoonEPGroupedMLP(MegatronModule):
             mg = []
             for p in mod.weights():
                 g = getattr(p, "main_grad", None)
+                if g is None and hasattr(p, "get_main_grad"):
+                    # Megatron-FSDP: the unsharded main grad is allocated on request (and
+                    # reduce-scattered / freed by FSDP's hooks); `main_grad` is not set before
+                    g = p.get_main_grad()
                 if g is None:  # no Megatron DDP (unit tests): an fp32 grad of our own
                     if getattr(p, "_moonep_grad", None) is None:
                         p._moonep_grad = torch.zeros(p.shape, dtype=torch.float32, device=p.device)

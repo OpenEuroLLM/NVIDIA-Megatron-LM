@@ -40,6 +40,12 @@ def _pg():
     )
 
 
+
+def _grad(layer):
+    """The table gradient as a dense tensor (dense buffer or ENGRAM_SPARSE_GRAD's SparseRowGrad)."""
+    g = layer.table_grad
+    return g.to_dense() if hasattr(g, "to_dense") else g
+
 def test_balanced_rows_and_owner():
     for total, size in ((10, 3), (2007, 4), (5, 8)):
         ranges = [balanced_row_range(total, r, size) for r in range(size)]
@@ -250,13 +256,15 @@ def test_sharded_matches_whole_table(tp):
 
 
 @pytest.mark.skipif(Utils.world_size < 2, reason="needs 2+ GPUs")
-def test_step_lookup_matches_per_microbatch():
+@pytest.mark.parametrize("sparse", [False, True])
+def test_step_lookup_matches_per_microbatch(monkeypatch, sparse):
     """ENGRAM_STEP_LOOKUP: one row exchange per step (prefetch_step_lookup) and one gradient
     exchange at the flush give the per-micro-batch path's outputs and table gradients, over
     three packed (document-masked) micro-batches with different tokens per rank."""
     from megatron.core.packed_seq_params import PackedSeqParams
     from megatron.core.ssm.engram_sharded import flush_step_lookups
 
+    monkeypatch.setenv("ENGRAM_SPARSE_GRAD", "1" if sparse else "0")
     Utils.initialize_model_parallel(tensor_model_parallel_size=1)
     try:
         model_parallel_cuda_manual_seed(123)
@@ -292,15 +300,96 @@ def test_step_lookup_matches_per_microbatch():
 
         layer.table_grad.zero_()
         ref_outs = run()
-        ref_grad = layer.table_grad.clone()
+        ref_grad = _grad(layer).clone()
         layer.table_grad.zero_()
-        layer.prefetch_step_lookup([m[0] for m in mbs], [m[1] for m in mbs])
+        # cu_seqlens as training hands them over ([1, docs + 1], maybe_prefetch_cu_seqlens)
+        layer.prefetch_step_lookup([m[0] for m in mbs], [m[1].view(1, -1) for m in mbs])
         outs = run()
-        assert layer.table_grad.abs().sum() == 0  # nothing exchanged before the flush
+        assert _grad(layer).abs().sum() == 0  # nothing exchanged before the flush
         flush_step_lookups()
         for a, b in zip(outs, ref_outs):
             torch.testing.assert_close(a, b)
-        torch.testing.assert_close(layer.table_grad, ref_grad, rtol=1e-4, atol=1e-5)
+        torch.testing.assert_close(_grad(layer), ref_grad, rtol=1e-4, atol=1e-5)
         assert layer._step_lookup is None
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(Utils.world_size < 2, reason="needs 2+ GPUs")
+@pytest.mark.parametrize("sparse", [False, True])
+@pytest.mark.parametrize("async_groups", [False, True])
+def test_step_lookup_groups_match_per_microbatch(monkeypatch, sparse, async_groups):
+    """ENGRAM_STEP_GROUP: the step lookup in groups of 2 of 5 micro-batches, under a pipelined,
+    fully recomputed order (no-grad forwards running ahead, recompute + backward later): the
+    per-micro-batch path's outputs and table gradients; a group's gradients reach their owners
+    once its last backward ran."""
+    from megatron.core.packed_seq_params import PackedSeqParams
+    from megatron.core.ssm.engram_sharded import PENDING_STEP_LOOKUPS, flush_step_lookups
+
+    monkeypatch.setenv("ENGRAM_SPARSE_GRAD", "1" if sparse else "0")
+    monkeypatch.setenv("ENGRAM_ASYNC_GROUPS", "1" if async_groups else "0")
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        layer = EngramLayer(
+            _config(engram_table_parallel="dp"), layer_number=1, pg_collection=_pg()
+        ).cuda()
+        with torch.no_grad():
+            gen = torch.Generator(device="cuda").manual_seed(5)
+            layer.conv1d.weight.copy_(
+                torch.randn(layer.conv1d.weight.shape, generator=gen, device="cuda")
+            )
+        dp_rank = parallel_state.get_data_parallel_rank()
+        gen = torch.Generator(device="cuda").manual_seed(200 + dp_rank)
+        T = 3 * SEQ
+        mbs = []
+        for k in range(5):
+            ids = torch.randint(0, 5000, (1, T), device="cuda", generator=gen)
+            cu = torch.tensor([0, 11 + k, 40, 77, T - 2], dtype=torch.int32, device="cuda")
+            psp = PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu,
+                                  max_seqlen_q=40, max_seqlen_kv=40)
+            h = torch.randn(T, 1, HIDDEN, device="cuda", generator=gen)
+            g = torch.randn(T, 1, HIDDEN, device="cuda", generator=gen)
+            mbs.append((ids, cu, psp, h, g))
+
+        def fwd(k, grad):
+            ids, _, psp, h, _ = mbs[k]
+            layer.set_input_ids(ids)
+            with torch.set_grad_enabled(grad):
+                return layer(h, packed_seq_params=psp)
+
+        layer.table_grad.zero_()
+        ref_outs = []
+        for k in range(5):
+            out = fwd(k, True)
+            out.backward(mbs[k][4])
+            ref_outs.append(out.detach())
+        ref_grad = _grad(layer).clone()
+
+        layer.table_grad.zero_()
+        layer.stash_step_groups([m[0] for m in mbs], [m[1].view(1, -1) for m in mbs], 2)
+        outs = {}
+        # forwards (no grad, as under full recompute) run ahead of the backwards
+        order = [("f", 0), ("f", 1), ("f", 2), ("b", 0), ("f", 3), ("b", 1), ("f", 4),
+                 ("b", 2), ("b", 3), ("b", 4)]
+        for what, k in order:
+            if what == "f":
+                fwd(k, False)
+                continue
+            out = fwd(k, True)  # the recompute, then its backward
+            out.backward(mbs[k][4])
+            outs[k] = out.detach()
+            if k == 0:
+                assert _grad(layer).abs().sum() == 0  # group {0, 1} still open
+            if k == 1:
+                from megatron.core.ssm.engram_sharded import join_async_flushes
+
+                join_async_flushes()  # (ENGRAM_ASYNC_GROUPS: the flush runs on a side stream)
+                assert _grad(layer).abs().sum() > 0  # ... flushed after its last backward
+        flush_step_lookups()  # the last group ({4}) flushed already; nothing left
+        assert not PENDING_STEP_LOOKUPS and layer._step_groups is None
+        for k in range(5):
+            torch.testing.assert_close(outs[k], ref_outs[k])
+        torch.testing.assert_close(_grad(layer), ref_grad, rtol=1e-4, atol=1e-5)
     finally:
         Utils.destroy_model_parallel()

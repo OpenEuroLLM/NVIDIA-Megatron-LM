@@ -359,8 +359,13 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
         if not args.fake_process_group and device_id is not None:
             init_process_group_kwargs['device_id'] = device_id
 
-        torch.distributed.init_process_group(**init_process_group_kwargs)
-        inprocess_restart.maybe_force_nccl_backend_init(device_id)
+        from megatron.core import mem_breakdown
+
+        if device_count > 0:
+            mem_breakdown.baseline("cuda_context")
+        with mem_breakdown.measure("nccl_default_pg"):
+            torch.distributed.init_process_group(**init_process_group_kwargs)
+            inprocess_restart.maybe_force_nccl_backend_init(device_id)
 
     # Set the tensor model-parallel, pipeline model-parallel, and
     # data-parallel communicators.
@@ -377,31 +382,34 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                     "Set both --gtp_remat-weight-remat-size and "
                     "--expert-generalized-tensor-parallel-remat-size to 1 to disable GTP."
                 )
-            mpu.initialize_model_parallel(
-                args.tensor_model_parallel_size,
-                args.pipeline_model_parallel_size,
-                args.virtual_pipeline_model_parallel_size,
-                pipeline_model_parallel_comm_backend=args.pipeline_model_parallel_comm_backend,
-                use_sharp=args.use_sharp,
-                # GTP_remat/EGTP_remat need world divisible by TP*PP*CP*GTP_remat (expert grid
-                # by ETP*EP*PP*EGTP_remat). Inactive when the remat sizes are 1.
-                gtp_remat_size=args.gtp_weight_remat_size,
-                expert_gtp_remat_size=args.expert_gtp_weight_remat_size,
-                context_parallel_size=args.context_parallel_size,
-                hierarchical_context_parallel_sizes=args.hierarchical_context_parallel_sizes,
-                hybrid_context_parallel=args.hybrid_context_parallel,
-                expert_model_parallel_size=args.expert_model_parallel_size,
-                num_distributed_optimizer_instances=args.num_distributed_optimizer_instances,
-                expert_tensor_parallel_size=args.expert_tensor_parallel_size,
-                distributed_timeout_minutes=args.distributed_timeout_minutes,
-                nccl_communicator_config_path=args.nccl_communicator_config_path,
-                order='tp-cp-ep-dp-pp' if not args.use_tp_pp_dp_mapping else 'tp-cp-ep-pp-dp',
-                get_embedding_ranks=get_embedding_ranks,
-                get_position_embedding_ranks=get_position_embedding_ranks,
-                create_gloo_process_groups=args.use_gloo_process_groups,
-                high_priority_stream_groups=args.high_priority_stream_groups,
-                sharp_enabled_group=args.sharp_enabled_group,
-            )
+            from megatron.core import mem_breakdown
+
+            with mem_breakdown.measure("nccl_model_parallel_groups"):
+                mpu.initialize_model_parallel(
+                    args.tensor_model_parallel_size,
+                    args.pipeline_model_parallel_size,
+                    args.virtual_pipeline_model_parallel_size,
+                    pipeline_model_parallel_comm_backend=args.pipeline_model_parallel_comm_backend,
+                    use_sharp=args.use_sharp,
+                    # GTP_remat/EGTP_remat need world divisible by TP*PP*CP*GTP_remat (expert grid
+                    # by ETP*EP*PP*EGTP_remat). Inactive when the remat sizes are 1.
+                    gtp_remat_size=args.gtp_weight_remat_size,
+                    expert_gtp_remat_size=args.expert_gtp_weight_remat_size,
+                    context_parallel_size=args.context_parallel_size,
+                    hierarchical_context_parallel_sizes=args.hierarchical_context_parallel_sizes,
+                    hybrid_context_parallel=args.hybrid_context_parallel,
+                    expert_model_parallel_size=args.expert_model_parallel_size,
+                    num_distributed_optimizer_instances=args.num_distributed_optimizer_instances,
+                    expert_tensor_parallel_size=args.expert_tensor_parallel_size,
+                    distributed_timeout_minutes=args.distributed_timeout_minutes,
+                    nccl_communicator_config_path=args.nccl_communicator_config_path,
+                    order='tp-cp-ep-dp-pp' if not args.use_tp_pp_dp_mapping else 'tp-cp-ep-pp-dp',
+                    get_embedding_ranks=get_embedding_ranks,
+                    get_position_embedding_ranks=get_position_embedding_ranks,
+                    create_gloo_process_groups=args.use_gloo_process_groups,
+                    high_priority_stream_groups=args.high_priority_stream_groups,
+                    sharp_enabled_group=args.sharp_enabled_group,
+                )
             print_rank_0(
                 f"> initialized tensor model parallel with size "
                 f"{mpu.get_tensor_model_parallel_world_size()}"

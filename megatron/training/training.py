@@ -3027,7 +3027,15 @@ def _maybe_start_mem_trace(iteration):
     torch.cuda.memory._record_memory_history(
         True, trace_alloc_max_entries=2_000_000, trace_alloc_record_context=True
     )
-    return os.path.join(out, f"mem_rank{rank}_iter{iteration}.pickle")
+    path = os.path.join(out, f"mem_rank{rank}_iter{iteration}.pickle")
+
+    def _oom(device, alloc, device_alloc, device_free):
+        # an OOM inside the traced forward-backward: dump what was live there
+        os.makedirs(out, exist_ok=True)
+        torch.cuda.memory._dump_snapshot(path.replace(".pickle", "_oom.pickle"))
+
+    torch._C._cuda_attach_out_of_memory_observer(_oom)
+    return path
 
 
 def _dump_mem_trace(path):
@@ -3141,6 +3149,10 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             prefetch_engram_step_lookups(model, packed_doc_attention)
         pipeline_seq_length, pipeline_micro_batch_size = get_pipeline_tensor_shapes(args)
         _mem_trace = _maybe_start_mem_trace(iteration)
+        from megatron.core import mem_breakdown
+
+        if iteration is not None and iteration < 3:
+            mem_breakdown.report(f"iteration {iteration} start")
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step_func,
             data_iterator=data_iterator,
@@ -3157,6 +3169,8 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         )
         if _mem_trace is not None:
             _dump_mem_trace(_mem_trace)
+        if iteration is not None and iteration < 3:
+            mem_breakdown.report(f"iteration {iteration} after forward-backward")
         if save_activations_in_this_iteration:
             save_activations(iteration + 1)
             disable_activation_logging()
