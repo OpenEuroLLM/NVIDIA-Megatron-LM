@@ -174,6 +174,12 @@ class GPTDataset(MegatronDataset):
         (self.document_index, self.sample_index, self.shuffle_index) = (
             self._build_document_sample_shuffle_indices()
         )
+        # The split's document ids (numpy.arange over every document of the split) are only read
+        # while the indices above are built: release them (as --dataloader-fast-cache-load never
+        # builds them). Across a blend's datasets they are 4 bytes per document per rank -- 42 GB
+        # per rank with the 904 datasets of the flag mix, which ran the nodes out of host memory.
+        if not self.config.defer_npy_index_mmap:  # (__len__ recomputes from them in that mode)
+            self.indices = None
 
     @staticmethod
     def numel_low_level_dataset(low_level_dataset: IndexedDataset) -> int:
