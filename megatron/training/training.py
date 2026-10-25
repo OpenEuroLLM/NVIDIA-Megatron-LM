@@ -3088,6 +3088,14 @@ def _debug_host_tensors(tag):
     for (shape, dtype, pinned), (n, nbytes) in sorted(groups.items(), key=lambda kv: -kv[1][1])[:15]:
         print(f"[host-tensors {tag}]   {nbytes / 2**30:8.2f} GB  x{n}  {shape} {dtype}"
               f"{' pinned' if pinned else ''}", flush=True)
+    import tracemalloc
+
+    if tracemalloc.is_tracing():  # PYTHONTRACEMALLOC=1: the Python-side allocation sites (numpy too)
+        top = tracemalloc.take_snapshot().statistics("lineno")[:15]
+        for stat in top:
+            frame = stat.traceback[0]
+            print(f"[host-tensors {tag}] traced {stat.size / 2**30:7.2f} GB x{stat.count} "
+                  f"{frame.filename.split('Megatron-LM/')[-1]}:{frame.lineno}", flush=True)
     try:
         stats = torch.cuda.host_memory_stats()
         print(f"[host-tensors {tag}] pinned allocator: "
