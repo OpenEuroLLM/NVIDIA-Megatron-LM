@@ -864,6 +864,10 @@ def save_checkpoint(
         if hasattr(torch._C, "_host_emptyCache"):
             torch.cuda.synchronize()
             torch._C._host_emptyCache()
+        if os.environ.get("MEGATRON_MALLOC_TRIM", "1") == "1":
+            from megatron.training.training import _malloc_trim
+
+            _malloc_trim(f"before the save at iteration {iteration}")
         _debug_optimizer_state(optimizer, f"at save {iteration}", model)
         state_dict = generate_state_dict(
             args,

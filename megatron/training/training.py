@@ -5600,6 +5600,25 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
     return train_dataloader, valid_dataloaders, test_dataloader
 
 
+def _malloc_trim(tag):
+    """glibc malloc_trim(0): hand freed heap memory back to the OS; logs rank 0's RSS around it."""
+    import ctypes
+
+    def rss_gb():
+        try:
+            with open("/proc/self/statm") as f:
+                return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 2**30
+        except OSError:
+            return float("nan")
+
+    before = rss_gb()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except OSError:
+        return
+    print_rank_0(f"malloc_trim ({tag}): rank 0 RSS {before:.1f} -> {rss_gb():.1f} GB")
+
+
 def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provider):
     """Build pretraining data iterators."""
 
@@ -5609,6 +5628,12 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
     train_dataloader, valid_dataloaders, test_dataloader = build_train_valid_test_data_loaders(
         build_train_valid_test_datasets_provider
     )
+    # Return the host memory freed during setup (dataset index builds, model init) to the OS before
+    # the data-loader workers fork: glibc keeps it, every worker shares the bloated image, and with
+    # RECOMPUTE_OFFLOAD's pinned blocks and a save on top the nodes ran out (2026-10-25, ~49 GB per
+    # rank). MEGATRON_MALLOC_TRIM=0 skips it.
+    if os.environ.get("MEGATRON_MALLOC_TRIM", "1") == "1":
+        _malloc_trim("before the data-loader workers fork")
 
     # Build iterators.
     dl_type = args.dataloader_type
