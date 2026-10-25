@@ -254,6 +254,18 @@ def get_load_checkpoint_path_by_args(args, load_arg='load'):
     # Allow user to specify the loaded iteration.
     if getattr(args, 'ckpt_step', None):
         iteration = args.ckpt_step
+    elif load_arg == 'load' and getattr(args, 'non_persistent_ckpt_type', None) == 'global':
+        # a newer global non-persistent (rolling) checkpoint is what _load_base_checkpoint loads
+        non_persistent_global_dir = (
+            args.non_persistent_global_ckpt_dir
+            if args.non_persistent_global_ckpt_dir or load_dir is None
+            else os.path.join(load_dir, _NON_PERSISTENT_CKPT_SUBDIR)
+        )
+        non_persistent_iteration = _get_non_persistent_iteration(non_persistent_global_dir, args)
+        if non_persistent_iteration != -1 and non_persistent_iteration >= iteration:
+            return get_checkpoint_name(
+                non_persistent_global_dir, non_persistent_iteration, False, return_base_dir=True
+            )
 
     return get_checkpoint_name(load_dir, iteration, release, return_base_dir=True)
 
@@ -1821,7 +1833,23 @@ def _load_base_checkpoint(
     set_loaded_iteration(iteration)
 
     if non_persistent_iteration != -1:  # there is a non-persistent checkpoint
-        if non_persistent_iteration >= iteration:
+        np_checkpoint_name = get_checkpoint_name(
+            non_persistent_global_dir, non_persistent_iteration, False, return_base_dir=True
+        )
+        if (
+            non_persistent_iteration >= iteration
+            and args.non_persistent_ckpt_type == 'global'
+            and _get_checkpoint_format(np_checkpoint_name, args) != 'torch_dist'
+        ):
+            # fsdp_dtensor / torch_dcp rolling checkpoints: the global path below loads them
+            # (_load_non_persistent_base_checkpoint only reads torch_dist ones)
+            load_dir, iteration, release = non_persistent_global_dir, non_persistent_iteration, False
+            set_loaded_iteration(iteration)
+            if not rank0:
+                print_rank_0(
+                    f'Loading from a non-persistent checkpoint (non-persistent iter {iteration})'
+                )
+        elif non_persistent_iteration >= iteration:
             return _load_non_persistent_base_checkpoint(
                 non_persistent_global_dir,
                 args,
