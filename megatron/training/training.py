@@ -3046,6 +3046,42 @@ def _dump_mem_trace(path):
           f"reserved {torch.cuda.max_memory_reserved() / 2**30:.2f} GiB", flush=True)
 
 
+def _debug_host_tensors(tag):
+    """MEGATRON_DEBUG_HOST_TENSORS=1: rank 0's largest live CPU tensors (grouped by shape, dtype and
+    pinned or not) and the pinned host allocator's statistics -- what holds the host memory."""
+    if torch.distributed.get_rank() != 0:
+        return
+    import gc
+    from collections import defaultdict
+
+    groups, seen = defaultdict(lambda: [0, 0]), set()
+    for obj in gc.get_objects():
+        try:
+            if not isinstance(obj, torch.Tensor) or obj.device.type != "cpu":
+                continue
+            storage = obj.untyped_storage()
+            if storage.data_ptr() in seen or storage.nbytes() == 0:
+                continue
+            seen.add(storage.data_ptr())
+            key = (tuple(obj.shape), str(obj.dtype), bool(obj.is_pinned()))
+            groups[key][0] += 1
+            groups[key][1] += storage.nbytes()
+        except Exception:
+            continue
+    total = sum(v[1] for v in groups.values())
+    print(f"[host-tensors {tag}] {len(seen)} CPU storages, {total / 2**30:.1f} GB", flush=True)
+    for (shape, dtype, pinned), (n, nbytes) in sorted(groups.items(), key=lambda kv: -kv[1][1])[:15]:
+        print(f"[host-tensors {tag}]   {nbytes / 2**30:8.2f} GB  x{n}  {shape} {dtype}"
+              f"{' pinned' if pinned else ''}", flush=True)
+    try:
+        stats = torch.cuda.host_memory_stats()
+        print(f"[host-tensors {tag}] pinned allocator: "
+              + ", ".join(f"{k}={v / 2**30:.1f}GB" for k, v in stats.items()
+                          if "bytes" in k and "current" in k), flush=True)
+    except Exception as exc:
+        print(f"[host-tensors {tag}] no pinned allocator stats: {exc}", flush=True)
+
+
 def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None, pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None, p2p_communicator: Optional[P2PCommunicator] = None):
     """Single training step.
 
@@ -3272,6 +3308,8 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
         _debug_optimizer_state(optimizer, f"before step {iteration + 1}", model)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+    if os.environ.get("MEGATRON_DEBUG_HOST_TENSORS") == "1" and iteration == args.iteration:
+        _debug_host_tensors(f"after the first step ({iteration + 1})")
     if _debug_step:
         _debug_optimizer_state(optimizer, f"after step {iteration + 1}", model)
 
