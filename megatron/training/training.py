@@ -3055,8 +3055,22 @@ def _debug_host_tensors(tag):
     from collections import defaultdict
 
     groups, seen = defaultdict(lambda: [0, 0]), set()
+    import numpy
+
     for obj in gc.get_objects():
         try:
+            if isinstance(obj, numpy.ndarray):
+                base = obj
+                while isinstance(base.base, numpy.ndarray):
+                    base = base.base
+                if id(base) in seen or isinstance(base.base, (memoryview, numpy.memmap)) \
+                        or isinstance(base, numpy.memmap) or base.nbytes < (1 << 20):
+                    continue
+                seen.add(id(base))
+                key = (tuple(base.shape), f"numpy.{base.dtype}", False)
+                groups[key][0] += 1
+                groups[key][1] += base.nbytes
+                continue
             if not isinstance(obj, torch.Tensor) or obj.device.type != "cpu":
                 continue
             storage = obj.untyped_storage()
@@ -3069,7 +3083,8 @@ def _debug_host_tensors(tag):
         except Exception:
             continue
     total = sum(v[1] for v in groups.values())
-    print(f"[host-tensors {tag}] {len(seen)} CPU storages, {total / 2**30:.1f} GB", flush=True)
+    print(f"[host-tensors {tag}] {len(seen)} CPU storages / numpy arrays, {total / 2**30:.1f} GB",
+          flush=True)
     for (shape, dtype, pinned), (n, nbytes) in sorted(groups.items(), key=lambda kv: -kv[1][1])[:15]:
         print(f"[host-tensors {tag}]   {nbytes / 2**30:8.2f} GB  x{n}  {shape} {dtype}"
               f"{' pinned' if pinned else ''}", flush=True)
@@ -5634,6 +5649,8 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
     # rank). MEGATRON_MALLOC_TRIM=0 skips it.
     if os.environ.get("MEGATRON_MALLOC_TRIM", "1") == "1":
         _malloc_trim("before the data-loader workers fork")
+    if os.environ.get("MEGATRON_DEBUG_HOST_TENSORS") == "1":
+        _debug_host_tensors("after the data setup")
 
     # Build iterators.
     dl_type = args.dataloader_type
