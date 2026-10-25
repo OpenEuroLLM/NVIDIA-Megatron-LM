@@ -856,14 +856,6 @@ def save_checkpoint(
                 )
         else:
             sharded_sd_metadata = None
-        # Release the pinned host cache first: RECOMPUTE_OFFLOAD keeps a micro-batch's checkpoint
-        # inputs in pinned host memory (~48 GB per rank with mHC-4 at 16k x mbs 4) and the caching
-        # host allocator keeps those blocks after the step -- with the save's own host copies on
-        # top the node ran out of host memory (OOM-killed saves, 2026-10-25). The next step pins
-        # them again.
-        if hasattr(torch._C, "_host_emptyCache"):
-            torch.cuda.synchronize()
-            torch._C._host_emptyCache()
         if os.environ.get("MEGATRON_MALLOC_TRIM", "1") == "1":
             from megatron.training.training import _malloc_trim
 
