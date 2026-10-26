@@ -861,6 +861,7 @@ def save_checkpoint(
 
             _malloc_trim(f"before the save at iteration {iteration}")
         _debug_optimizer_state(optimizer, f"at save {iteration}", model)
+        _save_phase("start")
         state_dict = generate_state_dict(
             args,
             model,
@@ -956,7 +957,9 @@ def save_checkpoint(
                 ensure_directory_exists(checkpoint_name, check_parent=False)
 
             if ckpt_format == 'fsdp_dtensor':
+                _save_phase("generate_state_dict")
                 state_dict = preprocess_fsdp_dtensor_state_dict(args, state_dict, model[0])
+                _save_phase("preprocess_fsdp_dtensor_state_dict")
 
             if args.async_save:
                 planner = torch.distributed.checkpoint.DefaultSavePlanner()
@@ -996,6 +999,7 @@ def save_checkpoint(
                 async_save_request = get_save_and_finalize_callbacks(
                     fs_storage_writer, save_state_dict_ret, args.async_strategy
                 )
+                _save_phase("save_state_dict_async_plan")
             else:
                 fs_storage_writer = torch.distributed.checkpoint.FileSystemWriter(checkpoint_name)
                 torch.distributed.checkpoint.save(
@@ -1497,6 +1501,16 @@ def generate_state_dict(
         state_dict['rng_state'] = rng_state
 
     return state_dict
+
+
+def _save_phase(tag, t0=[None]):
+    """MEGATRON_DEBUG_SAVE_TIMING=1: rank 0's time since the previous phase of a save."""
+    if os.environ.get("MEGATRON_DEBUG_SAVE_TIMING", "0") != "1":
+        return
+    now = time()
+    if t0[0] is not None and tag != "start":
+        print_rank_0(f"[save-timing] {tag}: {now - t0[0]:.1f} s")
+    t0[0] = now
 
 
 def _restore_loaded_scalars(raw, loaded):

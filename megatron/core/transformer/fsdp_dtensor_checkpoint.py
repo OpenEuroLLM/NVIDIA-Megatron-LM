@@ -238,8 +238,8 @@ def _split_row_state(data, dist_param, row_sizes, is_expert_param):
                 meta,
                 dist_index=dist_param.megatron_fsdp_dist_index,
                 is_expert_param=is_expert_param,
-                run_check=True,
-                update_uneven_dtensor_chunk_meta=True,
+                # metadata: set for every DTensor at once by preprocess_state_dict_for_uneven_dtensor
+                # (two collectives per split tensor here cost minutes per save at 512 ranks)
             )
         )
         first += size
@@ -374,16 +374,16 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
             w_meta,
             dist_index=megatron_fsdp_dist_index,
             is_expert_param=is_expert_param,
-            run_check=True,
-            update_uneven_dtensor_chunk_meta=True,
+            # metadata: set for every DTensor at once by preprocess_state_dict_for_uneven_dtensor
+            # (two collectives per split tensor here cost minutes per save at 512 ranks)
         )
         weight_v = make_fsdp_dtensor(
             weight_v.data,
             v_meta,
             dist_index=megatron_fsdp_dist_index,
             is_expert_param=is_expert_param,
-            run_check=True,
-            update_uneven_dtensor_chunk_meta=True,
+            # metadata: set for every DTensor at once by preprocess_state_dict_for_uneven_dtensor
+            # (two collectives per split tensor here cost minutes per save at 512 ranks)
         )
         return weight_w, weight_v
 
