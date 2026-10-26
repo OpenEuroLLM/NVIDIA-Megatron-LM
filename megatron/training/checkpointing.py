@@ -988,6 +988,17 @@ def save_checkpoint(
                     **_writer_kwargs,
                 )
 
+                if args.ckpt_assume_constant_structure and args.async_strategy == "nvrx":
+                    # enable_cache only works with nvrx's module-level metadata cache, which
+                    # nothing creates on this path: create it once. From the third save on the
+                    # cached global plan replaces the gather + central planning (~79 s per save
+                    # at 32 nodes, growing faster than the rank count)
+                    from nvidia_resiliency_ext.checkpointing.async_ckpt import (
+                        state_dict_saver as _nvrx_saver,
+                    )
+
+                    if _nvrx_saver._checkpoint_metadata_cache is None:
+                        _nvrx_saver.init_checkpoint_metadata_cache()
                 save_state_dict_ret = save_state_dict_async_plan(
                     state_dict,
                     fs_storage_writer,
