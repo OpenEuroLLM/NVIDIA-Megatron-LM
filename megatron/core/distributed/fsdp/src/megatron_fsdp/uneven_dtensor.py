@@ -26,43 +26,11 @@ from torch.distributed.checkpoint.planner import TensorWriteData, WriteItem, Wri
 from torch.distributed.tensor.placement_types import Replicate, Shard, _StridedShard
 
 
-def gather_and_compute_chunk_metadata(dtensor: DTensor) -> ChunkStorageMetadata:
-    """
-    Gather chunk metadata for a DTensor across all ranks and compute the
-    offsets and sizes of each chunk. This is necessary for handling uneven
-    sharding in distributed tensors.
-    """
-    local_tensor = dtensor.to_local()
-    local_shape = local_tensor.shape
+def _shard_order(dtensor: DTensor) -> List[int]:
+    """The mesh dimensions in the order their shard offsets compose (outermost first)."""
     device_mesh = dtensor.device_mesh
-
-    offsets = [0] * len(local_shape)
-    cumulative_shape = list(local_shape).copy()
-
-    def _update_offsets_and_cumulative_shape(
-        mesh_dim: int, offsets: List[int], cumulative_shape: List[int]
-    ):
-        shard_group = device_mesh.get_group(mesh_dim)
-        shard_dim = p.dim
-
-        # Synchronize local shard dimensions across ranks
-        world_size = dist.get_world_size(shard_group)
-        global_shapes = [None] * world_size
-        dist.all_gather_object(global_shapes, cumulative_shape, group=shard_group)
-
-        # Calculate global offset for current rank's shard
-        rank = dist.get_rank(shard_group)
-        offset = sum(s[shard_dim] for s in global_shapes[:rank])
-        # TODO: add documentation for the offset calculation
-        # Add on the offset of the current mesh dimension
-        offsets[shard_dim] += offset
-        # Calculate the global shape using the sum of the sharding dim sizes.
-        cumulative_shape[shard_dim] = sum(s[shard_dim] for s in global_shapes)
-
-    # Get the shard placements order.
     shard_order = getattr(device_mesh, "_shard_order", None)
     if shard_order is None:
-        shard_order = []
         reversed_shard_order = []
         mesh_dims = list(range(len(dtensor.placements)))
         strided_shard_count = 0
@@ -78,62 +46,104 @@ def gather_and_compute_chunk_metadata(dtensor: DTensor) -> ChunkStorageMetadata:
             )
         reversed_shard_order += mesh_dims
         shard_order = list(reversed(reversed_shard_order))
+    return list(shard_order)
 
-    for mesh_dim in reversed(shard_order):
-        p = dtensor.placements[mesh_dim]
-        if isinstance(p, (Shard, _StridedShard)):
-            _update_offsets_and_cumulative_shape(mesh_dim, offsets, cumulative_shape)
-        elif isinstance(p, Replicate):
-            # If we have a replicate placement, we do not need to update offsets
-            # or cumulative shape, as it does not affect the chunk metadata.
-            continue
-        else:
-            raise ValueError(f"Unsupported placement type {type(p)} in DTensor: {dtensor}")
 
-    return ChunkStorageMetadata(offsets=tuple(offsets), sizes=tuple(local_shape))
+def gather_and_compute_chunk_metadata(dtensor: DTensor) -> ChunkStorageMetadata:
+    """
+    Gather chunk metadata for a DTensor across all ranks and compute the
+    offsets and sizes of each chunk. This is necessary for handling uneven
+    sharding in distributed tensors.
+    """
+    return gather_and_compute_chunk_metadata_batched([dtensor])[0]
+
+
+def gather_and_compute_chunk_metadata_batched(
+    dtensors: List[DTensor],
+) -> List[ChunkStorageMetadata]:
+    """:func:`gather_and_compute_chunk_metadata` for many DTensors at once: one
+    ``all_gather_object`` per process group and mesh-dimension round instead of one per DTensor
+    and sharded mesh dimension. A checkpoint of the 50B hybrid holds ~25k DTensors (parameters and
+    their optimizer states); at 512 ranks the per-DTensor collectives took ~24 min per save.
+
+    Every rank must pass the same DTensors in the same order (as the per-DTensor collectives
+    already required). Groups are ordered by the first DTensor using them, so all ranks issue the
+    collectives in the same order.
+    """
+    offsets, cumulative, steps = [], [], []
+    for dtensor in dtensors:
+        local_shape = dtensor.to_local().shape
+        offsets.append([0] * len(local_shape))
+        cumulative.append(list(local_shape))
+        order = []
+        for mesh_dim in reversed(_shard_order(dtensor)):
+            p = dtensor.placements[mesh_dim]
+            if isinstance(p, (Shard, _StridedShard)):
+                order.append((mesh_dim, p.dim))
+            elif not isinstance(p, Replicate):
+                raise ValueError(f"Unsupported placement type {type(p)} in DTensor: {dtensor}")
+        steps.append(order)
+
+    for round_index in range(max((len(o) for o in steps), default=0)):
+        # (first DTensor index using the group, process group) -> DTensor indices
+        groups, first_use = {}, {}
+        for i, dtensor in enumerate(dtensors):
+            if round_index >= len(steps[i]):
+                continue
+            mesh_dim, _ = steps[i][round_index]
+            group = dtensor.device_mesh.get_group(mesh_dim)
+            if group not in first_use:
+                first_use[group] = i
+            groups.setdefault(group, []).append(i)
+        for group in sorted(groups, key=lambda g: first_use[g]):
+            members = groups[group]
+            world_size = dist.get_world_size(group)
+            gathered = [None] * world_size
+            dist.all_gather_object(gathered, [cumulative[i] for i in members], group=group)
+            rank = dist.get_rank(group)
+            for j, i in enumerate(members):
+                shard_dim = steps[i][round_index][1]
+                shapes = [gathered[r][j] for r in range(world_size)]
+                offsets[i][shard_dim] += sum(s[shard_dim] for s in shapes[:rank])
+                cumulative[i][shard_dim] = sum(s[shard_dim] for s in shapes)
+
+    return [
+        ChunkStorageMetadata(offsets=tuple(o), sizes=tuple(d.to_local().shape))
+        for o, d in zip(offsets, dtensors)
+    ]
+
+
+def _set_uneven_chunk_metadata(dtensor: DTensor, uneven_chunk_meta: ChunkStorageMetadata):
+    """Attach the chunk list and write-items closures for ``uneven_chunk_meta`` to ``dtensor``."""
+
+    def _write_items(fqn: str, tensor: DTensor) -> List[WriteItem]:
+        if tensor.to_local().numel() == 0:
+            # If the tensor is empty, return an empty list
+            return []
+        return [
+            WriteItem(
+                type=WriteItemType.SHARD,
+                index=MetadataIndex(fqn, uneven_chunk_meta.offsets),
+                tensor_data=TensorWriteData(
+                    chunk=uneven_chunk_meta,
+                    properties=TensorProperties.create_from_tensor(tensor.to_local()),
+                    size=tensor.size(),
+                ),
+            )
+        ]
+
+    dtensor._local_tensor.__create_chunk_list__ = lambda: [uneven_chunk_meta]
+    dtensor._local_tensor.__create_write_items__ = _write_items
 
 
 def update_uneven_dtensor_chunk_metadata(dtensor: DTensor) -> dict:
     """
     Update the DTensor's chunk metadata to handle uneven sharding.
     This function modifies the DTensor in-place to include chunk metadata
-    and write items closures for saving and loading.
+    and write items closures for saving and loading. (Many DTensors at once:
+    :func:`preprocess_state_dict_for_uneven_dtensor`, one batched gather.)
     """
-
-    def _chunk_list_closure(chunk_meta):
-        return lambda: chunk_meta
-
-    def _write_items_closure(uneven_chunk_meta):
-        def _write_items(fqn: str, tensor: DTensor) -> List[WriteItem]:
-            if tensor.to_local().numel() == 0:
-                # If the tensor is empty, return an empty list
-                return []
-
-            return [
-                WriteItem(
-                    type=WriteItemType.SHARD,
-                    index=MetadataIndex(fqn, uneven_chunk_meta.offsets),
-                    tensor_data=TensorWriteData(
-                        chunk=uneven_chunk_meta,
-                        properties=TensorProperties.create_from_tensor(tensor.to_local()),
-                        size=tensor.size(),
-                    ),
-                )
-            ]
-
-        return _write_items
-
-    # Get uneven chunk metadata for the DTensor
-    # TODO: Optimize gather_and_compute_chunk_metadata synchronization:
-    # 1. Add pre-check validation to verify tensor shape consistency
-    #    across devices before entering barrier (prevents potential hangs)
-    # 2. Implement batched barrier using grouped collectives
-    #    to amortize synchronization overhead
-    uneven_chunk_meta = gather_and_compute_chunk_metadata(dtensor)
-
-    # Set the chunk list and write items closure for the DTensor
-    dtensor._local_tensor.__create_chunk_list__ = _chunk_list_closure([uneven_chunk_meta])
-    dtensor._local_tensor.__create_write_items__ = _write_items_closure(uneven_chunk_meta)
+    _set_uneven_chunk_metadata(dtensor, gather_and_compute_chunk_metadata(dtensor))
 
 
 def validate_uneven_dtensor(dtensor: DTensor) -> None:
@@ -245,11 +255,10 @@ def preprocess_state_dict_for_uneven_dtensor(state_dict: dict) -> dict:
         state_dict, visit_condition=lambda x: isinstance(x, DTensor)
     )
     # Sort the keys, since some state dictionaries are mocked
-    # and extended to include empty global keys.
-    for key_chain in sorted(visit_dtensor):
-        # Get the DTensor at the key chain
-        dtensor = get_unflattened_state_dict(state_dict, key_chain)
-        update_uneven_dtensor_chunk_metadata(dtensor)
+    # and extended to include empty global keys. One batched metadata gather for all of them.
+    dtensors = [get_unflattened_state_dict(state_dict, k) for k in sorted(visit_dtensor)]
+    for dtensor, chunk_meta in zip(dtensors, gather_and_compute_chunk_metadata_batched(dtensors)):
+        _set_uneven_chunk_metadata(dtensor, chunk_meta)
     return state_dict
 
 
