@@ -41,11 +41,17 @@ class TestNgptDepthMemory:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    # "direct": LERP toward the RAW sublayer output, then renormalize exactly (no post-norm of the
+    # output: a vanishing output switches its sublayer off instead of amplifying gradients 1/|a|)
+    @pytest.mark.parametrize("variant", ["analytic", "direct"])
     @pytest.mark.parametrize("ldm", [False, True])
-    def test_stream_stays_on_the_sphere_and_trains(self, ldm):
+    def test_stream_stays_on_the_sphere_and_trains(self, ldm, variant):
         extra = dict(depth_memory=True, depth_memory_impl="torch", depth_memory_groups=4,
                      depth_memory_key_dim=8, depth_memory_hidden_dim=16,
                      depth_memory_lerp=True) if ldm else {}
+        if variant == "direct":
+            extra.update(ngpt_lerp_normalization="direct", ngpt_post_layer_norm_attn=False,
+                         ngpt_post_layer_norm_ffn=False, ngpt_alpha_activation="half_sigmoid")
         model = _model("*-*-", **extra)
         norms = []
 
