@@ -2111,12 +2111,20 @@ class TransformerConfig(ModelParallelConfig):
     stage holds one segment's tapes)."""
 
     depth_memory_unwind: bool = False
-    """LDM "torch" with full activation recompute, one layer per chunk, no pipeline parallelism:
-    nothing of the state is checkpointed. The forward updates (M, P) in place without a tape; a
-    layer's recompute (in the backward, the state then at that layer's edge) reads from the current
-    state and recovers the edge's update in closed form (kappa = P_e kbar, u = (vbar - M_e' kbar) /
-    (1 - kappa . kbar)); the backward unwinds M, P to the previous edge. The checkpoints carry
-    only the [x, r] streams (depth_memory_state.UnwindingDepthMemoryWorkspace)."""
+    """LDM with full activation recompute and no pipeline parallelism: nothing of the state is
+    checkpointed; the checkpoints carry only the [x, r] streams.
+    "torch" (one layer per chunk): the forward updates (M, P) in place without a tape; a layer's
+    recompute (in the backward, the state then at that layer's edge) reads from the current state
+    and recovers the edge's update in closed form (kappa = P_e kbar, u = (vbar - M_e' kbar) /
+    (1 - kappa . kbar)); the backward unwinds M, P to the previous edge
+    (depth_memory_state.UnwindingDepthMemoryWorkspace). This inverse amplifies the rounding of
+    the state across depth; the paper's kernels do not use it.
+    "cute" (any chunk size): the paper's kernels, unchanged. Their per-edge tapes travel in the
+    residual stream as records, one per edge of a recompute group, so Megatron checkpoints and
+    offloads them with the stream as it does mHC's streams; a recomputed layer takes its read
+    from the running state at its window's boundary (the read kernel), and the backward unwinds
+    M by subtraction and P by addition from the FP32 running covariance
+    (cute_ldm.workspace.CuteRecomputeWorkspace)."""
 
     depth_memory_window: int = 4
     """LDM "cute": the window E of deferred writes (the paper: 4)."""
@@ -2224,17 +2232,22 @@ class TransformerConfig(ModelParallelConfig):
                     "capturable); use depth_memory_impl torch or cute"
                 )
             if self.depth_memory_unwind:
-                if self.depth_memory_impl != "torch" or self.depth_memory_segments:
-                    raise ValueError("depth_memory_unwind needs depth_memory_impl torch, no segments")
-                if not (
-                    self.recompute_granularity == "full"
-                    and self.recompute_method == "uniform"
-                    and self.recompute_num_layers == 1
-                ):
+                if self.depth_memory_impl not in ("torch", "cute") or self.depth_memory_segments:
                     raise ValueError(
-                        "depth_memory_unwind needs full recompute, uniform, one layer per chunk "
-                        "(a layer is one edge: its recompute reads the state at that edge)"
+                        "depth_memory_unwind needs depth_memory_impl torch or cute, no segments"
                     )
+                if not (self.recompute_granularity == "full" and self.recompute_method == "uniform"):
+                    raise ValueError("depth_memory_unwind needs full, uniform recompute")
+                if self.depth_memory_impl == "torch" and self.recompute_num_layers != 1:
+                    raise ValueError(
+                        "depth_memory_unwind with torch needs one layer per chunk (a layer is one "
+                        "edge: its recompute reads the state at that edge)"
+                    )
+                if self.depth_memory_impl == "cute" and self.depth_memory_covariance_dtype != "float32":
+                    raise ValueError("depth_memory_unwind with cute needs a float32 covariance")
+                if self.depth_memory_impl == "cute" and self.depth_memory_sites != "all":
+                    # a pass-through sublayer carries [x, r], not the record stream
+                    raise ValueError("depth_memory_unwind with cute needs depth_memory_sites all")
                 if self.pipeline_model_parallel_size > 1:
                     raise ValueError("depth_memory_unwind without pipeline parallelism")
             elif self.recompute_granularity == "full" and not self.depth_memory_segments:

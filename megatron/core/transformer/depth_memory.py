@@ -263,12 +263,22 @@ class DepthMemoryMixer(nn.Module):
 
     def wire(self, edge: int, workspace) -> None:
         self.edge, self._workspace = edge, [workspace]
+        # depth_memory_unwind with cute: the workspace serves the reads, the stream carries x and
+        # the per-edge records (cute_ldm.workspace.CuteRecomputeWorkspace)
+        self._x_only = hasattr(workspace, "read")
 
     # -- mHC mixer API (TransformerLayer._mhc_read / _mhc_write, ResidualSchemeAdapter) --------
     def forward(self, streams: torch.Tensor):
         return None, None, None
 
     def read(self, streams: torch.Tensor, h_pre=None) -> torch.Tensor:
+        if self._x_only:
+            from megatron.core.transformer.depth_memory_state import stream_x
+
+            self._workspace[0].ingest(self.edge, streams)
+            x = stream_x(streams)
+            self._read_x = (streams, x)   # the write's residual: one gradient path into streams
+            return x + _read_from_workspace(self._workspace[0], self.edge - 1, x)
         return streams[..., 0, :] + streams[..., 1, :]
 
     def write(self, streams, sublayer_out, h_post=None, h_res=None, lerp=None) -> torch.Tensor:
@@ -276,6 +286,16 @@ class DepthMemoryMixer(nn.Module):
             raise NotImplementedError("depth_memory with the nGPT LERP residual")
         if self.edge is None:
             raise RuntimeError("depth_memory: the mixer was not wired by its HybridStack")
+        if self._x_only:
+            from megatron.core.transformer.depth_memory_state import stream_write, stream_x
+
+            read_x, self._read_x = getattr(self, "_read_x", None), None
+            x = read_x[1] if read_x is not None and read_x[0] is streams else stream_x(streams)
+            stream = ldm_step_x(
+                self.write_site, self.next_query, self._workspace[0], self.edge, x + sublayer_out,
+                sublayer_out,
+            )
+            return stream_write(self._workspace[0], self.edge, stream, streams)
         stream = streams[..., 0, :] + sublayer_out
         read = ldm_fused_step(
             self.write_site, self.next_query, self._workspace[0], self.edge, stream, sublayer_out
@@ -336,12 +356,11 @@ def _site_addresses_eager(*args):
 _site_addresses_compiled = None
 
 
-def ldm_fused_step(write, next_read, workspace, edge, stream, value) -> torch.Tensor:
-    """Write ``value`` under the key of ``stream``, then read with ``next_read``'s query of
-    ``stream``; returns the read as ``[..., h]`` in the stream's dtype."""
+def _step_inputs(write, next_read, workspace, stream, value):
+    """The step's inputs from the stream: key, query, value, scale and forgetting in the
+    workspace's layouts (the address networks compiled, see _site_addresses)."""
     global _site_addresses_compiled
     from megatron.core.transformer.attn_res import _maybe_compile
-    from megatron.core.transformer.depth_memory_state import depth_memory_step
 
     if _site_addresses_compiled is None:
         _site_addresses_compiled = _maybe_compile(_site_addresses_eager)
@@ -357,16 +376,31 @@ def ldm_fused_step(write, next_read, workspace, edge, stream, value) -> torch.Te
         qn.gate.weight, qn.gate.bias, next_read.read_gain,
     )
     g = key.shape[-2]
-    read = depth_memory_step(
-        workspace,
-        edge,
-        key.reshape(n, g, -1),
-        query.reshape(n, g, -1),
-        value.reshape(n, g, shape[-1] // g),
-        scale.reshape(n, g),
-        lam,
-    )
-    return read.reshape(shape).to(stream.dtype)
+    return (key.reshape(n, g, -1), query.reshape(n, g, -1), value.reshape(n, g, shape[-1] // g),
+            scale.reshape(n, g), lam)
+
+
+def ldm_fused_step(write, next_read, workspace, edge, stream, value) -> torch.Tensor:
+    """Write ``value`` under the key of ``stream``, then read with ``next_read``'s query of
+    ``stream``; returns the read as ``[..., h]`` in the stream's dtype."""
+    from megatron.core.transformer.depth_memory_state import depth_memory_step
+
+    read = depth_memory_step(workspace, edge, *_step_inputs(write, next_read, workspace, stream, value))
+    return read.reshape(stream.shape).to(stream.dtype)
+
+
+def ldm_step_x(write, next_read, workspace, edge, stream, value) -> torch.Tensor:
+    """The same write, as a pass-through on ``stream`` (depth_memory_unwind with cute); the read
+    is taken later with :func:`_read_from_workspace`."""
+    from megatron.core.transformer.depth_memory_state import depth_memory_step_x
+
+    return depth_memory_step_x(workspace, edge, stream, *_step_inputs(write, next_read, workspace, stream, value))
+
+
+def _read_from_workspace(workspace, edge, x) -> torch.Tensor:
+    from megatron.core.transformer.depth_memory_state import read_from_workspace
+
+    return read_from_workspace(workspace, edge, x)
 
 
 class DepthMemoryStreamBoundary(nn.Module):
@@ -383,6 +417,7 @@ class DepthMemoryStreamBoundary(nn.Module):
 
     def wire(self, workspace) -> None:
         self._workspace = [workspace]
+        self._x_only = hasattr(workspace, "read")
 
     def expand(self, embedding: torch.Tensor) -> torch.Tensor:
         # through __call__: the fused step reads the address weights directly, so Megatron-FSDP
@@ -390,10 +425,22 @@ class DepthMemoryStreamBoundary(nn.Module):
         return self(embedding)
 
     def forward(self, embedding: torch.Tensor) -> torch.Tensor:
+        if self._x_only:
+            from megatron.core.transformer.depth_memory_state import stream_write
+
+            x = ldm_step_x(self.embed_write, self.first_query, self._workspace[0], 0, embedding, embedding)
+            return stream_write(self._workspace[0], 0, x, None)
         read = ldm_fused_step(
             self.embed_write, self.first_query, self._workspace[0], 0, embedding, embedding
         )
         return torch.stack((embedding, read), dim=-2)
 
     def collapse(self, streams: torch.Tensor) -> torch.Tensor:
+        if self._x_only:
+            from megatron.core.transformer.depth_memory_state import stream_x
+
+            ws = self._workspace[0]
+            ws.ingest(ws.total_edges, streams)   # the last group's records, for the backward
+            x = stream_x(streams)
+            return x + _read_from_workspace(ws, ws.total_edges - 1, x)
         return streams[..., 0, :] + streams[..., 1, :]

@@ -416,14 +416,103 @@ def depth_memory_step(workspace, edge, khat, query, value, scale, forgetting) ->
     return DepthMemoryStep.apply(workspace, edge, khat, query, value, scale, forgetting)
 
 
+class DepthMemoryStepX(torch.autograd.Function):
+    """``depth_memory_unwind`` with the CuTe kernels: the write step of ``edge`` as a
+    pass-through node on the stream x. The read is taken by :class:`ReadFromWorkspace`,
+    whose backward runs the step's backward and leaves the step's input gradients in the
+    workspace; this node's backward hands them to the address networks."""
+
+    @staticmethod
+    def forward(ctx, workspace, edge: int, x, khat, query, value, scale, forgetting):
+        ctx.workspace, ctx.edge, ctx.value_dtype = workspace, edge, value.dtype
+        workspace.forward(edge, khat, query, value, scale, forgetting)
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_x):
+        dkhat, dq, dvalue, dscale, dforget = ctx.workspace.grad_stash.pop(ctx.edge)
+        return None, None, grad_x, dkhat, dq, dvalue.to(ctx.value_dtype), dscale, dforget
+
+
+class ReadFromWorkspace(torch.autograd.Function):
+    """The read of ``edge`` from the workspace (the step's own read in the forward, the read
+    kernel's under recompute). ``x`` is the step's output stream: it orders this node after the
+    step, so the read's backward (the step's backward) runs before the step node's."""
+
+    @staticmethod
+    def forward(ctx, workspace, edge: int, x):
+        ctx.workspace, ctx.edge = workspace, edge
+        return workspace.read(edge).reshape(x.shape).to(x.dtype)
+
+    @staticmethod
+    def backward(ctx, read_grad):
+        ctx.workspace.grad_stash[ctx.edge] = ctx.workspace.backward(ctx.edge, read_grad)
+        return None, None, None
+
+
+class StreamX(torch.autograd.Function):
+    """x out of the record stream [slots, ..., h] (depth_memory_unwind with the CuTe kernels; slot
+    first, so x and the records are contiguous blocks).
+    Only x carries a gradient: the backward hands x's gradient to every slot as a broadcast,
+    nothing allocated; the record slots' gradient is never read (StreamWrite takes the records
+    as data)."""
+
+    @staticmethod
+    def forward(ctx, streams):
+        ctx.shape = streams.shape
+        return streams[0]
+
+    @staticmethod
+    def backward(ctx, grad):
+        return grad.unsqueeze(0).expand(ctx.shape)
+
+
+class StreamWrite(torch.autograd.Function):
+    """The record stream after the step of ``edge``: x, then the incoming records with the
+    edge's own written in by the workspace (in the forward; under recompute they pass through).
+    ``streams`` None: the embedding write, the stream starts here."""
+
+    @staticmethod
+    def forward(ctx, workspace, edge: int, x, streams):
+        out = x.new_empty((workspace.stream_slots(x.dtype), *x.shape))
+        records = out[1:]
+        if streams is None:
+            records.zero_()
+        else:
+            records.copy_(streams[1:])
+        workspace.put_record(edge, records)
+        out[0].copy_(x)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad):
+        return None, None, grad[0], None
+
+
+def stream_x(streams) -> torch.Tensor:
+    return StreamX.apply(streams)
+
+
+def stream_write(workspace, edge, x, streams) -> torch.Tensor:
+    return StreamWrite.apply(workspace, edge, x, None if streams is None else streams.detach())
+
+
+def depth_memory_step_x(workspace, edge, x, khat, query, value, scale, forgetting) -> torch.Tensor:
+    return DepthMemoryStepX.apply(workspace, edge, x, khat, query, value, scale, forgetting)
+
+
+def read_from_workspace(workspace, edge, x) -> torch.Tensor:
+    return ReadFromWorkspace.apply(workspace, edge, x)
+
+
 def make_workspace(config, total_edges: int):
     """The state backend of ``config.depth_memory_impl`` ("torch" or "cute")."""
     groups, key_dim = config.depth_memory_groups, config.depth_memory_key_dim
     value_dim = config.hidden_size // groups
     if config.depth_memory_impl == "cute":
-        from cute_ldm.workspace import CuteDepthMemoryWorkspace
+        from cute_ldm.workspace import CuteDepthMemoryWorkspace, CuteRecomputeWorkspace
 
-        return CuteDepthMemoryWorkspace(
+        settings = dict(
             total_edges=total_edges,
             groups=groups,
             key_dim=key_dim,
@@ -432,6 +521,12 @@ def make_workspace(config, total_edges: int):
             span=config.depth_memory_window,
             running_covariance_dtype=config.depth_memory_covariance_dtype,
         )
+        if getattr(config, "depth_memory_unwind", False):
+            # full recompute: the per-edge tapes travel in the stream as records, the recomputed
+            # layers read from the running state, nothing of the state is checkpointed; the
+            # HybridStack sets the recompute groups (CuteRecomputeWorkspace.layout)
+            return CuteRecomputeWorkspace(**settings)
+        return CuteDepthMemoryWorkspace(**settings)
     if getattr(config, "depth_memory_unwind", False):
         return UnwindingDepthMemoryWorkspace(total_edges, groups, key_dim, value_dim,
                                              config.depth_memory_alpha)

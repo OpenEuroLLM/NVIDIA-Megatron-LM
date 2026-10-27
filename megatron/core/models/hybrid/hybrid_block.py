@@ -728,7 +728,8 @@ class HybridStack(MegatronModule):
                 scheme = getattr(layer, "residual_scheme", None)
                 candidates = (scheme.mhc_mixer if scheme is not None else None,)
             own = [m for m in candidates if isinstance(m, DepthMemoryMixer)]
-            if len(own) > 1 and getattr(self.config, "depth_memory_unwind", False):
+            if (len(own) > 1 and getattr(self.config, "depth_memory_unwind", False)
+                    and self.config.depth_memory_impl == "torch"):
                 # a recomputed layer reads the state at its edge: one edge per recompute chunk
                 raise ValueError("depth_memory_unwind: a layer with more than one LDM site")
             mixers += own
@@ -742,9 +743,35 @@ class HybridStack(MegatronModule):
             self._wire_depth_memory_segments(mixers, make_workspace)
             return
         self.ldm_workspace = make_workspace(self.config, total_edges=len(mixers) + 1)
+        self.ldm_records = hasattr(self.ldm_workspace, "layout")
+        if self.ldm_records:
+            # depth_memory_unwind with cute: the stream carries each recompute group's records,
+            # so the workspace needs the groups' edges (edge 0, the embedding write, alone)
+            self._ldm_layer_edges, edge = [], 1
+            for layer in self.layers:
+                count = len(self._layer_ldm_mixers(layer))
+                self._ldm_layer_edges.append((edge, count))
+                edge += count
+            groups = [(0, 1)] + [self.ldm_segment(a, b) for a, b in self._ldm_chunks()]
+            self.ldm_workspace.layout(groups, self.config.hidden_size)
         self.ldm_stream_boundary.wire(self.ldm_workspace)
         for edge, mixer in enumerate(mixers, start=1):
             mixer.wire(edge, self.ldm_workspace)
+
+    @staticmethod
+    def _layer_ldm_mixers(layer):
+        from megatron.core.transformer.depth_memory import DepthMemoryMixer
+
+        if isinstance(layer, TransformerLayer):
+            candidates = (
+                getattr(layer, "mhc_block_mixer", None),
+                layer.mhc_attn_mixer,
+                layer.mhc_mlp_mixer,
+            )
+        else:
+            scheme = getattr(layer, "residual_scheme", None)
+            candidates = (scheme.mhc_mixer if scheme is not None else None,)
+        return [m for m in candidates if isinstance(m, DepthMemoryMixer)]
 
     def _wire_depth_memory_segments(self, mixers, make_workspace) -> None:
         """depth_memory_segments: the steps numbered per stage (edge 0 the embedding on the first

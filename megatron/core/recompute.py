@@ -222,6 +222,10 @@ def checkpointed_forward(
         skip = _skip_chunks()
         if skip and getattr(self, "ldm_segmented", False):
             raise NotImplementedError("RECOMPUTE_SKIP_CHUNKS with depth_memory_segments")
+        if skip and getattr(self, "ldm_records", False):
+            # a chunk run without its checkpoint is never recomputed, so the records its input
+            # carries never reach the workspace
+            raise NotImplementedError("RECOMPUTE_SKIP_CHUNKS with depth_memory_unwind (cute)")
         bounds = []
         layer_idx = 0
         while layer_idx < len(order):

@@ -99,3 +99,37 @@ def test_unwind_matches_one_sequence(pattern, fused, monkeypatch):
                 torch.testing.assert_close(grads[k], ref_grads[k], **grad_tol, msg=k)
     finally:
         Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("chunk", [1, 2, 3, 4])   # 1: windows of 2 edges; 3: odd groups; 4: windows inside a group
+@pytest.mark.parametrize("pattern", ["*-*-*-*-", "*E*E-*"])
+def test_cute_recompute_matches_one_sequence(pattern, chunk):
+    """depth_memory_unwind with the CuTe kernels: full recompute with ``chunk`` layers per chunk,
+    the tapes carried in the stream as records, each recomputed layer's read from the running
+    state; two micro-batches in a row. Within the CuTe tolerance of the torch oracle
+    and of the CuTe one-sequence form without recompute."""
+    pytest.importorskip("cute_ldm.workspace")
+    if torch.cuda.get_device_capability()[0] < 9:
+        pytest.skip("cute_ldm needs Hopper / Blackwell")
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        kw = dict(num_moe_experts=4, moe_router_topk=2, moe_ffn_hidden_size=64) if "E" in pattern else {}
+        ids = [torch.randint(0, VOCAB, (B, S), device="cuda") for _ in range(2)]
+        oracle = _model(pattern, "torch", **kw)
+        ref = _model(pattern, "cute", **kw)
+        model = _model(pattern, "cute", depth_memory_unwind=True,
+                       recompute_granularity="full", recompute_method="uniform",
+                       recompute_num_layers=chunk, **kw)
+        tol = dict(rtol=3e-2, atol=3e-3)
+        for batch in ids:
+            oracle_out, oracle_grads = _fwd_bwd(oracle, batch)
+            ref_out, ref_grads = _fwd_bwd(ref, batch)
+            out, grads = _fwd_bwd(model, batch)
+            assert set(grads) == set(ref_grads) == set(oracle_grads)
+            torch.testing.assert_close(out, ref_out, **tol)
+            torch.testing.assert_close(out, oracle_out, **tol)
+            for k in ref_grads:
+                torch.testing.assert_close(grads[k], ref_grads[k], **tol, msg=k)
+                torch.testing.assert_close(grads[k], oracle_grads[k], **tol, msg=k)
+    finally:
+        Utils.destroy_model_parallel()
