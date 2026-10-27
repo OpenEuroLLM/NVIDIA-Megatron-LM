@@ -102,7 +102,7 @@ class ResidualSchemeAdapter(nn.Module):
         if not use_lerp:
             return None
         if self.ngpt_residual is None:
-            raise ValueError("mhc_lerp / attn_res_lerp require ngpt=True.")
+            raise ValueError("mhc_lerp / attn_res_lerp / depth_memory_lerp require ngpt=True.")
         return self.ngpt_residual
 
     def read(self, hidden_states: Tensor, depth_state=None) -> tuple[Tensor, tuple]:
@@ -133,9 +133,8 @@ class ResidualSchemeAdapter(nn.Module):
             out = self.post_norm(out)
         if self.mhc_mixer is not None:
             streams, h_post, h_res = ctx
-            return self.mhc_mixer.write(
-                streams, out, h_post, h_res, lerp=self._lerp(self.config.mhc_lerp)
-            )
+            use_lerp = self.config.mhc_lerp or getattr(self.config, "depth_memory_lerp", False)
+            return self.mhc_mixer.write(streams, out, h_post, h_res, lerp=self._lerp(use_lerp))
         if self.ldm is not None:
             return self.ldm.write_output(depth_state, out)
         if self.attnres is not None:
