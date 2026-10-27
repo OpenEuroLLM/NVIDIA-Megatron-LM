@@ -282,8 +282,6 @@ class DepthMemoryMixer(nn.Module):
         return streams[..., 0, :] + streams[..., 1, :]
 
     def write(self, streams, sublayer_out, h_post=None, h_res=None, lerp=None) -> torch.Tensor:
-        if lerp is not None:
-            raise NotImplementedError("depth_memory with the nGPT LERP residual")
         if self.edge is None:
             raise RuntimeError("depth_memory: the mixer was not wired by its HybridStack")
         if self._x_only:
@@ -291,14 +289,14 @@ class DepthMemoryMixer(nn.Module):
 
             read_x, self._read_x = getattr(self, "_read_x", None), None
             x = read_x[1] if read_x is not None and read_x[0] is streams else stream_x(streams)
+            stream, value = ldm_residual(x, sublayer_out, lerp)
             stream = ldm_step_x(
-                self.write_site, self.next_query, self._workspace[0], self.edge, x + sublayer_out,
-                sublayer_out,
+                self.write_site, self.next_query, self._workspace[0], self.edge, stream, value
             )
             return stream_write(self._workspace[0], self.edge, stream, streams)
-        stream = streams[..., 0, :] + sublayer_out
+        stream, value = ldm_residual(streams[..., 0, :], sublayer_out, lerp)
         read = ldm_fused_step(
-            self.write_site, self.next_query, self._workspace[0], self.edge, stream, sublayer_out
+            self.write_site, self.next_query, self._workspace[0], self.edge, stream, value
         )
         return torch.stack((stream, read), dim=-2)
 
@@ -318,9 +316,8 @@ class DepthMemoryPassThrough(nn.Module):
         return streams[..., 0, :]
 
     def write(self, streams, sublayer_out, h_post=None, h_res=None, lerp=None) -> torch.Tensor:
-        if lerp is not None:
-            raise NotImplementedError("depth_memory with the nGPT LERP residual")
-        return torch.stack((streams[..., 0, :] + sublayer_out, streams[..., 1, :]), dim=-2)
+        stream, _ = ldm_residual(streams[..., 0, :], sublayer_out, lerp)
+        return torch.stack((stream, streams[..., 1, :]), dim=-2)
 
     def record_metrics(self, streams, coeffs) -> None:
         pass
@@ -378,6 +375,21 @@ def _step_inputs(write, next_read, workspace, stream, value):
     g = key.shape[-2]
     return (key.reshape(n, g, -1), query.reshape(n, g, -1), value.reshape(n, g, shape[-1] // g),
             scale.reshape(n, g), lam)
+
+
+def ldm_residual(x: torch.Tensor, out: torch.Tensor, lerp=None):
+    """The stream update of one write site and the value it writes into the memory.
+
+    The paper: ``x + out``, value ``out``. With the nGPT LERP residual (``depth_memory_lerp``,
+    ``ngpt``): the LERP step of the unit-norm stream toward the normalized sublayer output, and
+    as the value its displacement ``x' - x`` -- what the sublayer changed in the stream, as
+    ``out`` is for the additive residual (bounded: at most 2 per token on the sphere). The
+    state math (M, P, its unwind) is the same for any value.
+    """
+    if lerp is None:
+        return x + out, out
+    stream = lerp(out, x)
+    return stream, stream - x
 
 
 def ldm_fused_step(write, next_read, workspace, edge, stream, value) -> torch.Tensor:

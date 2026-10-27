@@ -2126,6 +2126,12 @@ class TransformerConfig(ModelParallelConfig):
     M by subtraction and P by addition from the FP32 running covariance
     (cute_ldm.workspace.CuteRecomputeWorkspace)."""
 
+    depth_memory_lerp: bool = False
+    """LDM "torch" / "cute" with the nGPT residual (requires ngpt): every write site takes nGPT's
+    LERP step of the unit-norm stream toward the normalized sublayer output instead of
+    ``x + out``, and writes the step's displacement ``x' - x`` into the memory
+    (depth_memory.ldm_residual). The reads stay ``x + r``."""
+
     depth_memory_window: int = 4
     """LDM "cute": the window E of deferred writes (the paper: 4)."""
 
@@ -2217,6 +2223,12 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "depth_memory with pipeline parallelism needs depth_memory_segments and full "
                     "activation recompute"
+                )
+            if self.depth_memory_lerp and not (
+                self.ngpt and self.depth_memory_impl in ("torch", "cute")
+            ):
+                raise ValueError(
+                    "depth_memory_lerp needs ngpt=True and depth_memory_impl torch or cute"
                 )
             if self.depth_memory_sites not in ("all", "mixer", "mlp"):
                 raise ValueError("depth_memory_sites must be all, mixer or mlp")

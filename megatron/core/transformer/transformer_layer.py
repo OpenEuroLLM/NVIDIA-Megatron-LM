@@ -1036,7 +1036,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         lerp = self.ngpt_attn_residual if kind == "attn" else self.ngpt_mlp_residual
         if lerp is None:
             raise ValueError(
-                "mhc_lerp / attn_res_lerp require ngpt=True so the LERP residual modules exist."
+                "mhc_lerp / attn_res_lerp / depth_memory_lerp require ngpt=True so the LERP "
+                "residual modules exist."
             )
         return lerp
 
@@ -1120,7 +1121,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             self._sublayer_output(output_with_bias),
             h_post,
             h_res,
-            lerp=self._depth_lerp(kind, self.config.mhc_lerp),
+            lerp=self._depth_lerp(
+                kind, self.config.mhc_lerp or getattr(self.config, "depth_memory_lerp", False)
+            ),
             **extra,
         )
 

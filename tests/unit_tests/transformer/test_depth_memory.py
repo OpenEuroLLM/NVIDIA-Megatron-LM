@@ -214,3 +214,56 @@ def test_stream_form_runs_again_with_the_same_buffers():
     assert ws.m.data_ptr() == ptr
     for a, b in zip(g1, g2):
         torch.testing.assert_close(a, b)
+
+
+@pytest.mark.parametrize("mode", ["approx", "analytic"])
+def test_stream_form_with_the_ngpt_lerp_write(mode):
+    """depth_memory_lerp: each write site takes nGPT's LERP step and writes its displacement
+    x' - x. That is the reference with the sublayer output replaced by the displacement (x + d =
+    x', value d): outputs and every gradient match, and the stream stays near the sphere."""
+    from megatron.core.transformer.ngpt import NGPTResidual
+
+    torch.manual_seed(0)
+    sites = 3
+    cfg = _config(depth_memory_impl="torch", ngpt=True, depth_memory_lerp=True)
+    with pytest.raises(ValueError, match="depth_memory_lerp needs ngpt"):
+        _config(depth_memory_impl="torch", depth_memory_lerp=True)
+    boundary, mixers = _stream_chain(cfg, sites)
+    ref_boundary, ref_sites = DepthMemoryBoundary(cfg), [DepthMemorySite(cfg) for _ in range(sites)]
+    with torch.no_grad():
+        for p in [*boundary.parameters(), *(p for m in mixers for p in m.parameters())]:
+            p.add_(torch.randn_like(p) * 0.3)
+    ref_boundary.embed_write.load_state_dict(boundary.embed_write.state_dict())
+    ref_boundary.final_read.load_state_dict(mixers[-1].next_query.state_dict())
+    queries = [boundary.first_query] + [m.next_query for m in mixers[:-1]]
+    for site, mixer, query in zip(ref_sites, mixers, queries):
+        site.read.load_state_dict(query.state_dict())
+        site.write.load_state_dict(mixer.write_site.state_dict())
+    lins = [torch.nn.Linear(H, H) for _ in range(sites)]
+    lerps = [NGPTResidual(H, alpha_init_value=0.3, lerp_normalization=mode) for _ in range(sites)]
+    emb = torch.nn.functional.normalize(torch.randn(7, 3, H), dim=-1)
+
+    e1 = emb.clone().requires_grad_(True)
+    streams = boundary.expand(e1)
+    for mixer, lin, lerp in zip(mixers, lins, lerps):
+        streams = mixer.write(streams, torch.tanh(lin(mixer.read(streams))), lerp=lerp)
+        norm = streams[..., 0, :].norm(dim=-1)
+        # approx: nGPT's closed form assumes the update is orthogonal to x (drifts at alpha 0.3)
+        assert (norm - 1).abs().max() < (0.25 if mode == "approx" else 1e-4)
+    out = boundary.collapse(streams)
+
+    e2 = emb.clone().requires_grad_(True)
+    state = ref_boundary.enter(e2)
+    for site, lin, lerp in zip(ref_sites, lins, lerps):
+        x = state.stream
+        a = torch.tanh(lin(site.read_input(state)))
+        site.write_output(state, lerp(a, x) - x)
+    ref = ref_boundary.exit(state)
+    torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-5)
+
+    w = torch.randn_like(ref)
+    params = [*(p for lin in lins for p in lin.parameters()), *(p for l in lerps for p in l.parameters())]
+    grads = torch.autograd.grad((out * w).sum(), [e1, *params])
+    ref_grads = torch.autograd.grad((ref * w).sum(), [e2, *params])
+    for g, rg in zip(grads, ref_grads):
+        torch.testing.assert_close(g, rg, rtol=1e-4, atol=1e-5)
