@@ -493,6 +493,14 @@ class HybridStack(MegatronModule):
         if isinstance(hidden_states, WrappedTensor):
             hidden_states = hidden_states.unwrap()
 
+        if self.pre_process and getattr(self.config, "ngpt", False):
+            # nGPT: the stream starts on the unit sphere, which the LERP residual assumes. With
+            # the weight normalizer the embedding rows already are (a no-op then); without it
+            # (nGPT's residual alone) this is what puts the stream there.
+            from megatron.core.transformer.ngpt import l2_normalize
+
+            hidden_states = l2_normalize(hidden_states, eps=self.config.layernorm_epsilon)
+
         if inference_context and inference_context.is_static_batching():
             # NOTE(bnorick): match BaseInferenceContext attributes for
             # mamba_ssm.utils.generation.BaseInferenceContext,
