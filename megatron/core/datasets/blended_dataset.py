@@ -1,5 +1,6 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -13,7 +14,12 @@ import torch
 
 from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatronDatasetConfig
 from megatron.core.datasets.megatron_dataset import MegatronDataset
-from megatron.core.datasets.utils import normalize
+from megatron.core.datasets.utils import (
+    normalize,
+    atomic_numpy_save,
+    atomic_write_text,
+    cache_entry_lock,
+)
 from megatron.core.safe_globals import safe_numpy_load
 from megatron.core.utils import log_single_rank
 
@@ -151,72 +157,82 @@ class BlendedDataset(torch.utils.data.Dataset):
         else:
             cache_hit = False
 
-        if not path_to_cache or (
+        build = not path_to_cache or (
             not cache_hit
             and (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0)
-        ):
-            log_single_rank(
-                logger, logging.INFO, f"Build and save the {type(self).__name__} indices"
-            )
-
-            # Build the dataset and dataset sample indexes
-            log_single_rank(
-                logger, logging.INFO, f"\tBuild and save the dataset and dataset sample indexes"
-            )
-            t_beg = time.time()
-            from megatron.core.datasets import helpers
-
-            if self.size is not None:
-                dataset_index = numpy.zeros(self.size, dtype=numpy.int16)
-                dataset_sample_index = numpy.zeros(self.size, dtype=numpy.int64)
-                helpers.build_blending_indices(
-                    dataset_index,
-                    dataset_sample_index,
-                    self.weights,
-                    len(self.datasets),
-                    self.size,
-                    _VERBOSE,
+        )
+        with contextlib.ExitStack() as stack:
+            if build and path_to_cache and not self.config.fast_cache_load:
+                # another job may be building the same entry: wait for it, then re-check
+                base = f"{self.unique_description_hash}-{type(self).__name__}-{self.split.name}"
+                stack.enter_context(cache_entry_lock(path_to_cache, base))
+                build = not all(
+                    map(
+                        os.path.isfile,
+                        [path_to_description, path_to_dataset_index, path_to_dataset_sample_index],
+                    )
                 )
-            else:
-                size = sum(self.weights)
-                dataset_index = numpy.zeros(size, dtype=numpy.int16)
-                dataset_sample_index = numpy.zeros(size, dtype=numpy.int64)
-                helpers.build_exhaustive_blending_indices(
-                    dataset_index, dataset_sample_index, self.weights, len(self.datasets)
+            if build:
+                log_single_rank(
+                    logger, logging.INFO, f"Build and save the {type(self).__name__} indices"
                 )
 
-            dataset_indices, dataset_sizes = numpy.unique(dataset_index, return_counts=True)
-            for i, (_index, _size) in enumerate(zip(dataset_indices, dataset_sizes)):
-                if len(self.datasets[_index]) < _size:
-                    raise IndexError(
-                        f"The {self.split.name} blend oversamples the contributing datasets and, "
-                        f"for example, requests {_size} samples from "
-                        f"{type(self.datasets[_index]).__name__} number {i} in excess of its size "
-                        f"{len(self.datasets[_index])}. The current value of the config attribute "
-                        f"mid_level_dataset_surplus may be increased, e.g. two- or ten-fold, from "
-                        f"its current value ({self.config.mid_level_dataset_surplus}) to ensure a "
-                        f"sufficient mid-level dataset sample margin from which to draw."
+                # Build the dataset and dataset sample indexes
+                log_single_rank(
+                    logger, logging.INFO, f"\tBuild and save the dataset and dataset sample indexes"
+                )
+                t_beg = time.time()
+                from megatron.core.datasets import helpers
+
+                if self.size is not None:
+                    dataset_index = numpy.zeros(self.size, dtype=numpy.int16)
+                    dataset_sample_index = numpy.zeros(self.size, dtype=numpy.int64)
+                    helpers.build_blending_indices(
+                        dataset_index,
+                        dataset_sample_index,
+                        self.weights,
+                        len(self.datasets),
+                        self.size,
+                        _VERBOSE,
+                    )
+                else:
+                    size = sum(self.weights)
+                    dataset_index = numpy.zeros(size, dtype=numpy.int16)
+                    dataset_sample_index = numpy.zeros(size, dtype=numpy.int64)
+                    helpers.build_exhaustive_blending_indices(
+                        dataset_index, dataset_sample_index, self.weights, len(self.datasets)
                     )
 
-            if path_to_cache:
-                os.makedirs(path_to_cache, exist_ok=True)
-                # Write the description
-                with open(path_to_description, "wt") as writer:
-                    writer.write(self.unique_description)
-                # Save the indexes
-                numpy.save(path_to_dataset_index, dataset_index, allow_pickle=True)
-                numpy.save(path_to_dataset_sample_index, dataset_sample_index, allow_pickle=True)
-            else:
-                log_single_rank(
-                    logger,
-                    logging.WARNING,
-                    f"Cannot save the {type(self).__name__} indexes because path_to_cache is None",
-                )
+                dataset_indices, dataset_sizes = numpy.unique(dataset_index, return_counts=True)
+                for i, (_index, _size) in enumerate(zip(dataset_indices, dataset_sizes)):
+                    if len(self.datasets[_index]) < _size:
+                        raise IndexError(
+                            f"The {self.split.name} blend oversamples the contributing datasets and, "
+                            f"for example, requests {_size} samples from "
+                            f"{type(self.datasets[_index]).__name__} number {i} in excess of its size "
+                            f"{len(self.datasets[_index])}. The current value of the config attribute "
+                            f"mid_level_dataset_surplus may be increased, e.g. two- or ten-fold, from "
+                            f"its current value ({self.config.mid_level_dataset_surplus}) to ensure a "
+                            f"sufficient mid-level dataset sample margin from which to draw."
+                        )
 
-            t_end = time.time()
-            log_single_rank(logger, logging.DEBUG, f"\t> time elapsed: {t_end - t_beg:4f} seconds")
+                if path_to_cache:
+                    os.makedirs(path_to_cache, exist_ok=True)
+                    # atomic, the description last (see datasets/utils.py: shared caches)
+                    atomic_numpy_save(path_to_dataset_index, dataset_index)
+                    atomic_numpy_save(path_to_dataset_sample_index, dataset_sample_index)
+                    atomic_write_text(path_to_description, self.unique_description)
+                else:
+                    log_single_rank(
+                        logger,
+                        logging.WARNING,
+                        f"Cannot save the {type(self).__name__} indexes because path_to_cache is None",
+                    )
 
-            return dataset_index, dataset_sample_index
+                t_end = time.time()
+                log_single_rank(logger, logging.DEBUG, f"\t> time elapsed: {t_end - t_beg:4f} seconds")
+
+                return dataset_index, dataset_sample_index
 
         log_single_rank(logger, logging.INFO, f"Load the {type(self).__name__} indices")
 

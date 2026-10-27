@@ -1,5 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -16,7 +17,12 @@ from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatr
 from megatron.core.datasets.indexed_dataset import IndexedDataset
 from megatron.core.datasets.megatron_dataset import MegatronDataset
 from megatron.core.datasets.object_storage_utils import ObjectStorageConfig, is_object_storage_path
-from megatron.core.datasets.utils import Split
+from megatron.core.datasets.utils import (
+    Split,
+    atomic_numpy_save,
+    atomic_write_text,
+    cache_entry_lock,
+)
 from megatron.core.safe_globals import safe_numpy_load
 from megatron.core.tokenizers import MegatronTokenizerBase
 from megatron.core.utils import log_single_rank
@@ -550,135 +556,150 @@ class GPTDataset(MegatronDataset):
         else:
             cache_hit = False
 
-        if not path_to_cache or (
+        build = not path_to_cache or (
             not cache_hit
             and (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0)
-        ):
-            log_single_rank(
-                logger,
-                logging.INFO,
-                f"Build and save the {type(self).__name__} {self.index_split.name} indices",
-            )
-            t_beg = time.time()
-
-            sequence_length = self.config.sequence_length
-            num_tokens_per_epoch = self._get_num_tokens_per_epoch()
-            num_epochs = self._get_num_epochs(num_tokens_per_epoch)
-
-            if num_epochs == 1:
-                separate_final_epoch = False
-            else:
-                # Get the number of samples for the last epoch
-                num_samples_sans_final_epoch = (
-                    (num_epochs - 1) * num_tokens_per_epoch
-                    - self.config.add_extra_token_to_sequence
-                ) // sequence_length
-                num_samples_from_final_epoch = self.num_samples - num_samples_sans_final_epoch
-                num_samples_per_epoch = (
-                    num_tokens_per_epoch - self.config.add_extra_token_to_sequence
-                ) // sequence_length
-
-                # num_samples_from_final_epoch should be non-negative
-                assert num_samples_from_final_epoch >= 0
-
-                # num_samples_from_final_epoch should not exceed max value
-                assert num_samples_from_final_epoch <= num_samples_per_epoch + 1
-
-                # Separate the final epoch if it falls below the threshold
-                threshold = 0.80
-                separate_final_epoch = num_samples_from_final_epoch < int(
-                    threshold * num_samples_per_epoch
+        )
+        with contextlib.ExitStack() as stack:
+            if build and path_to_cache and not self.config.fast_cache_load:
+                # another job may be building the same entry: wait for it, then re-check
+                stack.enter_context(cache_entry_lock(path_to_cache, base))
+                build = not all(
+                    map(
+                        os.path.isfile,
+                        [
+                            path_to_description,
+                            path_to_document_index,
+                            path_to_sample_index,
+                            path_to_shuffle_index,
+                        ],
+                    )
                 )
-
+            if build:
                 log_single_rank(
                     logger,
-                    logging.DEBUG,
-                    f"> num_samples_from_final_epoch: {num_samples_from_final_epoch}",
+                    logging.INFO,
+                    f"Build and save the {type(self).__name__} {self.index_split.name} indices",
                 )
-                log_single_rank(logger, logging.DEBUG, f"> threshold: {threshold}")
+                t_beg = time.time()
+
+                sequence_length = self.config.sequence_length
+                num_tokens_per_epoch = self._get_num_tokens_per_epoch()
+                num_epochs = self._get_num_epochs(num_tokens_per_epoch)
+
+                if num_epochs == 1:
+                    separate_final_epoch = False
+                else:
+                    # Get the number of samples for the last epoch
+                    num_samples_sans_final_epoch = (
+                        (num_epochs - 1) * num_tokens_per_epoch
+                        - self.config.add_extra_token_to_sequence
+                    ) // sequence_length
+                    num_samples_from_final_epoch = self.num_samples - num_samples_sans_final_epoch
+                    num_samples_per_epoch = (
+                        num_tokens_per_epoch - self.config.add_extra_token_to_sequence
+                    ) // sequence_length
+
+                    # num_samples_from_final_epoch should be non-negative
+                    assert num_samples_from_final_epoch >= 0
+
+                    # num_samples_from_final_epoch should not exceed max value
+                    assert num_samples_from_final_epoch <= num_samples_per_epoch + 1
+
+                    # Separate the final epoch if it falls below the threshold
+                    threshold = 0.80
+                    separate_final_epoch = num_samples_from_final_epoch < int(
+                        threshold * num_samples_per_epoch
+                    )
+
+                    log_single_rank(
+                        logger,
+                        logging.DEBUG,
+                        f"> num_samples_from_final_epoch: {num_samples_from_final_epoch}",
+                    )
+                    log_single_rank(logger, logging.DEBUG, f"> threshold: {threshold}")
+                    log_single_rank(
+                        logger, logging.DEBUG, f"> num_samples_per_epoch: {num_samples_per_epoch}"
+                    )
+
                 log_single_rank(
-                    logger, logging.DEBUG, f"> num_samples_per_epoch: {num_samples_per_epoch}"
+                    logger, logging.DEBUG, f"> separate_final_epoch: {separate_final_epoch}"
                 )
 
-            log_single_rank(
-                logger, logging.DEBUG, f"> separate_final_epoch: {separate_final_epoch}"
-            )
+                numpy_random_state = numpy.random.RandomState(self.config.random_seed)
 
-            numpy_random_state = numpy.random.RandomState(self.config.random_seed)
-
-            # Build the document index
-            document_index = _build_document_index(
-                self.indices, num_epochs, numpy_random_state, separate_final_epoch
-            )
-
-            # Build the sample index
-            from megatron.core.datasets import helpers
-
-            if self.index_split == Split.valid:
-                drop_last_partial_sequence = self.config.drop_last_partial_validation_sequence
-            else:
-                drop_last_partial_sequence = True
-
-            assert document_index.dtype == numpy.int32
-            assert self.dataset.sequence_lengths.dtype == numpy.int32
-            if self._bos is not None:
-                # every document one token longer: its BOS
-                sequence_lengths_for_cpp = (self.dataset.sequence_lengths + 1).astype(numpy.int32)
-            elif len(document_index) * 2 > len(self.dataset.sequence_lengths):
-                # If "access density" of sequence_lengths is high, force load the mmap-ed array
-                # into memory by making a copy.
-                #
-                # System performance benefits come from two aspects:
-                #   1. We sequentially pre-load the whole file, most of which we expect to read
-                #   2. The GIL is held when entering the c++ program, improving the speed of which
-                #      improves parallelism
-                sequence_lengths_for_cpp = self.dataset.sequence_lengths.copy()
-            else:
-                sequence_lengths_for_cpp = self.dataset.sequence_lengths
-            sample_index = helpers.build_sample_idx(
-                sequence_lengths_for_cpp,
-                document_index,
-                sequence_length,
-                num_epochs,
-                num_tokens_per_epoch,
-                drop_last_partial_sequence,
-                self.config.add_extra_token_to_sequence,
-            )
-
-            # Build the shuffle index
-            if separate_final_epoch:
-                shuffle_index = _build_shuffle_index(
-                    num_samples_sans_final_epoch, sample_index.shape[0] - 1, numpy_random_state
-                )
-            else:
-                shuffle_index = _build_shuffle_index(
-                    sample_index.shape[0] - 1, sample_index.shape[0] - 1, numpy_random_state
+                # Build the document index
+                document_index = _build_document_index(
+                    self.indices, num_epochs, numpy_random_state, separate_final_epoch
                 )
 
-            if path_to_cache:
-                os.makedirs(path_to_cache, exist_ok=True)
-                # Write the description
-                with open(path_to_description, "wt") as writer:
-                    writer.write(self.unique_description)
-                numpy.save(path_to_document_index, document_index, allow_pickle=True)
-                numpy.save(path_to_sample_index, sample_index, allow_pickle=True)
-                numpy.save(path_to_shuffle_index, shuffle_index, allow_pickle=True)
-            else:
+                # Build the sample index
+                from megatron.core.datasets import helpers
+
+                if self.index_split == Split.valid:
+                    drop_last_partial_sequence = self.config.drop_last_partial_validation_sequence
+                else:
+                    drop_last_partial_sequence = True
+
+                assert document_index.dtype == numpy.int32
+                assert self.dataset.sequence_lengths.dtype == numpy.int32
+                if self._bos is not None:
+                    # every document one token longer: its BOS
+                    sequence_lengths_for_cpp = (self.dataset.sequence_lengths + 1).astype(numpy.int32)
+                elif len(document_index) * 2 > len(self.dataset.sequence_lengths):
+                    # If "access density" of sequence_lengths is high, force load the mmap-ed array
+                    # into memory by making a copy.
+                    #
+                    # System performance benefits come from two aspects:
+                    #   1. We sequentially pre-load the whole file, most of which we expect to read
+                    #   2. The GIL is held when entering the c++ program, improving the speed of which
+                    #      improves parallelism
+                    sequence_lengths_for_cpp = self.dataset.sequence_lengths.copy()
+                else:
+                    sequence_lengths_for_cpp = self.dataset.sequence_lengths
+                sample_index = helpers.build_sample_idx(
+                    sequence_lengths_for_cpp,
+                    document_index,
+                    sequence_length,
+                    num_epochs,
+                    num_tokens_per_epoch,
+                    drop_last_partial_sequence,
+                    self.config.add_extra_token_to_sequence,
+                )
+
+                # Build the shuffle index
+                if separate_final_epoch:
+                    shuffle_index = _build_shuffle_index(
+                        num_samples_sans_final_epoch, sample_index.shape[0] - 1, numpy_random_state
+                    )
+                else:
+                    shuffle_index = _build_shuffle_index(
+                        sample_index.shape[0] - 1, sample_index.shape[0] - 1, numpy_random_state
+                    )
+
+                if path_to_cache:
+                    os.makedirs(path_to_cache, exist_ok=True)
+                    # atomic, the description last (see datasets/utils.py: shared caches)
+                    atomic_numpy_save(path_to_document_index, document_index)
+                    atomic_numpy_save(path_to_sample_index, sample_index)
+                    atomic_numpy_save(path_to_shuffle_index, shuffle_index)
+                    atomic_write_text(path_to_description, self.unique_description)
+                else:
+                    log_single_rank(
+                        logger,
+                        logging.WARNING,
+                        f"Unable to save {type(self).__name__} indexes because path_to_cache is None",
+                    )
+
+                t_end = time.time()
+                log_single_rank(logger, logging.DEBUG, f"\t> time elapsed: {t_end - t_beg:4f} seconds")
+
                 log_single_rank(
-                    logger,
-                    logging.WARNING,
-                    f"Unable to save {type(self).__name__} indexes because path_to_cache is None",
+                    logger, logging.INFO, f"> total number of samples: {sample_index.shape[0] - 1}"
                 )
+                log_single_rank(logger, logging.INFO, f"> total number of epochs: {num_epochs}")
 
-            t_end = time.time()
-            log_single_rank(logger, logging.DEBUG, f"\t> time elapsed: {t_end - t_beg:4f} seconds")
-
-            log_single_rank(
-                logger, logging.INFO, f"> total number of samples: {sample_index.shape[0] - 1}"
-            )
-            log_single_rank(logger, logging.INFO, f"> total number of epochs: {num_epochs}")
-
-            return document_index, sample_index, shuffle_index
+                return document_index, sample_index, shuffle_index
 
         log_single_rank(
             logger, logging.INFO, f"Load the {type(self).__name__} {self.index_split.name} indices"
