@@ -488,6 +488,11 @@ class OptimizerConfig:
     angular_muown_u_decay_p: float = 1.0
     """Exponent for the "poly" U-decay schedule."""
 
+    angular_muown_fixed_row_norm: Optional[float] = None
+    """angular_muown / muown_classical: pin every matrix row's magnitude g at this norm (the
+    weights rescaled to it at the first step, g not trained), so only the row directions move --
+    nGPT's normalized weights in Muown coordinates. None trains g (Adam)."""
+
     angular_muown_u_decay_warmup_steps: int = 0
     """Steps before the AngularMuown U-decay schedule begins."""
 

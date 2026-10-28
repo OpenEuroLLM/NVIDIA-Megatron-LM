@@ -976,6 +976,7 @@ class TensorParallelAngularMuown(TensorParallelMuon):
         u_hyper_lr: float = 0.02,
         u_hyper_min_multiplier: float = 0.02,
         batched_step: bool = True,
+        fixed_row_norm: float | None = None,
     ) -> None:
         if not 0.0 <= betas[0] < 1.0:
             raise ValueError(f"Invalid beta1: {betas[0]}")
@@ -1030,6 +1031,13 @@ class TensorParallelAngularMuown(TensorParallelMuon):
         self._u_decay_schedule = u_decay_schedule
         self._u_decay_scale = None if u_decay_scale is None else float(u_decay_scale)
         self._u_decay_p = float(u_decay_p)
+        # Pinned row magnitudes (nGPT-style normalized weights in Muown's own coordinates): every
+        # row of a matrix starts at norm fixed_row_norm (W rescaled at the first step) and g is not
+        # trained, so only the direction U moves. A weight normalizer applied to W instead would be
+        # undone by every step, which rebuilds W = g U / |U| from the optimizer's own g.
+        if fixed_row_norm is not None and not fixed_row_norm > 0.0:
+            raise ValueError(f"fixed_row_norm must be positive, got {fixed_row_norm}")
+        self._fixed_row_norm = None if fixed_row_norm is None else float(fixed_row_norm)
         self._u_decay_warmup_steps = int(u_decay_warmup_steps)
         self._u_decay_steps = None if u_decay_steps is None else int(u_decay_steps)
         self._u_decay_min_multiplier = float(u_decay_min_multiplier)
@@ -1235,6 +1243,9 @@ class TensorParallelAngularMuown(TensorParallelMuon):
                 w_norm = torch.where(
                     zero_rows, w_norm.new_full(w_norm.shape, ANGULAR_MUOWN_ZERO_ROW_SCALE), w_norm
                 )
+            if self._fixed_row_norm is not None:
+                p.mul_((self._fixed_row_norm / w_norm).to(p.dtype))
+                w_norm = w_norm.new_full(w_norm.shape, self._fixed_row_norm)
             state["g"] = w_norm.clone()
             state["m_u"] = torch.zeros_like(p)
             state["m_g"] = torch.zeros_like(w_norm)
@@ -1250,6 +1261,9 @@ class TensorParallelAngularMuown(TensorParallelMuon):
             w_norm = torch.where(
                 zero_rows, w_norm.new_full(w_norm.shape, ANGULAR_MUOWN_ZERO_ROW_SCALE), w_norm
             )
+        if self._fixed_row_norm is not None:
+            local(p).mul_((self._fixed_row_norm / w_norm).to(local(p).dtype))
+            w_norm = w_norm.new_full(w_norm.shape, self._fixed_row_norm)
         w_norm = w_norm.to(local(p).dtype)
         state["g"] = row_state_like(p, w_norm.clone())
         state["m_u"] = torch.zeros_like(p)
@@ -1344,14 +1358,15 @@ class TensorParallelAngularMuown(TensorParallelMuon):
             u_step = u.add(direction, alpha=-self._u_step_size(group, step - 1))
 
             # Adam update on the row magnitudes g, with sign-preserving
-            # projection away from zero.
-            m_g.mul_(beta1).add_(grad_g, alpha=1 - beta1)
-            v_g.mul_(beta2).addcmul_(grad_g, grad_g, value=1 - beta2)
-            bc1 = 1 - beta1**step
-            bc2 = 1 - beta2**step
-            g_update = (m_g / bc1) / (v_g / bc2).sqrt().add_(adam_eps)
-            g_candidate = g.add(g_update, alpha=-lr)
-            g.copy_(torch.copysign(g_candidate.abs().clamp_min(ANGULAR_MUOWN_EPS), g_candidate))
+            # projection away from zero (pinned: g stays at fixed_row_norm).
+            if self._fixed_row_norm is None:
+                m_g.mul_(beta1).add_(grad_g, alpha=1 - beta1)
+                v_g.mul_(beta2).addcmul_(grad_g, grad_g, value=1 - beta2)
+                bc1 = 1 - beta1**step
+                bc2 = 1 - beta2**step
+                g_update = (m_g / bc1) / (v_g / bc2).sqrt().add_(adam_eps)
+                g_candidate = g.add(g_update, alpha=-lr)
+                g.copy_(torch.copysign(g_candidate.abs().clamp_min(ANGULAR_MUOWN_EPS), g_candidate))
 
             # Retraction: row-normalize the proposed U step. The row norm is
             # a dim=-1 reduction, so all-reduce the partial squared norms for
@@ -1511,13 +1526,14 @@ class TensorParallelAngularMuown(TensorParallelMuon):
 
         u_step = u.add(direction, alpha=-self._u_step_size(group, step - 1))
 
-        m_g_b.mul_(beta1).add_(grad_g, alpha=1 - beta1)
-        v_g_b.mul_(beta2).addcmul_(grad_g, grad_g, value=1 - beta2)
-        bc1 = 1 - beta1**step
-        bc2 = 1 - beta2**step
-        g_update = (m_g_b / bc1) / (v_g_b / bc2).sqrt().add_(adam_eps)
-        g_candidate = g_b.add(g_update, alpha=-lr)
-        g_b.copy_(torch.copysign(g_candidate.abs().clamp_min(ANGULAR_MUOWN_EPS), g_candidate))
+        if self._fixed_row_norm is None:  # pinned: g stays at fixed_row_norm
+            m_g_b.mul_(beta1).add_(grad_g, alpha=1 - beta1)
+            v_g_b.mul_(beta2).addcmul_(grad_g, grad_g, value=1 - beta2)
+            bc1 = 1 - beta1**step
+            bc2 = 1 - beta2**step
+            g_update = (m_g_b / bc1) / (v_g_b / bc2).sqrt().add_(adam_eps)
+            g_candidate = g_b.add(g_update, alpha=-lr)
+            g_b.copy_(torch.copysign(g_candidate.abs().clamp_min(ANGULAR_MUOWN_EPS), g_candidate))
 
         u_step_norm_sq = _angular_muown_u_step_norm_sq(u_step)
         if reduce_group is not None:

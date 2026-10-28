@@ -3041,6 +3041,13 @@ def _add_regularization_args(parser):
         help='Exponent for the poly U-decay schedule',
     )
     group.add_argument(
+        '--angular-muown-fixed-row-norm',
+        type=float,
+        default=None,
+        help='angular_muown / muown_classical: pin every matrix row magnitude at this norm '
+        '(weights rescaled at the first step, g not trained): nGPT-style normalized weights',
+    )
+    group.add_argument(
         '--angular-muown-u-decay-warmup-steps',
         type=int,
         default=0,

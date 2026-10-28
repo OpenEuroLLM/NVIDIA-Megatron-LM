@@ -2497,3 +2497,31 @@ def test_angular_muown_adaptive_state_checkpoints(schedule):
     opt2.load_state_dict(sd)
     for key in ("u_radius_sq", "u_log_kappa"):
         assert opt2.param_groups[0][key] == opt.param_groups[0][key]
+
+
+@pytest.mark.parametrize("batched", [False, True])
+@pytest.mark.parametrize("classical", [False, True])
+def test_angular_muown_fixed_row_norm_pins_the_rows(batched, classical):
+    """fixed_row_norm: the rows start at the pinned norm (W rescaled at the first step), g is never
+    trained, and the rows stay at that norm while their directions move."""
+    from megatron.core.optimizer.emerging_optimizers import TensorParallelMuownClassical
+
+    cls = TensorParallelMuownClassical if classical else TensorParallelAngularMuown
+    torch.manual_seed(0)
+    params = [torch.nn.Parameter(torch.randn(48, 32, device='cuda') * 0.02) for _ in range(3)]
+    opt = cls(params=params, lr=0.01, momentum=0.95, nesterov=True, betas=(0.9, 0.95),
+              num_ns_steps=5, scale_mode="shape_scaling", pg_collection=None, tp_mode="duplicated",
+              u_decay_p=0.0, batched_step=batched, fixed_row_norm=1.0)
+    with pytest.raises(ValueError, match="fixed_row_norm"):
+        cls(params=[torch.nn.Parameter(torch.randn(4, 4, device='cuda'))], fixed_row_norm=0.0)
+    first = None
+    for _ in range(4):
+        for p in params:
+            p.grad = torch.randn_like(p)
+        opt.step()
+        for p in params:
+            torch.testing.assert_close(p.norm(dim=1), torch.ones(48, device='cuda'))
+            torch.testing.assert_close(opt.state[p]["g"].abs().flatten(), torch.ones(48, device='cuda'))
+        if first is None:
+            first = [p.detach().clone() for p in params]
+    assert any(not torch.allclose(a, p) for a, p in zip(first, params)), "directions must move"
