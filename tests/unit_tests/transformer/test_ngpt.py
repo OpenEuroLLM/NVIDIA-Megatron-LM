@@ -165,3 +165,27 @@ class TestNGPTResidual:
         residual = NGPTResidual(HIDDEN, lerp_normalization="analytic")
         x = _unit(2, 2, HIDDEN).bfloat16()
         assert residual(torch.randn(2, 2, HIDDEN).bfloat16(), x).dtype == torch.bfloat16
+
+
+@pytest.mark.parametrize("mode", ["approx", "analytic", "direct"])
+def test_post_norm_floor_keeps_short_outputs_and_bounds_their_gradient(mode):
+    """post_norm_floor: a / max(|a|, floor) -- an output above the floor is normalized as before, a
+    shorter one is kept (a sublayer can switch off), and its gradient does not grow as 1 / |a|."""
+    from megatron.core.transformer.ngpt import NGPTResidual
+
+    torch.manual_seed(0)
+    h = 64
+    x = torch.nn.functional.normalize(torch.randn(4, 2, h), dim=-1)
+    plain = NGPTResidual(h, alpha_init_value=0.3, lerp_normalization=mode)
+    floored = NGPTResidual(h, alpha_init_value=0.3, lerp_normalization=mode, post_norm_floor=1.0)
+    big = torch.nn.functional.normalize(torch.randn(4, 2, h), dim=-1) * 3.0
+    torch.testing.assert_close(floored(big, x), plain(big, x))
+    grads, w = [], torch.randn(4, 2, h)
+    for res in (plain, floored):
+        torch.manual_seed(1)
+        tiny = (torch.randn(4, 2, h) * 1e-4).requires_grad_(True)
+        (res(tiny, x) * w).sum().backward()  # a linear readout (|out| is fixed for exact modes)
+        grads.append(tiny.grad.norm())
+    assert grads[0] > 1e3 * grads[1], grads  # plain: ~1 / |a|; floored: bounded
+    with pytest.raises(ValueError, match="post_norm_floor"):
+        NGPTResidual(h, post_norm_floor=-1.0)

@@ -499,6 +499,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     lerp_normalization=lerp_mode,
                     post_layer_norm=post_layer_norm,
                     eps=self.config.layernorm_epsilon,
+                    post_norm_floor=getattr(self.config, "ngpt_post_layer_norm_floor", 0.0),
                 )
 
             if has_attn:

@@ -78,14 +78,14 @@ def _lerp_analytic(x, a, alpha, eps):
 _lerp_analytic_compiled = _maybe_compile(_lerp_analytic)
 
 
-def _post_norm_lerp(hidden, x, alpha, correct, eps, post_layer_norm, analytic):
+def _post_norm_lerp(hidden, x, alpha, correct, eps, post_layer_norm, analytic, norm_floor):
     """The whole residual update of the ``approx`` / ``analytic`` modes, fused: the sublayer
     output's L2 normalization (``post_layer_norm``) and the LERP. Eager, each step is a full
     ``[s, b, h]`` pass forward and backward (~10 per sublayer); compiled it is a reduction
     and a pointwise kernel each way."""
     a = hidden
     if post_layer_norm:
-        a = hidden / torch.linalg.vector_norm(hidden, dim=-1, keepdim=True).clamp(min=eps)
+        a = hidden / torch.linalg.vector_norm(hidden, dim=-1, keepdim=True).clamp(min=norm_floor)
     if analytic:
         return _lerp_analytic(x, a, alpha, eps)
     return (x + alpha * (a - x)) * correct
@@ -223,6 +223,10 @@ class NGPTResidual(nn.Module):
         post_layer_norm: If True, L2-normalize the sublayer output before the
             interpolation (this is what puts ``a`` on the sphere).
         eps: Numerical floor for normalization and the ``rsqrt`` clamp.
+        post_norm_floor: Floor of the sublayer output's norm in its normalization, a / max(|a|,
+            floor) (anGPT's "bound"): an output longer than the floor is put on the sphere, a
+            shorter one is kept as is, so a sublayer can switch itself off (a -> 0) without the
+            1 / |a| amplification of the plain normalization. 0 (default): the plain L2 norm.
     """
 
     def __init__(
@@ -234,6 +238,7 @@ class NGPTResidual(nn.Module):
         lerp_normalization: str = "approx",
         post_layer_norm: bool = True,
         eps: float = 1e-6,
+        post_norm_floor: float = 0.0,
     ) -> None:
         super().__init__()
         if lerp_normalization not in LERP_NORMALIZATION_MODES:
@@ -252,6 +257,9 @@ class NGPTResidual(nn.Module):
         self.lerp_normalization = lerp_normalization
         self.post_layer_norm = post_layer_norm
         self.eps = eps
+        if post_norm_floor < 0.0:
+            raise ValueError(f"post_norm_floor must be >= 0, got {post_norm_floor}")
+        self.norm_floor = max(float(post_norm_floor), eps)
         self.base_scale = 1.0 / math.sqrt(hidden_size) if base_scale == -1.0 else base_scale
 
         # Pre-activation target t such that activation(t) == alpha_init_value, so
@@ -342,14 +350,17 @@ class NGPTResidual(nn.Module):
                     torch.clamp(1.0 - 2.0 * alpha32 * (1.0 - alpha32), min=self.eps)
                 ).to(input_dtype)
             out = _post_norm_lerp_compiled(
-                hidden_states, x, alpha, correct, self.eps, self.post_layer_norm, mode == "analytic"
+                hidden_states, x, alpha, correct, self.eps, self.post_layer_norm,
+                mode == "analytic", self.norm_floor,
             )
             return out.to(input_dtype)
 
         if self.post_layer_norm:
             # vector_norm saves only its input and output, so no [s, b, h]
             # temporary is retained (unlike x.float().pow(2).mean(...)).
-            inv = torch.linalg.vector_norm(hidden_states, dim=-1, keepdim=True).clamp(min=self.eps)
+            inv = torch.linalg.vector_norm(hidden_states, dim=-1, keepdim=True).clamp(
+                min=self.norm_floor
+            )
             a = hidden_states / inv
         else:
             a = hidden_states

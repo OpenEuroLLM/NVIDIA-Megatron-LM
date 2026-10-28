@@ -66,6 +66,7 @@ class ResidualSchemeAdapter(nn.Module):
                 or config.ngpt_lerp_normalization,
                 post_layer_norm=config.ngpt_post_layer_norm_attn,
                 eps=config.layernorm_epsilon,
+                post_norm_floor=getattr(config, "ngpt_post_layer_norm_floor", 0.0),
             )
         from megatron.core.transformer.attn_res import attn_res_streams
         from megatron.core.transformer.depth_memory import ldm_streams
