@@ -1131,6 +1131,12 @@ def save_checkpoint(
                 save_retain_interval = getattr(
                     args, 'save_retain_interval', None
                 )  # For backwards compatibility of tests.
+                if non_persistent_ckpt:
+                    # Retention is for the persistent checkpoints in args.save: a non-persistent
+                    # save's tracker (in its own directory) names a rolling iteration, which the
+                    # deletion below would look for in args.save; the rolling directory has its
+                    # own cleanup (cleanup_old_non_persistent_checkpoint).
+                    save_retain_interval = None
                 if save_retain_interval is not None:
                     if maybe_msc.os.path.exists(tracker_filename):
                         with maybe_msc.open(tracker_filename, 'r') as f:
@@ -1139,7 +1145,7 @@ def save_checkpoint(
                     f.write('release' if release else str(iteration))
                 print_rank_0(
                     f'  [{datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")}] successfully saved '
-                    f'checkpoint from iteration {int(iteration):7d} to {args.save} '
+                    f'checkpoint from iteration {int(iteration):7d} to {save_dir} '
                     f'[ t {tensor_mp_rank}/{tp_size_to_print}, '
                     f'gtp_remat {gtp_remat_rank}/{gtp_remat_size_to_print}, '
                     f'p {pipeline_mp_rank}/{pp_size_to_print} ]'
