@@ -89,7 +89,9 @@ def test_off_by_default():
     "scheme",
     [{}, {"mhc": True, "mhc_expansion_rate": 4, "mhc_routed_topk": 2},
      {"mhc": True, "mhc_expansion_rate": 2, "mhc_sinkhorn_iters": 4},
-     {"attn_res": True, "attn_res_num_blocks": 3}, {"ngpt": True}],
+     {"attn_res": True, "attn_res_num_blocks": 3}, {"ngpt": True},
+     {"depth_memory": True}, {"depth_memory": True, "depth_memory_impl": "torch"},
+     {"depth_memory": True, "depth_memory_impl": "torch", "ngpt": True, "depth_memory_lerp": True}],
 )
 def test_composes_with_residual_schemes_and_trains(scheme):
     model = _model(post_sublayer_norm=True, **scheme)

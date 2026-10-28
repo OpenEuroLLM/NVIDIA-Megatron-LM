@@ -1878,6 +1878,11 @@ class TransformerConfig(ModelParallelConfig):
     """Raw-parameter initialization for the alpha eigen-LR reparameterization.
     -1 selects 1/sqrt(hidden_size)."""
 
+    ngpt_alpha_trainable: bool = True
+    """Learn the LERP step alpha. False fixes it at ngpt_alpha_init_value (e.g. ~1 / depth), so
+    every layer's write stays in the normalized stream instead of decaying by (1 - alpha) per
+    later layer."""
+
     ngpt_alpha_activation: str = "abs"
     """Mapping from the raw alpha parameter to the effective LERP coefficient.
     'abs' is unbounded (nGPT default); 'half_sigmoid' and 'half_tanh_sq' cap alpha at the

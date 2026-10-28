@@ -189,3 +189,21 @@ def test_post_norm_floor_keeps_short_outputs_and_bounds_their_gradient(mode):
     assert grads[0] > 1e3 * grads[1], grads  # plain: ~1 / |a|; floored: bounded
     with pytest.raises(ValueError, match="post_norm_floor"):
         NGPTResidual(h, post_norm_floor=-1.0)
+
+
+def test_fixed_alpha_is_not_trained_and_keeps_its_init():
+    """alpha_trainable=False: alpha stays at alpha_init_value (no gradient, skipped by DDP and the
+    optimizer), the update still takes the LERP step of that size."""
+    from megatron.core.transformer.ngpt import NGPTResidual
+
+    torch.manual_seed(0)
+    h = 64
+    x = torch.nn.functional.normalize(torch.randn(4, 2, h), dim=-1)
+    a = torch.randn(4, 2, h, requires_grad=True)
+    learned = NGPTResidual(h, alpha_init_value=0.05, alpha_activation="half_sigmoid")
+    fixed = NGPTResidual(h, alpha_init_value=0.05, alpha_activation="half_sigmoid",
+                         alpha_trainable=False)
+    assert learned.alpha.requires_grad and not fixed.alpha.requires_grad
+    torch.testing.assert_close(fixed(a, x), learned(a, x))
+    fixed(a, x).sum().backward()
+    assert fixed.alpha.grad is None and a.grad is not None

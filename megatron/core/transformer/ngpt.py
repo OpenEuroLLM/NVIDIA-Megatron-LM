@@ -227,6 +227,9 @@ class NGPTResidual(nn.Module):
             floor) (anGPT's "bound"): an output longer than the floor is put on the sphere, a
             shorter one is kept as is, so a sublayer can switch itself off (a -> 0) without the
             1 / |a| amplification of the plain normalization. 0 (default): the plain L2 norm.
+        alpha_trainable: Learn alpha (default). False keeps it at ``alpha_init_value``: a small
+            fixed step (~1 / depth) keeps every layer's write in the stream, which a learned alpha
+            (0.2-0.4 at s1) forgets within a few layers.
     """
 
     def __init__(
@@ -239,6 +242,7 @@ class NGPTResidual(nn.Module):
         post_layer_norm: bool = True,
         eps: float = 1e-6,
         post_norm_floor: float = 0.0,
+        alpha_trainable: bool = True,
     ) -> None:
         super().__init__()
         if lerp_normalization not in LERP_NORMALIZATION_MODES:
@@ -274,6 +278,7 @@ class NGPTResidual(nn.Module):
         # following elementwise op instead of costing its own kernel.
         self.alpha_scaler = float(target / self.base_scale)
         self.alpha.is_ngpt_scaler = True
+        self.alpha.requires_grad_(alpha_trainable)
 
     def _alpha_preact_init_target(self) -> float:
         """Return the pre-activation value mapping to ``alpha_init_value``."""
