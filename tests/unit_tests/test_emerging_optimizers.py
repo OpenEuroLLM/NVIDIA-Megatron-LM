@@ -2509,9 +2509,10 @@ def test_angular_muown_fixed_row_norm_pins_the_rows(batched, classical):
     cls = TensorParallelMuownClassical if classical else TensorParallelAngularMuown
     torch.manual_seed(0)
     params = [torch.nn.Parameter(torch.randn(48, 32, device='cuda') * 0.02) for _ in range(3)]
+    extra = {} if classical else {"u_decay_p": 0.0}  # classical Muown has no u_* schedule
     opt = cls(params=params, lr=0.01, momentum=0.95, nesterov=True, betas=(0.9, 0.95),
               num_ns_steps=5, scale_mode="shape_scaling", pg_collection=None, tp_mode="duplicated",
-              u_decay_p=0.0, batched_step=batched, fixed_row_norm=1.0)
+              batched_step=batched, fixed_row_norm=1.0, **extra)
     with pytest.raises(ValueError, match="fixed_row_norm"):
         cls(params=[torch.nn.Parameter(torch.randn(4, 4, device='cuda'))], fixed_row_norm=0.0)
     first = None
