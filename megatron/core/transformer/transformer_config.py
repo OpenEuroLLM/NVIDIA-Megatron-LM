@@ -233,6 +233,16 @@ class TransformerConfig(ModelParallelConfig):
     bias_swiglu / weighted_swiglu kernels; the Triton SwiGLU falls back to the fused kernel, TE's
     fused ScaledSwiGLU op raises."""
 
+    moe_expert_post_act_norm: bool = False
+    """Routed experts: normalize the activation (SwiGLU output) per token over the hidden units
+    before the router weight and fc2, a = p * h / rms(h), without a scale vector (anGPT's
+    post_act_norm; fc2's rows carry the magnitude). Bounds an expert's output by its fc2 row
+    norms whatever its input or alignment does. TEGroupedMLP (fused SwiGLU kernel, or unfused),
+    MoonEP, SequentialMLP; not with the TE op fuser or TE activation modules; expert TP 1."""
+
+    mlp_post_act_norm: bool = False
+    """The same post-activation norm in the dense MLPs and the shared experts (TP 1)."""
+
     num_moe_experts: Optional[int] = None
     """Number of experts to use for MoE layer. When set, it replaces MLP with MoE layer. Set to None
     for no MoE."""
@@ -2182,6 +2192,18 @@ class TransformerConfig(ModelParallelConfig):
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
         details.
         """
+
+        if self.moe_expert_post_act_norm or self.mlp_post_act_norm:
+            if self.use_te_activation_func:
+                raise ValueError("post-activation norms need use_te_activation_func=False")
+        if self.moe_expert_post_act_norm:
+            if self.use_transformer_engine_op_fuser:
+                raise ValueError("moe_expert_post_act_norm is not supported by the TE op fuser")
+            etp = self.expert_tensor_parallel_size or self.tensor_model_parallel_size
+            if etp != 1:
+                raise ValueError("moe_expert_post_act_norm needs expert tensor parallel size 1")
+        if self.mlp_post_act_norm and self.tensor_model_parallel_size != 1:
+            raise ValueError("mlp_post_act_norm needs tensor_model_parallel_size 1")
         super().__post_init__()
 
         if self.moe_zero_expert_num:

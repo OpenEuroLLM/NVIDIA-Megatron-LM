@@ -21,7 +21,11 @@ from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_bias_geglu import quick_gelu, weighted_bias_quick_geglu_impl
-from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
+from megatron.core.fusions.fused_bias_swiglu import (
+    normed_swiglu_impl,
+    post_act_rms_norm,
+    weighted_bias_swiglu_impl,
+)
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 from megatron.core.inference.utils import InferenceMode
@@ -177,6 +181,40 @@ class GroupedMLPSubmodules:
     """
     Builder for an activation function module; only used if config.use_te_activation_func is True.
     """
+
+
+def _post_act_normed(
+    config, activation_func, x, bias, probs, with_glu_interleaving, remove_glu_interleaving
+):
+    """The expert activation with moe_expert_post_act_norm: probs * act(x) / rms(act(x)). SwiGLU
+    without bias / interleaving runs the fused kernel (clamp included); anything else the
+    unfused activation, then the norm, then the router weight."""
+    eps = config.layernorm_epsilon
+    limit = config.activation_func_clamp_value
+    if (
+        config.gated_linear_unit
+        and config.activation_func == F.silu
+        and bias is None
+        and not with_glu_interleaving
+        and config.glu_linear_offset == 0.0
+    ):
+        return normed_swiglu_impl(x, probs, config.activation_func_fp8_input_store, limit, eps)
+    if bias is not None:
+        x = x + bias
+    if with_glu_interleaving:
+        x = remove_glu_interleaving(x, config.moe_mlp_glu_interleave_size)
+    if config.gated_linear_unit:
+        x_glu, x_linear = torch.chunk(x, 2, dim=-1)
+        if limit is not None:
+            x_glu = x_glu.clamp(min=None, max=limit)
+            x_linear = x_linear.clamp(min=-limit, max=limit)
+        x = config.activation_func(x_glu) * (x_linear + config.glu_linear_offset)
+    else:
+        x = activation_func(x)
+    x = post_act_rms_norm(x, eps)
+    if probs is not None:
+        x = (x * probs).to(x.dtype)
+    return x
 
 
 class TEGroupedMLP(MegatronModule):
@@ -842,6 +880,12 @@ class TEGroupedMLP(MegatronModule):
                 self.config.gated_linear_unit
                 and self.config.moe_mlp_glu_interleave_size is not None
             )
+
+            if self.config.moe_expert_post_act_norm:
+                return _post_act_normed(
+                    self.config, self.activation_func, intermediate_parallel, bias_parallel,
+                    permuted_probs, with_glu_interleaving, self._remove_glu_interleaving,
+                )
 
             if self.config.use_te_activation_func:
                 if bias_parallel is not None:

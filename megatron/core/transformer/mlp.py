@@ -22,7 +22,12 @@ from megatron.core.fusions.fused_bias_geglu import (
     weighted_bias_quick_geglu_impl,
 )
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
-from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
+from megatron.core.fusions.fused_bias_swiglu import (
+    bias_swiglu_impl,
+    normed_swiglu_impl,
+    post_act_rms_norm,
+    weighted_bias_swiglu_impl,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -186,6 +191,11 @@ class MLP(MegatronModule):
         super().__init__(config=config)
 
         self.config: TransformerConfig = config
+        # post-activation RMS norm: moe_expert_post_act_norm for experts (SequentialMLP),
+        # mlp_post_act_norm for the dense MLPs and the shared experts
+        self.post_act_norm = bool(
+            getattr(config, "moe_expert_post_act_norm" if is_expert else "mlp_post_act_norm", False)
+        )
 
         self.input_size = input_size if input_size != None else self.config.hidden_size
 
@@ -300,6 +310,37 @@ class MLP(MegatronModule):
         halves = scale.chunk(2) if self.config.gated_linear_unit else (scale,)
         return torch.cat([h.chunk(tp_size)[tp_rank] for h in halves])
 
+    def _post_act_normed(self, x, bias, per_token_scale, activated):
+        """The activation with the post-activation norm: scale * act(x) / rms(act(x)), the fused
+        SwiGLU kernel where it applies (no bias), else unfused. ``activated``: canon's fused kernel
+        applied SwiGLU already (only the norm and the scale are left)."""
+        scale = per_token_scale.unsqueeze(-1) if per_token_scale is not None else None
+        cfg = self.config
+        eps, limit = cfg.layernorm_epsilon, cfg.activation_func_clamp_value
+        if (
+            not activated
+            and cfg.gated_linear_unit
+            and self.activation_func == F.silu
+            and bias is None
+            and cfg.glu_linear_offset == 0.0
+        ):
+            return normed_swiglu_impl(x, scale, cfg.activation_func_fp8_input_store, limit, eps)
+        if not activated:
+            if bias is not None:
+                x = x + bias
+            if cfg.gated_linear_unit:
+                x_glu, x_linear = torch.chunk(x, 2, dim=-1)
+                if limit is not None:
+                    x_glu = x_glu.clamp(min=None, max=limit)
+                    x_linear = x_linear.clamp(min=-limit, max=limit)
+                x = cfg.activation_func(x_glu) * (x_linear + cfg.glu_linear_offset)
+            else:
+                x = self.activation_func(x)
+        x = post_act_rms_norm(x, eps)
+        if scale is not None:
+            x = (x * scale).to(x.dtype)
+        return x
+
     def forward(
         self, hidden_states: torch.Tensor, per_token_scale: torch.Tensor | None = None, **kwargs
     ):
@@ -325,7 +366,11 @@ class MLP(MegatronModule):
             canon_activated = self.canon_d.swiglu  # the fused kernel applied SwiGLU too
 
         nvtx_range_push(suffix="activation")
-        if canon_activated:
+        if self.post_act_norm:
+            intermediate_parallel = self._post_act_normed(
+                intermediate_parallel, bias_parallel, per_token_scale, canon_activated
+            )
+        elif canon_activated:
             pass
         elif self.config.use_te_activation_func:
             if bias_parallel is not None:

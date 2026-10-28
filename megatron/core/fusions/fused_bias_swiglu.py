@@ -3,6 +3,8 @@
 
 # pylint: disable=missing-function-docstring, missing-class-docstring
 
+from typing import Optional
+
 import torch
 import torch.nn.functional as F
 
@@ -143,6 +145,54 @@ def weighted_clamped_swiglu_back(g, y, weights, limit: float):
     return torch.cat((d_1, d_2), -1).to(input_dtype), weights_grad.to(w_dtype)
 
 
+# Post-activation RMS norm (anGPT's post_act_norm; moe_expert_post_act_norm / mlp_post_act_norm):
+# the SwiGLU output is normalized per token over the hidden units, without a scale vector (the
+# rows of fc2 carry the magnitude), BEFORE the router weight -- a = p * h / rms(h). One fused
+# kernel each way, the reduction in fp32; the backward recomputes h from the saved fc1 output.
+# limit: the activation clamp (inf = none).
+@jit_fuser
+def normed_swiglu(y, weights: Optional[torch.Tensor], limit: float, eps: float):
+    dtype = y.dtype
+    y_1, y_2 = torch.chunk(y.float(), 2, -1)
+    act = F.silu(y_1.clamp(max=limit)) * y_2.clamp(min=-limit, max=limit)
+    act = act * torch.rsqrt(act.square().mean(-1, keepdim=True) + eps)
+    if weights is not None:
+        act = act * weights
+    return act.to(dtype)
+
+
+@jit_fuser
+def normed_swiglu_back(g, y, weights: Optional[torch.Tensor], limit: float, eps: float):
+    """Gradients of :func:`normed_swiglu` w.r.t. ``y`` (dtype of ``y``) and ``weights`` (its dtype;
+    None without weights): with n = h r, r = (mean(h^2) + eps)^-1/2 and G the gradient at n,
+    dL/dh = r (G - n mean(G n))."""
+    input_dtype = y.dtype
+    y_1, y_2 = torch.chunk(y.float(), 2, -1)
+    c_1 = y_1.clamp(max=limit)
+    c_2 = y_2.clamp(min=-limit, max=limit)
+    s_1 = torch.sigmoid(c_1)
+    act_1 = c_1 * s_1
+    act = act_1 * c_2
+    r = torch.rsqrt(act.square().mean(-1, keepdim=True) + eps)
+    n = act * r
+    gf = g.float()
+    weights_grad = None
+    if weights is not None:
+        weights_grad = torch.sum(n * gf, dim=-1, keepdim=True).to(weights.dtype)
+        gf = gf * weights.float()
+    ga = r * (gf - n * (gf * n).mean(-1, keepdim=True))
+    d_1 = ga * s_1 * (1 + c_1 * (1 - s_1)) * c_2 * (y_1 <= limit)
+    d_2 = ga * act_1 * (y_2.abs() <= limit)
+    return torch.cat((d_1, d_2), -1).to(input_dtype), weights_grad
+
+
+def post_act_rms_norm(x: torch.Tensor, eps: float) -> torch.Tensor:
+    """The unfused post-activation norm (any activation): x / rms(x) over the last dimension,
+    in fp32, no scale vector."""
+    xf = x.float()
+    return (xf * torch.rsqrt(xf.square().mean(-1, keepdim=True) + eps)).to(x.dtype)
+
+
 def _swiglu_fwd(y, limit):
     return swiglu(y) if limit is None else clamped_swiglu(y, limit)
 
@@ -266,6 +316,38 @@ class WeightedSwiGLUFunction(torch.autograd.Function):
         else:
             tmp, wgrad = weighted_clamped_swiglu_back(grad_output, input, weights, ctx.limit)
         return tmp, wgrad, None, None
+
+
+class NormedSwiGLUFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input, weights, fp8_input_store, limit, eps):
+        input_for_backward = input.to(torch.float8_e4m3fn) if fp8_input_store else input
+        ctx.save_for_backward(input_for_backward, weights)
+        ctx.ori_input_dtype = input.dtype
+        ctx.fp8_input_store = fp8_input_store
+        ctx.limit, ctx.eps = limit, eps
+        return normed_swiglu(input, weights, limit, eps)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input, weights = ctx.saved_tensors
+        input = input.to(ctx.ori_input_dtype) if ctx.fp8_input_store else input
+        tmp, wgrad = normed_swiglu_back(grad_output, input, weights, ctx.limit, ctx.eps)
+        return tmp, wgrad, None, None, None
+
+
+def normed_swiglu_impl(input, weights=None, fp8_input_store=False, limit=None, eps=1e-6):
+    """SwiGLU, then the per-token RMS norm over the hidden units (no scale vector), then the
+    optional token-wise weights (the router probabilities), fused: weights * h / rms(h)."""
+    ori_shape = input.shape
+    assert len(ori_shape) in [2, 3]
+    input = input.view(-1, ori_shape[-1])
+    if weights is not None:
+        weights = weights.reshape(-1, 1)
+    output = NormedSwiGLUFunction.apply(
+        input, weights, fp8_input_store, float("inf") if limit is None else float(limit), eps
+    )
+    return output if len(ori_shape) == 2 else output.view(ori_shape[0], ori_shape[1], -1)
 
 
 def bias_swiglu_impl(input, bias, fp8_input_store=False, cpu_offload_input=False, limit=None):

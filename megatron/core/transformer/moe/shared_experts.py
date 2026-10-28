@@ -272,7 +272,11 @@ class SharedExpertMLP(MLP):
             )
             self.cached_fc1_input = None
 
-            if self.config.use_te_activation_func:
+            if self.post_act_norm:
+                intermediate_parallel = self._post_act_normed(
+                    intermediate_parallel, bias_parallel, None, False
+                )
+            elif self.config.use_te_activation_func:
                 if bias_parallel is not None:
                     intermediate_parallel = intermediate_parallel + bias_parallel
                 intermediate_parallel = self.activation_func(intermediate_parallel)
@@ -398,6 +402,8 @@ class FusedSharedExpertMLP(SharedExpertMLP):
 
     def _validate_fused_grouped_swiglu(self) -> None:
         """Validate the requested GroupedLinear(num_groups=1) SwiGLU path."""
+        if self.post_act_norm:
+            raise ValueError(f"{self.__class__.__name__} does not support mlp_post_act_norm")
         if not HAVE_TE:
             raise RuntimeError(
                 f"{self.__class__.__name__} requires Transformer Engine when "
