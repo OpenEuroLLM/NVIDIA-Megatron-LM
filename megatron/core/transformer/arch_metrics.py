@@ -59,6 +59,12 @@ def graph_mode() -> bool:
     return _GRAPH_MODE
 
 
+def step_active() -> bool:
+    """True on the training steps the loop reports, whatever the grad mode: for records taken
+    outside the forward pass (the optimizer step runs under no_grad)."""
+    return _ACTIVE
+
+
 def active() -> bool:
     """True when a call site should compute and record its metrics now."""
     if not _ACTIVE or not torch.is_grad_enabled():

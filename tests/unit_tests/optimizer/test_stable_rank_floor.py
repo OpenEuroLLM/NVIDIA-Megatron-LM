@@ -158,3 +158,15 @@ def test_orthogonal_directions_keep_the_closest_orientation():
     _orthogonal_directions_(w)
     noise = float((w0[0] - q).norm() / q.norm())
     assert float((w - w0).norm() / w0.norm()) < noise
+
+
+def test_bound_stats():
+    w = torch.cat([torch.randn(2, 96, 192) / 192**0.5, 3.0 * _collapsed()[None]], 0)
+    st = {}
+    _spectral_bound_(w.clone(), r_min=20.0, cap=2.5, stats=st)
+    assert st["floored"].tolist() == [0.0, 0.0, 1.0]
+    assert st["srank"][-1] < 2 and (st["srank"][:2] > 25).all()
+    assert st["capped"].shape == (3,) and (st["sigma_over_cap"] > 0).all()
+    st = {}
+    _orthogonal_directions_(w.clone(), stats=st)
+    assert st["drift"].shape == (3,) and float(st["iters"][0]) >= 1

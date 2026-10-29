@@ -774,6 +774,7 @@ def _stable_rank_floor_(
 def _spectral_bound_(
     w: torch.Tensor, r_min: float = 0.0, cap: float = 0.0, g: Optional[torch.Tensor] = None,
     iters: int = 6, rounds: int = 3, cap_iters: int = 10,
+    stats: Optional[Dict[str, torch.Tensor]] = None,
 ) -> int:
     """Bound the top of every matrix's spectrum, in place: ``r_min`` > 1 a stable-rank floor (a
     deflation of the top direction), then ``cap`` > 0 a spectral-norm cap sigma_max <= cap (the
@@ -795,13 +796,15 @@ def _spectral_bound_(
     ``cap_iters`` power iterations (an underestimate at a small spectral gap: the bound is then
     slightly loose). Cost: per power iteration two batched matrix-vector products (memory-bound,
     a fraction of the Newton-Schulz step's matrix-matrix products).
-    Returns the number of matrices bounded."""
+    ``stats`` (optional): filled with per-matrix tensors -- ``floored`` / ``srank`` (before the
+    floor), ``capped`` / ``sigma_over_cap`` (before the cap). Returns the number of matrices
+    bounded."""
     floor_on, cap_on = r_min > 1.0, cap > 0.0
     if not (floor_on or cap_on) or w.numel() == 0:
         return 0
     W = w.float().reshape(-1, w.shape[-2], w.shape[-1])
     capped_any = None
-    for _ in range(rounds if floor_on else 0):
+    for round_ in range(rounds if floor_on else 0):
         fro2 = W.square().sum(dim=(-2, -1))
         v = W.abs().sum(dim=-2, keepdim=True).transpose(-2, -1)  # [B, n, 1]
         for _ in range(iters):
@@ -810,6 +813,9 @@ def _spectral_bound_(
         wv = W @ v
         sigma = wv.norm(dim=(-2, -1))
         over = sigma.square() * r_min > fro2
+        if stats is not None and round_ == 0:
+            stats["floored"] = over.float()
+            stats["srank"] = fro2 / sigma.square().clamp_min(1e-30)
         if not bool(over.any()):
             break
         c = ((fro2 - sigma.square()).clamp_min(0) / (r_min - 1.0)).sqrt()
@@ -824,6 +830,9 @@ def _spectral_bound_(
             v = v / v.norm(dim=-2, keepdim=True).clamp_min(1e-30)
         sigma = (W @ v).norm(dim=(-2, -1))
         over = sigma > cap
+        if stats is not None:
+            stats["capped"] = over.float()
+            stats["sigma_over_cap"] = sigma / cap
         if bool(over.any()):
             W = W * (cap / sigma.clamp_min(1e-30)).clamp_max(1.0)[:, None, None]
             capped_any = over if capped_any is None else (capped_any | over)
@@ -837,7 +846,10 @@ def _spectral_bound_(
 
 
 @torch.no_grad()
-def _orthogonal_directions_(w: torch.Tensor, max_iters: int = 16, tol: float = 1e-5) -> int:
+def _orthogonal_directions_(
+    w: torch.Tensor, max_iters: int = 16, tol: float = 1e-5,
+    stats: Optional[Dict[str, torch.Tensor]] = None,
+) -> int:
     """Muon-like weight balancing, in place: every matrix of ``w`` ([m, n] or [B, m, n]) becomes
     diag(|W_i|) Q_i / |Q_i| with Q the polar factor of its row-normalized U = W / |W_i| -- the row
     magnitudes kept, the direction part with all singular values 1 (Stiefel; exactly so when
@@ -852,7 +864,9 @@ def _orthogonal_directions_(w: torch.Tensor, max_iters: int = 16, tol: float = 1
     entry) of the identity -- X X^T is the iteration's own product, so the check is free but one
     host sync per iteration: applied every step, the weights stay within O(lr) of orthogonal and
     2-3 iterations (4-6 matmuls per matrix; Muon's 5 quintic steps: 15) suffice; a large step
-    (or the init) takes more, up to ``max_iters``. Returns the number of matrices."""
+    (or the init) takes more, up to ``max_iters``. ``stats`` (optional): ``drift`` (per matrix,
+    the rms of X X^T - I before the iteration: how far the step moved it from orthogonal) and
+    ``iters``. Returns the number of matrices."""
     if w.numel() == 0:
         return 0
     m, n = w.shape[-2], w.shape[-1]
@@ -871,11 +885,18 @@ def _orthogonal_directions_(w: torch.Tensor, max_iters: int = 16, tol: float = 1
         sigma = (X @ v).norm(dim=(-2, -1), keepdim=True)
         X = X / (1.05 * sigma).clamp_min(1e-30)  # sigma_max <~ 1 (a power-iteration underestimate)
         eye = torch.eye(X.shape[-2], device=X.device, dtype=X.dtype)
-        for _ in range(max_iters):
+        done = max_iters
+        for it in range(max_iters):
             A = X @ X.mT
-            if float((A - eye).square().mean(dim=(-2, -1)).max().sqrt()) < tol:
+            resid = (A - eye).square().mean(dim=(-2, -1)).sqrt()
+            if stats is not None and it == 0:
+                stats["drift"] = resid
+            if float(resid.max()) < tol:
+                done = it
                 break
             X = torch.baddbmm(X, A, X, beta=1.5, alpha=-0.5)
+        if stats is not None:
+            stats["iters"] = torch.full((1,), float(done), device=X.device)
     finally:
         torch.set_float32_matmul_precision(prec)
     if m > n:
@@ -1774,10 +1795,19 @@ class TensorParallelAngularMuown(TensorParallelMuon):
         return self._spectral_cap * self._spectral_ref[tuple(int(d) for d in shape[-2:])]
 
     def _bound_(self, w: torch.Tensor, g: Optional[torch.Tensor] = None) -> int:
+        from megatron.core.transformer import arch_metrics
+
+        stats = {} if arch_metrics.step_active() else None
         if self._expert_orthogonal:  # the row norms (g) are kept
-            return _orthogonal_directions_(w)
-        return _spectral_bound_(w, r_min=self._stable_rank_floor,
-                                cap=self._expert_cap(w.shape), g=g)
+            n = _orthogonal_directions_(w, stats=stats)
+        else:
+            n = _spectral_bound_(w, r_min=self._stable_rank_floor,
+                                 cap=self._expert_cap(w.shape), g=g, stats=stats)
+        if stats:  # per expert-matrix shape: muown/expert_<m>x<n>/<stat>, mean over matrices
+            name = f"muown/expert_{w.shape[-2]}x{w.shape[-1]}"
+            for key, value in stats.items():
+                arch_metrics.record(f"{name}/{key}", 1, 1, value.sum(), value.numel())
+        return n
 
     @torch.no_grad()
     def _init_spectral_refs(self) -> None:
