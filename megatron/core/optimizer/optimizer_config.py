@@ -462,6 +462,11 @@ class OptimizerConfig:
     """muown_classical: hold every routed-expert matrix at sigma_max <= this factor x its init
     sigma_max (per shape) after each step (deflation of the top singular directions; 0 = off)."""
 
+    muown_expert_orthogonal: bool = False
+    """muown_classical: after each step, replace every routed-expert matrix's direction part
+    (the row-normalized weight) by its polar factor at kept row norms: all singular values of the
+    direction 1 (Muon-like weight balancing; excludes the floor and the cap)."""
+
     muown_classical_g_weight_decay: float = 0.0
     """muown_classical: decoupled weight decay on the row magnitudes g, g <- g (1 - lr lambda): a soft
     cap at |g| ~ 1 / lambda against the Adam drift of g (~lr per step along a persistent sign)."""

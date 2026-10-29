@@ -6,6 +6,7 @@ import torch
 
 from megatron.core.optimizer.emerging_optimizers import (
     _is_expert_param,
+    _orthogonal_directions_,
     _spectral_bound_,
     _stable_rank_floor_,
 )
@@ -101,3 +102,59 @@ def test_floor_then_cap():
     _spectral_bound_(c, r_min=20.0, cap=0.5)  # both: floor, then the cap
     assert float(torch.linalg.matrix_norm(c[0], ord=2)) < 0.51
     assert float(_srank(c)[0]) > 0.95 * 20.0
+
+
+def _row_normalized_svals(w):
+    return torch.linalg.svdvals(w / w.norm(dim=-1, keepdim=True))
+
+
+def test_orthogonal_directions_wide_is_stiefel_at_kept_row_norms():
+    torch.manual_seed(4)
+    g = torch.rand(3, 64, 1) + 0.5
+    w = torch.randn(3, 64, 160) * g
+    rows = w.norm(dim=-1, keepdim=True)
+    for _ in range(2):  # from a random init: 2 calls (steps) to fp32 precision
+        assert _orthogonal_directions_(w) == 3
+    torch.testing.assert_close(w.norm(dim=-1, keepdim=True), rows)
+    s = _row_normalized_svals(w)
+    torch.testing.assert_close(s, torch.ones_like(s), atol=1e-4, rtol=0)
+
+
+def test_orthogonal_directions_lift_a_collapsed_matrix_over_steps():
+    """A collapsed matrix's bulk starts tiny after the sigma_max normalization and grows by ~1.5x
+    per iteration: it is balanced within a few steps (from an init, never needed)."""
+    w = 3.0 * _collapsed(64, 160)[None]
+    assert _srank(w)[0] < 2
+    for _ in range(6):
+        _orthogonal_directions_(w)
+    s = _row_normalized_svals(w)
+    torch.testing.assert_close(s, torch.ones_like(s), atol=1e-3, rtol=0)
+
+
+def test_orthogonal_directions_tall_balanced_and_settling():
+    """m > n: unit rows and an orthogonal direction cannot both hold exactly; repeated calls
+    (alternating projections) settle towards an equal-norm tight frame."""
+    torch.manual_seed(5)
+    w = torch.randn(2, 160, 64)
+    rows = w.norm(dim=-1, keepdim=True)
+    moves = []
+    for _ in range(6):
+        w0 = w.clone()
+        _orthogonal_directions_(w)
+        moves.append(float((w - w0).norm() / w0.norm()))
+    torch.testing.assert_close(w.norm(dim=-1, keepdim=True), rows)
+    s = _row_normalized_svals(w)
+    assert float(s.max() / s.min()) < 1.2, s
+    assert moves[-1] < 0.1 * moves[1], moves
+
+
+def test_orthogonal_directions_keep_the_closest_orientation():
+    """The polar factor is the orthogonal matrix closest to U: a near-orthogonal matrix moves by
+    about its distance from orthogonal, not more."""
+    torch.manual_seed(6)
+    q = torch.linalg.qr(torch.randn(128, 48))[0].T  # [48, 128], orthonormal rows
+    w = (q + 1e-3 * torch.randn_like(q))[None]
+    w0 = w.clone()
+    _orthogonal_directions_(w)
+    noise = float((w0[0] - q).norm() / q.norm())
+    assert float((w - w0).norm() / w0.norm()) < noise

@@ -836,6 +836,50 @@ def _spectral_bound_(
     return int(capped_any.sum())
 
 
+@torch.no_grad()
+def _orthogonal_directions_(w: torch.Tensor, iters: int = 5) -> int:
+    """Muon-like weight balancing, in place: every matrix of ``w`` ([m, n] or [B, m, n]) becomes
+    diag(|W_i|) Q_i / |Q_i| with Q the polar factor of its row-normalized U = W / |W_i| -- the row
+    magnitudes kept, the direction part with all singular values 1 (Stiefel; exactly so when
+    m <= n, where Q's rows are unit; a tall matrix's rows are renormalized). No direction can
+    dominate (rank collapse is impossible) and the row norms, i.e. Muown's g, do not change.
+
+    Q by the convergent cubic Newton-Schulz iteration X <- 1.5 X - 0.5 (X X^T) X in full fp32
+    (Muon's quintic leaves singular values in ~[0.7, 1.2] and TF32 adds ~5e-4 relative noise:
+    either would perturb the weights at every step), after normalizing by a power-iteration
+    sigma_max (convergence needs sigma < sqrt(3); the small singular values then converge
+    quadratically once near 1). From the init (normalized sigma down to ~0.25) 5 iterations reach
+    ~0.98 and the next step's 5 fp32 precision; applied every step, the weights then stay within
+    O(lr) of orthogonal. 10 matmuls per matrix (Muon's 5 quintic steps: 15). Returns the number of
+    matrices."""
+    if w.numel() == 0:
+        return 0
+    m, n = w.shape[-2], w.shape[-1]
+    W = w.float().reshape(-1, m, n)
+    rows = W.norm(dim=-1, keepdim=True).clamp_min(ANGULAR_MUOWN_EPS)
+    prec = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("highest")
+    try:
+        X = W / rows
+        if m > n:
+            X = X.mT
+        v = X.abs().sum(dim=-2, keepdim=True).transpose(-2, -1)
+        for _ in range(4):
+            v = X.transpose(-2, -1) @ (X @ v)
+            v = v / v.norm(dim=-2, keepdim=True).clamp_min(1e-30)
+        sigma = (X @ v).norm(dim=(-2, -1), keepdim=True)
+        X = X / (1.05 * sigma).clamp_min(1e-30)  # sigma_max <~ 1 (a power-iteration underestimate)
+        for _ in range(iters):
+            X = torch.baddbmm(X, X @ X.mT, X, beta=1.5, alpha=-0.5)
+    finally:
+        torch.set_float32_matmul_precision(prec)
+    if m > n:
+        X = X.mT
+    W = rows * X / X.norm(dim=-1, keepdim=True).clamp_min(1e-30)
+    w.copy_(W.reshape(w.shape).to(w.dtype))
+    return W.shape[0]
+
+
 def _batched_newton_schulz(
     x: torch.Tensor,
     steps: int,
@@ -1031,6 +1075,7 @@ class TensorParallelAngularMuown(TensorParallelMuon):
     # stable-rank floor of the expert matrices (TensorParallelMuownClassical only; 0 = off)
     _stable_rank_floor = 0.0
     _spectral_cap = 0.0
+    _expert_orthogonal = False
 
     def __init__(
         self,
@@ -1715,7 +1760,7 @@ class TensorParallelAngularMuown(TensorParallelMuon):
             self._row_sharded_floor(params)
 
     def _bound_on(self) -> bool:
-        return self._stable_rank_floor > 1.0 or self._spectral_cap > 0.0
+        return self._stable_rank_floor > 1.0 or self._spectral_cap > 0.0 or self._expert_orthogonal
 
     def _expert_cap(self, shape) -> float:
         """sigma_max cap of an expert matrix of (full) ``shape``: spectral_cap x its init value."""
@@ -1724,6 +1769,8 @@ class TensorParallelAngularMuown(TensorParallelMuon):
         return self._spectral_cap * self._spectral_ref[tuple(int(d) for d in shape[-2:])]
 
     def _bound_(self, w: torch.Tensor, g: Optional[torch.Tensor] = None) -> int:
+        if self._expert_orthogonal:  # the row norms (g) are kept
+            return _orthogonal_directions_(w)
         return _spectral_bound_(w, r_min=self._stable_rank_floor,
                                 cap=self._expert_cap(w.shape), g=g)
 
@@ -1944,7 +1991,8 @@ class TensorParallelMuownClassical(TensorParallelAngularMuown):
 
     def __init__(
         self, params: ParamsT, v_weight_decay: float = 0.0, g_weight_decay: float = 0.0,
-        stable_rank_floor: float = 0.0, spectral_cap: float = 0.0, **kwargs
+        stable_rank_floor: float = 0.0, spectral_cap: float = 0.0,
+        expert_orthogonal: bool = False, **kwargs
     ) -> None:
         """``v_weight_decay`` (not in the Muown paper, default off): decoupled weight decay on v,
         v <- v - lr (update + lambda v). v / ||v|| does not depend on ||v||, so it only shrinks the
@@ -1965,7 +2013,11 @@ class TensorParallelMuownClassical(TensorParallelAngularMuown):
 
         ``spectral_cap`` (default off): after each step, the routed-expert matrices are held at
         sigma_max <= this factor x their init sigma_max (per shape, from the init weights) by the
-        same deflation; unlike the floor it also bounds a matrix whose norms grow."""
+        same deflation; unlike the floor it also bounds a matrix whose norms grow.
+
+        ``expert_orthogonal`` (default off): after each step, the routed-expert matrices'
+        direction parts are replaced by their polar factor at kept row norms (Muon-like weight
+        balancing: every singular value of U is 1); exclusive with the floor and the cap."""
         for name in kwargs:
             if name.startswith("u_") or name in {"weight_decay", "use_decoupled_weight_decay"}:
                 raise ValueError(f"Muown does not support {name}")
@@ -1977,11 +2029,14 @@ class TensorParallelMuownClassical(TensorParallelAngularMuown):
             raise ValueError("stable_rank_floor must be finite and nonnegative")
         if not (math.isfinite(spectral_cap) and spectral_cap >= 0.0):
             raise ValueError("spectral_cap must be finite and nonnegative")
+        if expert_orthogonal and (stable_rank_floor > 1.0 or spectral_cap > 0.0):
+            raise ValueError("expert_orthogonal excludes stable_rank_floor and spectral_cap")
         super().__init__(params, **kwargs)
         self._v_weight_decay = float(v_weight_decay)
         self._g_weight_decay = float(g_weight_decay)
         self._stable_rank_floor = float(stable_rank_floor)
         self._spectral_cap = float(spectral_cap)
+        self._expert_orthogonal = bool(expert_orthogonal)
         self._spectral_ref: Dict[tuple, float] = {}
         if self._spectral_cap > 0.0:
             self._init_spectral_refs()
@@ -2173,6 +2228,7 @@ def _muown_classical_config_to_kwargs(config, model_chunks, pg_collection) -> Di
     kwargs["g_weight_decay"] = getattr(config, "muown_classical_g_weight_decay", 0.0)
     kwargs["stable_rank_floor"] = getattr(config, "muown_expert_stable_rank_floor", 0.0)
     kwargs["spectral_cap"] = getattr(config, "muown_expert_spectral_cap", 0.0)
+    kwargs["expert_orthogonal"] = getattr(config, "muown_expert_orthogonal", False)
     return kwargs
 
 

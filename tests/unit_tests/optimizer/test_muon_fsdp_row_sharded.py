@@ -178,6 +178,28 @@ def test_muown_classical_row_sharded_spectral_cap(mesh):
         assert float(torch.linalg.matrix_norm(f.detach(), ord=2)) < 1.05 * cap
 
 
+def test_muown_classical_row_sharded_expert_orthogonal(mesh):
+    """Muon-like expert weight balancing on row shards: the polar factor of the full matrix at
+    its owner; sharded and unsharded steps agree."""
+    os.environ["ANGULAR_MUOWN_COMPACT_CKPT"] = "1"
+    rank = mesh.get_rank()
+    options = dict(lr=0.05, nesterov=True, split_qkv=False, fp32_matmul_prec="highest",
+                   scale_mode="spectral", extra_scale_factor=0.2, expert_orthogonal=True)
+    fulls, shards, reference, sharded = _pair(TensorParallelMuownClassical, options, mesh, 17)
+    for p in fulls + shards:
+        p.allreduce = False
+    for step in range(4):
+        torch.manual_seed(400 + step)
+        _set_grads(fulls, shards, rank)
+        reference.step()
+        sharded.step()
+        for f, s, (_, counts) in zip(fulls, shards, LAYOUTS):
+            lo, hi = _rows(counts, rank)
+            torch.testing.assert_close(local(s).detach(), f.detach()[lo:hi], atol=2e-5, rtol=2e-5)
+            torch.testing.assert_close(local(sharded.state[s]["g"]),
+                                       reference.state[f]["g"][lo:hi], atol=2e-5, rtol=2e-5)
+
+
 def test_muon_row_sharded(mesh):
     rank = mesh.get_rank()
     options = dict(lr=0.02, weight_decay=0.01, split_qkv=False, fp32_matmul_prec="highest",
