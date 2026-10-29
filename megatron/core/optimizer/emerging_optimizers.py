@@ -763,49 +763,46 @@ def _is_expert_param(p) -> bool:
 
 
 @torch.no_grad()
-def _stable_rank_floor_(w: torch.Tensor, r_min: float, iters: int = 4, rounds: int = 4) -> int:
-    """:func:`_stable_rank_floor_once_` repeated (up to ``rounds``) while a matrix is still below
-    the floor: restoring the row norms after a deflation re-inflates a strongly collapsed matrix
-    (one round lifts stable rank ~1.6 only to ~4), so one round per step can trail a fast push.
-    The extra rounds run only while some matrix is capped. Returns the number capped in round 1."""
-    first = _stable_rank_floor_once_(w, r_min, iters)
-    n = first
-    for _ in range(rounds - 1):
-        if n == 0:
-            break
-        n = _stable_rank_floor_once_(w, r_min, iters)
-    return first
-
-
-@torch.no_grad()
-def _stable_rank_floor_once_(w: torch.Tensor, r_min: float, iters: int = 4) -> int:
-    """Hold every matrix of ``w`` ([m, n] or [B, m, n]) at stable rank >= ``r_min``, in place:
-    where sigma_max^2 > |W|_F^2 / r_min, shrink the top singular direction to
-    sigma = |W|_F / sqrt(r_min) (a rank-1 deflation, the other directions untouched), then restore
-    each row's norm (Muown's row magnitudes g stay what they were). sigma_max and its singular
-    vectors come from a short power iteration started at the column sums, deterministic on every
-    replica; a collapsed matrix (the runaway experts: top-5 share of |W|^2 0.1-0.25 against 0.02)
-    has a large spectral gap, so a few iterations suffice. Returns the number of matrices capped."""
-    W = w.float().reshape(-1, w.shape[-2], w.shape[-1])
-    row_norm = W.norm(dim=-1, keepdim=True)
-    fro2 = row_norm.square().sum(dim=(-2, -1))
-    v = W.sum(dim=-2, keepdim=True).transpose(-2, -1)  # [B, n, 1]
-    for _ in range(iters):
-        v = W.transpose(-2, -1) @ (W @ v)
-        v = v / v.norm(dim=-2, keepdim=True).clamp_min(1e-30)
-    wv = W @ v  # [B, m, 1]
-    sigma = wv.norm(dim=(-2, -1))
-    cap = (fro2 / r_min).sqrt()
-    over = sigma > cap
-    if not bool(over.any()):
+def _stable_rank_floor_(
+    w: torch.Tensor, r_min: float, g: Optional[torch.Tensor] = None, iters: int = 6, rounds: int = 3
+) -> int:
+    """Hold every matrix of ``w`` ([m, n] or [B, m, n]) at stable rank |W|_F^2 / sigma_max^2 >=
+    ``r_min``, in place, by deflating the top singular direction to the exact value
+    c = sqrt((|W|_F^2 - sigma_max^2) / (r_min - 1)) at which the deflated matrix has stable rank
+    r_min (repeated while a second direction is still above it). The rows aligned with that
+    direction shrink: ``g`` (Muown's row magnitudes, [.., m, 1]) is set to the new row norms with
+    its signs kept, so W = g U / |U| stays consistent -- restoring the old row norms instead
+    re-inflated the direction (a collapsed matrix's rows are nearly parallel) and held a fast-
+    collapsing matrix at about half the floor. sigma_max and its singular vectors come from a
+    power iteration started at the column sums of |W| (deterministic on every replica; a
+    collapsed matrix has a large spectral gap). Returns the number of matrices capped."""
+    if r_min <= 1.0:
         return 0
-    u = wv / sigma.clamp_min(1e-30)[:, None, None]
-    shrink = torch.where(over, sigma - cap, torch.zeros_like(sigma))[:, None, None]
-    W2 = W - shrink * (u @ v.transpose(-2, -1))
-    W2 = W2 * (row_norm / W2.norm(dim=-1, keepdim=True).clamp_min(1e-30))
-    W = torch.where(over[:, None, None], W2, W)
+    W = w.float().reshape(-1, w.shape[-2], w.shape[-1])
+    capped_any = None
+    for _ in range(rounds):
+        fro2 = W.square().sum(dim=(-2, -1))
+        v = W.abs().sum(dim=-2, keepdim=True).transpose(-2, -1)  # [B, n, 1]
+        for _ in range(iters):
+            v = W.transpose(-2, -1) @ (W @ v)
+            v = v / v.norm(dim=-2, keepdim=True).clamp_min(1e-30)
+        wv = W @ v
+        sigma = wv.norm(dim=(-2, -1))
+        over = sigma.square() * r_min > fro2
+        if not bool(over.any()):
+            break
+        c = ((fro2 - sigma.square()).clamp_min(0) / (r_min - 1.0)).sqrt()
+        u = wv / sigma.clamp_min(1e-30)[:, None, None]
+        shrink = torch.where(over, sigma - c, torch.zeros_like(sigma))[:, None, None]
+        W = W - shrink * (u @ v.transpose(-2, -1))
+        capped_any = over if capped_any is None else (capped_any | over)
+    if capped_any is None:
+        return 0
     w.copy_(W.reshape(w.shape).to(w.dtype))
-    return int(over.sum())
+    if g is not None:
+        rows = w.float().norm(dim=-1, keepdim=True).clamp_min(ANGULAR_MUOWN_EPS)
+        g.copy_(torch.copysign(rows.reshape(g.shape), g.float()).to(g.dtype))
+    return int(capped_any.sum())
 
 
 def _batched_newton_schulz(
@@ -1437,7 +1434,7 @@ class TensorParallelAngularMuown(TensorParallelMuon):
             if v_norm is not None:
                 v_norm.copy_(u_step_norm_sq.sqrt().clamp_min(ANGULAR_MUOWN_EPS))
             if self._stable_rank_floor and reduce_group is None and _is_expert_param(p):
-                _stable_rank_floor_(p.data, self._stable_rank_floor)
+                _stable_rank_floor_(p.data, self._stable_rank_floor, g=g)
 
     # ------------------------------------------------------------------
     # Batched step
@@ -1605,12 +1602,13 @@ class TensorParallelAngularMuown(TensorParallelMuon):
         if self._stable_rank_floor and reduce_group is None:
             experts = [i for i, p in enumerate(params) if _is_expert_param(p)]
             if len(experts) == len(params):
-                _stable_rank_floor_(w_b, self._stable_rank_floor)
+                _stable_rank_floor_(w_b, self._stable_rank_floor, g=g_b)
             elif experts:
                 idx = torch.tensor(experts, device=w_b.device)
-                sub = w_b.index_select(0, idx)
-                _stable_rank_floor_(sub, self._stable_rank_floor)
+                sub, sub_g = w_b.index_select(0, idx), g_b.index_select(0, idx)
+                _stable_rank_floor_(sub, self._stable_rank_floor, g=sub_g)
                 w_b.index_copy_(0, idx, sub)
+                g_b.index_copy_(0, idx, sub_g)
         if v_norm is not None:
             v_norm.copy_(u_step_norm_sq.sqrt().clamp_min(ANGULAR_MUOWN_EPS))
             torch._foreach_copy_([local(state["v_norm"]) for state in states],
