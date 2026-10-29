@@ -19,7 +19,7 @@ class TestQBDualUpdate:
     """Pure-tensor tests for the quantile-balancing dual update (CPU, no distributed)."""
 
     @pytest.mark.internal
-    @pytest.mark.parametrize("m,n,k", [(64, 8, 2), (40, 8, 1), (12, 4, 1)])
+    @pytest.mark.parametrize("m,n,k", [(64, 8, 2), (40, 8, 1), (12, 4, 1), (64, 27, 5), (100, 12, 3)])
     def test_column_quantile_contract(self, m, n, k):
         """qb_beta_local is the (col_target+1)-th largest score minus alpha per expert."""
         torch.manual_seed(123)
@@ -33,6 +33,26 @@ class TestQBDualUpdate:
         col_target = m * k // n
         expected = adjusted.sort(dim=0, descending=True).values[col_target]
         torch.testing.assert_close(beta_local, expected)
+
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize("m,n,k", [(4096, 216, 5), (4096, 112, 5), (4096, 64, 4)])
+    def test_dual_update_balances_non_divisible_loads(self, m, n, k):
+        """n need not divide m * k (216 or 112 experts at 2^j tokens, top-5): routing with the
+        bias the update returns gives every expert about m * k / n tokens; the bias from
+        imbalanced scores (a per-expert offset) cancels the offset."""
+        torch.manual_seed(0)
+        scores = torch.randn(m, n) + torch.linspace(-2.0, 2.0, n)
+        beta = torch.zeros(n)
+        for _ in range(30):
+            _, beta = qb_dual_update(scores, k, beta, update_beta=True)
+            beta = beta - beta.mean()
+        indices, _ = qb_dual_update(scores, k, beta, update_beta=False)
+        load = torch.bincount(indices.flatten(), minlength=n).float()
+        share = m * k / n
+        assert load.sum() == m * k
+        # bias-free routing puts ~0 tokens on the lowest-offset experts; balanced: within 15 %
+        assert (load - share).abs().max() < 0.15 * share, (load.min(), load.max(), share)
 
 
 class TestQuantileBalancingRouter:

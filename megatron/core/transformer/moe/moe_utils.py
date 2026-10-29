@@ -227,11 +227,9 @@ def qb_dual_update(
     if not update_beta:
         return indices, beta
 
-    assert (num_tokens * k) % num_experts == 0, (
-        "Quantile balancing requires the number of routed assignments "
-        f"({num_tokens} tokens * top-{k}) to be divisible by "
-        f"{num_experts} experts."
-    )
+    # Each expert's target load: m * k / n tokens, rounded down when n does not divide m * k
+    # (e.g. 216 experts at 4 x 16k tokens, top-5): the quantile then aims a fraction of a token
+    # below the exact share, and the shares of all experts still sum to m * k (top-k per token).
     col_target = num_tokens * k // num_experts
     alpha = topk_result.values[:, -1:]
     beta_local = (scores - alpha).topk(col_target + 1, dim=0).values[-1].contiguous()
