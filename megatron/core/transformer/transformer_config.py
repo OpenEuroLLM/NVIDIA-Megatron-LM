@@ -1279,7 +1279,10 @@ class TransformerConfig(ModelParallelConfig):
     - "sinkhorn": Balancing algorithm used in S-BASE.
     - "quantile_balancing": Dual coordinate-descent quantile balancing (QB). Load balance is
     handled entirely by an internal per-expert bias update; auxiliary losses must be disabled
-    (`moe_aux_loss_coeff` = 0) when QB is selected.
+    (`moe_aux_loss_coeff` = 0) when QB is selected alone. In the list form QB routes and the
+    listed auxiliary losses are added, e.g. ``[quantile_balancing, seq_aux_loss]`` with
+    `moe_aux_loss_coeff` ``[0.0, 1e-4]`` (QB's entry 0): QB balances the global batch, the small
+    sequence-level loss each sequence (DeepSeek-V3's complement to its bias).
     - "none": No load balancing.
     A list of strings can be provided to combine multiple aux-loss load balancing types.
     The default is "aux_loss".
@@ -2862,6 +2865,27 @@ class TransformerConfig(ModelParallelConfig):
                 "moe_aux_loss_coeff must be a list of the same length as "
                 "moe_router_load_balancing_type"
             )
+
+        from megatron.core.transformer.moe.moe_utils import uses_quantile_balancing
+
+        if uses_quantile_balancing(self.moe_router_load_balancing_type):
+            if self.moe_router_enable_expert_bias:
+                raise ValueError(
+                    "quantile_balancing keeps its own per-expert bias (qb_beta): disable "
+                    "moe_router_enable_expert_bias"
+                )
+            if isinstance(self.moe_router_load_balancing_type, list):
+                for kind, coeff in zip(self.moe_router_load_balancing_type, self.moe_aux_loss_coeff):
+                    if kind == "quantile_balancing" and coeff != 0:
+                        raise ValueError(
+                            "the moe_aux_loss_coeff entry of quantile_balancing must be 0 (QB "
+                            "has no loss; the other entries weight the auxiliary losses)"
+                        )
+                    if kind not in ("quantile_balancing", "aux_loss", "seq_aux_loss",
+                                    "global_aux_loss", "none"):
+                        raise ValueError(
+                            f"quantile_balancing combines only with auxiliary losses, not {kind}"
+                        )
 
         if self.moe_expert_viability_metrics and not self.moe_per_layer_logging:
             raise ValueError("moe_expert_viability_metrics requires moe_per_layer_logging.")

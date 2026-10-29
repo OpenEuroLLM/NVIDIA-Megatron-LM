@@ -686,7 +686,9 @@ def finalize_model_grads(
             )
         update_routed_residual_bias(model, config, tp_dp_cp_group=balance_group)
 
-    if config.moe_router_load_balancing_type == "quantile_balancing":
+    from megatron.core.transformer.moe.moe_utils import uses_quantile_balancing
+
+    if uses_quantile_balancing(config.moe_router_load_balancing_type):
         _update_router_qb_beta(model, config, dp_cp_group=dp_cp_group)
 
     reset_model_temporary_tensors(config, model)

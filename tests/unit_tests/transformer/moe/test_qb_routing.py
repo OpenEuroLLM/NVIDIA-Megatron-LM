@@ -157,3 +157,70 @@ class TestQuantileBalancingRouter:
 
         with pytest.raises(AssertionError, match="does not support padding masks"):
             self.router(hidden_states, padding_mask=padding_mask)
+
+
+class TestQuantileBalancingWithAuxLoss:
+    """[quantile_balancing, seq_aux_loss]: QB routes, the listed auxiliary loss is added."""
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @staticmethod
+    def _config(load_balancing_type, coeff, **kw):
+        return TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            num_moe_experts=8,
+            use_cpu_initialization=True,
+            moe_router_load_balancing_type=load_balancing_type,
+            moe_router_score_function="sigmoid",
+            moe_router_topk=2,
+            moe_aux_loss_coeff=coeff,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            add_bias_linear=False,
+            **kw,
+        )
+
+    def _router(self, load_balancing_type, coeff):
+        config = self._config(load_balancing_type, coeff)
+        submodules = get_submodules(
+            get_gpt_layer_local_submodules(num_experts=8, moe_grouped_gemm=False).mlp
+        )
+        torch.manual_seed(0)
+        return cast(Router, MoELayer(config, submodules).router).cuda()
+
+    @pytest.mark.internal
+    def test_config_validation(self):
+        self._config(["quantile_balancing", "seq_aux_loss"], [0.0, 1e-4])  # valid
+        with pytest.raises(ValueError, match="must be 0"):
+            self._config(["quantile_balancing", "seq_aux_loss"], [1e-4, 1e-4])
+        with pytest.raises(ValueError, match="only with auxiliary losses"):
+            self._config(["quantile_balancing", "sinkhorn"], [0.0, 0.0])
+        with pytest.raises(ValueError, match="qb_beta"):
+            self._config("quantile_balancing", 0.0, moe_router_enable_expert_bias=True)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_qb_routes_and_the_aux_loss_adds_gradient(self):
+        hidden = torch.randn((32, 2, 12), device="cuda").bfloat16()
+        grads = {}
+        for name, lb, coeff in (
+            ("qb", "quantile_balancing", 0.0),
+            ("qb_seq", ["quantile_balancing", "seq_aux_loss"], [0.0, 1e-1]),
+        ):
+            router = self._router(lb, coeff)
+            router.train()
+            assert router.uses_qb and router.qb_beta_count.item() == 0
+            probs, routing_map = router(hidden)
+            assert router.qb_beta_count.item() == 1  # QB routed and accumulated its quantile
+            assert routing_map.sum().item() == 64 * 2
+            probs.sum().backward()
+            grads[name] = router.weight.grad.float().clone()
+        # the same QB routing; the aux loss adds its gradient to the router weight
+        assert not torch.allclose(grads["qb"], grads["qb_seq"])

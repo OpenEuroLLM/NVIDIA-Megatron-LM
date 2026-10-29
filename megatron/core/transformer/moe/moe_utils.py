@@ -200,6 +200,15 @@ def sinkhorn(cost: torch.Tensor, tol: float = 0.0001) -> torch.Tensor:
     return d1 * cost * d0.unsqueeze(1)
 
 
+def uses_quantile_balancing(load_balancing_type) -> bool:
+    """True when quantile balancing (QB) routes: ``moe_router_load_balancing_type`` is
+    "quantile_balancing", or a list holding it next to auxiliary losses (e.g.
+    ``[quantile_balancing, seq_aux_loss]``: QB picks the experts, the aux loss is added)."""
+    if isinstance(load_balancing_type, (list, tuple)):
+        return "quantile_balancing" in load_balancing_type
+    return load_balancing_type == "quantile_balancing"
+
+
 def qb_dual_update(
     scores: torch.Tensor, k: int, beta: torch.Tensor, update_beta: bool = True
 ) -> Tuple[torch.Tensor, torch.Tensor]:

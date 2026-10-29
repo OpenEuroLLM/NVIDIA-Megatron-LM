@@ -23,6 +23,7 @@ from megatron.core.transformer.moe.moe_utils import (
     sinkhorn,
     switch_load_balancing_loss_func,
     topk_routing_with_score_function,
+    uses_quantile_balancing,
     z_loss_func,
 )
 from megatron.core.transformer.moe.router_replay import RouterReplay
@@ -221,10 +222,14 @@ class TopKRouter(Router):
         # Quantile balancing replaces the aux loss with a per-expert bias `qb_beta`.
         # `qb_beta_accum`/`qb_beta_count` collect the per-microbatch quantile, reduced
         # and reset each global batch.
-        if self.routing_type == "quantile_balancing":
-            assert not self.is_aux_loss_enabled(), (
+        # Combined with auxiliary losses only in the list form ([quantile_balancing,
+        # seq_aux_loss]): QB alone takes no aux loss.
+        self.uses_qb = uses_quantile_balancing(self.routing_type)
+        if self.uses_qb:
+            assert isinstance(self.routing_type, list) or not self.is_aux_loss_enabled(), (
                 "Quantile balancing handles load balance via the bias update; "
-                "aux losses must be disabled (set moe_aux_loss_coeff to 0)."
+                "aux losses must be disabled (set moe_aux_loss_coeff to 0), or listed next to it "
+                "(moe_router_load_balancing_type [quantile_balancing, seq_aux_loss])."
             )
             self.register_buffer(
                 'qb_beta',
@@ -813,7 +818,7 @@ class TopKRouter(Router):
         # Calculate probs and routing_map for token dispatching
         if self.routing_type == "sinkhorn":
             probs, routing_map = self.sinkhorn_load_balancing(logits)
-        elif self.routing_type == "quantile_balancing":
+        elif self.uses_qb:
             assert (
                 padding_mask is None
             ), "Quantile balancing routing does not support padding masks yet."
