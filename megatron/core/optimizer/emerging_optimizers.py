@@ -763,7 +763,22 @@ def _is_expert_param(p) -> bool:
 
 
 @torch.no_grad()
-def _stable_rank_floor_(w: torch.Tensor, r_min: float, iters: int = 4) -> int:
+def _stable_rank_floor_(w: torch.Tensor, r_min: float, iters: int = 4, rounds: int = 4) -> int:
+    """:func:`_stable_rank_floor_once_` repeated (up to ``rounds``) while a matrix is still below
+    the floor: restoring the row norms after a deflation re-inflates a strongly collapsed matrix
+    (one round lifts stable rank ~1.6 only to ~4), so one round per step can trail a fast push.
+    The extra rounds run only while some matrix is capped. Returns the number capped in round 1."""
+    first = _stable_rank_floor_once_(w, r_min, iters)
+    n = first
+    for _ in range(rounds - 1):
+        if n == 0:
+            break
+        n = _stable_rank_floor_once_(w, r_min, iters)
+    return first
+
+
+@torch.no_grad()
+def _stable_rank_floor_once_(w: torch.Tensor, r_min: float, iters: int = 4) -> int:
     """Hold every matrix of ``w`` ([m, n] or [B, m, n]) at stable rank >= ``r_min``, in place:
     where sigma_max^2 > |W|_F^2 / r_min, shrink the top singular direction to
     sigma = |W|_F / sqrt(r_min) (a rank-1 deflation, the other directions untouched), then restore
