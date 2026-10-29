@@ -2555,3 +2555,34 @@ def test_muown_classical_g_weight_decay_caps_the_row_norms(batched):
     with pytest.raises(ValueError, match="g_weight_decay"):
         TensorParallelMuownClassical(params=[torch.nn.Parameter(torch.randn(4, 4, device='cuda'))],
                                      g_weight_decay=-1.0)
+
+
+@pytest.mark.parametrize("batched", [False, True])
+def test_muown_classical_stable_rank_floor_holds_expert_matrices(batched):
+    """stable_rank_floor: a persistent rank-1 gradient collapses a matrix's spectrum at flat row
+    norms; the expert matrix (allreduce=False) is held near the floor, the dense one is not."""
+    from megatron.core.optimizer.emerging_optimizers import TensorParallelMuownClassical
+
+    torch.manual_seed(0)
+    expert = torch.nn.Parameter(torch.randn(48, 96, device='cuda') * 0.02)
+    expert.allreduce = False
+    dense = torch.nn.Parameter(expert.detach().clone())
+    opt = TensorParallelMuownClassical(
+        params=[expert, dense], lr=0.05, momentum=0.95, nesterov=True, betas=(0.9, 0.95),
+        num_ns_steps=5, scale_mode="shape_scaling", pg_collection=None, tp_mode="duplicated",
+        batched_step=batched, stable_rank_floor=10.0)
+    direction = torch.randn(48, 1, device='cuda') @ torch.randn(1, 96, device='cuda')
+    for _ in range(300):
+        for p in (expert, dense):
+            p.grad = -direction.clone()
+        opt.step()
+
+    def srank(w):
+        s = torch.linalg.svdvals(w.detach().float())
+        return float(s.square().sum() / s[0].square())
+
+    assert srank(dense) < 3.0, srank(dense)
+    assert srank(expert) > 0.85 * 10.0, srank(expert)
+    with pytest.raises(ValueError, match="stable_rank_floor"):
+        TensorParallelMuownClassical(params=[torch.nn.Parameter(torch.randn(4, 4, device='cuda'))],
+                                     stable_rank_floor=-1.0)

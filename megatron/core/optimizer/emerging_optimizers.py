@@ -757,6 +757,42 @@ def _angular_muown_u_recompose(
     w.copy_(g * (u_step / u_step_norm))
 
 
+def _is_expert_param(p) -> bool:
+    """Routed-expert weights carry allreduce=False (expert-data-parallel gradient reduction)."""
+    return getattr(p, "allreduce", True) is False
+
+
+@torch.no_grad()
+def _stable_rank_floor_(w: torch.Tensor, r_min: float, iters: int = 4) -> int:
+    """Hold every matrix of ``w`` ([m, n] or [B, m, n]) at stable rank >= ``r_min``, in place:
+    where sigma_max^2 > |W|_F^2 / r_min, shrink the top singular direction to
+    sigma = |W|_F / sqrt(r_min) (a rank-1 deflation, the other directions untouched), then restore
+    each row's norm (Muown's row magnitudes g stay what they were). sigma_max and its singular
+    vectors come from a short power iteration started at the column sums, deterministic on every
+    replica; a collapsed matrix (the runaway experts: top-5 share of |W|^2 0.1-0.25 against 0.02)
+    has a large spectral gap, so a few iterations suffice. Returns the number of matrices capped."""
+    W = w.float().reshape(-1, w.shape[-2], w.shape[-1])
+    row_norm = W.norm(dim=-1, keepdim=True)
+    fro2 = row_norm.square().sum(dim=(-2, -1))
+    v = W.sum(dim=-2, keepdim=True).transpose(-2, -1)  # [B, n, 1]
+    for _ in range(iters):
+        v = W.transpose(-2, -1) @ (W @ v)
+        v = v / v.norm(dim=-2, keepdim=True).clamp_min(1e-30)
+    wv = W @ v  # [B, m, 1]
+    sigma = wv.norm(dim=(-2, -1))
+    cap = (fro2 / r_min).sqrt()
+    over = sigma > cap
+    if not bool(over.any()):
+        return 0
+    u = wv / sigma.clamp_min(1e-30)[:, None, None]
+    shrink = torch.where(over, sigma - cap, torch.zeros_like(sigma))[:, None, None]
+    W2 = W - shrink * (u @ v.transpose(-2, -1))
+    W2 = W2 * (row_norm / W2.norm(dim=-1, keepdim=True).clamp_min(1e-30))
+    W = torch.where(over[:, None, None], W2, W)
+    w.copy_(W.reshape(w.shape).to(w.dtype))
+    return int(over.sum())
+
+
 def _batched_newton_schulz(
     x: torch.Tensor,
     steps: int,
@@ -949,6 +985,8 @@ class TensorParallelAngularMuown(TensorParallelMuon):
     _v_weight_decay = 0.0
     # decoupled weight decay on the row magnitudes g (TensorParallelMuownClassical only)
     _g_weight_decay = 0.0
+    # stable-rank floor of the expert matrices (TensorParallelMuownClassical only; 0 = off)
+    _stable_rank_floor = 0.0
 
     def __init__(
         self,
@@ -1383,6 +1421,8 @@ class TensorParallelAngularMuown(TensorParallelMuon):
             _angular_muown_u_recompose(p, g, u_step, u_step_norm_sq)
             if v_norm is not None:
                 v_norm.copy_(u_step_norm_sq.sqrt().clamp_min(ANGULAR_MUOWN_EPS))
+            if self._stable_rank_floor and reduce_group is None and _is_expert_param(p):
+                _stable_rank_floor_(p.data, self._stable_rank_floor)
 
     # ------------------------------------------------------------------
     # Batched step
@@ -1547,6 +1587,15 @@ class TensorParallelAngularMuown(TensorParallelMuon):
                 u_step_norm_sq, op=torch.distributed.ReduceOp.SUM, group=reduce_group
             )
         _angular_muown_u_recompose(w_b, g_b, u_step, u_step_norm_sq)
+        if self._stable_rank_floor and reduce_group is None:
+            experts = [i for i, p in enumerate(params) if _is_expert_param(p)]
+            if len(experts) == len(params):
+                _stable_rank_floor_(w_b, self._stable_rank_floor)
+            elif experts:
+                idx = torch.tensor(experts, device=w_b.device)
+                sub = w_b.index_select(0, idx)
+                _stable_rank_floor_(sub, self._stable_rank_floor)
+                w_b.index_copy_(0, idx, sub)
         if v_norm is not None:
             v_norm.copy_(u_step_norm_sq.sqrt().clamp_min(ANGULAR_MUOWN_EPS))
             torch._foreach_copy_([local(state["v_norm"]) for state in states],
@@ -1774,7 +1823,8 @@ class TensorParallelMuownClassical(TensorParallelAngularMuown):
     _row_state_keys = (*ANGULAR_MUOWN_ROW_STATE_KEYS, "v_norm")
 
     def __init__(
-        self, params: ParamsT, v_weight_decay: float = 0.0, g_weight_decay: float = 0.0, **kwargs
+        self, params: ParamsT, v_weight_decay: float = 0.0, g_weight_decay: float = 0.0,
+        stable_rank_floor: float = 0.0, **kwargs
     ) -> None:
         """``v_weight_decay`` (not in the Muown paper, default off): decoupled weight decay on v,
         v <- v - lr (update + lambda v). v / ||v|| does not depend on ||v||, so it only shrinks the
@@ -1785,7 +1835,13 @@ class TensorParallelMuownClassical(TensorParallelAngularMuown):
         ``g_weight_decay`` (default off): decoupled weight decay on the row magnitudes g,
         g <- g (1 - lr lambda) before their Adam step. Adam moves g by ~lr per step whatever the
         gradient's size, so without it g drifts without bound along a persistent gradient sign; the
-        decay balances that push at |g| ~ 1 / lambda and is negligible for rows well below it."""
+        decay balances that push at |g| ~ 1 / lambda and is negligible for rows well below it.
+
+        ``stable_rank_floor`` (default off): after each step, the routed-expert matrices
+        (allreduce=False) are held at stable rank |W|_F^2 / sigma_max^2 >= this value by a rank-1
+        deflation of their top singular direction at fixed row norms. A runaway expert collapses
+        its fc1 / fc2 spectra while every norm stays flat (stable rank down to single digits
+        against ~200-300); a floor of ~30-50 never touches a normal expert."""
         for name in kwargs:
             if name.startswith("u_") or name in {"weight_decay", "use_decoupled_weight_decay"}:
                 raise ValueError(f"Muown does not support {name}")
@@ -1793,9 +1849,12 @@ class TensorParallelMuownClassical(TensorParallelAngularMuown):
             raise ValueError("v_weight_decay must be finite and nonnegative")
         if not (math.isfinite(g_weight_decay) and g_weight_decay >= 0.0):
             raise ValueError("g_weight_decay must be finite and nonnegative")
+        if not (math.isfinite(stable_rank_floor) and stable_rank_floor >= 0.0):
+            raise ValueError("stable_rank_floor must be finite and nonnegative")
         super().__init__(params, **kwargs)
         self._v_weight_decay = float(v_weight_decay)
         self._g_weight_decay = float(g_weight_decay)
+        self._stable_rank_floor = float(stable_rank_floor)
         for group in self.param_groups:
             if "u_lr" in group:
                 raise ValueError("Muown uses the ordinary lr, not u_lr")
@@ -1982,6 +2041,7 @@ def _muown_classical_config_to_kwargs(config, model_chunks, pg_collection) -> Di
     kwargs = {name: value for name, value in kwargs.items() if not name.startswith("u_")}
     kwargs["v_weight_decay"] = getattr(config, "muown_classical_v_weight_decay", 0.0)
     kwargs["g_weight_decay"] = getattr(config, "muown_classical_g_weight_decay", 0.0)
+    kwargs["stable_rank_floor"] = getattr(config, "muown_expert_stable_rank_floor", 0.0)
     return kwargs
 
 

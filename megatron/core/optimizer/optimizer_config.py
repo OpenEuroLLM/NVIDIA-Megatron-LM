@@ -453,6 +453,11 @@ class OptimizerConfig:
     """muown_classical: decoupled weight decay on the unnormalized direction vectors v (not in the
     Muown paper): the rotation rate settles at ~sqrt(2 lr lambda) instead of annealing as t^-1/2."""
 
+    muown_expert_stable_rank_floor: float = 0.0
+    """muown_classical: hold every routed-expert matrix at stable rank |W|_F^2 / sigma_max^2 >= this
+    value after each step (a rank-1 deflation of the top singular direction at fixed row norms;
+    0 = off). Targets the runaway experts whose spectra collapse at flat norms."""
+
     muown_classical_g_weight_decay: float = 0.0
     """muown_classical: decoupled weight decay on the row magnitudes g, g <- g (1 - lr lambda): a soft
     cap at |g| ~ 1 / lambda against the Adam drift of g (~lr per step along a persistent sign)."""
