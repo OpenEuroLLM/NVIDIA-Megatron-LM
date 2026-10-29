@@ -151,18 +151,24 @@ def weighted_clamped_swiglu_back(g, y, weights, limit: float):
 # kernel each way, the reduction in fp32; the backward recomputes h from the saved fc1 output.
 # limit: the activation clamp (inf = none).
 @jit_fuser
-def normed_swiglu(y, weights: Optional[torch.Tensor], limit: float, eps: float):
+def normed_swiglu(
+    y, weights: Optional[torch.Tensor], limit: float, eps: float, floor: float = 0.0
+):
+    """floor > 0: the bounded norm h / max(rms(h), floor) -- rows below the floor pass through
+    (scaled by 1 / floor), larger ones are normalized to rms floor."""
     dtype = y.dtype
     y_1, y_2 = torch.chunk(y.float(), 2, -1)
     act = F.silu(y_1.clamp(max=limit)) * y_2.clamp(min=-limit, max=limit)
-    act = act * torch.rsqrt(act.square().mean(-1, keepdim=True) + eps)
+    act = act * torch.rsqrt((act.square().mean(-1, keepdim=True) + eps).clamp(min=floor * floor))
     if weights is not None:
         act = act * weights
     return act.to(dtype)
 
 
 @jit_fuser
-def normed_swiglu_back(g, y, weights: Optional[torch.Tensor], limit: float, eps: float):
+def normed_swiglu_back(
+    g, y, weights: Optional[torch.Tensor], limit: float, eps: float, floor: float = 0.0
+):
     """Gradients of :func:`normed_swiglu` w.r.t. ``y`` (dtype of ``y``) and ``weights`` (its dtype;
     None without weights): with n = h r, r = (mean(h^2) + eps)^-1/2 and G the gradient at n,
     dL/dh = r (G - n mean(G n))."""
@@ -173,24 +179,27 @@ def normed_swiglu_back(g, y, weights: Optional[torch.Tensor], limit: float, eps:
     s_1 = torch.sigmoid(c_1)
     act_1 = c_1 * s_1
     act = act_1 * c_2
-    r = torch.rsqrt(act.square().mean(-1, keepdim=True) + eps)
+    ms = act.square().mean(-1, keepdim=True) + eps
+    active = (ms >= floor * floor).float()  # rows held at the floor: r is a constant there
+    r = torch.rsqrt(ms.clamp(min=floor * floor))
     n = act * r
     gf = g.float()
     weights_grad = None
     if weights is not None:
         weights_grad = torch.sum(n * gf, dim=-1, keepdim=True).to(weights.dtype)
         gf = gf * weights.float()
-    ga = r * (gf - n * (gf * n).mean(-1, keepdim=True))
+    ga = r * (gf - active * n * (gf * n).mean(-1, keepdim=True))
     d_1 = ga * s_1 * (1 + c_1 * (1 - s_1)) * c_2 * (y_1 <= limit)
     d_2 = ga * act_1 * (y_2.abs() <= limit)
     return torch.cat((d_1, d_2), -1).to(input_dtype), weights_grad
 
 
-def post_act_rms_norm(x: torch.Tensor, eps: float) -> torch.Tensor:
-    """The unfused post-activation norm (any activation): x / rms(x) over the last dimension,
-    in fp32, no scale vector."""
+def post_act_rms_norm(x: torch.Tensor, eps: float, floor: float = 0.0) -> torch.Tensor:
+    """The unfused post-activation norm (any activation): x / max(rms(x), floor) over the last
+    dimension, in fp32, no scale vector (floor 0: x / rms(x))."""
     xf = x.float()
-    return (xf * torch.rsqrt(xf.square().mean(-1, keepdim=True) + eps)).to(x.dtype)
+    ms = (xf.square().mean(-1, keepdim=True) + eps).clamp(min=floor * floor)
+    return (xf * torch.rsqrt(ms)).to(x.dtype)
 
 
 def _swiglu_fwd(y, limit):
@@ -320,32 +329,38 @@ class WeightedSwiGLUFunction(torch.autograd.Function):
 
 class NormedSwiGLUFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, input, weights, fp8_input_store, limit, eps):
+    def forward(ctx, input, weights, fp8_input_store, limit, eps, floor=0.0):
         input_for_backward = input.to(torch.float8_e4m3fn) if fp8_input_store else input
         ctx.save_for_backward(input_for_backward, weights)
         ctx.ori_input_dtype = input.dtype
         ctx.fp8_input_store = fp8_input_store
-        ctx.limit, ctx.eps = limit, eps
-        return normed_swiglu(input, weights, limit, eps)
+        ctx.limit, ctx.eps, ctx.floor = limit, eps, floor
+        return normed_swiglu(input, weights, limit, eps, floor)
 
     @staticmethod
     def backward(ctx, grad_output):
         input, weights = ctx.saved_tensors
         input = input.to(ctx.ori_input_dtype) if ctx.fp8_input_store else input
-        tmp, wgrad = normed_swiglu_back(grad_output, input, weights, ctx.limit, ctx.eps)
-        return tmp, wgrad, None, None, None
+        tmp, wgrad = normed_swiglu_back(
+            grad_output, input, weights, ctx.limit, ctx.eps, ctx.floor
+        )
+        return tmp, wgrad, None, None, None, None
 
 
-def normed_swiglu_impl(input, weights=None, fp8_input_store=False, limit=None, eps=1e-6):
+def normed_swiglu_impl(
+    input, weights=None, fp8_input_store=False, limit=None, eps=1e-6, floor=0.0
+):
     """SwiGLU, then the per-token RMS norm over the hidden units (no scale vector), then the
-    optional token-wise weights (the router probabilities), fused: weights * h / rms(h)."""
+    optional token-wise weights (the router probabilities), fused: weights * h / rms(h); with
+    floor > 0 the bounded weights * h / max(rms(h), floor)."""
     ori_shape = input.shape
     assert len(ori_shape) in [2, 3]
     input = input.view(-1, ori_shape[-1])
     if weights is not None:
         weights = weights.reshape(-1, 1)
     output = NormedSwiGLUFunction.apply(
-        input, weights, fp8_input_store, float("inf") if limit is None else float(limit), eps
+        input, weights, fp8_input_store, float("inf") if limit is None else float(limit), eps,
+        float(floor),
     )
     return output if len(ori_shape) == 2 else output.view(ori_shape[0], ori_shape[1], -1)
 

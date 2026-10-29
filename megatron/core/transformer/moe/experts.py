@@ -189,7 +189,7 @@ def _post_act_normed(
     """The expert activation with moe_expert_post_act_norm: probs * act(x) / rms(act(x)). SwiGLU
     without bias / interleaving runs the fused kernel (clamp included); anything else the
     unfused activation, then the norm, then the router weight."""
-    eps = config.layernorm_epsilon
+    eps, floor = config.layernorm_epsilon, config.post_act_norm_floor
     limit = config.activation_func_clamp_value
     if (
         config.gated_linear_unit
@@ -198,7 +198,9 @@ def _post_act_normed(
         and not with_glu_interleaving
         and config.glu_linear_offset == 0.0
     ):
-        return normed_swiglu_impl(x, probs, config.activation_func_fp8_input_store, limit, eps)
+        return normed_swiglu_impl(
+            x, probs, config.activation_func_fp8_input_store, limit, eps, floor
+        )
     if bias is not None:
         x = x + bias
     if with_glu_interleaving:
@@ -211,7 +213,7 @@ def _post_act_normed(
         x = config.activation_func(x_glu) * (x_linear + config.glu_linear_offset)
     else:
         x = activation_func(x)
-    x = post_act_rms_norm(x, eps)
+    x = post_act_rms_norm(x, eps, floor)
     if probs is not None:
         x = (x * probs).to(x.dtype)
     return x

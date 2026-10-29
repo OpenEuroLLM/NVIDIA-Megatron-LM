@@ -23,26 +23,29 @@ from tests.unit_tests.test_utilities import Utils
 EPS = 1e-5
 
 
-def _reference(h, probs, limit):
+def _reference(h, probs, limit, floor=0.0):
     y1, y2 = torch.chunk(h.float(), 2, -1)
     if limit is not None:
         y1, y2 = y1.clamp(max=limit), y2.clamp(min=-limit, max=limit)
     a = F.silu(y1) * y2
-    a = a * torch.rsqrt(a.square().mean(-1, keepdim=True) + EPS)
+    a = a * torch.rsqrt((a.square().mean(-1, keepdim=True) + EPS).clamp(min=floor * floor))
     return a if probs is None else a * probs
 
 
 @pytest.mark.parametrize("limit", [None, 10.0, 0.7])
 @pytest.mark.parametrize("weighted", [True, False])
-def test_fused_normed_swiglu_matches_autograd(limit, weighted):
+@pytest.mark.parametrize("floor", [0.0, 1.0])
+def test_fused_normed_swiglu_matches_autograd(limit, weighted, floor):
     torch.manual_seed(0)
-    h = (torch.randn(64, 2 * 48, dtype=torch.float64) * 3).requires_grad_()
+    # rows of very different scale: with floor 1 some are held at the floor, some pass through
+    h = (torch.randn(64, 2 * 48, dtype=torch.float64) * torch.logspace(-1, 1, 64)[:, None])
+    h.requires_grad_()
     probs = torch.rand(64, 1, dtype=torch.float64).requires_grad_() if weighted else None
-    ref = _reference(h, probs, limit)
+    ref = _reference(h, probs, limit, floor)
     g = torch.randn_like(ref)
     inputs = (h, probs) if weighted else (h,)
     grads_ref = torch.autograd.grad(ref, inputs, g)
-    out = normed_swiglu_impl(h, probs, False, limit, EPS)
+    out = normed_swiglu_impl(h, probs, False, limit, EPS, floor)
     grads = torch.autograd.grad(out, inputs, g)
     # the kernel reduces in fp32 (fp64 in, fp64 out): fp32 tolerances
     torch.testing.assert_close(out, ref.to(out.dtype), atol=1e-6, rtol=1e-5)
@@ -58,6 +61,21 @@ def test_output_has_unit_rms_times_the_weight_and_bf16_runs():
     assert out.dtype == torch.bfloat16
     rms = (out.float() / probs).square().mean(-1).sqrt()
     torch.testing.assert_close(rms, torch.ones_like(rms), atol=2e-2, rtol=0)
+
+
+def test_bounded_norm_passes_small_rows_and_caps_large_ones():
+    torch.manual_seed(4)
+    small = torch.randn(8, 2 * 64) * 0.3   # rms(SwiGLU) well below 1
+    large = torch.randn(8, 2 * 64) * 30.0
+    for h, passes in ((small, True), (large, False)):
+        out = normed_swiglu_impl(h, None, False, None, EPS, 1.0)
+        y1, y2 = torch.chunk(h, 2, -1)
+        act = F.silu(y1) * y2
+        if passes:
+            torch.testing.assert_close(out, act)
+        else:
+            rms = out.square().mean(-1).sqrt()
+            torch.testing.assert_close(rms, torch.ones_like(rms), atol=1e-4, rtol=0)
 
 
 @pytest.mark.parametrize("limit", [None, 10.0, 0.7])

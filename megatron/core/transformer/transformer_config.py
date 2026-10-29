@@ -243,6 +243,12 @@ class TransformerConfig(ModelParallelConfig):
     mlp_post_act_norm: bool = False
     """The same post-activation norm in the dense MLPs and the shared experts (TP 1)."""
 
+    post_act_norm_floor: float = 0.0
+    """Both post-activation norms: 0 normalizes every token, h / rms(h); > 0 is the bounded norm
+    h / max(rms(h), floor) (anGPT's "bound"): activations below the floor pass through (scaled
+    by 1 / floor), only larger ones are held at rms floor -- a cap on runaway activations that
+    leaves normal operation unchanged."""
+
     num_moe_experts: Optional[int] = None
     """Number of experts to use for MoE layer. When set, it replaces MLP with MoE layer. Set to None
     for no MoE."""
@@ -2204,6 +2210,8 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError("moe_expert_post_act_norm needs expert tensor parallel size 1")
         if self.mlp_post_act_norm and self.tensor_model_parallel_size != 1:
             raise ValueError("mlp_post_act_norm needs tensor_model_parallel_size 1")
+        if self.post_act_norm_floor < 0.0:
+            raise ValueError("post_act_norm_floor must be >= 0")
         super().__post_init__()
 
         if self.moe_zero_expert_num:

@@ -317,6 +317,7 @@ class MLP(MegatronModule):
         scale = per_token_scale.unsqueeze(-1) if per_token_scale is not None else None
         cfg = self.config
         eps, limit = cfg.layernorm_epsilon, cfg.activation_func_clamp_value
+        floor = getattr(cfg, "post_act_norm_floor", 0.0)
         if (
             not activated
             and cfg.gated_linear_unit
@@ -324,7 +325,9 @@ class MLP(MegatronModule):
             and bias is None
             and cfg.glu_linear_offset == 0.0
         ):
-            return normed_swiglu_impl(x, scale, cfg.activation_func_fp8_input_store, limit, eps)
+            return normed_swiglu_impl(
+                x, scale, cfg.activation_func_fp8_input_store, limit, eps, floor
+            )
         if not activated:
             if bias is not None:
                 x = x + bias
@@ -336,7 +339,7 @@ class MLP(MegatronModule):
                 x = cfg.activation_func(x_glu) * (x_linear + cfg.glu_linear_offset)
             else:
                 x = self.activation_func(x)
-        x = post_act_rms_norm(x, eps)
+        x = post_act_rms_norm(x, eps, floor)
         if scale is not None:
             x = (x * scale).to(x.dtype)
         return x

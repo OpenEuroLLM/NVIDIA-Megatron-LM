@@ -54,21 +54,26 @@ def _norm_eps(config):
     return config.layernorm_epsilon if getattr(config, "moe_expert_post_act_norm", False) else None
 
 
-def _weighted_act(h, probs, limit, norm_eps=None):
+def _norm_floor(config):
+    return float(getattr(config, "post_act_norm_floor", 0.0))
+
+
+def _weighted_act(h, probs, limit, norm_eps=None, norm_floor=0.0):
     """The probability-weighted SwiGLU of the experts, clamped (activation_func_clamp_value) as
     WeightedSwiGLUFunction; with norm_eps the post-activation norm before the weight
     (moe_expert_post_act_norm, NormedSwiGLUFunction)."""
     if norm_eps is not None:
-        return normed_swiglu(h, probs, float("inf") if limit is None else float(limit), norm_eps)
+        lim = float("inf") if limit is None else float(limit)
+        return normed_swiglu(h, probs, lim, norm_eps, norm_floor)
     if limit is None:
         return weighted_swiglu(h, probs)
     return weighted_clamped_swiglu(h, probs, limit)
 
 
-def _weighted_act_back(grad_a, h, probs, limit, norm_eps=None):
+def _weighted_act_back(grad_a, h, probs, limit, norm_eps=None, norm_floor=0.0):
     if norm_eps is not None:
         lim = float("inf") if limit is None else float(limit)
-        return normed_swiglu_back(grad_a, h, probs, lim, norm_eps)
+        return normed_swiglu_back(grad_a, h, probs, lim, norm_eps, norm_floor)
     if limit is None:
         return weighted_swiglu_back(grad_a, h, probs)
     return weighted_clamped_swiglu_back(grad_a, h, probs, limit)
@@ -435,7 +440,7 @@ class _MoonEPExperts(torch.autograd.Function):
         probs = w_nvs.unsqueeze(-1)
         a = _weighted_act(
             h, probs, getattr(module.config, "activation_func_clamp_value", None),
-            _norm_eps(module.config),
+            _norm_eps(module.config), _norm_floor(module.config),
         )
         # zero copy: fc2 writes straight into the NVLink shard the combine reads (the shard is
         # free: the dispatch copied the tokens out; y is not saved for backward)
@@ -472,7 +477,7 @@ class _MoonEPExperts(torch.autograd.Function):
         _wgrad(main2, gpools[1], a, ffn, grad_y, hidden, splits, offsets, overwrite)
         grad_h, grad_probs = _weighted_act_back(
             grad_a, h, probs, getattr(module.config, "activation_func_clamp_value", None),
-            _norm_eps(module.config),
+            _norm_eps(module.config), _norm_floor(module.config),
         )
         # fc1
         # zero copy: the dispatch backward (a combine) reads fc1's dgrad from the shard
