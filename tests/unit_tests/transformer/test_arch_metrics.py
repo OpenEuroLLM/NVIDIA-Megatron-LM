@@ -171,6 +171,47 @@ def test_ldm_stream_form_reads_and_writes():
     assert all(0.0 < v < 1.0 for k, v in vals.items() if k.endswith("/forget")), vals
 
 
+LDM_METRICS = ("read_ratio", "write_ratio", "forget", "read_gain", "write_weight", "read_gate")
+
+
+@pytest.mark.parametrize("impl", ["torch", "cute"])
+def test_ldm_stream_form_under_full_recompute(impl):
+    """The production path (depth_memory_unwind + full recompute): the first forward runs without
+    grad and records nothing, the recompute in the backward records -- every LDM layer exactly
+    once per metric step (count = tokens), with the values of the run without recompute (the
+    CuTe recompute's reads come from the read kernel: within its tolerance)."""
+    if impl == "cute":
+        pytest.importorskip("cute_ldm.workspace")
+        if torch.cuda.get_device_capability()[0] not in (9, 10):
+            pytest.skip("cute_ldm needs Hopper / Blackwell")
+    kw = dict(depth_memory=True, depth_memory_impl=impl, depth_memory_groups=4,
+              depth_memory_key_dim=8, depth_memory_hidden_dim=16, use_cpu_initialization=True)
+    recompute = dict(depth_memory_unwind=True, recompute_granularity="full",
+                     recompute_method="uniform", recompute_num_layers=1 if impl == "torch" else 2)
+    ids = torch.randint(0, VOCAB, (2, 16), device="cuda")
+    results = []
+    for extra in ({}, recompute):
+        torch.manual_seed(0)  # use_cpu_initialization: the CPU generator draws the weights
+        model = _model("*-*-*-", **kw, **extra)
+        arch_metrics.reset()
+        arch_metrics.set_active(True)
+        logits = model(ids, position_ids=None, attention_mask=None)
+        logits.float().logsumexp(-1).mean().backward()
+        arch_metrics.set_active(False)
+        counts = arch_metrics._COUNTS["ldm/read_ratio"].clone()
+        results.append((counts, arch_metrics.collect()))
+    (ref_counts, ref), (counts, out) = results
+    assert torch.equal(counts, ref_counts), (counts, ref_counts)
+    assert set(counts[counts > 0].tolist()) == {float(ids.numel())}, counts  # once per token
+    assert counts.gt(0).sum() == 6  # every layer has its site
+    tol = 1e-4 if impl == "torch" else 3e-2
+    for key in LDM_METRICS:
+        layers = [k for k in ref if k.startswith(f"ldm/{key}/layer_")]
+        assert layers, (key, sorted(ref))
+        for k in layers:
+            assert out[k] == pytest.approx(ref[k], rel=tol, abs=tol), (k, out[k], ref[k])
+
+
 def test_attn_res_depth_attention():
     model = _model("*-*-*-", attn_res=True, attn_res_num_blocks=2)
     arch_metrics.set_active(True)
