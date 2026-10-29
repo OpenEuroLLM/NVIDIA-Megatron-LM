@@ -278,8 +278,54 @@ class DepthMemoryMixer(nn.Module):
             self._workspace[0].ingest(self.edge, streams)
             x = stream_x(streams)
             self._read_x = (streams, x)   # the write's residual: one gradient path into streams
-            return x + _read_from_workspace(self._workspace[0], self.edge - 1, x)
+            read = _read_from_workspace(self._workspace[0], self.edge - 1, x)
+            self._record_read(x, read)
+            return x + read
+        self._record_read(streams[..., 0, :], streams[..., 1, :])
         return streams[..., 0, :] + streams[..., 1, :]
+
+    # -- architecture metrics of the stream form (the reference DepthMemoryRead / Write record
+    #    theirs; the cute / torch stream form computes reads and writes in fused kernels) --------
+    def _tag(self):
+        from megatron.core.transformer import arch_metrics
+
+        return arch_metrics.tag_of(self) if arch_metrics.active() else None
+
+    def _record_read(self, x: torch.Tensor, read: torch.Tensor) -> None:
+        tag = self._tag()  # before no_grad: arch_metrics.active() requires grad mode
+        if tag is None:
+            return
+        with torch.no_grad():
+            self._record_read_values(tag, x, read)
+
+    def _record_read_values(self, tag, x: torch.Tensor, read: torch.Tensor) -> None:
+        from megatron.core.transformer import arch_metrics
+
+        _, layer, n = tag
+        xs = x.float().square().sum(-1).sqrt() + 1e-6
+        arch_metrics.record_mean("ldm/read_ratio", layer, n, read.float().square().sum(-1).sqrt() / xs)
+        arch_metrics.record_mean("ldm/stream_rms", layer, n, x.float().square().mean(-1).sqrt())
+
+    def _record_write(self, x: torch.Tensor, value: torch.Tensor) -> None:
+        tag = self._tag()  # before no_grad: arch_metrics.active() requires grad mode
+        if tag is None:
+            return
+        with torch.no_grad():
+            self._record_write_values(tag, x, value)
+
+    def _record_write_values(self, tag, x: torch.Tensor, value: torch.Tensor) -> None:
+        from megatron.core.transformer import arch_metrics
+
+        _, layer, n = tag
+        xs = x.float().square().sum(-1).sqrt() + 1e-6
+        arch_metrics.record_mean("ldm/write_ratio", layer, n, value.float().square().sum(-1).sqrt() / xs)
+        lam = torch.sigmoid(self.write_site.forget_logit.float())
+        arch_metrics.record_mean("ldm/forget", layer, n, lam)
+        arch_metrics.record_mean("ldm/read_gain", layer, n, self.next_query.read_gain.float().abs())
+        _, weight = self.write_site.net(x)
+        _, gate = self.next_query.net(x)
+        arch_metrics.record_mean("ldm/write_weight", layer, n, weight.float())
+        arch_metrics.record_mean("ldm/read_gate", layer, n, gate.float())
 
     def write(self, streams, sublayer_out, h_post=None, h_res=None, lerp=None) -> torch.Tensor:
         if self.edge is None:
@@ -290,11 +336,13 @@ class DepthMemoryMixer(nn.Module):
             read_x, self._read_x = getattr(self, "_read_x", None), None
             x = read_x[1] if read_x is not None and read_x[0] is streams else stream_x(streams)
             stream, value = ldm_residual(x, sublayer_out, lerp)
+            self._record_write(x, value)
             stream = ldm_step_x(
                 self.write_site, self.next_query, self._workspace[0], self.edge, stream, value
             )
             return stream_write(self._workspace[0], self.edge, stream, streams)
         stream, value = ldm_residual(streams[..., 0, :], sublayer_out, lerp)
+        self._record_write(streams[..., 0, :], value)
         read = ldm_fused_step(
             self.write_site, self.next_query, self._workspace[0], self.edge, stream, value
         )

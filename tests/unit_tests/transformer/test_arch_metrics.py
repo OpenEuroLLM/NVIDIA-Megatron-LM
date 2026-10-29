@@ -156,6 +156,21 @@ def test_dense_mhc_stream_usage():
     assert out["mhc_attn/stream_rms/max_over_min"] == pytest.approx(1.0, abs=1e-2)
 
 
+def test_ldm_stream_form_reads_and_writes():
+    """The stream form of LDM (depth_memory_impl torch / cute, the production path) records its
+    read / write statistics like the reference form."""
+    model = _model("*-*-*-", depth_memory=True, depth_memory_impl="torch")
+    arch_metrics.set_active(True)
+    _step(model)
+    out = arch_metrics.collect()
+    for key in ("read_ratio", "write_ratio", "forget", "read_gain", "write_weight", "read_gate",
+                "stream_rms"):
+        assert key in "".join(out), (key, sorted(out))
+    vals = {k: v for k, v in out.items() if k.startswith("ldm")}
+    assert all(v == v for v in vals.values()), vals  # no NaN
+    assert all(0.0 < v < 1.0 for k, v in vals.items() if k.endswith("/forget")), vals
+
+
 def test_attn_res_depth_attention():
     model = _model("*-*-*-", attn_res=True, attn_res_num_blocks=2)
     arch_metrics.set_active(True)
