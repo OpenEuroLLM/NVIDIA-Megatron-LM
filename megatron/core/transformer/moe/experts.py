@@ -183,6 +183,29 @@ class GroupedMLPSubmodules:
     """
 
 
+@torch.no_grad()
+def record_expert_act_stats(module, fc1_output: torch.Tensor, config) -> None:
+    """Architecture metrics of the routed experts' activation h = SwiGLU(fc1 x), per (token,
+    expert) row: its mean rms (moe_act/rms) and the share of rows at or above the
+    post-activation cap (moe_act/capped: rms(h) >= post_act_norm_floor, or 1 without a floor),
+    with or without the post-activation norm. Call only when arch_metrics is active (an extra
+    elementwise pass over the activation)."""
+    from megatron.core.transformer import arch_metrics
+
+    tag = arch_metrics.tag_of(module)
+    if tag is None or not config.gated_linear_unit or fc1_output.numel() == 0:
+        return
+    _, layer, n = tag
+    limit = config.activation_func_clamp_value
+    y_1, y_2 = torch.chunk(fc1_output.float(), 2, -1)
+    if limit is not None:
+        y_1, y_2 = y_1.clamp(max=limit), y_2.clamp(min=-limit, max=limit)
+    rms = (F.silu(y_1) * y_2).square().mean(-1).sqrt()
+    cap = config.post_act_norm_floor if config.post_act_norm_floor > 0 else 1.0
+    arch_metrics.record_mean("moe_act/rms", layer, n, rms)
+    arch_metrics.record_mean("moe_act/capped", layer, n, (rms >= cap).float())
+
+
 def _post_act_normed(
     config, activation_func, x, bias, probs, with_glu_interleaving, remove_glu_interleaving
 ):
@@ -190,6 +213,7 @@ def _post_act_normed(
     without bias / interleaving runs the fused kernel (clamp included); anything else the
     unfused activation, then the norm, then the router weight."""
     eps, floor = config.layernorm_epsilon, config.post_act_norm_floor
+    smooth = config.post_act_norm_smooth
     limit = config.activation_func_clamp_value
     if (
         config.gated_linear_unit
@@ -199,7 +223,7 @@ def _post_act_normed(
         and config.glu_linear_offset == 0.0
     ):
         return normed_swiglu_impl(
-            x, probs, config.activation_func_fp8_input_store, limit, eps, floor
+            x, probs, config.activation_func_fp8_input_store, limit, eps, floor, smooth
         )
     if bias is not None:
         x = x + bias
@@ -213,7 +237,7 @@ def _post_act_normed(
         x = config.activation_func(x_glu) * (x_linear + config.glu_linear_offset)
     else:
         x = activation_func(x)
-    x = post_act_rms_norm(x, eps, floor)
+    x = post_act_rms_norm(x, eps, floor, smooth)
     if probs is not None:
         x = (x * probs).to(x.dtype)
     return x
@@ -874,6 +898,10 @@ class TEGroupedMLP(MegatronModule):
         )
 
         moe_act_manager = off_interface(self.offload_moe_act, fc1_output, "moe_act")
+        from megatron.core.transformer import arch_metrics
+
+        if arch_metrics.active() and bias_parallel is None:
+            record_expert_act_stats(self, fc1_output, self.config)
 
         def bias_act_func(intermediate_parallel, bias_parallel, permuted_probs):
 

@@ -217,6 +217,7 @@ class BaseMoELayer(MegatronModule, ABC):
         from megatron.core.transformer import arch_metrics
 
         arch_metrics.tag(self.shared_experts, "mlp", layer_number, self.config)
+        arch_metrics.tag(self.experts, "mlp", layer_number, self.config)
 
 
 class MoELayer(BaseMoELayer):

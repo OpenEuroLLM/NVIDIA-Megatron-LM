@@ -160,3 +160,69 @@ class TestMoELayerPostActNorm:
                 num_layers=1, hidden_size=32, num_attention_heads=4,
                 moe_expert_post_act_norm=True, use_te_activation_func=True,
             )
+
+
+@pytest.mark.parametrize("limit", [None, 0.7])
+@pytest.mark.parametrize("weighted", [True, False])
+def test_smooth_bounded_norm_matches_autograd(limit, weighted):
+    """post_act_norm_smooth: h / sqrt(1 + mean(h^2) / c^2), fused fwd + bwd against autograd."""
+    torch.manual_seed(5)
+    c = 1.0
+    h = (torch.randn(64, 2 * 48, dtype=torch.float64) * torch.logspace(-1, 1, 64)[:, None])
+    h.requires_grad_()
+    probs = torch.rand(64, 1, dtype=torch.float64).requires_grad_() if weighted else None
+    y1, y2 = torch.chunk(h, 2, -1)
+    if limit is not None:
+        y1, y2 = y1.clamp(max=limit), y2.clamp(min=-limit, max=limit)
+    a = F.silu(y1) * y2
+    ref = a * torch.rsqrt(1.0 + a.square().mean(-1, keepdim=True) / c**2)
+    ref = ref if probs is None else ref * probs
+    g = torch.randn_like(ref)
+    inputs = (h, probs) if weighted else (h,)
+    grads_ref = torch.autograd.grad(ref, inputs, g)
+    out = normed_swiglu_impl(h, probs, False, limit, EPS, c, True)
+    grads = torch.autograd.grad(out, inputs, g)
+    torch.testing.assert_close(out, ref.to(out.dtype), atol=1e-6, rtol=1e-5)
+    for x, y in zip(grads, grads_ref):
+        torch.testing.assert_close(x, y, atol=1e-5, rtol=1e-4)
+
+
+def test_smooth_norm_is_identity_below_and_caps_above():
+    torch.manual_seed(6)
+    small, large = torch.randn(8, 128) * 0.05, torch.randn(8, 128) * 50.0
+    for h, passes in ((small, True), (large, False)):
+        out = normed_swiglu_impl(h, None, False, None, EPS, 1.0, True)
+        y1, y2 = torch.chunk(h, 2, -1)
+        act = F.silu(y1) * y2
+        if passes:
+            torch.testing.assert_close(out, act, atol=1e-4, rtol=1e-3)
+        else:
+            rms = out.square().mean(-1).sqrt()
+            torch.testing.assert_close(rms, torch.ones_like(rms), atol=1e-2, rtol=0)
+    with pytest.raises(ValueError, match="post_act_norm_smooth"):
+        TransformerConfig(num_layers=1, hidden_size=32, num_attention_heads=4,
+                          moe_expert_post_act_norm=True, post_act_norm_smooth=True)
+
+
+def test_expert_activation_metrics_are_recorded():
+    """moe_act/rms and moe_act/capped: the routed experts' activation statistics (grouped GEMM),
+    with or without the post-activation norm."""
+    from megatron.core.transformer import arch_metrics
+
+    Utils.initialize_model_parallel(1, 1)
+    model_parallel_cuda_manual_seed(123)
+    try:
+        layer = TestMoELayerPostActNorm._layer(True, True, False)
+        layer.set_layer_number(1)
+        arch_metrics.reset()
+        arch_metrics.set_active(True)
+        out, _ = layer(torch.randn(8, 2, 32, device="cuda"))
+        out.sum().backward()
+        stats = arch_metrics.collect()
+        arch_metrics.set_active(False)
+        assert any(k.startswith("moe_act/rms") for k in stats), sorted(stats)
+        capped = [v for k, v in stats.items() if k.startswith("moe_act/capped")]
+        assert capped and all(0.0 <= v <= 1.0 for v in capped)
+    finally:
+        arch_metrics.reset()
+        Utils.destroy_model_parallel()

@@ -254,6 +254,11 @@ class TransformerConfig(ModelParallelConfig):
     by 1 / floor), only larger ones are held at rms floor -- a cap on runaway activations that
     leaves normal operation unchanged."""
 
+    post_act_norm_smooth: bool = False
+    """The smooth bounded post-activation norm h / sqrt(1 + mean(h^2) / floor^2): the identity
+    for small activations and rms floor for large ones, without the kink of the max (needs
+    post_act_norm_floor > 0)."""
+
     num_moe_experts: Optional[int] = None
     """Number of experts to use for MoE layer. When set, it replaces MLP with MoE layer. Set to None
     for no MoE."""
@@ -2217,6 +2222,8 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError("mlp_post_act_norm needs tensor_model_parallel_size 1")
         if self.post_act_norm_floor < 0.0:
             raise ValueError("post_act_norm_floor must be >= 0")
+        if self.post_act_norm_smooth and not self.post_act_norm_floor > 0.0:
+            raise ValueError("post_act_norm_smooth needs post_act_norm_floor > 0 (the cap)")
         super().__post_init__()
 
         if self.moe_zero_expert_num:

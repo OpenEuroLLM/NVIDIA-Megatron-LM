@@ -58,22 +58,26 @@ def _norm_floor(config):
     return float(getattr(config, "post_act_norm_floor", 0.0))
 
 
-def _weighted_act(h, probs, limit, norm_eps=None, norm_floor=0.0):
+def _norm_smooth(config):
+    return bool(getattr(config, "post_act_norm_smooth", False))
+
+
+def _weighted_act(h, probs, limit, norm_eps=None, norm_floor=0.0, norm_smooth=False):
     """The probability-weighted SwiGLU of the experts, clamped (activation_func_clamp_value) as
     WeightedSwiGLUFunction; with norm_eps the post-activation norm before the weight
     (moe_expert_post_act_norm, NormedSwiGLUFunction)."""
     if norm_eps is not None:
         lim = float("inf") if limit is None else float(limit)
-        return normed_swiglu(h, probs, lim, norm_eps, norm_floor)
+        return normed_swiglu(h, probs, lim, norm_eps, norm_floor, norm_smooth)
     if limit is None:
         return weighted_swiglu(h, probs)
     return weighted_clamped_swiglu(h, probs, limit)
 
 
-def _weighted_act_back(grad_a, h, probs, limit, norm_eps=None, norm_floor=0.0):
+def _weighted_act_back(grad_a, h, probs, limit, norm_eps=None, norm_floor=0.0, norm_smooth=False):
     if norm_eps is not None:
         lim = float("inf") if limit is None else float(limit)
-        return normed_swiglu_back(grad_a, h, probs, lim, norm_eps, norm_floor)
+        return normed_swiglu_back(grad_a, h, probs, lim, norm_eps, norm_floor, norm_smooth)
     if limit is None:
         return weighted_swiglu_back(grad_a, h, probs)
     return weighted_clamped_swiglu_back(grad_a, h, probs, limit)
@@ -438,9 +442,14 @@ class _MoonEPExperts(torch.autograd.Function):
         h = torch.empty(x.shape[0], ffn2, dtype=x.dtype, device=x.device)
         _gemm(w1, x, hidden, h, ffn2, splits, offsets, "TN")
         probs = w_nvs.unsqueeze(-1)
+        if getattr(module, "_record_act", False):
+            from megatron.core.transformer.moe.experts import record_expert_act_stats
+
+            record_expert_act_stats(module, h, module.config)
+            module._record_act = False
         a = _weighted_act(
             h, probs, getattr(module.config, "activation_func_clamp_value", None),
-            _norm_eps(module.config), _norm_floor(module.config),
+            _norm_eps(module.config), _norm_floor(module.config), _norm_smooth(module.config),
         )
         # zero copy: fc2 writes straight into the NVLink shard the combine reads (the shard is
         # free: the dispatch copied the tokens out; y is not saved for backward)
@@ -477,7 +486,7 @@ class _MoonEPExperts(torch.autograd.Function):
         _wgrad(main2, gpools[1], a, ffn, grad_y, hidden, splits, offsets, overwrite)
         grad_h, grad_probs = _weighted_act_back(
             grad_a, h, probs, getattr(module.config, "activation_func_clamp_value", None),
-            _norm_eps(module.config), _norm_floor(module.config),
+            _norm_eps(module.config), _norm_floor(module.config), _norm_smooth(module.config),
         )
         # fc1
         # zero copy: the dispatch backward (a combine) reads fc1's dgrad from the shard
@@ -628,6 +637,10 @@ class MoonEPGroupedMLP(MegatronModule):
         return self.linear_fc1() + self.linear_fc2()
 
     def forward(self, permuted_hidden, tokens_per_expert, permuted_probs, **_):
+        from megatron.core.transformer import arch_metrics
+
+        # the expert function runs without grad mode, where arch_metrics.active() is False
+        self._record_act = arch_metrics.active()
         # tokens_per_expert carries MoonEP's cu_seqlens [2 * epn]
         out = _MoonEPExperts.apply(
             permuted_hidden, permuted_probs, tokens_per_expert, self, self.state, self.holder,
