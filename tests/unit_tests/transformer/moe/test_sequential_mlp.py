@@ -1,4 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+import os
+
 import pytest
 import torch
 
@@ -68,6 +70,10 @@ class TestParallelSequentialMLP:
         assert output.device.type == 'cuda'
 
 
+@pytest.mark.skipif(
+    torch.cuda.device_count() < 2 or int(os.environ.get("WORLD_SIZE", "1")) < 2,
+    reason="TP 2 x EP 2: needs two GPUs and a torchrun launch with WORLD_SIZE >= 2",
+)
 class TestTEParallelSequentialMLP:
     def setup_method(self, method):
         Utils.initialize_model_parallel(tensor_model_parallel_size=2, expert_model_parallel_size=2)
