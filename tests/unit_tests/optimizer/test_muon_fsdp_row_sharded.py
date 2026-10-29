@@ -105,6 +105,41 @@ def test_muown_classical_row_sharded(mesh, nesterov):
                                            reference.state[f][key][lo:hi])
 
 
+def test_muown_classical_row_sharded_stable_rank_floor(mesh):
+    """The expert stable-rank floor sees the full matrices (not a rank's rows): sharded and
+    unsharded steps agree, with the floor active."""
+    os.environ["ANGULAR_MUOWN_COMPACT_CKPT"] = "1"
+    rank = mesh.get_rank()
+    r_min = 4.0
+    options = dict(lr=0.05, nesterov=True, split_qkv=False, fp32_matmul_prec="highest",
+                   scale_mode="spectral", extra_scale_factor=0.2, stable_rank_floor=r_min)
+    fulls, shards, reference, sharded = _pair(TensorParallelMuownClassical, options, mesh, 11)
+    for p in fulls + shards:
+        p.allreduce = False  # expert parameters
+    for f in fulls:  # collapse them: rank-1 dominated, far below the floor
+        with torch.no_grad():
+            f.add_(torch.outer(torch.randn(f.shape[0], device="cuda"),
+                               torch.randn(f.shape[1], device="cuda")))
+    for f, s, (_, counts) in zip(fulls, shards, LAYOUTS):
+        lo, hi = _rows(counts, rank)
+        with torch.no_grad():
+            local(s).copy_(f[lo:hi])
+    for step in range(4):
+        torch.manual_seed(200 + step)
+        _set_grads(fulls, shards, rank)
+        reference.step()
+        sharded.step()
+        for f, s, (_, counts) in zip(fulls, shards, LAYOUTS):
+            lo, hi = _rows(counts, rank)
+            torch.testing.assert_close(local(s).detach(), f.detach()[lo:hi])
+            torch.testing.assert_close(local(sharded.state[s]["g"]),
+                                       reference.state[f]["g"][lo:hi])
+    for f in fulls:
+        if min(f.shape) > r_min:
+            srank = f.detach().square().sum() / torch.linalg.matrix_norm(f.detach(), 2) ** 2
+            assert srank > 0.8 * r_min, srank  # power-iteration sigma at a small gap
+
+
 def test_muon_row_sharded(mesh):
     rank = mesh.get_rank()
     options = dict(lr=0.02, weight_decay=0.01, split_qkv=False, fp32_matmul_prec="highest",

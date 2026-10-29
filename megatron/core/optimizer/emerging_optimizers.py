@@ -776,7 +776,7 @@ def _stable_rank_floor_(
     collapsing matrix at about half the floor. sigma_max and its singular vectors come from a
     power iteration started at the column sums of |W| (deterministic on every replica; a
     collapsed matrix has a large spectral gap). Returns the number of matrices capped."""
-    if r_min <= 1.0:
+    if r_min <= 1.0 or w.numel() == 0:
         return 0
     W = w.float().reshape(-1, w.shape[-2], w.shape[-1])
     capped_any = None
@@ -1567,8 +1567,10 @@ class TensorParallelAngularMuown(TensorParallelMuon):
             update = m_u_b
         return {"bufs": bufs, "u": u, "grad_g": grad_g, "update": update}
 
-    def _batch_post(self, group: dict, batch: dict, ctx: dict, direction: torch.Tensor) -> None:
-        """The batched update from the orthogonalized direction on."""
+    def _batch_post(self, group: dict, batch: dict, ctx: dict, direction: torch.Tensor,
+                    floor: bool = True) -> None:
+        """The batched update from the orthogonalized direction on. ``floor=False``: the
+        stable-rank floor is left to the caller (row-sharded: it needs the full matrices)."""
         params = batch["params"]
         states = [self.state[p] for p in params]
         reduce_group = batch["reduce_group"]
@@ -1599,7 +1601,7 @@ class TensorParallelAngularMuown(TensorParallelMuon):
                 u_step_norm_sq, op=torch.distributed.ReduceOp.SUM, group=reduce_group
             )
         _angular_muown_u_recompose(w_b, g_b, u_step, u_step_norm_sq)
-        if self._stable_rank_floor and reduce_group is None:
+        if floor and self._stable_rank_floor and reduce_group is None:
             experts = [i for i, p in enumerate(params) if _is_expert_param(p)]
             if len(experts) == len(params):
                 _stable_rank_floor_(w_b, self._stable_rank_floor, g=g_b)
@@ -1676,7 +1678,34 @@ class TensorParallelAngularMuown(TensorParallelMuon):
         direction_of = {id(p): d for p, d in zip(params, directions)}
         for batch, ctx in ctxs:
             stack = torch.stack([direction_of[id(p)] for p in batch["params"]])
-            self._batch_post(group, batch, ctx, stack)
+            self._batch_post(group, batch, ctx, stack, floor=False)
+        if self._stable_rank_floor:
+            self._row_sharded_floor(params)
+
+    def _row_sharded_floor(self, params: list) -> None:
+        """The stable-rank floor on row-sharded expert matrices: a matrix's stable rank is not
+        its rows', so the rows go to the matrix's owner rank (as the Newton-Schulz inputs do),
+        are floored there and come back; g follows the new local row norms."""
+        experts = [p for p in params if _is_expert_param(p)]  # the same list on every rank
+        if not experts:
+            return
+
+        def floor_fn(stack, metadata):  # returns the change: exactly 0 where nothing is capped
+            floored = stack.clone()
+            _stable_rank_floor_(floored, self._stable_rank_floor)
+            return floored.sub_(stack)
+
+        rows = [local(p).detach().float() for p in experts]
+        deltas = orthogonalize_rows(experts, rows, [self._batch_key_for(p) for p in experts],
+                                    floor_fn)
+        for p, d in zip(experts, deltas):
+            lw = local(p).detach()
+            if lw.numel() == 0 or not bool(d.any()):
+                continue
+            lw.add_(d.to(lw.dtype))
+            g = local(self.state[p]["g"])
+            norms = lw.float().norm(dim=-1, keepdim=True).clamp_min(ANGULAR_MUOWN_EPS)
+            g.copy_(torch.copysign(norms.reshape(g.shape), g.float()).to(g.dtype))
 
     def state_dict(self) -> dict:
         """Return a checkpoint-friendly state dict with full-shape per-row states.
