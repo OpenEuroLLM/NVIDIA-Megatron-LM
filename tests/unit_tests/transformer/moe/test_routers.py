@@ -132,6 +132,29 @@ class TestTop2Router:
         out.sum().mul_(0).backward()
         assert self.sequential_mlp.router.weight.grad.abs().sum() > 0
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_log_seq_aux_loss_records_without_changing_the_gradient(self):
+        """moe_log_seq_aux_loss: seq_load_balancing_loss is recorded for a batch-level aux_loss
+        run, and the router gradient (from the aux loss alone) is unchanged."""
+        from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
+
+        self.sequential_mlp = self.sequential_mlp.cuda()
+        self.sequential_mlp.router.layer_number = 1  # the tracker skips layer_number None
+        self.transformer_config.moe_aux_loss_coeff = 1
+        hidden_states = torch.randn((32, 2, self.router.config.hidden_size)).cuda().bfloat16()
+        grads, recorded = [], []
+        for flag in (False, True):
+            self.transformer_config.moe_log_seq_aux_loss = flag
+            get_moe_metrics_tracker().clear()
+            self.sequential_mlp.router.weight.grad = None
+            out = self.sequential_mlp(hidden_states)[0]
+            out.sum().mul_(0).backward()
+            grads.append(self.sequential_mlp.router.weight.grad.clone())
+            m = get_moe_metrics_tracker().metrics.get("seq_load_balancing_loss")
+            recorded.append(None if m is None else float(m.values.float().sum()))
+        torch.testing.assert_close(grads[0], grads[1])
+        assert recorded[0] in (None, 0.0) and recorded[1] is not None and recorded[1] > 0
+
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_router_with_padding_mask(self):

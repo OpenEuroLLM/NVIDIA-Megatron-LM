@@ -233,6 +233,11 @@ class TransformerConfig(ModelParallelConfig):
     bias_swiglu / weighted_swiglu kernels; the Triton SwiGLU falls back to the fused kernel, TE's
     fused ScaledSwiGLU op raises."""
 
+    moe_log_seq_aux_loss: bool = False
+    """Record the sequence-level load-balancing loss (seq_load_balancing_loss, the
+    seq_aux_loss of DeepSeek-V3 at coefficient 1) as a metric without adding it to the
+    objective -- for runs balancing with the batch-level aux_loss / the expert bias."""
+
     moe_expert_post_act_norm: bool = False
     """Routed experts: normalize the activation (SwiGLU output) per token over the hidden units
     before the router weight and fc2, a = p * h / rms(h), without a scale vector (anGPT's

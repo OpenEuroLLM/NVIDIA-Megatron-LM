@@ -445,6 +445,53 @@ class TopKRouter(Router):
         )
         return probs
 
+    @torch.no_grad()
+    def _log_seq_aux_loss(
+        self,
+        scores_for_aux_loss: torch.Tensor,
+        routing_map: torch.Tensor,
+        seq_length: int,
+        bsz: int,
+        with_padding_mask: bool = False,
+    ) -> None:
+        """moe_log_seq_aux_loss: the sequence-level load-balancing loss of _apply_seq_aux_loss,
+        recorded as seq_load_balancing_loss (unscaled: coefficient 1) but never added to the
+        objective -- a diagnostic for runs that balance with the batch-level aux_loss."""
+        scores_for_aux_loss = scores_for_aux_loss.reshape(seq_length, -1)
+        routing_map = routing_map.reshape(seq_length, -1)
+        global_tokens_per_expert, _, total_num_tokens = get_tokens_per_expert_and_token_count(
+            routing_map=routing_map,
+            reduce_group=self.tp_cp_group,
+            with_padding_mask=with_padding_mask,
+            topk=self.topk * bsz,
+        )
+        aux_loss = (
+            switch_load_balancing_loss_func(
+                probs=scores_for_aux_loss,
+                tokens_per_expert=global_tokens_per_expert,
+                total_num_tokens=total_num_tokens,
+                topk=self.topk,
+                num_experts=self.config.num_moe_experts,
+                moe_aux_loss_coeff=1.0,
+                fused=self.config.moe_router_fusion,
+            )
+            / bsz
+        )
+        num_layers = self.config.num_layers
+        if self.config.mtp_num_layers is not None:
+            num_layers += self.config.mtp_num_layers
+        layer_number = (
+            self.layer_number + self.config.num_layers if self.is_mtp_layer else self.layer_number
+        )
+        get_moe_metrics_tracker().record(
+            "seq_load_balancing_loss",
+            aux_loss,
+            layer_number,
+            num_layers,
+            reduce_group=self.tp_cp_group,
+            needs_dp_avg=True,
+        )
+
     def _apply_seq_aux_loss(
         self,
         probs: torch.Tensor,
@@ -830,6 +877,14 @@ class TopKRouter(Router):
                 routing_map_for_aux_loss,
                 with_padding_mask=padding_mask is not None,
             )
+            if (
+                getattr(self.config, "moe_log_seq_aux_loss", False)
+                and self.get_aux_loss_coeff("seq_aux_loss") == 0
+            ):
+                self._log_seq_aux_loss(
+                    scores_for_aux_loss, routing_map_for_aux_loss, seq_length, bsz,
+                    with_padding_mask=padding_mask is not None,
+                )
 
         # Optionally apply expert bias
         self._apply_expert_bias(routing_map, padding_mask=padding_mask)

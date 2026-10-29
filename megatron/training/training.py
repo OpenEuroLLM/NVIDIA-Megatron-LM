@@ -3668,7 +3668,9 @@ def training_log(
         track_names = []
         if "aux_loss" in args.moe_router_load_balancing_type:
             track_names.append("load_balancing_loss")
-        if "seq_aux_loss" in args.moe_router_load_balancing_type:
+        if "seq_aux_loss" in args.moe_router_load_balancing_type or getattr(
+            args, "moe_log_seq_aux_loss", False
+        ):
             track_names.append("seq_load_balancing_loss")
         if "global_aux_loss" in args.moe_router_load_balancing_type:
             track_names.append("global_load_balancing_loss")
