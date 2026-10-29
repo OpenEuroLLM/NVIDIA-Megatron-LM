@@ -140,6 +140,44 @@ def test_muown_classical_row_sharded_stable_rank_floor(mesh):
             assert srank > 0.8 * r_min, srank  # power-iteration sigma at a small gap
 
 
+def test_muown_classical_row_sharded_spectral_cap(mesh):
+    """The spectral cap on row shards: init references from all-reduced row sums, the cap on
+    the full matrices at their owners; sharded and unsharded steps agree."""
+    os.environ["ANGULAR_MUOWN_COMPACT_CKPT"] = "1"
+    rank = mesh.get_rank()
+    options = dict(lr=0.05, nesterov=True, split_qkv=False, fp32_matmul_prec="highest",
+                   scale_mode="spectral", extra_scale_factor=0.2)
+    torch.manual_seed(13)
+    fulls = [torch.nn.Parameter(torch.randn(shape, device="cuda") * 0.2) for shape, _ in LAYOUTS]
+    shards = [_shard(f.detach(), counts, mesh) for f, (_, counts) in zip(fulls, LAYOUTS)]
+    for p in fulls + shards:
+        p.allreduce = False
+    reference = TensorParallelMuownClassical(fulls, spectral_cap=1.2, **options)
+    sharded = TensorParallelMuownClassical(shards, spectral_cap=1.2, **options)
+    for k, v in reference._spectral_ref.items():
+        assert abs(sharded._spectral_ref[k] - v) < 1e-5 * v, (k, v, sharded._spectral_ref[k])
+    for step in range(6):
+        torch.manual_seed(300 + step)
+        _set_grads(fulls, shards, rank)
+        for f in fulls:  # a shared rank-1 push: grows sigma_max past the cap
+            f.grad.add_(-3.0 * torch.outer(torch.ones(f.shape[0], device="cuda"),
+                                           torch.ones(f.shape[1], device="cuda")))
+        for f, s, (_, counts) in zip(fulls, shards, LAYOUTS):
+            lo, hi = _rows(counts, rank)
+            if hi > lo:
+                s.grad = DTensor.from_local(f.grad[lo:hi].clone(), device_mesh=s.device_mesh,
+                                            placements=[Shard(0)], run_check=False,
+                                            shape=f.shape, stride=f.stride())
+        reference.step()
+        sharded.step()
+        for f, s, (_, counts) in zip(fulls, shards, LAYOUTS):
+            lo, hi = _rows(counts, rank)
+            torch.testing.assert_close(local(s).detach(), f.detach()[lo:hi])
+    for f in fulls:
+        cap = 1.2 * reference._spectral_ref[tuple(f.shape)]
+        assert float(torch.linalg.matrix_norm(f.detach(), ord=2)) < 1.05 * cap
+
+
 def test_muon_row_sharded(mesh):
     rank = mesh.get_rank()
     options = dict(lr=0.02, weight_decay=0.01, split_qkv=False, fp32_matmul_prec="highest",

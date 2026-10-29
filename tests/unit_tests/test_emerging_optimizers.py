@@ -2586,3 +2586,33 @@ def test_muown_classical_stable_rank_floor_holds_expert_matrices(batched):
     with pytest.raises(ValueError, match="stable_rank_floor"):
         TensorParallelMuownClassical(params=[torch.nn.Parameter(torch.randn(4, 4, device='cuda'))],
                                      stable_rank_floor=-1.0)
+
+
+@pytest.mark.parametrize("batched", [False, True])
+def test_muown_classical_spectral_cap_holds_expert_matrices(batched):
+    """spectral_cap: the expert matrix's sigma_max stays at <= cap x its init sigma_max under a
+    persistent rank-1 gradient (which also grows the row norms); the dense one is not bounded."""
+    from megatron.core.optimizer.emerging_optimizers import TensorParallelMuownClassical
+
+    torch.manual_seed(0)
+    expert = torch.nn.Parameter(torch.randn(48, 96, device='cuda') * 0.02)
+    expert.allreduce = False
+    dense = torch.nn.Parameter(expert.detach().clone())
+    smax0 = float(torch.linalg.matrix_norm(expert.detach(), ord=2))
+    opt = TensorParallelMuownClassical(
+        params=[expert, dense], lr=0.05, momentum=0.95, nesterov=True, betas=(0.9, 0.95),
+        num_ns_steps=5, scale_mode="shape_scaling", pg_collection=None, tp_mode="duplicated",
+        batched_step=batched, spectral_cap=2.0)
+    ref = opt._spectral_ref[(48, 96)]
+    assert abs(ref - smax0) < 0.1 * smax0, (ref, smax0)  # rms (sqrt(m) + sqrt(n)) at init
+    direction = torch.randn(48, 1, device='cuda') @ torch.randn(1, 96, device='cuda')
+    for _ in range(300):
+        for p in (expert, dense):
+            p.grad = -direction.clone()
+        opt.step()
+    smax = lambda w: float(torch.linalg.matrix_norm(w.detach().float(), ord=2))
+    assert smax(dense) > 3.0 * ref, smax(dense)
+    assert smax(expert) < 1.02 * 2.0 * ref, (smax(expert), ref)
+    with pytest.raises(ValueError, match="spectral_cap"):
+        TensorParallelMuownClassical(params=[torch.nn.Parameter(torch.randn(4, 4, device='cuda'))],
+                                     spectral_cap=-1.0)

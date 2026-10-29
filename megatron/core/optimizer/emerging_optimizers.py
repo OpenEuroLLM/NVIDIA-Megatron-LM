@@ -766,7 +766,20 @@ def _is_expert_param(p) -> bool:
 def _stable_rank_floor_(
     w: torch.Tensor, r_min: float, g: Optional[torch.Tensor] = None, iters: int = 6, rounds: int = 3
 ) -> int:
-    """Hold every matrix of ``w`` ([m, n] or [B, m, n]) at stable rank |W|_F^2 / sigma_max^2 >=
+    """:func:`_spectral_bound_` with the stable-rank floor alone."""
+    return _spectral_bound_(w, r_min=r_min, g=g, iters=iters, rounds=rounds)
+
+
+@torch.no_grad()
+def _spectral_bound_(
+    w: torch.Tensor, r_min: float = 0.0, cap: float = 0.0, g: Optional[torch.Tensor] = None,
+    iters: int = 6, rounds: int = 3, cap_iters: int = 10,
+) -> int:
+    """Bound the top of every matrix's spectrum, in place: ``r_min`` > 1 a stable-rank floor (a
+    deflation of the top direction), then ``cap`` > 0 a spectral-norm cap sigma_max <= cap (the
+    whole matrix scaled by min(1, cap / sigma_max): spectral normalization above the cap).
+
+    The floor: hold every matrix of ``w`` ([m, n] or [B, m, n]) at stable rank |W|_F^2 / sigma_max^2 >=
     ``r_min``, in place, by deflating the top singular direction to the exact value
     c = sqrt((|W|_F^2 - sigma_max^2) / (r_min - 1)) at which the deflated matrix has stable rank
     r_min (repeated while a second direction is still above it). The rows aligned with that
@@ -775,12 +788,20 @@ def _stable_rank_floor_(
     re-inflated the direction (a collapsed matrix's rows are nearly parallel) and held a fast-
     collapsing matrix at about half the floor. sigma_max and its singular vectors come from a
     power iteration started at the column sums of |W| (deterministic on every replica; a
-    collapsed matrix has a large spectral gap). Returns the number of matrices capped."""
-    if r_min <= 1.0 or w.numel() == 0:
+    collapsed matrix has a large spectral gap).
+
+    The cap scales instead of deflating: a matrix whose whole spectrum grows has many directions
+    above the cap, which a few rank-1 deflations per step do not bound. Its sigma_max comes from
+    ``cap_iters`` power iterations (an underestimate at a small spectral gap: the bound is then
+    slightly loose). Cost: per power iteration two batched matrix-vector products (memory-bound,
+    a fraction of the Newton-Schulz step's matrix-matrix products).
+    Returns the number of matrices bounded."""
+    floor_on, cap_on = r_min > 1.0, cap > 0.0
+    if not (floor_on or cap_on) or w.numel() == 0:
         return 0
     W = w.float().reshape(-1, w.shape[-2], w.shape[-1])
     capped_any = None
-    for _ in range(rounds):
+    for _ in range(rounds if floor_on else 0):
         fro2 = W.square().sum(dim=(-2, -1))
         v = W.abs().sum(dim=-2, keepdim=True).transpose(-2, -1)  # [B, n, 1]
         for _ in range(iters):
@@ -796,6 +817,16 @@ def _stable_rank_floor_(
         shrink = torch.where(over, sigma - c, torch.zeros_like(sigma))[:, None, None]
         W = W - shrink * (u @ v.transpose(-2, -1))
         capped_any = over if capped_any is None else (capped_any | over)
+    if cap_on:
+        v = W.abs().sum(dim=-2, keepdim=True).transpose(-2, -1)
+        for _ in range(cap_iters):
+            v = W.transpose(-2, -1) @ (W @ v)
+            v = v / v.norm(dim=-2, keepdim=True).clamp_min(1e-30)
+        sigma = (W @ v).norm(dim=(-2, -1))
+        over = sigma > cap
+        if bool(over.any()):
+            W = W * (cap / sigma.clamp_min(1e-30)).clamp_max(1.0)[:, None, None]
+            capped_any = over if capped_any is None else (capped_any | over)
     if capped_any is None:
         return 0
     w.copy_(W.reshape(w.shape).to(w.dtype))
@@ -999,6 +1030,7 @@ class TensorParallelAngularMuown(TensorParallelMuon):
     _g_weight_decay = 0.0
     # stable-rank floor of the expert matrices (TensorParallelMuownClassical only; 0 = off)
     _stable_rank_floor = 0.0
+    _spectral_cap = 0.0
 
     def __init__(
         self,
@@ -1433,8 +1465,8 @@ class TensorParallelAngularMuown(TensorParallelMuon):
             _angular_muown_u_recompose(p, g, u_step, u_step_norm_sq)
             if v_norm is not None:
                 v_norm.copy_(u_step_norm_sq.sqrt().clamp_min(ANGULAR_MUOWN_EPS))
-            if self._stable_rank_floor and reduce_group is None and _is_expert_param(p):
-                _stable_rank_floor_(p.data, self._stable_rank_floor, g=g)
+            if self._bound_on() and reduce_group is None and _is_expert_param(p):
+                self._bound_(p.data, g=g)
 
     # ------------------------------------------------------------------
     # Batched step
@@ -1601,14 +1633,14 @@ class TensorParallelAngularMuown(TensorParallelMuon):
                 u_step_norm_sq, op=torch.distributed.ReduceOp.SUM, group=reduce_group
             )
         _angular_muown_u_recompose(w_b, g_b, u_step, u_step_norm_sq)
-        if floor and self._stable_rank_floor and reduce_group is None:
+        if floor and self._bound_on() and reduce_group is None:
             experts = [i for i, p in enumerate(params) if _is_expert_param(p)]
             if len(experts) == len(params):
-                _stable_rank_floor_(w_b, self._stable_rank_floor, g=g_b)
+                self._bound_(w_b, g=g_b)
             elif experts:
                 idx = torch.tensor(experts, device=w_b.device)
                 sub, sub_g = w_b.index_select(0, idx), g_b.index_select(0, idx)
-                _stable_rank_floor_(sub, self._stable_rank_floor, g=sub_g)
+                self._bound_(sub, g=sub_g)
                 w_b.index_copy_(0, idx, sub)
                 g_b.index_copy_(0, idx, sub_g)
         if v_norm is not None:
@@ -1679,8 +1711,54 @@ class TensorParallelAngularMuown(TensorParallelMuon):
         for batch, ctx in ctxs:
             stack = torch.stack([direction_of[id(p)] for p in batch["params"]])
             self._batch_post(group, batch, ctx, stack, floor=False)
-        if self._stable_rank_floor:
+        if self._bound_on():
             self._row_sharded_floor(params)
+
+    def _bound_on(self) -> bool:
+        return self._stable_rank_floor > 1.0 or self._spectral_cap > 0.0
+
+    def _expert_cap(self, shape) -> float:
+        """sigma_max cap of an expert matrix of (full) ``shape``: spectral_cap x its init value."""
+        if self._spectral_cap <= 0.0:
+            return 0.0
+        return self._spectral_cap * self._spectral_ref[tuple(int(d) for d in shape[-2:])]
+
+    def _bound_(self, w: torch.Tensor, g: Optional[torch.Tensor] = None) -> int:
+        return _spectral_bound_(w, r_min=self._stable_rank_floor,
+                                cap=self._expert_cap(w.shape), g=g)
+
+    @torch.no_grad()
+    def _init_spectral_refs(self) -> None:
+        """The init sigma_max of the routed-expert matrices, per full shape: rms * (sqrt(m) +
+        sqrt(n)), exact for i.i.d. init (the optimizer is built before a checkpoint loads, so this
+        is the init on a resume too). Sums of squares over local rows, all-reduced: no rank needs a
+        full matrix."""
+        stats: Dict[tuple, list] = {}
+        for group in self.param_groups:
+            for p in group["params"]:
+                if _is_expert_param(p) and p.ndim == 2:
+                    lw = local(p).detach().float()
+                    acc = stats.setdefault(tuple(int(d) for d in p.shape), [0.0, 0])
+                    acc[0] += float(lw.square().sum())
+                    acc[1] += lw.numel()
+        shapes = sorted(stats)
+        dist = torch.distributed.is_available() and torch.distributed.is_initialized()
+        if dist:
+            every = [None] * torch.distributed.get_world_size()
+            torch.distributed.all_gather_object(every, shapes)
+            shapes = sorted({s for ss in every for s in ss})
+            dev = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() \
+                else torch.device("cpu")
+            t = torch.tensor([stats.get(s, [0.0, 0])[i] for s in shapes for i in (0, 1)],
+                             dtype=torch.float64, device=dev)
+            torch.distributed.all_reduce(t)
+            vals = t.view(-1, 2).tolist()
+        else:
+            vals = [stats[s] for s in shapes]
+        self._spectral_ref = {
+            s: math.sqrt(sq / max(n, 1)) * (math.sqrt(s[0]) + math.sqrt(s[1]))
+            for s, (sq, n) in zip(shapes, vals)
+        }
 
     def _row_sharded_floor(self, params: list) -> None:
         """The stable-rank floor on row-sharded expert matrices: a matrix's stable rank is not
@@ -1692,7 +1770,7 @@ class TensorParallelAngularMuown(TensorParallelMuon):
 
         def floor_fn(stack, metadata):  # returns the change: exactly 0 where nothing is capped
             floored = stack.clone()
-            _stable_rank_floor_(floored, self._stable_rank_floor)
+            self._bound_(floored)
             return floored.sub_(stack)
 
         rows = [local(p).detach().float() for p in experts]
@@ -1866,7 +1944,7 @@ class TensorParallelMuownClassical(TensorParallelAngularMuown):
 
     def __init__(
         self, params: ParamsT, v_weight_decay: float = 0.0, g_weight_decay: float = 0.0,
-        stable_rank_floor: float = 0.0, **kwargs
+        stable_rank_floor: float = 0.0, spectral_cap: float = 0.0, **kwargs
     ) -> None:
         """``v_weight_decay`` (not in the Muown paper, default off): decoupled weight decay on v,
         v <- v - lr (update + lambda v). v / ||v|| does not depend on ||v||, so it only shrinks the
@@ -1883,7 +1961,11 @@ class TensorParallelMuownClassical(TensorParallelAngularMuown):
         (allreduce=False) are held at stable rank |W|_F^2 / sigma_max^2 >= this value by a rank-1
         deflation of their top singular direction at fixed row norms. A runaway expert collapses
         its fc1 / fc2 spectra while every norm stays flat (stable rank down to single digits
-        against ~200-300); a floor of ~30-50 never touches a normal expert."""
+        against ~200-300); a floor of ~30-50 never touches a normal expert.
+
+        ``spectral_cap`` (default off): after each step, the routed-expert matrices are held at
+        sigma_max <= this factor x their init sigma_max (per shape, from the init weights) by the
+        same deflation; unlike the floor it also bounds a matrix whose norms grow."""
         for name in kwargs:
             if name.startswith("u_") or name in {"weight_decay", "use_decoupled_weight_decay"}:
                 raise ValueError(f"Muown does not support {name}")
@@ -1893,10 +1975,16 @@ class TensorParallelMuownClassical(TensorParallelAngularMuown):
             raise ValueError("g_weight_decay must be finite and nonnegative")
         if not (math.isfinite(stable_rank_floor) and stable_rank_floor >= 0.0):
             raise ValueError("stable_rank_floor must be finite and nonnegative")
+        if not (math.isfinite(spectral_cap) and spectral_cap >= 0.0):
+            raise ValueError("spectral_cap must be finite and nonnegative")
         super().__init__(params, **kwargs)
         self._v_weight_decay = float(v_weight_decay)
         self._g_weight_decay = float(g_weight_decay)
         self._stable_rank_floor = float(stable_rank_floor)
+        self._spectral_cap = float(spectral_cap)
+        self._spectral_ref: Dict[tuple, float] = {}
+        if self._spectral_cap > 0.0:
+            self._init_spectral_refs()
         for group in self.param_groups:
             if "u_lr" in group:
                 raise ValueError("Muown uses the ordinary lr, not u_lr")
@@ -2084,6 +2172,7 @@ def _muown_classical_config_to_kwargs(config, model_chunks, pg_collection) -> Di
     kwargs["v_weight_decay"] = getattr(config, "muown_classical_v_weight_decay", 0.0)
     kwargs["g_weight_decay"] = getattr(config, "muown_classical_g_weight_decay", 0.0)
     kwargs["stable_rank_floor"] = getattr(config, "muown_expert_stable_rank_floor", 0.0)
+    kwargs["spectral_cap"] = getattr(config, "muown_expert_spectral_cap", 0.0)
     return kwargs
 
 

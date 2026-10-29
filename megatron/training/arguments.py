@@ -2920,6 +2920,10 @@ def _add_regularization_args(parser):
                        help='muown_classical: decoupled weight decay on the unnormalized direction '
                        'vectors v (not in the Muown paper): the rotation rate settles at about '
                        'sqrt(2 lr lambda) instead of annealing as t^-1/2.')
+    group.add_argument('--muown-expert-spectral-cap', type=float, default=0.0,
+                       help='muown_classical: hold every routed-expert matrix at sigma_max <= this '
+                       'factor x its init sigma_max (per shape) after each step (deflation of the '
+                       'top singular directions; 0 = off).')
     group.add_argument('--muown-expert-stable-rank-floor', type=float, default=0.0,
                        help='muown_classical: hold every routed-expert matrix at stable rank '
                        '|W|_F^2 / sigma_max^2 >= this value after each step (rank-1 deflation of '

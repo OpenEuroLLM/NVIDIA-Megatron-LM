@@ -1,9 +1,14 @@
 # Copyright (c) 2026, OpenEuroLLM. All rights reserved.
-"""The stable-rank floor of Muown's expert matrices (muown_expert_stable_rank_floor)."""
+"""The spectral bounds of Muown's expert matrices: the stable-rank floor
+(muown_expert_stable_rank_floor) and the spectral-norm cap (muown_expert_spectral_cap)."""
 
 import torch
 
-from megatron.core.optimizer.emerging_optimizers import _is_expert_param, _stable_rank_floor_
+from megatron.core.optimizer.emerging_optimizers import (
+    _is_expert_param,
+    _spectral_bound_,
+    _stable_rank_floor_,
+)
 
 
 def _srank(w):
@@ -58,3 +63,41 @@ def test_expert_marker():
     assert not _is_expert_param(p)
     p.allreduce = False
     assert _is_expert_param(p)
+
+
+def test_cap_bounds_sigma_max_and_leaves_matrices_below_it():
+    healthy = torch.randn(4, 96, 192) / 192**0.5  # sigma_max ~ 1 + sqrt(96/192) ~ 1.7
+    w = torch.cat([healthy, 3.0 * _collapsed()[None]], 0)
+    g = w.norm(dim=-1, keepdim=True)
+    w0 = w.clone()
+    cap = 2.5
+    assert torch.linalg.matrix_norm(w, ord=2)[-1] > 2 * cap
+    assert _spectral_bound_(w, cap=cap, g=g) == 1
+    smax = torch.linalg.matrix_norm(w, ord=2)
+    assert smax[-1] < 1.02 * cap, smax
+    assert torch.equal(w[:-1], w0[:-1])
+    torch.testing.assert_close(w[-1] / w[-1].norm(), w0[-1] / w0[-1].norm())  # scaled only
+    torch.testing.assert_close(g, w.norm(dim=-1, keepdim=True))
+
+
+def test_cap_holds_under_a_persistent_push_of_the_whole_spectrum():
+    """Growth of every direction (not only one): sigma_max stays at the cap."""
+    torch.manual_seed(2)
+    w = torch.randn(1, 48, 96) * 0.02
+    cap = float(torch.linalg.matrix_norm(w[0], ord=2)) * 2
+    for _ in range(300):
+        w = w * 1.05 + 0.002 * torch.randn_like(w)
+        _spectral_bound_(w, cap=cap)
+    assert float(torch.linalg.matrix_norm(w[0], ord=2)) < 1.05 * cap
+
+
+def test_floor_then_cap():
+    w = 3.0 * _collapsed()[None]
+    a, b = w.clone(), w.clone()
+    _spectral_bound_(a, r_min=20.0, cap=100.0)  # the floor alone binds
+    _stable_rank_floor_(b, 20.0)
+    torch.testing.assert_close(a, b)
+    c = w.clone()
+    _spectral_bound_(c, r_min=20.0, cap=0.5)  # both: floor, then the cap
+    assert float(torch.linalg.matrix_norm(c[0], ord=2)) < 0.51
+    assert float(_srank(c)[0]) > 0.95 * 20.0

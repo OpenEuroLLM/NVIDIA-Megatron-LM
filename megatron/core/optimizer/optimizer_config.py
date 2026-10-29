@@ -458,6 +458,10 @@ class OptimizerConfig:
     value after each step (a rank-1 deflation of the top singular direction at fixed row norms;
     0 = off). Targets the runaway experts whose spectra collapse at flat norms."""
 
+    muown_expert_spectral_cap: float = 0.0
+    """muown_classical: hold every routed-expert matrix at sigma_max <= this factor x its init
+    sigma_max (per shape) after each step (deflation of the top singular directions; 0 = off)."""
+
     muown_classical_g_weight_decay: float = 0.0
     """muown_classical: decoupled weight decay on the row magnitudes g, g <- g (1 - lr lambda): a soft
     cap at |g| ~ 1 / lambda against the Adam drift of g (~lr per step along a persistent sign)."""
