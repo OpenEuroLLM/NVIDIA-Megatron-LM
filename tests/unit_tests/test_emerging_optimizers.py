@@ -2526,3 +2526,32 @@ def test_angular_muown_fixed_row_norm_pins_the_rows(batched, classical):
         if first is None:
             first = [p.detach().clone() for p in params]
     assert any(not torch.allclose(a, p) for a, p in zip(first, params)), "directions must move"
+
+
+@pytest.mark.parametrize("batched", [False, True])
+def test_muown_classical_g_weight_decay_caps_the_row_norms(batched):
+    """g_weight_decay: along a persistent gradient (grad = -W: every row wants to grow) Adam moves g by
+    ~lr per step without bound; the decoupled decay g <- g (1 - lr lambda) balances it at ~1 / lambda.
+    The row norm of W is |g| in both cases (W = g v / |v|)."""
+    from megatron.core.optimizer.emerging_optimizers import TensorParallelMuownClassical
+
+    finals = {}
+    for wd in (0.0, 1.0):
+        torch.manual_seed(0)
+        params = [torch.nn.Parameter(torch.randn(48, 32, device='cuda') * 0.02) for _ in range(2)]
+        opt = TensorParallelMuownClassical(
+            params=params, lr=0.05, momentum=0.95, nesterov=True, betas=(0.9, 0.95),
+            num_ns_steps=5, scale_mode="shape_scaling", pg_collection=None, tp_mode="duplicated",
+            batched_step=batched, g_weight_decay=wd)
+        for _ in range(300):
+            for p in params:
+                p.grad = -p.detach().clone()
+            opt.step()
+        g = torch.cat([opt.state[p]["g"].abs().flatten() for p in params])
+        torch.testing.assert_close(torch.cat([p.norm(dim=1) for p in params]), g, rtol=1e-4, atol=1e-5)
+        finals[wd] = g
+    assert finals[0.0].min() > 10.0, finals[0.0].min()  # ~lr per step: 300 x 0.05 = 15
+    assert finals[1.0].max() < 1.5, finals[1.0].max()  # the cap at ~1 / lambda
+    with pytest.raises(ValueError, match="g_weight_decay"):
+        TensorParallelMuownClassical(params=[torch.nn.Parameter(torch.randn(4, 4, device='cuda'))],
+                                     g_weight_decay=-1.0)

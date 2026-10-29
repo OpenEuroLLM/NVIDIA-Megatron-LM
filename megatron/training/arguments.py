@@ -2920,6 +2920,10 @@ def _add_regularization_args(parser):
                        help='muown_classical: decoupled weight decay on the unnormalized direction '
                        'vectors v (not in the Muown paper): the rotation rate settles at about '
                        'sqrt(2 lr lambda) instead of annealing as t^-1/2.')
+    group.add_argument('--muown-classical-g-weight-decay', type=float, default=0.0,
+                       help='muown_classical: decoupled weight decay on the row magnitudes g, '
+                       'g <- g (1 - lr lambda): a soft cap at |g| ~ 1 / lambda against the Adam '
+                       'drift of g.')
     group.add_argument(
         '--angular-muown-c',
         type=float,

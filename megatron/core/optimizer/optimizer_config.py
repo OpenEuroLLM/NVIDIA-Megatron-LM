@@ -453,6 +453,10 @@ class OptimizerConfig:
     """muown_classical: decoupled weight decay on the unnormalized direction vectors v (not in the
     Muown paper): the rotation rate settles at ~sqrt(2 lr lambda) instead of annealing as t^-1/2."""
 
+    muown_classical_g_weight_decay: float = 0.0
+    """muown_classical: decoupled weight decay on the row magnitudes g, g <- g (1 - lr lambda): a soft
+    cap at |g| ~ 1 / lambda against the Adam drift of g (~lr per step along a persistent sign)."""
+
     angular_muown_extra_scale_factor: float = 0.2
     """Additional scale factor for the AngularMuown U direction. Defaults to 0.2 to
     pair with "spectral" scaling (Muon convention)."""

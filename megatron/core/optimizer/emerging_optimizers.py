@@ -947,6 +947,8 @@ class TensorParallelAngularMuown(TensorParallelMuon):
     _row_state_keys = ANGULAR_MUOWN_ROW_STATE_KEYS
     # decoupled weight decay on Muown's unnormalized v (TensorParallelMuownClassical only)
     _v_weight_decay = 0.0
+    # decoupled weight decay on the row magnitudes g (TensorParallelMuownClassical only)
+    _g_weight_decay = 0.0
 
     def __init__(
         self,
@@ -1360,6 +1362,8 @@ class TensorParallelAngularMuown(TensorParallelMuon):
             # Adam update on the row magnitudes g, with sign-preserving
             # projection away from zero (pinned: g stays at fixed_row_norm).
             if self._fixed_row_norm is None:
+                if self._g_weight_decay:  # decoupled: a soft cap at |g| ~ 1 / lambda
+                    g.mul_(1.0 - lr * self._g_weight_decay)
                 m_g.mul_(beta1).add_(grad_g, alpha=1 - beta1)
                 v_g.mul_(beta2).addcmul_(grad_g, grad_g, value=1 - beta2)
                 bc1 = 1 - beta1**step
@@ -1527,6 +1531,8 @@ class TensorParallelAngularMuown(TensorParallelMuon):
         u_step = u.add(direction, alpha=-self._u_step_size(group, step - 1))
 
         if self._fixed_row_norm is None:  # pinned: g stays at fixed_row_norm
+            if self._g_weight_decay:  # decoupled: a soft cap at |g| ~ 1 / lambda
+                g_b.mul_(1.0 - lr * self._g_weight_decay)
             m_g_b.mul_(beta1).add_(grad_g, alpha=1 - beta1)
             v_g_b.mul_(beta2).addcmul_(grad_g, grad_g, value=1 - beta2)
             bc1 = 1 - beta1**step
@@ -1767,19 +1773,29 @@ class TensorParallelMuownClassical(TensorParallelAngularMuown):
 
     _row_state_keys = (*ANGULAR_MUOWN_ROW_STATE_KEYS, "v_norm")
 
-    def __init__(self, params: ParamsT, v_weight_decay: float = 0.0, **kwargs) -> None:
+    def __init__(
+        self, params: ParamsT, v_weight_decay: float = 0.0, g_weight_decay: float = 0.0, **kwargs
+    ) -> None:
         """``v_weight_decay`` (not in the Muown paper, default off): decoupled weight decay on v,
         v <- v - lr (update + lambda v). v / ||v|| does not depend on ||v||, so it only shrinks the
         norm and so raises the rotation per step: instead of the endless ~t^-1/2 annealing, the
         rate settles at ~sqrt(2 lr lambda) (the equilibrium of Muon / AdamW with weight decay) after
-        ~1 / (2 lr lambda) steps. Directions and magnitudes are otherwise updated as without it."""
+        ~1 / (2 lr lambda) steps. Directions and magnitudes are otherwise updated as without it.
+
+        ``g_weight_decay`` (default off): decoupled weight decay on the row magnitudes g,
+        g <- g (1 - lr lambda) before their Adam step. Adam moves g by ~lr per step whatever the
+        gradient's size, so without it g drifts without bound along a persistent gradient sign; the
+        decay balances that push at |g| ~ 1 / lambda and is negligible for rows well below it."""
         for name in kwargs:
             if name.startswith("u_") or name in {"weight_decay", "use_decoupled_weight_decay"}:
                 raise ValueError(f"Muown does not support {name}")
         if not (math.isfinite(v_weight_decay) and v_weight_decay >= 0.0):
             raise ValueError("v_weight_decay must be finite and nonnegative")
+        if not (math.isfinite(g_weight_decay) and g_weight_decay >= 0.0):
+            raise ValueError("g_weight_decay must be finite and nonnegative")
         super().__init__(params, **kwargs)
         self._v_weight_decay = float(v_weight_decay)
+        self._g_weight_decay = float(g_weight_decay)
         for group in self.param_groups:
             if "u_lr" in group:
                 raise ValueError("Muown uses the ordinary lr, not u_lr")
@@ -1965,6 +1981,7 @@ def _muown_classical_config_to_kwargs(config, model_chunks, pg_collection) -> Di
     kwargs = _angular_muown_config_to_kwargs(config, model_chunks, pg_collection)
     kwargs = {name: value for name, value in kwargs.items() if not name.startswith("u_")}
     kwargs["v_weight_decay"] = getattr(config, "muown_classical_v_weight_decay", 0.0)
+    kwargs["g_weight_decay"] = getattr(config, "muown_classical_g_weight_decay", 0.0)
     return kwargs
 
 
