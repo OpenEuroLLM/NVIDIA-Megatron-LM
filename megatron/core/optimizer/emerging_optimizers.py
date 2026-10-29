@@ -837,7 +837,7 @@ def _spectral_bound_(
 
 
 @torch.no_grad()
-def _orthogonal_directions_(w: torch.Tensor, iters: int = 5) -> int:
+def _orthogonal_directions_(w: torch.Tensor, max_iters: int = 16, tol: float = 1e-5) -> int:
     """Muon-like weight balancing, in place: every matrix of ``w`` ([m, n] or [B, m, n]) becomes
     diag(|W_i|) Q_i / |Q_i| with Q the polar factor of its row-normalized U = W / |W_i| -- the row
     magnitudes kept, the direction part with all singular values 1 (Stiefel; exactly so when
@@ -848,10 +848,11 @@ def _orthogonal_directions_(w: torch.Tensor, iters: int = 5) -> int:
     (Muon's quintic leaves singular values in ~[0.7, 1.2] and TF32 adds ~5e-4 relative noise:
     either would perturb the weights at every step), after normalizing by a power-iteration
     sigma_max (convergence needs sigma < sqrt(3); the small singular values then converge
-    quadratically once near 1). From the init (normalized sigma down to ~0.25) 5 iterations reach
-    ~0.98 and the next step's 5 fp32 precision; applied every step, the weights then stay within
-    O(lr) of orthogonal. 10 matmuls per matrix (Muon's 5 quintic steps: 15). Returns the number of
-    matrices."""
+    quadratically once near 1). It stops when every matrix's X X^T is within ``tol`` (rms per
+    entry) of the identity -- X X^T is the iteration's own product, so the check is free but one
+    host sync per iteration: applied every step, the weights stay within O(lr) of orthogonal and
+    2-3 iterations (4-6 matmuls per matrix; Muon's 5 quintic steps: 15) suffice; a large step
+    (or the init) takes more, up to ``max_iters``. Returns the number of matrices."""
     if w.numel() == 0:
         return 0
     m, n = w.shape[-2], w.shape[-1]
@@ -869,8 +870,12 @@ def _orthogonal_directions_(w: torch.Tensor, iters: int = 5) -> int:
             v = v / v.norm(dim=-2, keepdim=True).clamp_min(1e-30)
         sigma = (X @ v).norm(dim=(-2, -1), keepdim=True)
         X = X / (1.05 * sigma).clamp_min(1e-30)  # sigma_max <~ 1 (a power-iteration underestimate)
-        for _ in range(iters):
-            X = torch.baddbmm(X, X @ X.mT, X, beta=1.5, alpha=-0.5)
+        eye = torch.eye(X.shape[-2], device=X.device, dtype=X.dtype)
+        for _ in range(max_iters):
+            A = X @ X.mT
+            if float((A - eye).square().mean(dim=(-2, -1)).max().sqrt()) < tol:
+                break
+            X = torch.baddbmm(X, A, X, beta=1.5, alpha=-0.5)
     finally:
         torch.set_float32_matmul_precision(prec)
     if m > n:
