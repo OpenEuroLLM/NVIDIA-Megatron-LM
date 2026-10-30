@@ -4740,14 +4740,14 @@ class AllGatherPipeline:
         logged = self.__dict__.setdefault("_fp8_gather_logged", set())
         if bucket_id not in logged:
             logged.add(bucket_id)
+            # printed, not logged at INFO (the default log level filters it)
             if torch.distributed.get_rank() == 0:
-                logger.info(
-                    "fsdp_fp8_param_gather: bucket %d through FP8 (%d elements, expert=%s, "
-                    "group size %d)",
-                    bucket_id,
-                    bucket.data.numel(),
-                    self.buffer.parameter_groups[bucket_id].is_expert_param,
-                    wbuf.data_parallel_group.size(),
+                print(
+                    f"fsdp_fp8_param_gather: bucket {bucket_id} through FP8 "
+                    f"({bucket.data.numel()} elements, "
+                    f"expert={self.buffer.parameter_groups[bucket_id].is_expert_param}, "
+                    f"group size {wbuf.data_parallel_group.size()})",
+                    flush=True,
                 )
         param_gather_event = fp8_all_gather_into_tensor(
             output_tensor=bucket.data,
