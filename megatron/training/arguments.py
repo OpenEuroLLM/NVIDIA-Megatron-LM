@@ -3659,6 +3659,12 @@ def _add_distributed_args(parser):
                         "Double-buffering the communication memory improves memory management efficiency by "
                         "reusing previously allocated buffers, rather than creating new buffers for each FSDP communication. "
                         "This is required for user buffer registration and is enabled by default when using NCCL user buffers.")
+    group.add_argument('--fsdp-fp8-param-gather', type=str, default='none',
+                       choices=['none', 'experts', 'all'],
+                       help='Megatron-FSDP: all-gather bf16 weights through FP8 E4M3 with one fp32 '
+                            'scale per 128 elements (~1.03 instead of 2 bytes per element); the '
+                            'GEMMs stay bf16 on the dequantized weights. experts: only '
+                            'expert-parallel buckets; all: every bf16 bucket.')
     group.add_argument('--suggested-communication-unit-size', type=int, default=None,
                    help='Specifies the number of elements to communicate at once during FSDP (Fully Sharded Data Parallel) operations. '
                         'This flag also affects FSDP all-gather prefetch behavior. Setting a larger value increases the communication buffer size, '

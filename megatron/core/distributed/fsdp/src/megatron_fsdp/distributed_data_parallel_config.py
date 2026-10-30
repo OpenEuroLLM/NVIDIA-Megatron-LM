@@ -75,6 +75,15 @@ class DistributedDataParallelConfig:
       | IB                   | True      | 1 / 1               |
     """
 
+    fsdp_fp8_param_gather: str = "none"
+    """All-gather bf16 FSDP weights through FP8 E4M3 with one fp32 scale per 128 elements
+      (megatron_fsdp/fp8_param_gather.py): ~1.03 instead of 2 bytes per element on the wire; the
+      GEMMs run in bf16 on the dequantized weights, master weights / gradients / optimizer are
+      unchanged. "none" (default), "experts" (only expert-parallel buckets, the bulk of the
+      traffic in large MoEs), "all" (every bf16 bucket). Needs optim_grads_params and no HSDP
+      outer-group parameter gather.
+    """
+
     fsdp_double_buffer: bool = False
     """If true, use persistently allocated double buffers for the 
       temporary memory needed in the Megatron FSDP communications.

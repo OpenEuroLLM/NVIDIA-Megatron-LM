@@ -4539,10 +4539,26 @@ class AllGatherPipeline:
             bucket_group_to_buckets[group_id].append(bucket_id)
 
         # Coalesce all-gather operations for all buckets in the same data-parallel-group
+        all_buckets = []
         for _, buckets in bucket_group_to_buckets.items():
+            all_buckets.extend(buckets)
             all_gather_stream = (
                 self.ag_stream if self.ag_stream is not None else torch.cuda.current_stream()
             )
+            # fsdp_fp8_param_gather: these buckets are gathered through FP8 below, outside the
+            # coalescing manager (their dequantization must run after the collective)
+            fp8_buckets = [b for b in buckets if self._uses_fp8_param_gather(b, bwd)]
+            if fp8_buckets:
+                assert not outer_fsdp_group_param_gather, (
+                    "fsdp_fp8_param_gather does not support the DP-Outer (HSDP) parameter gather"
+                )
+                buckets = [b for b in buckets if b not in fp8_buckets]
+                all_gather_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(all_gather_stream):
+                    for bucket_id in fp8_buckets:
+                        self.async_bucket_gather_fp8(bucket_id, bwd)
+            if not buckets:
+                continue
             if outer_fsdp_group_param_gather:
                 self.outer_fsdp_group_param_gather_stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(self.outer_fsdp_group_param_gather_stream):
@@ -4588,7 +4604,7 @@ class AllGatherPipeline:
 
         # Wait for all-gather to finish
         if not async_param_gather:
-            for bucket_id in buckets:
+            for bucket_id in all_buckets:
                 self.wait_bucket_ready(bucket_id, bwd)
 
     def wait_bucket_ready(self, bucket_id, bwd, empty_ok=False):
@@ -4688,6 +4704,62 @@ class AllGatherPipeline:
             return param_group.transpose_weight_buffer
         else:
             return param_group.model_weight_buffer
+
+    def _uses_fp8_param_gather(self, bucket_id, bwd) -> bool:
+        """Whether this bucket's weights are all-gathered through FP8 (fsdp_fp8_param_gather)."""
+        ddp_config = self.buffer.ddp_config
+        mode = getattr(ddp_config, "fsdp_fp8_param_gather", "none") or "none"
+        if mode == "none":
+            return False
+        assert mode in ("experts", "all"), f"fsdp_fp8_param_gather={mode!r}"
+        if ddp_config.data_parallel_sharding_strategy != "optim_grads_params":
+            return False
+        if mode == "experts" and not self.buffer.parameter_groups[bucket_id].is_expert_param:
+            return False
+        wbuf = self.get_fsdp_buffer(bucket_id, bwd)
+        return wbuf.data.dtype == torch.bfloat16 and wbuf.data_parallel_group.size() > 1
+
+    @torch.no_grad()
+    def async_bucket_gather_fp8(self, bucket_id, bwd) -> None:
+        """async_bucket_gather through FP8 (megatron_fsdp/fp8_param_gather.py): quantize the
+        local bf16 shard, all-gather the packed shards, dequantize into the bucket, all on the
+        current (all-gather) stream; the handle orders the consumer after the dequantization."""
+        from .fp8_param_gather import fp8_all_gather_into_tensor
+
+        bucket_key = self.get_bucket_key(bucket_id, bwd)
+        self.bucket_can_be_released[bucket_key] = False
+        if self.bucket_status[bucket_key] in (
+            BucketStatus.COMMUNICATING,
+            BucketStatus.READY_TO_USE,
+        ):
+            return
+        self.bucket_status[bucket_key] = BucketStatus.COMMUNICATING
+        wbuf = self.get_fsdp_buffer(bucket_id, bwd)
+        self.recycle_unused_buckets()
+        bucket = wbuf.fetch_bucket(set_param_data=True)
+        logged = self.__dict__.setdefault("_fp8_gather_logged", set())
+        if bucket_id not in logged:
+            logged.add(bucket_id)
+            if torch.distributed.get_rank() == 0:
+                logger.info(
+                    "fsdp_fp8_param_gather: bucket %d through FP8 (%d elements, expert=%s, "
+                    "group size %d)",
+                    bucket_id,
+                    bucket.data.numel(),
+                    self.buffer.parameter_groups[bucket_id].is_expert_param,
+                    wbuf.data_parallel_group.size(),
+                )
+        param_gather_event = fp8_all_gather_into_tensor(
+            output_tensor=bucket.data,
+            input_tensor=wbuf.get_shard_from_local_buffer(),
+            group=wbuf.data_parallel_group,
+        )
+
+        @torch.no_grad()
+        def mark_bucket_ready_to_use():
+            self.bucket_status[bucket_key] = BucketStatus.READY_TO_USE
+
+        self.param_gather_event_map[bucket_key] = (param_gather_event, mark_bucket_ready_to_use)
 
     @torch.no_grad()
     def async_bucket_gather(self, bucket_id, bwd) -> None:
