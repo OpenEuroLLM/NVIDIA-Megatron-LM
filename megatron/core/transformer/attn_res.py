@@ -51,23 +51,85 @@ import torch.nn.functional as F
 from torch import nn
 
 
+_MISALIGNED_REPORTED = set()
+
+
+def _report_misaligned(what):
+    # printed once per kind (not logged at INFO, which the default log level filters)
+    if what not in _MISALIGNED_REPORTED:
+        _MISALIGNED_REPORTED.add(what)
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        print(f"[compiled fn] rank {rank}: {what} not 16-byte aligned: cloned", flush=True)
+
+
+def _aligned_args(args, name="fn"):
+    """CUDA tensor arguments whose data pointer is not 16-byte aligned, cloned (differentiable:
+    the gradient reaches the original). Inductor specializes its kernels on 16-byte aligned
+    tensors; a misaligned one makes a vectorized load fault ("CUDA error: misaligned address",
+    the LDM address networks at hidden 1280 under Megatron-FSDP, 2026-10-30)."""
+    out = []
+    for i, a in enumerate(args):
+        if isinstance(a, torch.Tensor) and a.is_cuda and a.data_ptr() % 16:
+            _report_misaligned(f"{name} argument {i} {tuple(a.shape)}")
+            a = a.clone()
+        out.append(a)
+    return tuple(out)
+
+
+class _AlignedGrad(torch.autograd.Function):
+    """Identity whose backward passes the incoming gradient on 16-byte aligned: the compiled
+    backward of a torch.compile'd function reads its tangents with the same vectorized loads,
+    and AOTAutograd does not check their alignment (a consumer -- e.g. a fused kernel writing
+    into a workspace -- can hand back a view at any offset)."""
+
+    @staticmethod
+    def forward(ctx, x, name):
+        ctx.name = name
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, g):
+        if g is not None and g.is_cuda and g.data_ptr() % 16:
+            _report_misaligned(f"gradient of {ctx.name}")
+            g = g.clone()
+        return g, None
+
+
+def _aligned_outputs(out, name="fn"):
+    if isinstance(out, torch.Tensor):
+        return _AlignedGrad.apply(out, f"{name} output") if out.requires_grad else out
+    if isinstance(out, (tuple, list)):
+        return type(out)(
+            _AlignedGrad.apply(o, f"{name} output {i}")
+            if isinstance(o, torch.Tensor) and o.requires_grad
+            else o
+            for i, o in enumerate(out)
+        )
+    return out
+
+
 def _maybe_compile(fn):
     """Compile ``fn`` with Inductor, falling back to eager if unavailable.
 
     The depth-wise aggregation is a chain of small per-source kernels run twice
     per layer, so it is launch-bound rather than compute-bound; fusing it is
-    worth far more than the arithmetic it performs.
+    worth far more than the arithmetic it performs. Tensor arguments are passed 16-byte
+    aligned (``_aligned_args``), and so are the gradients the compiled backward reads
+    (``_aligned_outputs``).
     """
     state = {"fn": None}
 
+    name = getattr(fn, "__name__", "fn")
+
     def wrapper(*args, **kwargs):
+        args = _aligned_args(args, name)
         if state["fn"] is None:
             try:
                 state["fn"] = torch.compile(fn, dynamic=False)
             except Exception:  # pragma: no cover - depends on the runtime
                 state["fn"] = fn
         try:
-            return state["fn"](*args, **kwargs)
+            return _aligned_outputs(state["fn"](*args, **kwargs), name)
         except Exception:  # pragma: no cover - Inductor/Triton unavailable
             state["fn"] = fn
             return fn(*args, **kwargs)

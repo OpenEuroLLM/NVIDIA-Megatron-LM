@@ -40,17 +40,23 @@ LERP_NORMALIZATION_MODES = (
 
 
 def _maybe_compile(fn):
-    """Compile ``fn`` with Inductor, falling back to eager if unavailable."""
+    """Compile ``fn`` with Inductor, falling back to eager if unavailable; tensor arguments
+    and the gradients its backward reads passed 16-byte aligned (attn_res._aligned_args /
+    _aligned_outputs)."""
+    from megatron.core.transformer.attn_res import _aligned_args, _aligned_outputs
+
     state = {"fn": None}
+    name = getattr(fn, "__name__", "fn")
 
     def wrapper(*args, **kwargs):
+        args = _aligned_args(args, name)
         if state["fn"] is None:
             try:
                 state["fn"] = torch.compile(fn, dynamic=False)
             except Exception:  # pragma: no cover - depends on the runtime
                 state["fn"] = fn
         try:
-            return state["fn"](*args, **kwargs)
+            return _aligned_outputs(state["fn"](*args, **kwargs), name)
         except Exception:  # pragma: no cover - Inductor unavailable
             state["fn"] = fn
             return fn(*args, **kwargs)
