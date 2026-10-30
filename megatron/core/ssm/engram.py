@@ -62,6 +62,9 @@ from megatron.core.transformer.utils import (
 _ROW_ALIGN = 4096
 # Fixed seed of the hash multipliers: part of the model definition, not of training.
 _HASH_SEED = 0x5EED_E46A
+# Fixed seeds of the sign hash (engram_sign_hash): its multipliers and its +-1 table.
+_SIGN_HASH_SEED = 0x516E_0BAD
+_SIGN_TABLE_SEED = 0x516E_7AB1
 # A token-id offset so that the "before the sequence start" filler (0) is distinct.
 _PAD_ID = 0
 
@@ -91,17 +94,23 @@ def engram_table_sizes(config: TransformerConfig) -> list[int]:
 
 
 def engram_hash_multipliers(
-    config: TransformerConfig, layer_number: Optional[int] = None
+    config: TransformerConfig, layer_number: Optional[int] = None, seed: int = _HASH_SEED
 ) -> torch.Tensor:
     """[orders * heads, max_order] odd int64 multipliers (< 2**31), deterministic; per
-    layer under ``engram_hash_per_layer``."""
-    seed = _HASH_SEED
+    layer under ``engram_hash_per_layer``. ``seed``: the row hash's, or the sign hash's."""
     if config.engram_hash_per_layer:
         seed += 10007 * int(layer_number or 0)
     rng = np.random.default_rng(seed)
     n_lookups = len(config.engram_ngram_orders) * config.engram_num_heads
     mult = rng.integers(1 << 20, 1 << 31, size=(n_lookups, max(config.engram_ngram_orders)))
     return torch.from_numpy(mult | 1).to(torch.int64)
+
+
+def engram_sign_table(config: TransformerConfig) -> torch.Tensor:
+    """The fixed +-1 table of ``engram_sign_hash``: [engram_sign_table_size, embed_dim]."""
+    rng = np.random.default_rng(_SIGN_TABLE_SEED)
+    bits = rng.integers(0, 2, size=(config.engram_sign_table_size, config.engram_embed_dim))
+    return torch.from_numpy(2.0 * bits - 1.0).to(torch.float32)
 
 
 def document_positions(cu_seqlens: torch.Tensor, total: int) -> torch.Tensor:
@@ -200,6 +209,13 @@ class EngramLayer(MegatronModule):
         self.register_buffer(
             "hash_mult", engram_hash_multipliers(config, layer_number), persistent=False
         )
+        if config.engram_sign_hash:
+            self.register_buffer(
+                "sign_mult",
+                engram_hash_multipliers(config, layer_number, seed=_SIGN_HASH_SEED),
+                persistent=False,
+            )
+            self.register_buffer("sign_table", engram_sign_table(config), persistent=False)
         token_map = None
         if config.engram_token_map is not None:
             token_map = torch.from_numpy(np.load(config.engram_token_map).astype(np.int64))
@@ -568,6 +584,23 @@ class EngramLayer(MegatronModule):
         b, s = input_ids.shape
         return emb.reshape(b, s, -1).transpose(0, 1)
 
+    def _signs(
+        self, input_ids: torch.Tensor, positions: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """``engram_sign_hash``: the +-1 pattern of every (n-gram, lookup), [s, b, L * dim],
+        from an independent hash of the same (canonical) n-grams into the fixed sign table.
+        Applied to e_t in every lookup path (direct, step, grouped); constant, so autograd
+        carries the sign into the row gradients."""
+        ids = input_ids if self.token_map is None else self.token_map[input_ids]
+        n_lookups = len(self.orders) * self.num_heads
+        rows = engram_hash(
+            ids, self.orders, self.num_heads, self.sign_mult,
+            [self.config.engram_sign_table_size] * n_lookups, positions=positions,
+        )  # [b, s, L]
+        signs = F.embedding(rows, self.sign_table)  # [b, s, L, dim]
+        b, s = input_ids.shape
+        return signs.reshape(b, s, -1).transpose(0, 1)
+
     def _sharded_memory(self, rows: torch.Tensor) -> torch.Tensor:
         """``engram_table_parallel="dp"``: [b, s, L] rows -> [s, b, L * embed_dim].
 
@@ -626,6 +659,10 @@ class EngramLayer(MegatronModule):
         e = self._memory(
             input_ids, None if positions is None else positions.unsqueeze(0)
         ).to(h.dtype)
+        if self.config.engram_sign_hash:
+            e = e * self._signs(
+                input_ids, None if positions is None else positions.unsqueeze(0)
+            ).to(e.dtype)
         k = self.key_proj(e)
         v = self.value_proj(e)
         gate = (self.hidden_norm(h).float() * self.key_norm(k).float()).sum(-1, keepdim=True)

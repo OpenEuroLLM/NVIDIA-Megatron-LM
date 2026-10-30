@@ -14,6 +14,7 @@ from megatron.core.ssm.engram import (
     document_positions,
     engram_hash,
     engram_hash_multipliers,
+    engram_sign_table,
     engram_table_sizes,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -199,6 +200,68 @@ class TestEngramLayer:
         for lo, n in zip((0, 8), lens):
             layer.set_input_ids(ids[:, lo : lo + n])
             alone.append(layer(h[lo : lo + n]))
+        torch.testing.assert_close(packed, torch.cat(alone, 0))
+
+    def _sign_layer(self, **kw):
+        pg = ProcessGroupCollection(
+            tp=parallel_state.get_tensor_model_parallel_group(),
+            cp=parallel_state.get_context_parallel_group(),
+        )
+        cfg = _config(engram_sign_hash=True, engram_sign_table_size=64, **kw)
+        return EngramLayer(cfg, layer_number=1, pg_collection=pg).cuda()
+
+    def test_sign_hash_patterns(self):
+        """engram_sign_hash: a fixed +-1 pattern per (n-gram, lookup); the same n-gram gets the
+        same pattern wherever it occurs, different n-grams mostly different ones."""
+        layer = self._sign_layer()
+        table = engram_sign_table(layer.config)
+        assert table.shape == (64, 16) and set(table.unique().tolist()) == {-1.0, 1.0}
+        torch.testing.assert_close(table, engram_sign_table(layer.config))  # fixed seed
+        ids = torch.tensor([[5, 7, 9, 5, 7, 9, 11, 13]], device="cuda")
+        signs = layer._signs(ids)  # [s, b, L * dim]
+        assert signs.shape == (8, 1, 4 * 16) and bool((signs.abs() == 1).all())
+        # positions 2 and 5 end the same bigram (7, 9) and trigram (5, 7, 9)
+        torch.testing.assert_close(signs[2], signs[5])
+        assert not torch.equal(signs[2], signs[7])
+        # independent of the row hash: other multipliers than the table lookup's
+        assert not torch.equal(layer.sign_mult, layer.hash_mult)
+
+    def test_sign_hash_multiplies_the_memory(self):
+        torch.manual_seed(2)
+        layer = self._sign_layer()
+        with torch.no_grad():
+            layer.table.normal_()
+        ids = torch.randint(0, 50000, (2, 24), device="cuda")
+        h = torch.randn(24, 2, HIDDEN, device="cuda")
+        layer.set_input_ids(ids)
+        out = layer(h)
+        e = layer._memory(ids) * layer._signs(ids)
+        k, v = layer.key_proj(e), layer.value_proj(e)
+        gate = (layer.hidden_norm(h) * layer.key_norm(k)).sum(-1, keepdim=True)
+        torch.testing.assert_close(out, h + torch.sigmoid(gate / HIDDEN**0.5) * v)
+        out.sum().backward()  # the sign reaches the row gradients through autograd
+        assert layer.key_proj.weight.grad is not None
+
+    def test_sign_hash_restarts_at_documents(self):
+        torch.manual_seed(3)
+        layer = self._sign_layer()
+        with torch.no_grad():
+            layer.table.normal_()
+            layer.conv1d.weight.normal_()
+        lens = [5, 1, 11, 7]
+        ids = [torch.randint(0, 50000, (1, n), device="cuda") for n in lens]
+        hs = [torch.randn(n, 1, HIDDEN, device="cuda") for n in lens]
+        cu = torch.tensor([0] + list(torch.tensor(lens).cumsum(0)), dtype=torch.int32).cuda()
+        params = PackedSeqParams(
+            qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu,
+            max_seqlen_q=max(lens), max_seqlen_kv=max(lens),
+        )
+        layer.set_input_ids(torch.cat(ids, 1))
+        packed = layer(torch.cat(hs, 0), packed_seq_params=params)
+        alone = []
+        for i, h in zip(ids, hs):
+            layer.set_input_ids(i)
+            alone.append(layer(h))
         torch.testing.assert_close(packed, torch.cat(alone, 0))
 
     def test_table_stays_fp32_through_the_bf16_cast(self):
