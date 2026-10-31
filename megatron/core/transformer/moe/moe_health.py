@@ -18,6 +18,7 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import is_graph_warmup
+from megatron.core.transformer.moe.moe_logging import all_reduce_skip_singleton
 
 # A deliberately internal threshold: it is a diagnostic definition, not a training knob.
 EXPERT_COLLAPSE_RMS_FRACTION = 0.10
@@ -548,9 +549,9 @@ def _all_reduce_tensors(tensors, groups, avg_last: bool = False):
             if group is None:
                 continue
             if avg_last and i == len(groups) - 1:
-                torch.distributed.all_reduce(value, group=group, op=torch.distributed.ReduceOp.AVG)
+                all_reduce_skip_singleton(value, group=group, op=torch.distributed.ReduceOp.AVG)
             else:
-                torch.distributed.all_reduce(value, group=group)
+                all_reduce_skip_singleton(value, group=group)
 
 
 def report_moe_health_metrics(
@@ -574,10 +575,10 @@ def report_moe_health_metrics(
         for values in (selected_values, dispatched_values) + (
             (weight_values,) if weight_values is not None else ()
         ):
-            torch.distributed.all_reduce(values, group=pp_group)
+            all_reduce_skip_singleton(values, group=pp_group)
             if reduce_group is not None:
-                torch.distributed.all_reduce(values, group=reduce_group)
-            torch.distributed.all_reduce(values, group=dp_group, op=torch.distributed.ReduceOp.AVG)
+                all_reduce_skip_singleton(values, group=reduce_group)
+            all_reduce_skip_singleton(values, group=dp_group, op=torch.distributed.ReduceOp.AVG)
 
         active_layers = selected_values.sum(dim=-1) > 0
         selected_means = selected_values.mean(dim=-1, keepdim=True)
@@ -702,12 +703,12 @@ def report_moe_health_metrics(
         pp_group = _pp_group(pg_collection)
         dp_group = _dp_group(pg_collection)
         for t in (sum_max_score, sum_score_entropy, sum_logits, token_count):
-            torch.distributed.all_reduce(t, group=pp_group)
+            all_reduce_skip_singleton(t, group=pp_group)
         if rs_tracker.get("reduce_group") is not None:
             for t in (sum_max_score, sum_score_entropy, sum_logits, token_count):
-                torch.distributed.all_reduce(t, group=rs_tracker["reduce_group"])
+                all_reduce_skip_singleton(t, group=rs_tracker["reduce_group"])
         for t in (sum_max_score, sum_score_entropy, sum_logits, token_count):
-            torch.distributed.all_reduce(t, group=dp_group, op=torch.distributed.ReduceOp.AVG)
+            all_reduce_skip_singleton(t, group=dp_group, op=torch.distributed.ReduceOp.AVG)
 
         have_wandb_rs = per_layer_logging and (wandb_writer is not None)
         logit_spread_list = []
@@ -876,7 +877,7 @@ def report_moe_health_metrics(
         for name in ("weight_sq_sum", "weight_count", "grad_sq_sum", "grad_count", "initial_rms"):
             value = viability_tracker[name]
             for group in groups:
-                torch.distributed.all_reduce(value, group=group)
+                all_reduce_skip_singleton(value, group=group)
         weight_rms = torch.sqrt(
             viability_tracker["weight_sq_sum"] / viability_tracker["weight_count"].clamp_min(1)
         )

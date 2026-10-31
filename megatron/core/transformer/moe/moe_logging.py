@@ -30,6 +30,21 @@ from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
 
 
+def all_reduce_skip_singleton(tensor, group=None, op=torch.distributed.ReduceOp.SUM):
+    """``all_reduce`` that skips single-rank groups (a no-op for SUM / AVG / MAX).
+
+    Under MEGATRON_LAZY_SINGLETON_GROUPS=1 (parallel_state._new_group) a single-rank group has no
+    NCCL communicator until its first collective, which then allocates ~0.38 GiB of device memory
+    mid-training. The metric reductions over PP (size 1 without pipelining) did exactly that and
+    ran out of memory on a full device (ambitious v2 at 128 nodes, 2026-10-31: ncclCuMemAlloc in
+    _sync_metrics after step 1, once global_aux_loss gave the tracker metrics to sync).
+    """
+    size = getattr(group, "size", None)
+    if group is not None and callable(size) and size() == 1:
+        return
+    torch.distributed.all_reduce(tensor, group=group, op=op)
+
+
 @dataclass
 class MetricEntry:
     """Per-layer metric with distributed reduction configuration."""
@@ -274,18 +289,18 @@ class MoEMetricsTracker:
             entry = self._metrics[name]
             v = entry.values
 
-            torch.distributed.all_reduce(v, group=pp_group)
+            all_reduce_skip_singleton(v, group=pp_group)
 
             if entry.reduce_group is not None:
-                torch.distributed.all_reduce(v, group=entry.reduce_group)
+                all_reduce_skip_singleton(v, group=entry.reduce_group)
 
             if entry.avg_group is not None:
-                torch.distributed.all_reduce(
+                all_reduce_skip_singleton(
                     v, group=entry.avg_group, op=torch.distributed.ReduceOp.AVG
                 )
 
             if entry.needs_dp_avg:
-                torch.distributed.all_reduce(v, group=dp_group, op=torch.distributed.ReduceOp.AVG)
+                all_reduce_skip_singleton(v, group=dp_group, op=torch.distributed.ReduceOp.AVG)
 
     @staticmethod
     def _count_moe_layers(

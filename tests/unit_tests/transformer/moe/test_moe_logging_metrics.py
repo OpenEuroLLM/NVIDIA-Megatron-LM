@@ -308,3 +308,30 @@ def test_ghost_expert_weight_ratio(monkeypatch):
     assert math.isclose(agg["expert_mean_weight_ratio_min"], 0.01 / layer_mean, rel_tol=1e-5)
     clear_expert_utilization_tracker()
     assert not utilization["weight_values"].any()
+
+
+def test_metric_reductions_skip_single_rank_groups(monkeypatch):
+    """No collective on a single-rank group: under MEGATRON_LAZY_SINGLETON_GROUPS=1 its first
+    collective would allocate an NCCL communicator (~0.38 GiB) mid-training."""
+    from megatron.core.transformer.moe.moe_logging import all_reduce_skip_singleton
+
+    calls = []
+    monkeypatch.setattr(
+        torch.distributed, "all_reduce", lambda t, group=None, op=None: calls.append(group)
+    )
+    single, multi = SimpleNamespace(size=lambda: 1), SimpleNamespace(size=lambda: 4)
+    t = torch.ones(2)
+    all_reduce_skip_singleton(t, group=single)
+    all_reduce_skip_singleton(t, group=multi)
+    all_reduce_skip_singleton(t, group=None)  # the default (world) group is never skipped
+    all_reduce_skip_singleton(t, group=object())  # no size(): reduced as before
+    assert calls[0] is multi and calls[1] is None and len(calls) == 3
+    assert torch.equal(t, torch.ones(2))
+
+    calls.clear()
+    tracker = MoEMetricsTracker()
+    tracker.record("load_balancing_loss", torch.tensor(1.0), 0, 1, reduce_group=single)
+    tracker._sync_metrics(
+        ["load_balancing_loss"], SimpleNamespace(pp=single, dp_cp_gtp_remat=multi)
+    )
+    assert calls == [multi]  # only the DP average
