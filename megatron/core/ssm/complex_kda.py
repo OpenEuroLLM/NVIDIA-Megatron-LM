@@ -297,6 +297,10 @@ class ComplexKDA(_MegatronSelfAttentionAdapter):
             mod = getattr(self.layer, proj, None)
             if mod is not None and getattr(mod, "weight", None) is not None:
                 mod.weight.headwise_dim = head_dim
+        # linear_beta_adam: beta's per-head scalar gates on Adam (as the MoE router)
+        b_proj = getattr(self.layer, "b_proj", None)
+        if getattr(config, "linear_beta_adam", False) and b_proj is not None:
+            b_proj.weight.use_adam_with_emerging_optimizers = True
 
 
 class ComplexKDAHybridAttention(_MegatronSelfAttentionAdapter):
