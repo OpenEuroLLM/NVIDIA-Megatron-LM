@@ -276,11 +276,13 @@ def get_tokens_per_expert_and_token_count(
     Compute global_tokens_per_expert, local_num_tokens and total_num_tokens with padding mask.
     """
     local_tokens_per_expert = routing_map.sum(dim=0)
+    # before the reduction: it all-reduces its input in place, so local_tokens_per_expert would
+    # read the group's counts afterwards
+    local_num_tokens = local_tokens_per_expert.sum() / topk if with_padding_mask else None
     global_tokens_per_expert = reduce_from_tensor_model_parallel_region(
         local_tokens_per_expert, reduce_group
     )
     if with_padding_mask:
-        local_num_tokens = local_tokens_per_expert.sum() / topk
         total_num_tokens = global_tokens_per_expert.sum() / topk
     else:
         local_num_tokens = routing_map.shape[0]
