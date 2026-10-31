@@ -198,6 +198,7 @@ class TestQuantileBalancingWithAuxLoss:
     @pytest.mark.internal
     def test_config_validation(self):
         self._config(["quantile_balancing", "seq_aux_loss"], [0.0, 1e-4])  # valid
+        self._config(["quantile_balancing", "global_aux_loss"], [0.0, 1e-5])  # valid
         with pytest.raises(ValueError, match="must be 0"):
             self._config(["quantile_balancing", "seq_aux_loss"], [1e-4, 1e-4])
         with pytest.raises(ValueError, match="only with auxiliary losses"):
@@ -213,6 +214,7 @@ class TestQuantileBalancingWithAuxLoss:
         for name, lb, coeff in (
             ("qb", "quantile_balancing", 0.0),
             ("qb_seq", ["quantile_balancing", "seq_aux_loss"], [0.0, 1e-1]),
+            ("qb_global", ["quantile_balancing", "global_aux_loss"], [0.0, 1e-1]),
         ):
             router = self._router(lb, coeff)
             router.train()
@@ -224,3 +226,5 @@ class TestQuantileBalancingWithAuxLoss:
             grads[name] = router.weight.grad.float().clone()
         # the same QB routing; the aux loss adds its gradient to the router weight
         assert not torch.allclose(grads["qb"], grads["qb_seq"])
+        # the global-batch loss too: its token fractions come from the raw top-k (no QB bias)
+        assert not torch.allclose(grads["qb"], grads["qb_global"])

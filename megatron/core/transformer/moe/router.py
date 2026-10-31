@@ -914,6 +914,7 @@ class TopKRouter(Router):
                 layer_number,
                 num_layers,
                 reduce_group=self.tp_cp_group,
+                probs=probs,
             )
 
         return probs, routing_map

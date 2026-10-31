@@ -194,8 +194,12 @@ def save_to_expert_utilization_tracker(
     layer_number: int,
     num_layers: int,
     reduce_group: Optional[torch.distributed.ProcessGroup] = None,
+    dispatched_weight_per_expert: Optional[torch.Tensor] = None,
 ) -> None:
-    """Accumulate selected and dispatched expert counts for global-step logging."""
+    """Accumulate selected and dispatched expert counts for global-step logging, and the sum
+    of the routing weights of each expert's dispatched tokens (``dispatched_weight_per_expert``):
+    its mean weight per assignment exposes "ghost" experts that get tokens (e.g. through a
+    balancing bias) but almost no weight, which the token counts cannot show."""
     if layer_number is None:
         return
     tracker = get_expert_utilization_tracker()
@@ -208,6 +212,7 @@ def save_to_expert_utilization_tracker(
             num_layers, num_experts, device=device, dtype=torch.float32
         )
         tracker["dispatched_values"] = torch.zeros_like(tracker["selected_values"])
+        tracker["weight_values"] = torch.zeros_like(tracker["selected_values"])
         tracker["selected_near_dead_streaks"] = torch.zeros(
             num_layers, num_experts, device=device, dtype=torch.int32
         )
@@ -215,6 +220,8 @@ def save_to_expert_utilization_tracker(
     idx = layer_number - 1
     tracker["selected_values"][idx] += selected_tokens_per_expert.detach().float()
     tracker["dispatched_values"][idx] += dispatched_tokens_per_expert.detach().float()
+    if dispatched_weight_per_expert is not None:
+        tracker["weight_values"][idx] += dispatched_weight_per_expert.detach().float()
 
 
 def clear_expert_utilization_tracker() -> None:
@@ -223,6 +230,8 @@ def clear_expert_utilization_tracker() -> None:
     if "selected_values" in tracker:
         tracker["selected_values"].zero_()
         tracker["dispatched_values"].zero_()
+        if "weight_values" in tracker:
+            tracker["weight_values"].zero_()
 
 
 def get_router_stats_tracker() -> dict:
@@ -281,8 +290,10 @@ def record_router_health_metrics(
     layer_number: Optional[int],
     num_layers: int,
     reduce_group: Optional[torch.distributed.ProcessGroup],
+    probs: Optional[torch.Tensor] = None,
 ) -> None:
-    """Record utilization and score-distribution stats for one router forward.
+    """Record utilization and score-distribution stats for one router forward (``probs``: the
+    sparse [tokens, experts] routing weights, for the per-expert mean weight).
 
     Graph-safe (also recorded inside a captured MoE-router CUDA graph): in-place adds into
     buffers created in the eager warmup steps, padding masked by multiplication rather than
@@ -290,20 +301,28 @@ def record_router_health_metrics(
     the extra eager passes graph creation runs before capturing (they repeat a step)."""
     if layer_number is None or is_graph_warmup():
         return
+    dispatched_weight_per_expert = None
     if padding_mask is not None:
         valid = (~padding_mask).reshape(-1, 1).float()  # [tokens, 1]
         selected_tokens_per_expert = (selected_routing_map.float() * valid).sum(dim=0)
         dispatched_tokens_per_expert = (routing_map.float() * valid).sum(dim=0)
+        if probs is not None:
+            dispatched_weight_per_expert = (
+                probs.detach().float() * routing_map.float() * valid
+            ).sum(dim=0)
     else:
         valid = None
         selected_tokens_per_expert = selected_routing_map.sum(dim=0).float()
         dispatched_tokens_per_expert = routing_map.sum(dim=0).float()
+        if probs is not None:
+            dispatched_weight_per_expert = (probs.detach().float() * routing_map.float()).sum(dim=0)
     save_to_expert_utilization_tracker(
         selected_tokens_per_expert,
         dispatched_tokens_per_expert,
         layer_number,
         num_layers,
         reduce_group=reduce_group,
+        dispatched_weight_per_expert=dispatched_weight_per_expert,
     )
     with torch.no_grad():
         score_distribution = compute_router_score_distribution(logits, score_function, expert_bias)
@@ -551,7 +570,10 @@ def report_moe_health_metrics(
         pp_group = _pp_group(pg_collection)
         dp_group = _dp_group(pg_collection)
         reduce_group = util_tracker.get("reduce_group")
-        for values in (selected_values, dispatched_values):
+        weight_values = util_tracker.get("weight_values")
+        for values in (selected_values, dispatched_values) + (
+            (weight_values,) if weight_values is not None else ()
+        ):
             torch.distributed.all_reduce(values, group=pp_group)
             if reduce_group is not None:
                 torch.distributed.all_reduce(values, group=reduce_group)
@@ -568,6 +590,27 @@ def report_moe_health_metrics(
             near_dead_streaks = torch.zeros_like(selected_values, dtype=torch.int32)
             util_tracker["selected_near_dead_streaks"] = near_dead_streaks
         update_expert_near_dead_streaks(near_dead_streaks, selected_near_dead_mask)
+
+        # Ghost experts: dispatched tokens but a mean routing weight per assignment far below
+        # the layer's (< 0.1x); invisible in the counts (quantile balancing fills every quota).
+        weight_ratio_min, ghost_slots = None, None
+        if weight_values is not None and bool(weight_values.any()):
+            has = dispatched_values > 0
+            mean_w = weight_values / dispatched_values.clamp_min(1.0)
+            layer_w = weight_values.sum(dim=-1, keepdim=True) / dispatched_values.sum(
+                dim=-1, keepdim=True
+            ).clamp_min(1.0)
+            ratio = mean_w / layer_w.clamp_min(1e-20)
+            ratio = torch.where(has, ratio, torch.full_like(ratio, float("inf")))
+            weight_ratio_min = ratio.min().item()
+            ghost_slots = ((ratio < 0.1) & has).sum().item()
+            if per_layer_logging and writer is not None:
+                for i in range(ratio.shape[0]):
+                    if bool(has[i].any()):
+                        writer.add_scalar(
+                            f"moe/expert_mean_weight_ratio_min_layer_{i}",
+                            ratio[i].min().item(), iteration,
+                        )
 
         selected_zero_slots = selected_zero_mask.sum().item()
         selected_near_dead_slots = selected_near_dead_mask.sum().item()
@@ -632,6 +675,9 @@ def report_moe_health_metrics(
                 "selected_expert_max_vio_max": max(selected_max_vio_list),
                 "dropped_assignment_frac_max": max(dropped_frac_list),
             }
+            if weight_ratio_min is not None:
+                aggregate_log["expert_mean_weight_ratio_min"] = weight_ratio_min
+                aggregate_log["ghost_expert_layer_slots"] = ghost_slots
             if writer is not None:
                 for name, value in aggregate_log.items():
                     writer.add_scalar(f"moe/{name}", value, iteration)

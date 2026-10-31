@@ -281,3 +281,30 @@ def test_health_wandb_groups_are_compact(monkeypatch):
         "viability-layers": 8,
         "viability-aggregates": 9,
     }
+
+
+def test_ghost_expert_weight_ratio(monkeypatch):
+    """An expert that gets its tokens (e.g. through quantile balancing's bias) but almost no
+    routing weight is a ghost: mean weight per assignment < 0.1 x the layer's."""
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda *_args, **_kwargs: None)
+    groups = SimpleNamespace(pp=object(), dp_cp_gtp_remat=object(), tp_cp=object(), ep=object())
+    utilization = get_expert_utilization_tracker()
+    utilization.clear()
+    save_to_expert_utilization_tracker(
+        torch.tensor([5.0, 5.0]), torch.tensor([5.0, 5.0]), 1, 2,
+        dispatched_weight_per_expert=torch.tensor([2.5, 0.05]),  # mean weight 0.5 vs 0.01
+    )
+    save_to_expert_utilization_tracker(
+        torch.tensor([4.0, 4.0]), torch.tensor([4.0, 4.0]), 2, 2,
+        dispatched_weight_per_expert=torch.tensor([1.0, 1.2]),
+    )
+    assert torch.equal(utilization["weight_values"][0], torch.tensor([2.5, 0.05]))
+    get_router_stats_tracker().clear()
+    wandb = FakeWandb()
+    report_moe_health_metrics(iteration=1, wandb_writer=wandb, pg_collection=groups)
+    agg = {k.split("/", 1)[1]: v for k, v in wandb.data.items() if k.startswith("router-aggregates/")}
+    assert agg["ghost_expert_layer_slots"] == 1
+    layer_mean = 2.55 / 10
+    assert math.isclose(agg["expert_mean_weight_ratio_min"], 0.01 / layer_mean, rel_tol=1e-5)
+    clear_expert_utilization_tracker()
+    assert not utilization["weight_values"].any()
