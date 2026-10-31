@@ -3220,7 +3220,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         _mem_trace = _maybe_start_mem_trace(iteration)
         from megatron.core import mem_breakdown
 
-        if iteration is not None and iteration < 3:
+        if iteration is not None and iteration < mem_breakdown.STEPS:
             mem_breakdown.report(f"iteration {iteration} start")
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step_func,
@@ -3238,7 +3238,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         )
         if _mem_trace is not None:
             _dump_mem_trace(_mem_trace)
-        if iteration is not None and iteration < 3:
+        if iteration is not None and iteration < mem_breakdown.STEPS:
             mem_breakdown.report(f"iteration {iteration} after forward-backward")
         # EMPTY_CACHE_FIRST_STEPS=N: release the allocator cache after the forward-backward of the
         # first N steps only -- NCCL allocates its buffers of the optimizer step / grad norm

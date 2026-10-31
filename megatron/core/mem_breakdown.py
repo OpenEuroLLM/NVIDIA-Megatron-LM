@@ -15,6 +15,10 @@ import torch
 
 ENABLED = os.environ.get("MEM_BREAKDOWN", "0") == "1"
 _RANKS = {int(r) for r in os.environ.get("MEM_BREAKDOWN_RANKS", "0,8,16,24").split(",")}
+# MEM_BREAKDOWN_STEPS=N: report at the first N iterations (default 3). The allocator retries
+# (num_alloc_retries: a failed cudaMalloc at the cap -> free the cached blocks -> retry) show
+# allocator thrash directly, which sets in a few steps after the start
+STEPS = int(os.environ.get("MEM_BREAKDOWN_STEPS", "3"))
 _totals = {}
 
 
@@ -37,9 +41,11 @@ def report(tag: str) -> None:
     g = 2**30
     parts = ", ".join(f"{k} {v / g:.2f}" for k, v in sorted(_totals.items()))
     print(
-        f"[mem_breakdown] rank {_rank()} {tag}: in use {(total - free) / g:.2f} GiB, reserved "
+        f"[mem_breakdown] rank {_rank()} {tag}: in use {(total - free) / g:.2f} of {total / g:.2f} GiB, reserved "
         f"{torch.cuda.memory_reserved() / g:.2f}, allocated {torch.cuda.memory_allocated() / g:.2f}, "
-        f"non-PyTorch {non_torch_bytes() / g:.2f} (measured: {parts or '-'})",
+        f"non-PyTorch {non_torch_bytes() / g:.2f}, max reserved {torch.cuda.max_memory_reserved() / g:.2f}, "
+        f"alloc retries {torch.cuda.memory_stats().get('num_alloc_retries', 0)} "
+        f"(measured: {parts or '-'})",
         flush=True,
     )
 
