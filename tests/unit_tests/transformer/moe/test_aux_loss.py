@@ -552,7 +552,7 @@ class TestRouterAuxLoss:
         global_aux_loss_1 = get_moe_layer_wise_logging_tracker()["global_load_balancing_loss"][
             "values"
         ][0]
-        reduce_from_tensor_model_parallel_region(global_aux_loss_1, router.tp_dp_cp_group)
+        reduce_from_tensor_model_parallel_region(global_aux_loss_1, router.tp_cp_group)
         assert global_aux_loss_1 >= 1
 
         # When DP size is 1, the global aux loss should match the aux loss
@@ -582,7 +582,7 @@ class TestRouterAuxLoss:
         global_aux_loss_2 = get_moe_layer_wise_logging_tracker()["global_load_balancing_loss"][
             "values"
         ][0]
-        reduce_from_tensor_model_parallel_region(global_aux_loss_2, router.tp_dp_cp_group)
+        reduce_from_tensor_model_parallel_region(global_aux_loss_2, router.tp_cp_group)
         assert torch.all(global_aux_loss_2 >= 1), f"global_aux_loss_2: {global_aux_loss_2}"
 
         # Verify tokens were accumulated
@@ -594,6 +594,46 @@ class TestRouterAuxLoss:
         router.reset_global_aux_loss_tracker()
         assert router.ga_steps == 0
         assert torch.all(router.global_tokens_per_expert == 0)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("tp_size,cp_size", [(1, 1), (2, 1), (1, 2)])
+    def test_global_aux_loss_dp_invariant(self, tp_size, cp_size):
+        """With the same tokens on every DP rank the global token fractions equal the local ones,
+        so global_aux_loss must push the router exactly as aux_loss at the same coefficient, at
+        any DP size (it was 1 / DP as strong: probabilities averaged over the whole group)."""
+        clear_aux_losses_tracker()
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=tp_size, context_parallel_size=cp_size
+        )
+        grads, logged = {}, {}
+        for kind, name in (("aux_loss", "load_balancing_loss"),
+                           ("global_aux_loss", "global_load_balancing_loss")):
+            torch.manual_seed(7)
+            router = self.new_router(
+                moe_router_load_balancing_type=kind,
+                moe_aux_loss_coeff=1e-2,
+                tensor_model_parallel_size=tp_size,
+                context_parallel_size=cp_size,
+                bf16=False,
+                params_dtype=torch.float32,
+            ).cuda()
+            with torch.no_grad():
+                router.weight.copy_(torch.randn_like(router.weight))  # same on every rank
+            # the same tokens on every DP rank (seeded independently of the rank)
+            gen = torch.Generator(device="cuda").manual_seed(11)
+            hidden = torch.randn(
+                (32, 2, router.config.hidden_size), device="cuda", generator=gen
+            )
+            probs, _ = router(hidden)
+            (probs * 0).sum().backward()  # only the attached aux loss carries a gradient
+            grads[kind] = router.weight.grad.clone()
+            value = get_moe_layer_wise_logging_tracker()[name]["values"][0].clone()
+            reduce_from_tensor_model_parallel_region(value, router.tp_cp_group)
+            logged[kind] = value
+            clear_aux_losses_tracker()
+        assert grads["aux_loss"].abs().max() > 0
+        torch.testing.assert_close(grads["global_aux_loss"], grads["aux_loss"], rtol=1e-5, atol=1e-9)
+        torch.testing.assert_close(logged["global_aux_loss"], logged["aux_loss"], rtol=1e-5, atol=1e-7)
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

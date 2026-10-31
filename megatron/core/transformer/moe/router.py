@@ -589,13 +589,25 @@ class TopKRouter(Router):
             moe_aux_loss_coeff=global_aux_loss_coeff,
             fused=self.config.moe_router_fusion,
         )
+        # The loss above averages this rank's router probabilities over the token count of the
+        # whole TP x DP x CP group, so with DP-averaged gradients its pressure was 1 / DP of
+        # aux_loss's at the same coefficient (DP 512: 1e-4 acted as ~2e-7). Rescale the
+        # probability average to the local TP x CP tokens, as aux_loss: only the token fractions
+        # f_i stay global, and with identical routing on every DP rank the gradient equals
+        # aux_loss's. Logged (and reduced) as aux_loss: summed over TP x CP, averaged over DP.
+        local_group_tokens = local_num_tokens * self.tp_cp_group.size()
+        if torch.is_tensor(local_group_tokens):
+            local_group_tokens = local_group_tokens.clamp(min=1)
+        else:
+            local_group_tokens = max(local_group_tokens, 1)
+        global_aux_loss = global_aux_loss * (total_num_tokens / local_group_tokens)
         probs = self.attach_and_log_load_balancing_loss(
             probs,
             global_aux_loss_coeff,
             global_aux_loss,
             "global_load_balancing_loss",
-            self.tp_dp_cp_group,
-            needs_dp_avg=False,
+            self.tp_cp_group,
+            needs_dp_avg=True,
             valid_token_count=local_num_tokens,
         )
         return probs
