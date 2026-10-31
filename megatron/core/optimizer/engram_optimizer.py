@@ -150,6 +150,9 @@ class EngramTableOptimizer(MegatronOptimizer):
                 is_engram_table=True,
                 is_expert_parallel=False,
                 sharded_table_lr_mult=mult,
+                # adam_lr_warmup_iters: the tables are Adam-updated too (scheduler factor)
+                **({'lr_warmup_steps': config.adam_lr_warmup_iters}
+                   if getattr(config, 'adam_lr_warmup_iters', 0) else {}),
             )
             for mult, group_params in sorted(by_mult.items())
         ] or [dict(params=[], lr=0.0, max_lr=0.0, min_lr=0.0, wd_mult=0.0, weight_decay=0.0)]

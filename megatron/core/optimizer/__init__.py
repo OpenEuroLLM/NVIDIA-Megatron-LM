@@ -217,6 +217,19 @@ def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, Par
                     max_lr=config.lr * mult, min_lr=(config.min_lr or 0.0) * mult
                 )
 
+    # MoE router: its own lr warmup (see OptimizerConfig.moe_router_lr_warmup_iters).
+    router_warmup = getattr(config, 'moe_router_lr_warmup_iters', 0) or 0
+    adam_warmup = getattr(config, 'adam_lr_warmup_iters', 0) or 0
+    if router_warmup < 0 or adam_warmup < 0:
+        raise ValueError("moe_router_lr_warmup_iters / adam_lr_warmup_iters must be >= 0")
+    if router_warmup and adam_warmup and router_warmup != adam_warmup:
+        raise ValueError("moe_router_lr_warmup_iters and adam_lr_warmup_iters must be equal when both "
+                         "are set (the router is an Adam parameter)")
+    if router_warmup:
+        config_overrides[ParamKey(name='*router.weight')] = ParamGroupOverride(
+            lr_warmup_steps=router_warmup
+        )
+
     if config.decoupled_lr is not None:
         decoupled_lr_config: ParamGroupOverride = {"max_lr": config.decoupled_lr}
         decoupled_param_key = ParamKey(attr="is_embedding_or_output_parameter")
@@ -957,6 +970,12 @@ def _prepare_emerging_optimizer_params(config, eopt_name, model_chunks, config_o
             'optimizer': head_opt
         }
         default_param_overrides = rewritten
+    # adam_lr_warmup_iters: every parameter routed to the scalar optimizer warms up its lr
+    adam_warmup = getattr(config, 'adam_lr_warmup_iters', 0) or 0
+    if adam_warmup:
+        for override in default_param_overrides.values():
+            if override.get('optimizer') not in (None, eopt_name):
+                override['lr_warmup_steps'] = adam_warmup
     config_overrides.update(default_param_overrides)
 
 

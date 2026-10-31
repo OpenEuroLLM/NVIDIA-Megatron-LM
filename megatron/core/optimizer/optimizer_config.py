@@ -226,6 +226,18 @@ class OptimizerConfig:
     each step, so recipes usually lower it. No effect with tied embeddings (the shared matrix is the
     word embedding). Conflicts with decoupled_lr."""
 
+    moe_router_lr_warmup_iters: int = 0
+    """Linear lr warmup of the MoE router weights (`*router.weight`) over this many steps, on top of
+    the schedule; 0 = off. Without it the router's Adam moves every weight by ~lr from the first
+    step and the routing collapses within ~6 steps at large batches (one expert per layer taking
+    30-60x its share), faster than quantile balancing or the expert bias react."""
+
+    adam_lr_warmup_iters: int = 0
+    """Linear lr warmup over this many steps of every parameter a Muon-family optimizer hands to
+    Adam (router, embedding, output layer, norms, biases, gates) and of the Engram / PKM tables
+    (TableAdam), on top of the schedule; the Muon-family matrices keep the schedule's lr. 0 = off.
+    With moe_router_lr_warmup_iters both must be equal (the router is one of these parameters)."""
+
     allow_new_param_groups_on_load: bool = False
     """When an optimizer checkpoint is loaded whose param_groups contain no group with the
     identifier of a current group (e.g. `embedding_wd_mult` or a norm multiplier enabled mid-run),

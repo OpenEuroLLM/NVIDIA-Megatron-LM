@@ -35,6 +35,9 @@ class ParamGroupOverride(TypedDict, total=False):
     end_wd: float
     wd_mult: float
     optimizer: str
+    lr_warmup_steps: int
+    """A linear warmup of this group's lr on top of the schedule (factor num_steps / lr_warmup_steps
+    until it reaches 1; moe_router_lr_warmup_iters, adam_lr_warmup_iters)."""
 
 
 def get_canonical_lr_for_logging(param_groups: list[dict]) -> float | None:
@@ -263,6 +266,18 @@ class OptimizerParamScheduler:
         return start_wd + coeff * delta_wd
 
     def get_lr(self, param_group: dict) -> float:
+        """The scheduled lr of a group, times its own linear warmup (`lr_warmup_steps`, if set).
+
+        Args:
+            param_group (dict): parameter group from the optimizer.
+        """
+        lr = self._get_scheduled_lr(param_group)
+        group_warmup = param_group.get('lr_warmup_steps') or 0
+        if group_warmup > 0 and self.num_steps < group_warmup:
+            lr *= float(self.num_steps) / float(group_warmup)
+        return lr
+
+    def _get_scheduled_lr(self, param_group: dict) -> float:
         """Learning rate decay functions from:
         https://openreview.net/pdf?id=BJYwwY9ll pg. 4
 

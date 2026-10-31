@@ -2852,6 +2852,13 @@ def _add_regularization_args(parser):
     group.add_argument('--output-layer-lr-mult', type=float, default=1.0,
                        help='Learning-rate multiplier of the untied output layer (max and min lr). '
                        'No effect with tied embeddings. Conflicts with --decoupled-lr.')
+    group.add_argument('--moe-router-lr-warmup-iters', type=int, default=0,
+                       help='Linear lr warmup of the MoE router weights over this many steps, on '
+                       'top of the schedule (0: off).')
+    group.add_argument('--adam-lr-warmup-iters', type=int, default=0,
+                       help='Linear lr warmup over this many steps of every parameter a Muon-family '
+                       'optimizer hands to Adam (router, embedding, output layer, norms) and of the '
+                       'Engram / PKM tables; the Muon-family matrices keep the schedule (0: off).')
     group.add_argument('--allow-new-param-groups-on-load', action='store_true',
                        help='When the loaded optimizer checkpoint has no param_group matching a '
                        'current group (a multiplier enabled mid-run creates a new group), load '
