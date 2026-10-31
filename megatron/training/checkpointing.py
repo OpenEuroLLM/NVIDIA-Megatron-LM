@@ -140,6 +140,19 @@ def get_loaded_iteration():
     return _LOADED_ITERATION
 
 
+def rescale_scheduler_for_phase(opt_param_scheduler, iteration: int, global_batch_size: int) -> None:
+    """--phase-transition-variable-batch: the scheduler counts samples (global batch size per step); a
+    phase with another global batch size (constant tokens per step at another sequence length) continues
+    the schedule at the same iteration -- its progress re-expressed in this phase's samples. The schedule
+    lengths (warmup / decay) come from this phase's arguments, i.e. are already in these units."""
+    steps = iteration * global_batch_size
+    if opt_param_scheduler.num_steps != steps:
+        print_rank_0(f' > phase transition with a new global batch size: scheduler steps '
+                     f'{opt_param_scheduler.num_steps} -> {steps} (iteration {iteration} x {global_batch_size})')
+    opt_param_scheduler.num_steps = steps
+    opt_param_scheduler.step(0)
+
+
 def check_checkpoint_args(checkpoint_args, skip_args: set[str] | None = None):
     """Ensure fixed arguments for a model are the same for the input
     arguments and the one retrieved from checkpoint."""
@@ -177,7 +190,7 @@ def check_checkpoint_args(checkpoint_args, skip_args: set[str] | None = None):
         _compare('tokenizer_type')
     if args.data_parallel_random_init:
         _compare('data_parallel_random_init')
-    if args.phase_transition_iterations:
+    if args.phase_transition_iterations and not getattr(args, 'phase_transition_variable_batch', False):
         _compare('global_batch_size')
     if get_checkpoint_version() < 3.0:
         _compare('tensor_model_parallel_size', old_arg_name='model_parallel_size')
@@ -2839,6 +2852,8 @@ def load_checkpoint(
                     opt_param_scheduler.load_state_dict(state_dict['lr_scheduler'])
                 else:
                     opt_param_scheduler.load_state_dict(state_dict['opt_param_scheduler'])
+                if getattr(args, 'phase_transition_variable_batch', False):
+                    rescale_scheduler_for_phase(opt_param_scheduler, iteration, args.global_batch_size)
         except KeyError as e:
             print_rank_0(
                 'Unable to load optimizer from checkpoint {}. '

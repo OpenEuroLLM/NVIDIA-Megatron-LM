@@ -843,6 +843,15 @@ def validate_args(args, defaults={}):
                    for elt in [args.train_data_path, args.valid_data_path, args.test_data_path]) is False or \
             args.per_split_data_args_path is None
 
+    if args.phase_transition_variable_batch:
+        assert args.phase_transition_iterations, \
+            '--phase-transition-variable-batch requires --phase-transition-iterations'
+        assert args.rampup_batch_size is None, \
+            '--phase-transition-variable-batch: no batch-size rampup (the phase sets the batch size)'
+        # the scheduler's lengths are in samples (x global batch size): take this phase's values
+        assert not args.use_checkpoint_opt_param_scheduler, \
+            '--phase-transition-variable-batch takes the scheduler from the arguments, not the checkpoint'
+        args.override_opt_param_scheduler = True
     if args.phase_transition_iterations:
         args.phase_transition_iterations = sorted(
             int(x.strip()) for x in args.phase_transition_iterations.split(",")
@@ -3731,6 +3740,13 @@ def _add_data_args(parser):
     group.add_argument('--phase-transition-iterations', type=str, default=None,
                        help='Comma-separated list of iterations where phase '
                        'transitions occur. Requires fixed global batch size across phases.')
+    group.add_argument('--phase-transition-variable-batch', action='store_true', default=False,
+                       help='Allow another global batch size in each phase (e.g. constant tokens per step '
+                       'across a sequence-length curriculum): no global-batch-size check against the '
+                       'checkpoint; the LR scheduler (which counts samples) continues at the same iteration '
+                       '(num_steps = iteration x the current global batch size, its other settings from '
+                       'the arguments: implies --override-opt-param-scheduler). Requires '
+                       '--phase-transition-iterations.')
     group.add_argument('--split', type=str, default=None,
                        help='Comma-separated list of proportions for training,'
                        ' validation, and test split. For example the split '
