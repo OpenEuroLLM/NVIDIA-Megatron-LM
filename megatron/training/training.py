@@ -5478,6 +5478,23 @@ def cyclic_iter(iterable):
             )
 
 
+def _phase_iteration_bounds(args):
+    """(first, end) iteration of the phase args.iteration lies in (--phase-transition-iterations)."""
+    bounds = [0, *args.phase_transition_iterations, args.train_iters]
+    first = max(t for t in bounds[:-1] if t <= args.iteration)
+    end = min(t for t in bounds[1:] if t > args.iteration) if args.iteration < args.train_iters else args.train_iters
+    return first, end
+
+
+def _phase_eval_points(args, first, end):
+    """Evaluations a variable-batch phase [first, end) runs: one per eval_interval multiple in
+    (first, end], plus the one at the phase's exit, from start_eval_at_iter on."""
+    start = max(first, args.start_eval_at_iter or 0)
+    if start >= end:
+        return 0
+    return end // args.eval_interval - start // args.eval_interval + 1
+
+
 def get_train_valid_test_num_samples():
     """Train/valid/test num samples."""
 
@@ -5493,6 +5510,13 @@ def get_train_valid_test_num_samples():
     else:
         if args.skip_train:
             eval_iters = args.eval_iters
+        elif args.phase_transition_iterations and getattr(args, 'phase_transition_variable_batch', False):
+            # every phase has its own stage data and global batch size: size the validation index for
+            # this phase's evaluations, not the whole run's at this phase's batch size (at constant
+            # tokens per step that is ~80B tokens of validation in every phase -- a 4k phase's
+            # 0.2 % split repeated over many epochs, an index build of hours)
+            assert args.train_iters is not None
+            eval_iters = _phase_eval_points(args, *_phase_iteration_bounds(args)) * args.eval_iters
         else:
             assert args.train_iters is not None
             total_eval_points = args.train_iters // args.eval_interval + 1
@@ -5564,6 +5588,17 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
                 * getattr(args, 'eval_global_batch_size', args.global_batch_size)
             )
 
+    # Variable-batch phases: the validation dataset is this phase's (see
+    # get_train_valid_test_num_samples), so its loader starts at the phase's own evaluations.
+    consumed_valid_samples = args.consumed_valid_samples
+    if args.phase_transition_iterations and getattr(args, 'phase_transition_variable_batch', False):
+        first, _ = _phase_iteration_bounds(args)
+        done = _phase_eval_points(args, first, args.iteration) - 1 if args.iteration > first else 0
+        consumed_valid_samples = (
+            max(0, done) * args.eval_iters
+            * getattr(args, 'eval_global_batch_size', args.global_batch_size)
+        )
+
     # Get consumed train samples in this phase.
     if args.phase_transition_iterations:
         last_transition = max(iteration for iteration in (0, *args.phase_transition_iterations) if iteration <= args.iteration)
@@ -5604,7 +5639,7 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
                         # TODO(bnorick): for multiple validation sets without full validation, args.consumed_valid_samples is not
                         # correct and needs to be calculated/set per validation set
                         raise NotImplementedError("--multiple-validation-sets currently requires --full-validation")
-                    valid_dataloaders.append(build_pretraining_data_loader(valid_d, args.consumed_valid_samples))
+                    valid_dataloaders.append(build_pretraining_data_loader(valid_d, consumed_valid_samples))
             if not args.multiple_validation_sets:
                 assert len(valid_dataloaders) == 1
             test_dataloader = build_pretraining_data_loader(test_ds, 0)
