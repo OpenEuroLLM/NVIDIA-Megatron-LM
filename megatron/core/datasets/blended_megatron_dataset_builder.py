@@ -190,10 +190,27 @@ class BlendedMegatronDatasetBuilder(object):
             for i in range(len(Split)):
                 if split[i] is not None:
                     weights_i = weights
+                    datasets_i = megatron_datasets[i]
                     if weights_i is not None and self.sizes[i] is not None:
                         # Blend according to client-specified weights and client-specified size
                         size_per_dataset = list(zip(*sizes_per_dataset_target))[i]
                         size_i = sum(size_per_dataset)
+                        empty = _empty_split_datasets(self.cls, prefixes, split[i], self.config)
+                        if empty:
+                            # drop the datasets with an empty split, renormalize the rest; their
+                            # mid-level datasets were built with the original weights' surplus
+                            keep = [j for j in range(len(prefixes)) if j not in empty]
+                            dropped = sum(weights[j] for j in empty)
+                            assert dropped <= self.config.mid_level_dataset_surplus, (
+                                f"the {Split(i).name} split is empty in datasets of weight "
+                                f"{dropped:.4g} > mid_level_dataset_surplus "
+                                f"{self.config.mid_level_dataset_surplus}"
+                            )
+                            weights_i = normalize([weights[j] for j in keep])
+                            datasets_i = [megatron_datasets[i][j] for j in keep]
+                            size_i = sum(
+                                list(zip(*_get_size_per_split_per_dataset(weights_i, self.sizes)))[i]
+                            )
                     elif weights_i is None:
                         # Blend according to dataset sizes as-is and (maybe) client-specified size
                         try:
@@ -222,7 +239,7 @@ class BlendedMegatronDatasetBuilder(object):
                             )
                             else True
                         ),  # synchronize_ranks, default behavior to build on rank-0 first. Set to False if we are using --dataloader-fast-cache-load # pylint: disable=C0301
-                        megatron_datasets[i],
+                        datasets_i,
                         weights_i,
                         size_i,
                         self.config,
@@ -470,6 +487,21 @@ class BlendedMegatronDatasetBuilder(object):
                     beg = int(round(split[i][0] * float(num_elements)))
                     end = int(round(split[i][1] * float(num_elements)))
                     indexed_indices = numpy.arange(start=beg, stop=end, step=1, dtype=numpy.int32)
+                    if end == beg and sizes[i]:
+                        # an empty split (a small dataset whose 0.2 % rounds to 0 documents): no
+                        # mid-level dataset -- a request for samples from it never ends (GPTDataset
+                        # adds epochs of 0 tokens); the blend drops it and renormalizes. The same
+                        # barrier as build_generic_dataset, so the ranks stay in step.
+                        log_single_rank(
+                            logger,
+                            logging.WARNING,
+                            f"{dataset_path}: the {_split.name} split is empty "
+                            f"({num_elements} documents), dropped from the {_split.name} blend",
+                        )
+                        if torch.distributed.is_initialized() and synchronize_ranks:
+                            torch.distributed.barrier()
+                        mid_level_datasets.append(None)
+                        continue
 
                 mid_level_datasets.append(
                     self.build_generic_dataset(
@@ -548,6 +580,17 @@ class BlendedMegatronDatasetBuilder(object):
             return dataset
 
         return cls(*args)
+
+
+def _empty_split_datasets(cls, prefixes, split_i, config) -> List[int]:
+    """Indices of the blend's datasets whose split holds no elements, rounded as the mid-level
+    build does (round(split boundary x numel_low_level_dataset))."""
+    empty = []
+    for j, prefix in enumerate(prefixes):
+        n = cls.numel_low_level_dataset(cls.build_low_level_dataset(prefix, config))
+        if int(round(split_i[1] * float(n))) == int(round(split_i[0] * float(n))):
+            empty.append(j)
+    return empty
 
 
 def _get_size_per_split_per_dataset(
