@@ -2863,7 +2863,13 @@ def load_checkpoint(
             )
             raise e
     else:
-        if (args.fp16 or args.bf16) and optimizer is not None:
+        if (args.fp16 or args.bf16) and optimizer is not None and getattr(args, 'use_megatron_fsdp', False):
+            # Megatron-FSDP (--no-load-optim, e.g. an evaluation of a checkpoint): the model state was
+            # loaded into the main-weight DTensors in place, and the module's load_state_dict post-hook
+            # (install_optimized_model_weights) copied them to the compute weights -- there is no
+            # separate model -> main copy to make (and Megatron-FSDP implements none)
+            pass
+        elif (args.fp16 or args.bf16) and optimizer is not None:
             if args.load_main_params_from_ckpt:
                 optimizer.reload_model_params(state_dict=state_dict)
             else:
