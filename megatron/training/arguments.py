@@ -511,6 +511,26 @@ def _validate_packed_doc_attention(args):
     )
 
 
+def apply_fixed_valid_args(args):
+    """--fixed-valid-data-path / --valid-seq-length: the sets are evaluated independently and completely; at
+    another sequence length the eval batch sizes default to the training ones at the same tokens."""
+    if getattr(args, 'fixed_valid_data_path', None):
+        args.multiple_validation_sets = True
+        args.full_validation = True
+        if args.validation_set_names:
+            assert len(args.validation_set_names) == len(args.fixed_valid_data_path), \
+                '--validation-set-names must name every --fixed-valid-data-path set'
+    vsl = getattr(args, 'valid_seq_length', None)
+    if vsl is not None and vsl != args.seq_length:
+        assert args.seq_length % vsl == 0, \
+            f'--seq-length ({args.seq_length}) must be a multiple of --valid-seq-length ({vsl})'
+        ratio = args.seq_length // vsl    # the same tokens per (micro) batch
+        if args.eval_micro_batch_size is None:
+            args.eval_micro_batch_size = args.micro_batch_size * ratio
+        if args.eval_global_batch_size is None:
+            args.eval_global_batch_size = args.global_batch_size * ratio
+
+
 def validate_args(args, defaults={}):
     if args.optimizer == 'muown_classical':
         # explicit (non-default) angular settings: launchers omit defaults
@@ -870,6 +890,8 @@ def validate_args(args, defaults={}):
         args.global_batch_size = args.micro_batch_size * args.data_parallel_size
         print_rank_0('setting global batch size to {}'.format(args.global_batch_size))
     assert args.global_batch_size > 0
+
+    apply_fixed_valid_args(args)
 
     # Eval batch size defaults and validation.
     if args.eval_global_batch_size is None:
@@ -3758,6 +3780,16 @@ def _add_data_args(parser):
     group.add_argument('--valid-data-path', nargs='*', default=None,
                        help='The weight and prefix list for an independent validation dataset. '
                        'Follows the same pattern rules as --data-path.')
+    group.add_argument('--fixed-valid-data-path', nargs='*', default=None,
+                       help='Fixed held-out validation sets, one unweighted prefix each, evaluated independently '
+                       'and completely at every evaluation (implies --multiple-validation-sets and '
+                       '--full-validation; names: --validation-set-names). Training keeps its --data-path / '
+                       '--data-args-path and --split: its datasets (and their cache) are built as without this '
+                       'flag, only the split\'s validation part is not used.')
+    group.add_argument('--valid-seq-length', type=int, default=None,
+                       help='Sequence length of the validation sets and of evaluation (default: --seq-length), '
+                       'e.g. one short-context validation set across the stages of a sequence-length curriculum. '
+                       'The eval micro / global batch sizes default to the training ones at the same tokens.')
     group.add_argument('--test-data-path', nargs='*', default=None,
                        help='The weight and prefix list for an independent test dataset. '
                        'Follows the same pattern rules as --data-path.')

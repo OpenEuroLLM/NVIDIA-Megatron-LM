@@ -5137,7 +5137,22 @@ def train(
     return iteration, num_floating_point_operations_so_far
 
 
-def evaluate(
+def evaluate(*args_, **kwargs_):
+    """Evaluation, at --valid-seq-length when it is set: args.seq_length is the evaluation's sequence length
+    while it runs (batch shapes, pipeline tensors, packed-document metadata read it), then restored."""
+    args = get_args()
+    valid_seq_length = getattr(args, 'valid_seq_length', None)
+    if not valid_seq_length or valid_seq_length == args.seq_length:
+        return _evaluate(*args_, **kwargs_)
+    train_seq_length = args.seq_length
+    args.seq_length = valid_seq_length
+    try:
+        return _evaluate(*args_, **kwargs_)
+    finally:
+        args.seq_length = train_seq_length
+
+
+def _evaluate(
     forward_step_func,
     data_iterator,
     model,

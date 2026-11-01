@@ -10,6 +10,7 @@ _PROGRAM_START_TIME = time.time()
 import json
 
 # Suppress warnings on all ranks but rank 0.
+import dataclasses
 import os
 import warnings
 
@@ -594,6 +595,42 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
     return GPTDatasetConfig(**data_args)
 
 
+def fixed_valid_dataset_configs(config, args):
+    """(training config, validation config) for --fixed-valid-data-path. The training config differs only in
+    fields outside the dataset cache key (multiple_validation_sets, full_validation), so the training datasets
+    keep their cache; the validation config: one unweighted prefix per set, at --valid-seq-length."""
+    train_config = dataclasses.replace(config, multiple_validation_sets=False, full_validation=False)
+    valid_config = dataclasses.replace(
+        config,
+        blend=None,
+        split=None,
+        blend_per_split=[None, (list(args.fixed_valid_data_path), None), None],
+        sequence_length=args.valid_seq_length or config.sequence_length,
+        multiple_validation_sets=True,
+        full_validation=True,
+    )
+    return train_config, valid_config
+
+
+def build_with_fixed_valid_sets(dataset_type, train_val_test_num_samples, is_dataset_built, config, args):
+    """Training / test as without the flag (the split's validation part: 1 sample, unused); validation: the
+    fixed sets, each completely (one epoch)."""
+    train_config, valid_config = fixed_valid_dataset_configs(config, args)
+    sizes = list(train_val_test_num_samples)
+    sizes[1] = 1                       # the split's own validation part: unused (a weighted blend needs a size)
+    if sizes[2] is None:
+        sizes[2] = 1
+    train_ds, _, test_ds = BlendedMegatronDatasetBuilder(
+        dataset_type, sizes, is_dataset_built, train_config
+    ).build()
+    _, valid_ds, _ = BlendedMegatronDatasetBuilder(
+        dataset_type, [None, None, None], is_dataset_built, valid_config
+    ).build()
+    print_rank_0(f"> fixed validation sets: {len(args.fixed_valid_data_path)} at sequence length "
+                 f"{valid_config.sequence_length}")
+    return train_ds, valid_ds, test_ds
+
+
 def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None):
     """Build the train test and validation datasets.
 
@@ -634,9 +671,14 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
     is_dataset_built = partial(
         is_dataset_built_on_rank, vp_stage=vp_stage, is_packed_sequence=is_packed_sequence
     )
-    train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
-        dataset_type, train_val_test_num_samples, is_dataset_built, config
-    ).build()
+    if getattr(args, 'fixed_valid_data_path', None):
+        train_ds, valid_ds, test_ds = build_with_fixed_valid_sets(
+            dataset_type, train_val_test_num_samples, is_dataset_built, config, args
+        )
+    else:
+        train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
+            dataset_type, train_val_test_num_samples, is_dataset_built, config
+        ).build()
 
     print_rank_0("> finished creating GPT datasets ...")
 
