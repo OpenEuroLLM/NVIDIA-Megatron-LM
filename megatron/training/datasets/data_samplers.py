@@ -96,6 +96,15 @@ def build_pretraining_data_loader(dataset, consumed_samples):
     else:
         raise Exception('{} dataloader type is not supported.'.format(args.dataloader_type))
 
+    # MEGATRON_SAMPLE_DUMP_DIR: write the first MEGATRON_SAMPLE_DUMP_N (default 200) training
+    # micro-batches' sample indices of every rank to <dir>/train_rank<global rank>.jsonl -- to
+    # check that two layouts train on the same samples per step
+    dump_dir = os.environ.get("MEGATRON_SAMPLE_DUMP_DIR")
+    if dump_dir and split not in (Split.valid, Split.test):
+        batch_sampler = _SampleDumpSampler(
+            batch_sampler, dump_dir, int(os.environ.get("MEGATRON_SAMPLE_DUMP_N", "200"))
+        )
+
     def worker_init_fn(_):
         import os
 
@@ -547,3 +556,29 @@ class MegatronPretrainingReferenceLayoutSampler:
             for b in range(0, self.per_rank, self.micro_batch_size):
                 self.consumed_samples += self.micro_batch_size * self.data_parallel_size
                 yield samples[b : b + self.micro_batch_size]
+
+
+class _SampleDumpSampler:
+    """Wraps a batch sampler; writes the first ``limit`` micro-batches it yields (one JSON line
+    each: the consumed-samples counter at the start and the sample indices) per rank."""
+
+    def __init__(self, inner, dump_dir, limit):
+        self.inner, self.dump_dir, self.limit = inner, dump_dir, limit
+
+    def __len__(self):
+        return len(self.inner)
+
+    def __iter__(self):
+        import json
+
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        os.makedirs(self.dump_dir, exist_ok=True)
+        path = os.path.join(self.dump_dir, f"train_rank{rank}.jsonl")
+        written = 0
+        with open(path, "a") as f:
+            for batch in self.inner:
+                if written < self.limit:
+                    f.write(json.dumps({"ids": [int(x) for x in batch]}) + "\n")
+                    f.flush()
+                    written += 1
+                yield batch
