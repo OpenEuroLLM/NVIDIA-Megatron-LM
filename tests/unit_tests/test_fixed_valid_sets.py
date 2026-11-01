@@ -28,15 +28,23 @@ def _args(**kw):
 
 def test_apply_fixed_valid_args():
     a = _args(fixed_valid_data_path=["/x/all", "/x/code"], validation_set_names=["all", "code"],
-              valid_seq_length=4096)
+              valid_seq_length=4096, data_parallel_size=64)
     apply_fixed_valid_args(a)
     assert a.multiple_validation_sets and a.full_validation
-    assert (a.eval_micro_batch_size, a.eval_global_batch_size) == (16, 16384)   # 2^26 tokens per batch
+    # full validation samples one sequence per rank per micro batch: exactly one micro batch per eval step
+    assert (a.eval_micro_batch_size, a.eval_global_batch_size) == (1, 64)
+    a = _args(seq_length=65536, valid_seq_length=4096)                # without fixed sets: the same tokens
+    apply_fixed_valid_args(a)
+    assert (a.eval_micro_batch_size, a.eval_global_batch_size) == (16, 16384)
     a = _args(seq_length=4096, global_batch_size=16384, micro_batch_size=16, valid_seq_length=4096)
     apply_fixed_valid_args(a)                       # the same length: nothing changes
     assert a.eval_micro_batch_size is None and not a.full_validation
     with pytest.raises(AssertionError):
-        apply_fixed_valid_args(_args(fixed_valid_data_path=["/x/a"], validation_set_names=["a", "b"]))
+        apply_fixed_valid_args(_args(fixed_valid_data_path=["/x/a"], validation_set_names=["a", "b"],
+                                     data_parallel_size=1))
+    with pytest.raises(AssertionError):
+        apply_fixed_valid_args(_args(fixed_valid_data_path=["/x/a"], fixed_valid_seq_lengths=[4096, 65536],
+                                     data_parallel_size=1))
     with pytest.raises(AssertionError):
         apply_fixed_valid_args(_args(seq_length=6000, valid_seq_length=4096))
 
@@ -47,6 +55,10 @@ def test_evaluate_runs_at_valid_seq_length(monkeypatch):
     args = SimpleNamespace(seq_length=65536, valid_seq_length=4096)
     set_args(args)
     assert training.evaluate() == "r" and seen == [4096] and args.seq_length == 65536
+    args._eval_set_seq_length = 32768                # a per-set length (--fixed-valid-seq-lengths) wins
+    training.evaluate()
+    assert seen[-1] == 32768 and args.seq_length == 65536
+    args._eval_set_seq_length = None
     monkeypatch.setattr(training, "_evaluate", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x")))
     with pytest.raises(RuntimeError):
         training.evaluate()
@@ -74,8 +86,9 @@ def test_build_with_fixed_valid_sets():
                                     reset_attention_mask=False, eod_mask_loss=False,
                                     path_to_cache=os.path.join(d, "cache"),
                                     multiple_validation_sets=True, full_validation=True)
-        args = SimpleNamespace(fixed_valid_data_path=valid, valid_seq_length=8)
-        train_cfg, valid_cfg = pretrain_gpt.fixed_valid_dataset_configs(cfg(), args)
+        args = SimpleNamespace(fixed_valid_data_path=valid, valid_seq_length=8, fixed_valid_seq_lengths=[8, 16])
+        train_cfg, valid_cfgs = pretrain_gpt.fixed_valid_dataset_configs(cfg(), args)
+        assert [c.sequence_length for c in valid_cfgs] == [8, 16]
         for attr in GPTDataset._key_config_attributes():          # the training cache key is unchanged
             assert getattr(train_cfg, attr) == getattr(cfg(), attr), attr
         train_ds, valid_ds, _ = pretrain_gpt.build_with_fixed_valid_sets(
@@ -85,8 +98,8 @@ def test_build_with_fixed_valid_sets():
         plain_train, _, _ = BlendedMegatronDatasetBuilder(GPTDataset, [100, 1, 1], lambda: True, cfg()).build()
         assert train_ds.unique_description_hash == plain_train.unique_description_hash   # the same cache
         assert isinstance(valid_ds, list) and len(valid_ds) == 2
-        for v, prefix in zip(valid_ds, valid):
-            assert v.config.sequence_length == 8
+        for v, prefix, length in zip(valid_ds, valid, [8, 16]):
+            assert v.config.sequence_length == length
             n_tokens = 32 * 64                            # every document of the set, one epoch
-            assert len(v) == (n_tokens - 1) // 8
+            assert len(v) == (n_tokens - 1) // length
             assert v.dataset.path_prefix == prefix

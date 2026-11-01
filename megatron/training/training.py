@@ -5141,7 +5141,7 @@ def evaluate(*args_, **kwargs_):
     """Evaluation, at --valid-seq-length when it is set: args.seq_length is the evaluation's sequence length
     while it runs (batch shapes, pipeline tensors, packed-document metadata read it), then restored."""
     args = get_args()
-    valid_seq_length = getattr(args, 'valid_seq_length', None)
+    valid_seq_length = getattr(args, '_eval_set_seq_length', None) or getattr(args, 'valid_seq_length', None)
     if not valid_seq_length or valid_seq_length == args.seq_length:
         return _evaluate(*args_, **kwargs_)
     train_seq_length = args.seq_length
@@ -5414,6 +5414,9 @@ def evaluate_and_print_results(
                 suffix = f"-{args.validation_set_names[index]}"
             else:
                 suffix = f"-{index}"
+        # --fixed-valid-seq-lengths: this set's sequence length (evaluate() runs at it)
+        lengths = getattr(args, 'fixed_valid_seq_lengths', None)
+        args._eval_set_seq_length = lengths[index] if lengths else None
         total_loss_dict, collected_non_loss_data, timelimit = evaluate(
             forward_step_func,
             iterator,

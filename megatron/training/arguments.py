@@ -520,6 +520,15 @@ def apply_fixed_valid_args(args):
         if args.validation_set_names:
             assert len(args.validation_set_names) == len(args.fixed_valid_data_path), \
                 '--validation-set-names must name every --fixed-valid-data-path set'
+        if getattr(args, 'fixed_valid_seq_lengths', None):
+            assert len(args.fixed_valid_seq_lengths) == len(args.fixed_valid_data_path), \
+                '--fixed-valid-seq-lengths needs one length per --fixed-valid-data-path set'
+        # full validation samples ONE sequence per data-parallel rank per micro batch (and cycles), so the eval
+        # step must be exactly that: otherwise every set is evaluated eval_num_microbatches times per pass.
+        # One sequence of the set's length per rank -- a 64k set takes the memory of a 64k training micro batch.
+        args.eval_micro_batch_size = 1
+        args.eval_global_batch_size = args.data_parallel_size * getattr(args, 'gtp_weight_remat_size', 1)
+        return
     vsl = getattr(args, 'valid_seq_length', None)
     if vsl is not None and vsl != args.seq_length:
         assert args.seq_length % vsl == 0, \
@@ -3786,6 +3795,9 @@ def _add_data_args(parser):
                        '--full-validation; names: --validation-set-names). Training keeps its --data-path / '
                        '--data-args-path and --split: its datasets (and their cache) are built as without this '
                        'flag, only the split\'s validation part is not used.')
+    group.add_argument('--fixed-valid-seq-lengths', nargs='*', type=int, default=None,
+                       help='A sequence length per --fixed-valid-data-path set (e.g. 4096 for short-context sets and '
+                       '65536 for a long-context set); default: --valid-seq-length for every set.')
     group.add_argument('--valid-seq-length', type=int, default=None,
                        help='Sequence length of the validation sets and of evaluation (default: --seq-length), '
                        'e.g. one short-context validation set across the stages of a sequence-length curriculum. '
