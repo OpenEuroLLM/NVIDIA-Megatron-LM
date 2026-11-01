@@ -63,6 +63,26 @@ def build_pretraining_data_loader(dataset, consumed_samples):
                 micro_batch_size=micro_batch_size,
                 data_parallel_rank=mpu.get_data_parallel_rank(),
                 data_parallel_size=mpu.get_data_parallel_world_size())
+    elif args.dataloader_type == 'cyclic' and getattr(
+        args, 'data_sampler_reference_dp_size', None
+    ):
+        # keep the sample order of a reference layout across a node-count change
+        batch_sampler = MegatronPretrainingReferenceLayoutSampler(
+            dataset,
+            total_samples=len(dataset),
+            consumed_samples=consumed_samples,
+            micro_batch_size=micro_batch_size,
+            global_batch_size=global_batch_size,
+            data_parallel_rank=mpu.get_data_parallel_rank(),
+            data_parallel_size=mpu.get_data_parallel_world_size(),
+            data_sharding=args.data_sharding,
+            reference_dp_size=args.data_sampler_reference_dp_size,
+            reference_micro_batch_size=(
+                args.data_sampler_reference_micro_batch_size
+                if args.data_sampler_reference_micro_batch_size
+                else micro_batch_size
+            ),
+        )
     elif args.dataloader_type == 'cyclic':
         batch_sampler = MegatronPretrainingRandomSampler(
             dataset,
@@ -418,3 +438,112 @@ class MegatronPretrainingRandomSampler:
                 self.consumed_samples += self.micro_batch_times_data_parallel_size
                 yield batch
                 batch = []
+
+
+class MegatronPretrainingReferenceLayoutSampler:
+    """The cyclic sampler's sample order of a REFERENCE layout, served to any layout.
+
+    ``MegatronPretrainingRandomSampler`` orders the samples by the data-parallel layout: with data
+    sharding every rank shuffles its own bucket of ``total // (mbs x dp) x mbs`` samples, so a
+    different node count (or micro-batch size) reorders the whole stream. This sampler computes,
+    for every global step, exactly the samples the reference layout (``reference_dp_size`` ranks x
+    ``reference_micro_batch_size``) would have used in that step, and splits them over the actual
+    ranks (``data_parallel_size`` x ``micro_batch_size``). Every step trains on the same set of
+    samples as in the reference layout (the gradient is the same sum, up to reduction order); with
+    the actual layout equal to the reference it yields exactly the reference sampler's batches.
+
+    The global batch size must stay the same; consumed_samples (from the checkpoint) is a step
+    boundary. Steps that straddle an epoch end take the next epoch's first micro-batches, as the
+    reference run's re-created iterator does.
+    """
+
+    def __init__(
+        self,
+        dataset,
+        total_samples,
+        consumed_samples,
+        micro_batch_size,
+        global_batch_size,
+        data_parallel_rank,
+        data_parallel_size,
+        data_sharding,
+        reference_dp_size,
+        reference_micro_batch_size,
+    ):
+        self.dataset = dataset
+        self.total_samples = total_samples
+        self.consumed_samples = consumed_samples
+        self.micro_batch_size = micro_batch_size
+        self.global_batch_size = global_batch_size
+        self.data_parallel_rank = data_parallel_rank
+        self.data_parallel_size = data_parallel_size
+        self.data_sharding = data_sharding
+        self.ref_dp = reference_dp_size
+        self.ref_mbs = reference_micro_batch_size
+        self.ref_mb_dp = self.ref_mbs * self.ref_dp
+        assert total_samples > 0, f'no sample to consume: {total_samples}'
+        assert data_parallel_rank < data_parallel_size
+        assert global_batch_size % self.ref_mb_dp == 0, (
+            f'global batch {global_batch_size} is not a multiple of the reference layout '
+            f'{self.ref_dp} x {self.ref_mbs}'
+        )
+        assert global_batch_size % (micro_batch_size * data_parallel_size) == 0
+        self.ref_microbatches = global_batch_size // self.ref_mb_dp  # per step
+        self.per_rank = global_batch_size // data_parallel_size  # samples per rank per step
+        # micro-batches per reference rank and epoch (the reference sampler's bucket length)
+        self.mb_per_epoch = total_samples // self.ref_mb_dp
+        assert self.mb_per_epoch > 0
+        self._perm_epoch, self._perm = None, None
+
+    def __len__(self):
+        return self.total_samples
+
+    def _perm_for(self, epoch):
+        if epoch != self._perm_epoch:
+            g = torch.Generator()
+            g.manual_seed(epoch)
+            if self.data_sharding:
+                size = self.mb_per_epoch * self.ref_mbs  # the reference bucket
+            else:
+                size = (self.total_samples // self.ref_mbs) * self.ref_mbs
+            self._perm = torch.randperm(size, generator=g)
+            self._perm_epoch = epoch
+        return self._perm
+
+    def _reference_samples(self, ref_rank, ref_mb, offsets):
+        """Samples ``offsets`` of global reference micro-batch ``ref_mb`` of rank ``ref_rank``."""
+        epoch, j = divmod(ref_mb, self.mb_per_epoch)
+        perm = self._perm_for(epoch)
+        if self.data_sharding:
+            bucket = self.mb_per_epoch * self.ref_mbs
+            return [ref_rank * bucket + int(perm[j * self.ref_mbs + i]) for i in offsets]
+        return [
+            int(perm[j * self.ref_mb_dp + i * self.ref_dp + ref_rank]) for i in offsets
+        ]
+
+    def __iter__(self):
+        assert self.consumed_samples % self.global_batch_size == 0, (
+            f'consumed_samples {self.consumed_samples} is not a step boundary '
+            f'(global batch {self.global_batch_size})'
+        )
+        self.epoch = self.consumed_samples // (self.mb_per_epoch * self.ref_mb_dp)
+        if isinstance(self.dataset, RandomSeedDataset):
+            self.dataset.set_epoch(self.epoch)
+        per_ref_rank = self.ref_microbatches * self.ref_mbs  # samples per reference rank and step
+        lo = self.data_parallel_rank * self.per_rank
+        while True:
+            step = self.consumed_samples // self.global_batch_size
+            first_mb = step * self.ref_microbatches
+            # this rank's slice [lo, lo + per_rank) of the step's samples, ordered by
+            # (reference rank, reference micro-batch, position)
+            samples = []
+            pos = lo
+            while pos < lo + self.per_rank:
+                ref_rank, rem = divmod(pos, per_ref_rank)
+                k, i0 = divmod(rem, self.ref_mbs)
+                n = min(self.ref_mbs - i0, lo + self.per_rank - pos)
+                samples += self._reference_samples(ref_rank, first_mb + k, range(i0, i0 + n))
+                pos += n
+            for b in range(0, self.per_rank, self.micro_batch_size):
+                self.consumed_samples += self.micro_batch_size * self.data_parallel_size
+                yield samples[b : b + self.micro_batch_size]

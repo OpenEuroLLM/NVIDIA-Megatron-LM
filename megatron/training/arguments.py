@@ -4023,6 +4023,15 @@ def _add_vision_args(parser):
     group.add_argument('--no-data-sharding', action='store_false',
                        help='Disable data sharding.',
                        dest='data_sharding')
+    group.add_argument('--data-sampler-reference-dp-size', type=int, default=None,
+                       help='cyclic dataloader: serve the sample order of a reference layout '
+                       'of this many data-parallel ranks (x --data-sampler-reference-micro-'
+                       'batch-size), whatever the actual layout -- the same samples per step '
+                       'across a node-count change (MegatronPretrainingReferenceLayoutSampler). '
+                       'The global batch size must stay the same.')
+    group.add_argument('--data-sampler-reference-micro-batch-size', type=int, default=None,
+                       help='the reference layout\'s micro-batch size (default: the actual '
+                       'one); see --data-sampler-reference-dp-size')
     group.add_argument('--head-lr-mult', type=float, default=1.0,
                        help='learning rate multiplier for head during finetuning')
 
