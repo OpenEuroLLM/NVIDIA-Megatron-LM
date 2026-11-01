@@ -2589,7 +2589,10 @@ def setup_model_and_optimizer(
     # Even with --skip-train, RL still creates an optimizer unless --no-load-optim is set.
     has_rl_optimizer = args.perform_rl_step and not args.no_load_optim
     skip_optimizer = not (has_normal_optimizer or has_rl_optimizer)
-    wrap_with_ddp = not skip_optimizer
+    # Megatron-FSDP keeps its wrapper without an optimizer (--skip-train evaluation): the model's
+    # parameters live in the FSDP buffers, and an fsdp_dtensor checkpoint loads into the wrapped
+    # module only ("HybridModel has no attribute `module`" otherwise)
+    wrap_with_ddp = not skip_optimizer or getattr(args, "use_megatron_fsdp", False)
 
     if has_nvidia_modelopt:
         maybe_enable_modelopt(args)
