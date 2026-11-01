@@ -111,6 +111,19 @@ def record(
     _COUNTS[name][layer_number - 1] += count
 
 
+# tokens per micro-batch a metric pass looks at: fp32 copies of a whole 64k-token micro-batch
+# (~0.5 GB per [tokens, 2048] tensor, ~2 GB for the routed experts' fc1 output) ran a full
+# device out of memory (v3 main run, iteration 500); a strided subsample keeps the means unbiased
+MAX_TOKENS = 4096
+
+
+def token_rows(x: torch.Tensor, inner: int = 1, max_tokens: int = MAX_TOKENS) -> torch.Tensor:
+    """x with its leading (token) dims flattened, ``[T, *x.shape[-inner:]]``, strided down to at
+    most ``max_tokens`` rows (a view: no copy)."""
+    x = x.reshape(-1, *x.shape[x.dim() - inner:])
+    return x[:: max(1, -(-x.shape[0] // max_tokens))]
+
+
 def record_mean(name, layer_number, num_layers, values: torch.Tensor) -> None:
     """Record the mean of all elements of ``values``."""
     values = values.detach().float()

@@ -197,7 +197,8 @@ def record_expert_act_stats(module, fc1_output: torch.Tensor, config) -> None:
         return
     _, layer, n = tag
     limit = config.activation_func_clamp_value
-    y_1, y_2 = torch.chunk(fc1_output.float(), 2, -1)
+    # a strided token subsample: the whole dispatched fc1 output in fp32 was ~2 GB at 64k tokens
+    y_1, y_2 = torch.chunk(arch_metrics.token_rows(fc1_output).float(), 2, -1)
     if limit is not None:
         y_1, y_2 = y_1.clamp(max=limit), y_2.clamp(min=-limit, max=limit)
     rms = (F.silu(y_1) * y_2).square().mean(-1).sqrt()

@@ -1855,14 +1855,18 @@ class Attention(MegatronModule, ABC):
         from megatron.core.transformer import arch_metrics
 
         layer, n = self.layer_number, arch_metrics.num_layers_of(self.config)
+
+        # a strided token subsample (arch_metrics.token_rows): whole-micro-batch fp32 copies ran
+        # a full device out of memory at 64k tokens (v3 main run, iteration 500)
         if gate is not None:
-            g = torch.sigmoid(gate.float())
+            g = torch.sigmoid(arch_metrics.token_rows(gate).float())
             arch_metrics.record_mean("attn_gate/mean", layer, n, g)
             arch_metrics.record_mean("attn_gate/closed", layer, n, g < 0.05)
         if own_value is not None:
             hkv, dim = own_value.shape[-2], own_value.shape[-1]
-            o = core_attn_out.reshape(-1, core_attn_out.shape[-1] // dim, dim).float()
-            v = own_value.reshape(-1, hkv, dim).float().repeat_interleave(o.shape[1] // hkv, 1)
+            o = arch_metrics.token_rows(core_attn_out).float()
+            o = o.reshape(o.shape[0], -1, dim)
+            v = arch_metrics.token_rows(own_value, 2).float().repeat_interleave(o.shape[1] // hkv, 1)
             cos = torch.nn.functional.cosine_similarity(o, v, dim=-1, eps=1e-6)
             arch_metrics.record_mean("xsa/self_cos", layer, n, cos.abs())
 

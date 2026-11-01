@@ -97,6 +97,10 @@ class DepthMemoryRead(nn.Module):
         if tag is None:
             return
         kind, layer, n = tag
+        # a strided token subsample: whole-micro-batch fp32 copies ran a full device out of memory
+        lead = stream.dim() - 1  # the token dims, shared by stream / read / gate
+        gate = arch_metrics.token_rows(gate, gate.dim() - lead) if gate.dim() > lead else gate
+        stream, read = arch_metrics.token_rows(stream), arch_metrics.token_rows(read, 2)
         ratio = read.float().square().sum(dim=(-2, -1)).sqrt() / (
             stream.float().square().sum(-1).sqrt() + 1e-6
         )
@@ -302,6 +306,7 @@ class DepthMemoryMixer(nn.Module):
         from megatron.core.transformer import arch_metrics
 
         _, layer, n = tag
+        x, read = arch_metrics.token_rows(x), arch_metrics.token_rows(read)  # a token subsample
         xs = x.float().square().sum(-1).sqrt() + 1e-6
         arch_metrics.record_mean("ldm/read_ratio", layer, n, read.float().square().sum(-1).sqrt() / xs)
         arch_metrics.record_mean("ldm/stream_rms", layer, n, x.float().square().mean(-1).sqrt())
@@ -317,6 +322,7 @@ class DepthMemoryMixer(nn.Module):
         from megatron.core.transformer import arch_metrics
 
         _, layer, n = tag
+        x, value = arch_metrics.token_rows(x), arch_metrics.token_rows(value)  # a token subsample
         xs = x.float().square().sum(-1).sqrt() + 1e-6
         arch_metrics.record_mean("ldm/write_ratio", layer, n, value.float().square().sum(-1).sqrt() / xs)
         lam = torch.sigmoid(self.write_site.forget_logit.float())
