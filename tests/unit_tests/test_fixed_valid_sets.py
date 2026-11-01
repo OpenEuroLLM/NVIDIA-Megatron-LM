@@ -71,8 +71,10 @@ def test_evaluate_runs_at_valid_seq_length(monkeypatch):
 
 def test_build_with_fixed_valid_sets():
     """Single process, no torch.distributed (the builder then runs everything on this rank)."""
-    import pretrain_gpt
     from megatron.core.datasets.utils import compile_helpers
+    from megatron.training.datasets import (
+        fixed_valid as pretrain_gpt,  # shared by pretrain_gpt / pretrain_hybrid
+    )
 
     compile_helpers()
     tokenizer = _build_null_tokenizer()
@@ -94,7 +96,9 @@ def test_build_with_fixed_valid_sets():
         train_ds, valid_ds, _ = pretrain_gpt.build_with_fixed_valid_sets(
             GPTDataset, [100, None, None], lambda: True, cfg(), args)
         assert len(train_ds) >= 100
-        from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
+        from megatron.core.datasets.blended_megatron_dataset_builder import (
+            BlendedMegatronDatasetBuilder,
+        )
         plain_train, _, _ = BlendedMegatronDatasetBuilder(GPTDataset, [100, 1, 1], lambda: True, cfg()).build()
         assert train_ds.unique_description_hash == plain_train.unique_description_hash   # the same cache
         assert isinstance(valid_ds, list) and len(valid_ds) == 2
@@ -103,3 +107,12 @@ def test_build_with_fixed_valid_sets():
             n_tokens = 32 * 64                            # every document of the set, one epoch
             assert len(v) == (n_tokens - 1) // length
             assert v.dataset.path_prefix == prefix
+
+
+def test_both_entry_points_use_fixed_valid():
+    """Both pretraining entry points route --fixed-valid-data-path through the shared builder (the production
+    recipes run pretrain_hybrid.py)."""
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    for script in ("pretrain_gpt.py", "pretrain_hybrid.py"):
+        src = open(os.path.join(root, script)).read()
+        assert "fixed_valid.build_with_fixed_valid_sets(" in src, script

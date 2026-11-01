@@ -10,7 +10,6 @@ _PROGRAM_START_TIME = time.time()
 import json
 
 # Suppress warnings on all ranks but rank 0.
-import dataclasses
 import os
 import warnings
 
@@ -52,13 +51,14 @@ from megatron.core.utils import (
     get_torch_version,
 )
 from megatron.training import get_args, get_timers, inprocess_restart
-from megatron.training.diagnostics import get_diagnostics
 from megatron.training import packed_doc_attention as pda
 from megatron.training import pretrain, print_rank_0, set_startup_timestamps
 from megatron.training.argument_utils import gpt_config_from_args, pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.datasets import fixed_valid
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.training.datasets.sft_dataset import SFTDataset
+from megatron.training.diagnostics import get_diagnostics
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
 from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
 from model_provider import model_provider
@@ -595,51 +595,6 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
     return GPTDatasetConfig(**data_args)
 
 
-def fixed_valid_dataset_configs(config, args):
-    """(training config, [validation config per set]) for --fixed-valid-data-path. The training config differs
-    only in fields outside the dataset cache key (multiple_validation_sets, full_validation), so the training
-    datasets keep their cache; per set: its one unweighted prefix, at its --fixed-valid-seq-lengths entry
-    (default --valid-seq-length, else the training sequence length)."""
-    train_config = dataclasses.replace(config, multiple_validation_sets=False, full_validation=False)
-    lengths = getattr(args, 'fixed_valid_seq_lengths', None) or \
-        [args.valid_seq_length or config.sequence_length] * len(args.fixed_valid_data_path)
-    valid_configs = [
-        dataclasses.replace(
-            config,
-            blend=None,
-            split=None,
-            blend_per_split=[None, ([prefix], None), None],
-            sequence_length=length,
-            multiple_validation_sets=True,
-            full_validation=True,
-        )
-        for prefix, length in zip(args.fixed_valid_data_path, lengths)
-    ]
-    return train_config, valid_configs
-
-
-def build_with_fixed_valid_sets(dataset_type, train_val_test_num_samples, is_dataset_built, config, args):
-    """Training / test as without the flag (the split's validation part: 1 sample, unused); validation: the
-    fixed sets, each completely (one epoch)."""
-    train_config, valid_configs = fixed_valid_dataset_configs(config, args)
-    sizes = list(train_val_test_num_samples)
-    sizes[1] = 1                       # the split's own validation part: unused (a weighted blend needs a size)
-    if sizes[2] is None:
-        sizes[2] = 1
-    train_ds, _, test_ds = BlendedMegatronDatasetBuilder(
-        dataset_type, sizes, is_dataset_built, train_config
-    ).build()
-    valid_ds = []
-    for valid_config in valid_configs:      # one set per config, each at its own sequence length
-        _, v, _ = BlendedMegatronDatasetBuilder(
-            dataset_type, [None, None, None], is_dataset_built, valid_config
-        ).build()
-        valid_ds.extend(v if isinstance(v, list) else [v])
-    print_rank_0("> fixed validation sets: " + ", ".join(
-        f"{os.path.basename(c.blend_per_split[1][0][0])} @ {c.sequence_length}" for c in valid_configs))
-    return train_ds, valid_ds, test_ds
-
-
 def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None):
     """Build the train test and validation datasets.
 
@@ -681,7 +636,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
         is_dataset_built_on_rank, vp_stage=vp_stage, is_packed_sequence=is_packed_sequence
     )
     if getattr(args, 'fixed_valid_data_path', None):
-        train_ds, valid_ds, test_ds = build_with_fixed_valid_sets(
+        train_ds, valid_ds, test_ds = fixed_valid.build_with_fixed_valid_sets(
             dataset_type, train_val_test_num_samples, is_dataset_built, config, args
         )
     else:

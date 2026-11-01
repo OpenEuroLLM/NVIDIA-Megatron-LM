@@ -53,11 +53,7 @@ from megatron.core.utils import (
     get_te_version,
     get_torch_version,
 )
-from megatron.training import (
-    get_args,
-    get_timers,
-    inprocess_restart,
-)
+from megatron.training import get_args, get_timers, inprocess_restart
 from megatron.training import packed_doc_attention as pda
 from megatron.training import pretrain, print_rank_0, set_startup_timestamps
 from megatron.training.argument_utils import (
@@ -65,6 +61,7 @@ from megatron.training.argument_utils import (
     pretrain_cfg_container_from_args,
 )
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.datasets import fixed_valid
 from megatron.training.datasets.sft_dataset import SFTDataset
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
 from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
@@ -582,12 +579,15 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
 
     print_rank_0("> building train, validation, and test datasets for GPT ...")
 
-    train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
-        dataset_type,
-        train_val_test_num_samples,
-        partial(is_dataset_built_on_rank, vp_stage=vp_stage, is_packed_sequence=is_packed_sequence),
-        config,
-    ).build()
+    is_dataset_built = partial(is_dataset_built_on_rank, vp_stage=vp_stage, is_packed_sequence=is_packed_sequence)
+    if getattr(args, 'fixed_valid_data_path', None):
+        train_ds, valid_ds, test_ds = fixed_valid.build_with_fixed_valid_sets(
+            dataset_type, train_val_test_num_samples, is_dataset_built, config, args
+        )
+    else:
+        train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
+            dataset_type, train_val_test_num_samples, is_dataset_built, config
+        ).build()
 
     print_rank_0("> finished creating GPT datasets ...")
 
