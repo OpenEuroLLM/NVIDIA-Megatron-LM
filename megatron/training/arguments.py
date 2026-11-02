@@ -2886,6 +2886,11 @@ def _add_regularization_args(parser):
                        'weight. 0.0 excludes the embeddings from weight decay as OLMo 2/3 and '
                        'Levanter/Marin do (decay erodes the rows of rare tokens). The untied '
                        'output layer is not affected.')
+    group.add_argument('--moe-router-wd-mult', type=float, default=1.0,
+                       help='Multiplier on --weight-decay for the MoE router weights '
+                       '(*router.weight). 0.0 excludes them from weight decay: under '
+                       'muown_classical the matrices get none, so a decayed router shrinks '
+                       'against the hidden states it scores (Laguna M.1, arXiv:2605.27605).')
     group.add_argument('--embedding-lr-mult', type=float, default=1.0,
                        help='Learning-rate multiplier of the word-embedding matrix (max and min lr). '
                        'Conflicts with --decoupled-lr.')
