@@ -85,6 +85,15 @@ class LanguageModelEmbedding(MegatronModule):
         # Embeddings dropout
         self.embedding_dropout = torch.nn.Dropout(self.config.hidden_dropout)
 
+        # embedding_norm: RMSNorm on the embedding output, learnable gain (init 1)
+        if getattr(self.config, "embedding_norm", False):
+            self.embedding_norm_weight = torch.nn.Parameter(
+                torch.ones(self.config.hidden_size, dtype=self.config.params_dtype)
+            )
+            setattr(self.embedding_norm_weight, "sequence_parallel", self.config.sequence_parallel)
+        else:
+            self.embedding_norm_weight = None
+
     def zero_parameters(self):
         """Zero out all parameters in embedding."""
         self.word_embeddings.weight.data.fill_(0)
@@ -134,6 +143,15 @@ class LanguageModelEmbedding(MegatronModule):
         # MuP: scale embeddings by alpha_input.
         if self.config.use_mup and self.config.mup_embedding_mult != 1.0:
             embeddings = embeddings * self.config.mup_embedding_mult
+
+        # embedding_norm: the first layers' stream at rms ~gain, whatever the rows' scale
+        if self.embedding_norm_weight is not None:
+            embeddings = torch.nn.functional.rms_norm(
+                embeddings.float(),
+                (embeddings.shape[-1],),
+                self.embedding_norm_weight.float(),
+                self.config.layernorm_epsilon,
+            ).to(embeddings.dtype)
 
         # If the input flag for fp32 residual connection is set, convert for float.
         if self.config.fp32_residual_connection:
