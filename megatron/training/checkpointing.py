@@ -3,6 +3,7 @@
 """Input/output checkpointing."""
 
 import contextlib
+import hashlib
 import inspect
 import multiprocessing
 import os
@@ -1577,25 +1578,47 @@ class _MetadataOnceReader(FileSystemReader):
 
 def fsdp_dtensor_checkpoint_is_packed(state_dict_metadata):
     """Whether an fsdp_dtensor checkpoint holds the packed optimizer scalars."""
-    suffix = "." + _PACKED_GROUP_META
-    return any(key == _PACKED_GROUP_META or key.endswith(suffix) for key in state_dict_metadata)
+    return any(f".{_PACKED_GROUP_META}." in f".{key}" for key in state_dict_metadata)
 
 
-def pack_fsdp_dtensor_optimizer_scalars(state_dict):
-    """Fold the optimizer's non-tensor leaves into two pickled DCP items per (sub-)optimizer.
+def _packed_keys(prefix, checkpoint_keys):
+    """{tag: (group-meta key, scalars key)} of the packed items a checkpoint holds under
+    ``prefix`` (e.g. ``optimizer.0``): one per distinct parameter set (an expert-parallel rank)."""
+    out = {}
+    for key in checkpoint_keys:
+        for kind in (_PACKED_GROUP_META, _PACKED_STATE_SCALARS):
+            head = f"{prefix}.{kind}."
+            if key.startswith(head):
+                out.setdefault(key[len(head):], set()).add(kind)
+    return out
+
+
+def pack_fsdp_dtensor_optimizer_scalars(state_dict, checkpoint_keys=None):
+    """Fold the optimizer's non-tensor leaves into a few pickled DCP items per (sub-)optimizer.
 
     DCP stores every non-tensor leaf as its own item, replicated: each rank plans and reads all of
     them, and the coordinator gathers every rank's plan. ``param_to_group_meta`` maps each
     parameter to its group's hyperparameters, and the routed experts are one parameter per expert
     (TE grouped GEMM): the 84B v4 run's checkpoint had 559k such items of 877k (484k group-meta
     leaves for 34,560 expert weights, 52k ``step`` counters), a 485 MB ``.metadata``, ~8 min of
-    silent planning per save and ~30 min per load at 128 nodes. Packed: the group metadata as
-    unique groups + a parameter -> group index, the scalars as ``{param: {key: value}}``.
+    silent planning per save and ~30 min per load at 128 nodes.
+
+    Packed, per (sub-)optimizer: ``param_to_group_meta_packed.<tag>`` (unique groups + a
+    parameter -> group index) and ``state_scalars_packed.<tag>`` (``{param: {key: value}}``),
+    where ``<tag>`` hashes the parameter names the rank holds. DCP keeps one copy of a bytes item
+    saved by several ranks, so ranks with the same parameters (data-parallel replicas) share one
+    item and ranks with other parameters (expert-parallel ranks: other experts) get their own.
+
+    Saving: ``checkpoint_keys`` None, the rank's own tag. Loading: the checkpoint's keys
+    (``state_dict_metadata``); the template then holds every saved tag (each rank reads them all
+    and keeps its own parameters, so a load on another layout works).
 
     Returns ``(state_dict, unpack)``: a shallow copy of ``state_dict`` with packed optimizer
     entries (the input is not modified; tensors are shared), and ``unpack()``, which after a DCP
-    load into the returned dict writes the loaded values back into the input's
-    ``param_to_group_meta`` and ``state`` entries (for the names they hold) and returns it.
+    load into the returned dict writes the loaded optimizer values back into the input's
+    ``param_to_group_meta`` and ``state`` entries (for the parameters they hold) and returns the
+    loaded state dict: the packed copy's top-level values (``iteration``, ``args``, scheduler and
+    RNG state: DCP wrote them there) with the input's optimizer.
     """
     optim = state_dict.get("optimizer")
     subs = _optimizer_sub_state_dicts(optim)
@@ -1605,15 +1628,6 @@ def pack_fsdp_dtensor_optimizer_scalars(state_dict):
     for key, sub in subs:
         new = dict(sub)
         group_meta = new.pop("param_to_group_meta", None)
-        if isinstance(group_meta, dict):
-            groups, index, param_group = [], {}, {}
-            for name, meta in group_meta.items():
-                blob = pickle.dumps(meta)
-                if blob not in index:
-                    index[blob] = len(groups)
-                    groups.append(meta)
-                param_group[name] = index[blob]
-            new[_PACKED_GROUP_META] = pickle.dumps({"groups": groups, "param_group": param_group})
         state, scalars = {}, {}
         for name, entry in sub["state"].items():
             if isinstance(entry, dict):
@@ -1624,7 +1638,29 @@ def pack_fsdp_dtensor_optimizer_scalars(state_dict):
             else:
                 state[name] = entry
         new["state"] = state
-        new[_PACKED_STATE_SCALARS] = pickle.dumps(scalars)
+        if checkpoint_keys is None:
+            names = sorted(set(sub["state"]) | set(group_meta or {}), key=str)
+            tag = hashlib.sha1("\n".join(map(str, names)).encode()).hexdigest()[:16]
+            meta_blob = None
+            if isinstance(group_meta, dict):
+                groups, index, param_group = [], {}, {}
+                for name, meta in group_meta.items():
+                    blob = pickle.dumps(meta)
+                    if blob not in index:
+                        index[blob] = len(groups)
+                        groups.append(meta)
+                    param_group[name] = index[blob]
+                meta_blob = pickle.dumps({"groups": groups, "param_group": param_group})
+            new[_PACKED_GROUP_META] = {tag: meta_blob} if meta_blob is not None else {}
+            new[_PACKED_STATE_SCALARS] = {tag: pickle.dumps(scalars)}
+        else:
+            # placeholders for every saved tag (bytes: a leaf DCP replaces with the loaded value)
+            prefix = "optimizer" if key is None else f"optimizer.{key}"
+            tags = _packed_keys(prefix, checkpoint_keys)
+            new[_PACKED_GROUP_META] = {t: b"" for t, kinds in tags.items() if _PACKED_GROUP_META in kinds}
+            new[_PACKED_STATE_SCALARS] = {
+                t: b"" for t, kinds in tags.items() if _PACKED_STATE_SCALARS in kinds
+            }
         if key is None:
             packed_optim = new
         else:
@@ -1635,28 +1671,37 @@ def pack_fsdp_dtensor_optimizer_scalars(state_dict):
     def unpack():
         root = packed["optimizer"]
         for key, sub in subs:
-            # DCP writes loaded non-tensor values of an int-keyed dict (a ChainedOptimizer's
-            # {0: ..., 1: ...}) under the str key: prefer that entry when it exists
-            if key is None:
-                loaded = root
-            elif not isinstance(key, str) and isinstance(root.get(str(key)), dict):
-                loaded = root[str(key)]
-            else:
-                loaded = root[key]
-            blob = loaded.get(_PACKED_GROUP_META)
+            # DCP writes the loaded non-tensor values of an int-keyed dict (a ChainedOptimizer's
+            # {0: ..., 1: ...}) under the str key: that entry, when present, wins over the template
+            views = [root] if key is None else [root.get(key), root.get(str(key))]
+            blobs = {_PACKED_GROUP_META: {}, _PACKED_STATE_SCALARS: {}}
+            for view in views:
+                if isinstance(view, dict):
+                    for kind in blobs:
+                        for tag, blob in (view.get(kind) or {}).items():
+                            if isinstance(blob, bytes) and blob:
+                                blobs[kind][tag] = blob
             group_meta = sub.get("param_to_group_meta")
-            if isinstance(blob, bytes) and isinstance(group_meta, dict):
-                meta = pickle.loads(blob)
-                for name, gi in meta["param_group"].items():
-                    if name in group_meta:
-                        group_meta[name] = meta["groups"][gi]
-            blob = loaded.get(_PACKED_STATE_SCALARS)
-            if isinstance(blob, bytes):
+            if isinstance(group_meta, dict):
+                for blob in blobs[_PACKED_GROUP_META].values():
+                    meta = pickle.loads(blob)
+                    for name, gi in meta["param_group"].items():
+                        if name in group_meta:
+                            group_meta[name] = meta["groups"][gi]
+            for blob in blobs[_PACKED_STATE_SCALARS].values():
+                # every saved scalar: a template entry may lack one (an optimizer that creates its
+                # step counter at the first update)
                 for name, found in pickle.loads(blob).items():
                     entry = sub["state"].get(name)
                     if isinstance(entry, dict):
-                        entry.update({k: v for k, v in found.items() if k in entry})
-        return state_dict
+                        entry.update(found)
+        # any other loaded non-tensor value of the optimizer (DCP wrote it into the packed copy)
+        _restore_loaded_scalars(state_dict["optimizer"], root)
+        # the packed dict holds every other loaded non-tensor value (iteration, args, scheduler
+        # and RNG state, ...): return it, with the unpacked optimizer
+        loaded = dict(packed)
+        loaded["optimizer"] = state_dict["optimizer"]
+        return loaded
 
     return packed, unpack
 
@@ -2143,7 +2188,9 @@ def _load_base_checkpoint(
         # key comparison below, which would otherwise list every unpacked leaf as missing)
         unpack = None
         if fsdp_dtensor_checkpoint_is_packed(state_dict_metadata):
-            state_dict, unpack = pack_fsdp_dtensor_optimizer_scalars(state_dict)
+            state_dict, unpack = pack_fsdp_dtensor_optimizer_scalars(
+                state_dict, checkpoint_keys=state_dict_metadata
+            )
 
         ckpt_type = CheckpointType.FSDP_DTENSOR
         allow_partial_load = not getattr(args, 'strict_fsdp_dtensor_load', False)
