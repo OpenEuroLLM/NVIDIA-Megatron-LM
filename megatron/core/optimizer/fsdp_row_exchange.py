@@ -69,12 +69,15 @@ def shard_group(p: torch.Tensor) -> "torch.distributed.ProcessGroup":
     return p.device_mesh.get_group(_shard_dim(p))
 
 
-def row_state_like(p: torch.Tensor, rows_local: torch.Tensor) -> torch.Tensor:
-    """A per-row ``[rows, 1]`` state of row-sharded ``p`` as a DTensor with p's row sharding."""
-    from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
-        update_uneven_dtensor_chunk_metadata,
-    )
+def row_state_like(
+    p: torch.Tensor, rows_local: torch.Tensor, pending: Optional[List[DTensor]] = None
+) -> torch.Tensor:
+    """A per-row ``[rows, 1]`` state of row-sharded ``p`` as a DTensor with p's row sharding.
 
+    Its uneven-shard chunk metadata takes a collective over p's mesh. ``pending``: append the
+    state instead, for :func:`set_row_state_chunk_metadata` to cover many states in one batched
+    gather (one ``all_gather_object`` per process group, not one per state: 3 states per Muown
+    matrix, unbatched, cost ~13 min of the 128-node checkpoint load's dummy-state init)."""
     out = DTensor.from_local(
         rows_local,
         device_mesh=p.device_mesh,
@@ -83,8 +86,25 @@ def row_state_like(p: torch.Tensor, rows_local: torch.Tensor) -> torch.Tensor:
         shape=torch.Size((p.shape[0], 1)),
         stride=(1, 1),
     )
-    update_uneven_dtensor_chunk_metadata(out)
+    if pending is not None:
+        pending.append(out)
+    else:
+        set_row_state_chunk_metadata([out])
     return out
+
+
+def set_row_state_chunk_metadata(states: Sequence[DTensor]) -> None:
+    """Uneven-shard chunk metadata for ``states`` in one batched gather. Every rank must pass the
+    same states in the same order (as the per-state collectives required)."""
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
+        _set_uneven_chunk_metadata,
+        gather_and_compute_chunk_metadata_batched,
+    )
+
+    if not states:
+        return
+    for state, meta in zip(states, gather_and_compute_chunk_metadata_batched(list(states))):
+        _set_uneven_chunk_metadata(state, meta)
 
 
 class _RowCounts:

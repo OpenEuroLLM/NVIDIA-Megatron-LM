@@ -21,7 +21,13 @@ from torch.optim.optimizer import ParamsT
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import get_pg_rank, get_pg_size, log_single_rank
 
-from .fsdp_row_exchange import is_row_sharded, local, orthogonalize_rows, row_state_like
+from .fsdp_row_exchange import (
+    is_row_sharded,
+    local,
+    orthogonalize_rows,
+    row_state_like,
+    set_row_state_chunk_metadata,
+)
 from .muown import Muown
 from .optimizer_config import ParamKey, ParamPredicate
 
@@ -1371,6 +1377,8 @@ class TensorParallelAngularMuown(TensorParallelMuon):
     @torch.no_grad()  # type: ignore[misc]
     def _init_group(self, group: dict, skip_non_grad_params: bool = True) -> None:
         """Lazily initialize AngularMuown state (g, m_u, m_g, v_g, step) for 2D params."""
+        # row-sharded states: their chunk metadata in one batched gather after the loop
+        pending_row_states = []
         for p in group["params"]:
             if skip_non_grad_params and p.grad is None:
                 continue
@@ -1378,7 +1386,7 @@ class TensorParallelAngularMuown(TensorParallelMuon):
             if len(state) != 0:
                 continue
             if is_row_sharded(p):
-                self._init_row_sharded_state(p, state)
+                self._init_row_sharded_state(p, state, pending_row_states)
                 continue
             # Zero rows have no direction for U = W / g. Give just those rows the
             # expected row scale of the default linear init so the first U update
@@ -1406,10 +1414,14 @@ class TensorParallelAngularMuown(TensorParallelMuon):
             state["m_g"] = torch.zeros_like(w_norm)
             state["v_g"] = torch.zeros_like(w_norm)
             state["step"] = 0
+        set_row_state_chunk_metadata(pending_row_states)
 
-    def _init_row_sharded_state(self, p: torch.Tensor, state: dict) -> None:
+    def _init_row_sharded_state(
+        self, p: torch.Tensor, state: dict, pending: Optional[list] = None
+    ) -> None:
         """The state of a Megatron-FSDP (row-sharded) matrix: every row lives on one rank, so the
-        per-row seeds are local; the [rows, 1] states are DTensors with p's row sharding."""
+        per-row seeds are local; the [rows, 1] states are DTensors with p's row sharding
+        (``pending``: their chunk metadata is set later, in one batched gather)."""
         w_norm = local(p).detach().float().pow(2).sum(dim=1, keepdim=True).sqrt()
         zero_rows = w_norm <= ANGULAR_MUOWN_EPS
         if zero_rows.any():
@@ -1420,10 +1432,10 @@ class TensorParallelAngularMuown(TensorParallelMuon):
             local(p).mul_((self._fixed_row_norm / w_norm).to(local(p).dtype))
             w_norm = w_norm.new_full(w_norm.shape, self._fixed_row_norm)
         w_norm = w_norm.to(local(p).dtype)
-        state["g"] = row_state_like(p, w_norm.clone())
+        state["g"] = row_state_like(p, w_norm.clone(), pending)
         state["m_u"] = torch.zeros_like(p)
-        state["m_g"] = row_state_like(p, torch.zeros_like(w_norm))
-        state["v_g"] = row_state_like(p, torch.zeros_like(w_norm))
+        state["m_g"] = row_state_like(p, torch.zeros_like(w_norm), pending)
+        state["v_g"] = row_state_like(p, torch.zeros_like(w_norm), pending)
         state["step"] = 0
 
     @torch.no_grad()  # type: ignore[misc]
