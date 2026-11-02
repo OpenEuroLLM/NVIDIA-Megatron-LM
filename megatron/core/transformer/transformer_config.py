@@ -943,6 +943,14 @@ class TransformerConfig(ModelParallelConfig):
     scaling up.
     """
 
+    embedding_multiplier: float = 1.0
+    """Fixed scale on the word-embedding output (after the lookup, before the first layer), without
+    muP (``mup_embedding_mult`` applies only with ``use_mup``). The embedding starts at init std
+    ~0.02 and grows only lr-limited under Adam, so the first sublayers see a tiny residual stream:
+    their pre-norm's backward gain ~1/rms is large there and, under Linear Depth Memory, the memory
+    reads dominate the front inputs (the LDM v3 run's front-site instability). E.g. 50 brings the
+    stream at the first site to rms ~1. Default 1.0 (no scaling)."""
+
     mup_embedding_mult: float = 1.0
     """
     Multiplier for embedding layer output. Applied after the embedding lookup.

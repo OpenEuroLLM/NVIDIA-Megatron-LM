@@ -214,6 +214,13 @@ class OptimizerConfig:
     shrinks the rows of rare tokens, which receive few gradient updates, while the Jacobian of the
     following norm scales as 1/||x||. The untied output layer is not affected by this multiplier."""
 
+    moe_router_wd_mult: float = 1.0
+    """Multiplier applied to `weight_decay` for the MoE router weights (`*router.weight`; Adam under
+    every Muon-family optimizer). 0.0 excludes them from decay: under muown_classical the matrices
+    get no decay at all, so a decayed router shrinks against the hidden states it scores -- the
+    effective-decay mismatch behind the early-layer expert collapse in Laguna M.1 (arXiv:2605.27605,
+    section 3.1.3)."""
+
     embedding_lr_mult: float = 1.0
     """Learning-rate multiplier of the word-embedding matrix (the 2-D parameter whose name contains
     `word_embeddings`; Adam under every Muon-family optimizer). Applies to max_lr and min_lr alike.

@@ -127,6 +127,10 @@ class LanguageModelEmbedding(MegatronModule):
         else:
             assert self.tokentype_embeddings is None
 
+        # A fixed embedding output scale (without muP): the first layers' stream at O(1).
+        if getattr(self.config, "embedding_multiplier", 1.0) != 1.0 and not self.config.use_mup:
+            embeddings = embeddings * self.config.embedding_multiplier
+
         # MuP: scale embeddings by alpha_input.
         if self.config.use_mup and self.config.mup_embedding_mult != 1.0:
             embeddings = embeddings * self.config.mup_embedding_mult

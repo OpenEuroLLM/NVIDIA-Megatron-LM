@@ -173,6 +173,17 @@ def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, Par
             wd_mult=config.embedding_wd_mult
         )
 
+    if getattr(config, 'moe_router_wd_mult', 1.0) != 1.0:
+        # MoE router weights: a name predicate of its own, so it combines with the router's
+        # optimizer / lr-warmup keys on the same parameter (they set other fields)
+        router_weight = ParamWithNamePredicate(
+            name="moe_router_wd",
+            fn=lambda param, name: len(param.shape) == 2 and name.endswith("router.weight"),
+        )
+        config_overrides[ParamKey(with_name_predicate=router_weight)] = ParamGroupOverride(
+            wd_mult=config.moe_router_wd_mult
+        )
+
     # Engram tables (megatron/core/ssm/engram.py): their own learning rate and no weight
     # decay, as in the paper. Matches nothing in a model without Engram layers.
     if config.lr is not None:

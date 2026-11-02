@@ -49,3 +49,35 @@ def test_conflicts_with_decoupled_lr():
     config = OptimizerConfig(optimizer='adam', lr=2e-3, decoupled_lr=1e-3, output_layer_lr_mult=0.2)
     with pytest.raises(ValueError):
         get_standard_config_overrides(config=config)
+
+
+class _Router(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.randn(4, 8))
+
+
+class _MoENet(_Net):
+    def __init__(self):
+        super().__init__()
+        self.router = _Router()
+
+
+@patch('torch.distributed.get_world_size', return_value=1)
+@patch('torch.distributed.all_gather_object', lambda out, obj: out.__setitem__(0, obj))
+@pytest.mark.parametrize("rwd,ewd", [(0.0, 0.0), (0.0, 1.0), (1.0, 1.0)])
+def test_router_wd_mult(_ws, rwd, ewd):
+    """moe_router_wd_mult: the router weights' own weight-decay multiplier, independent of the
+    embedding's and of the other matrices."""
+    net = _MoENet()
+    config = OptimizerConfig(optimizer='adam', lr=2e-3, min_lr=2e-4, weight_decay=0.1,
+                             embedding_wd_mult=ewd, moe_router_wd_mult=rwd)
+    groups = _get_param_groups([net], config, get_standard_config_overrides(config=config))
+    want = {id(net.router.weight): rwd, id(net.embedding.word_embeddings.weight): ewd,
+            id(net.output_layer.weight): 1.0, id(net.fc.weight): 1.0}
+    seen = set()
+    for g in groups:
+        for p in g['params']:
+            assert g['wd_mult'] == pytest.approx(want[id(p)])
+            seen.add(id(p))
+    assert seen == set(want)
