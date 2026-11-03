@@ -22,6 +22,7 @@ import inspect
 import logging
 import math
 import operator
+import time
 import traceback
 import warnings
 from collections import defaultdict, namedtuple
@@ -46,7 +47,13 @@ from .mixed_precision import (
     is_float8tensor,
     is_te_min_version,
 )
-from .uneven_dtensor import update_uneven_dtensor_chunk_metadata, validate_uneven_dtensor
+from .uneven_dtensor import (
+    _set_uneven_chunk_metadata,
+    gather_and_compute_chunk_metadata_batched,
+    update_uneven_dtensor_chunk_metadata,
+    validate_uneven_dtensor,
+    validate_uneven_dtensors,
+)
 from .utils import (
     _MODEL_PARALLEL_RNG_TRACKER_NAME,
     FSDPDistributedIndex,
@@ -3222,6 +3229,7 @@ class ParamAndGradBuffer:
         specified or "no_shard" is utilized.
         """
         dist_main_weight = {}
+        attach_chunk_metadata = []
         for pg in self.parameter_groups:
             wbuf = pg.model_weight_buffer
             tbuf = pg.transpose_weight_buffer
@@ -3247,6 +3255,7 @@ class ParamAndGradBuffer:
                         is_sharded_param=sharded_optimizer_state,
                         is_expert_param=pg.is_expert_param,
                         run_check=True,
+                        defer_uneven_dtensor_metadata=True,
                         update_uneven_dtensor_chunk_meta=True,
                         force_sync_tp_duplicated_param=True,
                     )
@@ -3260,6 +3269,7 @@ class ParamAndGradBuffer:
                         is_sharded_param=sharded_optimizer_state,
                         is_expert_param=pg.is_expert_param,
                         run_check=True,
+                        defer_uneven_dtensor_metadata=True,
                         update_uneven_dtensor_chunk_meta=True,
                         force_sync_tp_duplicated_param=True,
                     )
@@ -3275,10 +3285,29 @@ class ParamAndGradBuffer:
                         is_sharded_param=False,
                         is_expert_param=pg.is_expert_param,
                         run_check=True,
+                        defer_uneven_dtensor_metadata=True,
                         update_uneven_dtensor_chunk_meta=False,
                         force_sync_tp_duplicated_param=True,
                     )
                     dist_main_weight[param_name] = dist_param
+
+                attach_chunk_metadata.append(bool(mbuf or wbuf))
+
+        # Reuse one batched metadata gather for validation and checkpoint hooks.
+        # TP checks / broadcasts above still run at construction, unchanged.
+        tensors = list(dist_main_weight.values())
+        metadata_started = time.perf_counter()
+        metadata = gather_and_compute_chunk_metadata_batched(tensors)
+        validate_uneven_dtensors(tensors, metadata)
+        for tensor, chunk_meta, attach in zip(tensors, metadata, attach_chunk_metadata):
+            if attach:
+                _set_uneven_chunk_metadata(tensor, chunk_meta)
+        log_single_rank(
+            logger,
+            logging.INFO,
+            f"[Megatron-FSDP] initialized metadata for {len(tensors)} DTensors "
+            f"in {time.perf_counter() - metadata_started:.3f}s (batched validation and attachment)",
+        )
 
         # Store the registered parameters.
         self.dist_main_weight = dist_main_weight
@@ -5103,6 +5132,7 @@ def make_fsdp_dtensor(
     run_check: bool = False,
     update_uneven_dtensor_chunk_meta: bool = False,
     force_sync_tp_duplicated_param: bool = False,
+    defer_uneven_dtensor_metadata: bool = False,
 ):
     """
     Creates a distributed tensor (DTensor) from a local tensor with support for
@@ -5121,6 +5151,8 @@ def make_fsdp_dtensor(
             devices. Defaults to True.
         is_expert_param (bool, optional): Indicates if the tensor corresponds to
             Megatron-Core expert (Mixture-of-Experts) parameters. Defaults to False.
+        defer_uneven_dtensor_metadata (bool, optional): Defer uneven-shard validation and
+            checkpoint metadata attachment to the caller, which must finalize both in a batch.
         run_check (bool, optional): Enables additional internal validation for
             DTensor. Defaults to False.
         update_uneven_dtensor_chunk_meta (bool, optional): Whether to update metadata
@@ -5246,11 +5278,11 @@ def make_fsdp_dtensor(
         stride=param.stride(),
     )
 
-    if run_check:
+    if run_check and not defer_uneven_dtensor_metadata:
         validate_uneven_dtensor(fsdp_tensor)
 
     # Update metadata if uneven sharding is expected
-    if update_uneven_dtensor_chunk_meta:
+    if update_uneven_dtensor_chunk_meta and not defer_uneven_dtensor_metadata:
         update_uneven_dtensor_chunk_metadata(fsdp_tensor)
 
     return fsdp_tensor

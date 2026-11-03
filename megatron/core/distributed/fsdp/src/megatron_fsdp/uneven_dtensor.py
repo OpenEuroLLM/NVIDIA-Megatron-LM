@@ -146,71 +146,76 @@ def update_uneven_dtensor_chunk_metadata(dtensor: DTensor) -> dict:
     _set_uneven_chunk_metadata(dtensor, gather_and_compute_chunk_metadata(dtensor))
 
 
-def validate_uneven_dtensor(dtensor: DTensor) -> None:
+def validate_uneven_dtensors(
+    dtensors: List[DTensor], chunk_metadata: List[ChunkStorageMetadata] = None
+) -> None:
+    """Validate bounds and boundary coverage, batching collectives across tensors.
+
+    Callers may reuse metadata already gathered for checkpointing. Every rank must
+    supply the same tensors in the same order, as for the metadata gather itself.
+    Boundary flags are reduced once per process group and mesh-dimension round;
+    multiple sharded mesh dimensions retain the single-tensor reduction order.
     """
-    Validates the chunk metadata of an uneven DTensor to ensure correctness and boundary coverage.
-
-    Notes:
-    - `gather_and_compute_chunk_metadata` will ensure that all chunks do not overlap.
-
-    This function performs the following checks:
-      - All chunk offsets and sizes are within the tensor shape bounds.
-      - All boundaries of each dimension are actually covered by shard placements.
-
-    Args:
-        dtensor (DTensor): The distributed tensor to validate.
-
-    Raises:
-        AssertionError: If any chunk falls out of bounds or not all boundaries are touched.
-    """
-
-    # gather_and_compute_chunk_metadata will ensure that all chunks do not overlap.
-    chunk_meta = gather_and_compute_chunk_metadata(dtensor)
-
-    # Validate that each chunk's metadata is within bounds.
-    assert all(
-        [
-            0 <= offset and offset + size <= dtensor.shape[dim]
-            for (dim, (offset, size)) in enumerate(zip(chunk_meta.offsets, chunk_meta.sizes))
-        ]
-    ), (
-        "[Megatron-FSDP] DTensor chunk metadata is invalid. "
-        f"Offsets: {chunk_meta.offsets}, "
-        f"Sizes: {chunk_meta.sizes}, "
-        f"Global shape: {dtensor.shape}, "
-        f"Local shape: {dtensor.to_local().shape}, "
-        f"Device mesh: {dtensor.device_mesh}."
-    )
-
-    # Check that all boundaries (start and end) are touched.
-    # Skip under fake process group — all_reduce is a no-op so only rank 0's
-    # boundaries are visible, which makes the end-boundary check always fail.
-    if torch.distributed.is_initialized() and torch.distributed.get_backend() == 'fake':
+    if not dtensors:
         return
+    if chunk_metadata is None:
+        chunk_metadata = gather_and_compute_chunk_metadata_batched(dtensors)
+    if len(chunk_metadata) != len(dtensors):
+        raise ValueError("Expected one chunk-metadata entry per DTensor")
 
-    boundary_checks = torch.tensor(
-        [
+    flags, row_ranges = [], []
+    for dtensor, chunk_meta in zip(dtensors, chunk_metadata):
+        assert all(
+            0 <= offset and offset + size <= dtensor.shape[dim]
+            for dim, (offset, size) in enumerate(zip(chunk_meta.offsets, chunk_meta.sizes))
+        ), (
+            "[Megatron-FSDP] DTensor chunk metadata is invalid. "
+            f"Offsets: {chunk_meta.offsets}, Sizes: {chunk_meta.sizes}, "
+            f"Global shape: {dtensor.shape}, Local shape: {dtensor.to_local().shape}, "
+            f"Device mesh: {dtensor.device_mesh}."
+        )
+        start = len(flags)
+        flags.extend(
             [offset == 0, offset + size == dtensor.shape[dim]]
-            for (dim, (offset, size)) in enumerate(zip(chunk_meta.offsets, chunk_meta.sizes))
-        ],
-        dtype=torch.int,
-    ).cuda()
+            for dim, (offset, size) in enumerate(zip(chunk_meta.offsets, chunk_meta.sizes))
+        )
+        row_ranges.append(range(start, len(flags)))
 
-    for i, p in enumerate(dtensor.placements):
-        if isinstance(p, Shard) or isinstance(p, _StridedShard):
-            torch.distributed.all_reduce(
-                boundary_checks,
-                op=torch.distributed.ReduceOp.MAX,
-                group=dtensor.device_mesh.get_group(i),
+    # Fake collectives cannot discover other ranks' end boundaries.
+    if dist.is_initialized() and dist.get_backend() == 'fake':
+        return
+    device = dtensors[0].to_local().device
+    if any(d.to_local().device != device for d in dtensors):
+        raise ValueError("Batched DTensor validation requires a common local device")
+    boundaries = torch.tensor(flags, dtype=torch.int, device=device).reshape(-1, 2)
+    for mesh_dim in range(max(len(d.placements) for d in dtensors)):
+        groups = {}
+        for i, dtensor in enumerate(dtensors):
+            if mesh_dim < len(dtensor.placements) and isinstance(
+                dtensor.placements[mesh_dim], (Shard, _StridedShard)
+            ):
+                group = dtensor.device_mesh.get_group(mesh_dim)
+                groups.setdefault(group, []).extend(row_ranges[i])
+        for group, rows in groups.items():
+            indices = torch.tensor(rows, dtype=torch.long, device=device)
+            checks = boundaries.index_select(0, indices)
+            dist.all_reduce(checks, op=dist.ReduceOp.MAX, group=group)
+            boundaries.index_copy_(0, indices, checks)
+    if not bool(torch.all(boundaries)):
+        # Copy once, only on failure, to identify the offending tensor.
+        checked = boundaries.cpu().tolist()
+        for dtensor, chunk_meta, rows in zip(dtensors, chunk_metadata, row_ranges):
+            assert all(all(checked[j]) for j in rows), (
+                "[Megatron-FSDP] DTensor chunk metadata boundary check failed. "
+                f"Offsets: {chunk_meta.offsets}, Sizes: {chunk_meta.sizes}, "
+                f"Global shape: {dtensor.shape}, Local shape: {dtensor.to_local().shape}, "
+                f"Device mesh: {dtensor.device_mesh}."
             )
-    assert torch.all(boundary_checks), (
-        "[Megatron-FSDP] DTensor chunk metadata boundary check failed. "
-        f"Offsets: {chunk_meta.offsets}, "
-        f"Sizes: {chunk_meta.sizes}, "
-        f"Global shape: {dtensor.shape}, "
-        f"Local shape: {dtensor.to_local().shape}, "
-        f"Device mesh: {dtensor.device_mesh}."
-    )
+
+
+def validate_uneven_dtensor(dtensor: DTensor) -> None:
+    """Validate the bounds and boundary coverage of one uneven DTensor."""
+    validate_uneven_dtensors([dtensor])
 
 
 def filter_unflattened_state_dict(state_dict, key_chain=[], visit_condition=lambda x: False):

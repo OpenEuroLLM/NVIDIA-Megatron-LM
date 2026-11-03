@@ -4,6 +4,7 @@ one (uneven and empty shards, 1-D and 2-D meshes, Replicate x Shard as under HSD
 run with torch.distributed.run --nproc-per-node 4."""
 
 import os
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -16,6 +17,8 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
     _shard_order,
     gather_and_compute_chunk_metadata_batched,
     preprocess_state_dict_for_uneven_dtensor,
+    validate_uneven_dtensor,
+    validate_uneven_dtensors,
 )
 
 
@@ -90,3 +93,49 @@ def test_preprocess_state_dict(meshes):
         assert tuple(write_items[0].index.offset) == expected[0]
     else:
         assert write_items == []
+
+
+def test_batched_validation_reuses_metadata_and_reduces_collectives(meshes):
+    cases = _cases(meshes)[:3]
+    # Many parameters on the same mesh must not add collectives.
+    cases = cases * 8
+    metadata = gather_and_compute_chunk_metadata_batched(cases)
+    with patch.object(dist, "all_gather_object", wraps=dist.all_gather_object) as gather, patch.object(
+        dist, "all_reduce", wraps=dist.all_reduce
+    ) as reduce:
+        validate_uneven_dtensors(cases, metadata)
+        assert gather.call_count == 0
+        assert reduce.call_count == 2  # global mesh, then this rank's inner mesh
+    for d in cases[:3]:
+        validate_uneven_dtensor(d)
+
+
+def test_batched_validation_multiple_shard_dimensions(meshes):
+    _, mesh = meshes
+    o, i = divmod(dist.get_rank(), 2)
+    cases = [
+        _dtensor(mesh, [Shard(0), Shard(1)], ([3, 1][o], [2, 4][i]), (4, 6)),
+        _dtensor(mesh, [Shard(0), Shard(0)], (dist.get_rank() + 1, 3), (10, 3)),
+        _dtensor(mesh, [Replicate(), Replicate()], (2, 3), (2, 3)),
+    ]
+    validate_uneven_dtensors(cases)
+    for d in cases:
+        validate_uneven_dtensor(d)
+
+
+def test_batched_validation_rejects_missing_boundaries(meshes):
+    mesh, _ = meshes
+    # Every shard fits, but the final row of the declared global tensor is missing.
+    d = _dtensor(mesh, [Shard(0)], (1, 3), (5, 3))
+    with pytest.raises(AssertionError, match="boundary check failed"):
+        validate_uneven_dtensors([d])
+
+
+def test_batched_validation_rejects_out_of_bounds_metadata(meshes):
+    from torch.distributed.checkpoint.metadata import ChunkStorageMetadata
+
+    mesh, _ = meshes
+    d = _dtensor(mesh, [Shard(0)], (1, 3), (4, 3))
+    bad = ChunkStorageMetadata(offsets=(4, 0), sizes=(1, 3))
+    with pytest.raises(AssertionError, match="metadata is invalid"):
+        validate_uneven_dtensors([d], [bad])
