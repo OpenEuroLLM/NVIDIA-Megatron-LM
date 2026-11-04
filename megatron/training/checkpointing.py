@@ -656,6 +656,23 @@ def _debug_optimizer_state(optimizer, tag, model=None):
                 for chunk in model:
                     for name, mp in chunk.named_parameters():
                         f.write(f"{name} {tuple(mp.shape)} {sq(mp.detach())}\n")
+            # Aggregate / EMA state lives in buffers, not parameters (router expert_bias,
+            # quantile-balancing qb_beta, viability _initial_expert_rms, routed route_bias, ...).
+            # Persistent buffers are checkpointed; non-persistent accumulators are per global
+            # batch and are only printed for information.
+            tag_file = tag.replace(' ', '_')
+            with open(f"{path}.{tag_file}.buffers.rank{rank}.txt", "w") as fp, open(
+                f"{path}.{tag_file}.buffers_nonpersistent.rank{rank}.txt", "w"
+            ) as fn:
+                for chunk in model:
+                    for mod_name, mod in chunk.named_modules():
+                        nonpersistent = getattr(mod, "_non_persistent_buffers_set", set())
+                        for bname, buf in mod.named_buffers(recurse=False):
+                            if buf is None:
+                                continue
+                            full = f"{mod_name}.{bname}" if mod_name else bname
+                            out = fn if bname in nonpersistent else fp
+                            out.write(f"{full} {tuple(buf.shape)} {sq(buf.detach())}\n")
         with open(f"{path}.{tag.replace(' ', '_')}.rank{rank}.txt", "w") as f:
             for idx, opt in enumerate(getattr(optimizer, "chained_optimizers", [optimizer])):
                 inner = getattr(opt, "optimizer", opt)
@@ -1576,6 +1593,26 @@ class _MetadataOnceReader(FileSystemReader):
         return self._metadata_once
 
 
+def _load_fsdp_dtensor_checkpoint(state_dict, storage_reader, planner):
+    """Optionally avoid gathering every rank's load plan on one coordinator.
+
+    DefaultLoadPlanner and FileSystemReader leave the global load plans unchanged.
+    DCP's no_dist mode therefore still reads each DTensor's requested local shard
+    from the global metadata, including across a world-size change. At 1024 ranks
+    the otherwise redundant plan gather can serialize tens of GB on rank zero.
+    Keep this opt-in while validating large production resumes.
+    """
+    local_plans = os.environ.get('FSDP_DCP_LOCAL_LOAD_PLAN', '0') == '1'
+    if local_plans:
+        print_rank_0('FSDP DCP: rank-local load planning (no global plan gather)')
+    torch.distributed.checkpoint.load_state_dict(
+        state_dict=state_dict, storage_reader=storage_reader, planner=planner,
+        no_dist=local_plans,
+    )
+    if local_plans and torch.distributed.is_initialized():
+        torch.distributed.barrier()
+
+
 def fsdp_dtensor_checkpoint_is_packed(state_dict_metadata):
     """Whether an fsdp_dtensor checkpoint holds the packed optimizer scalars."""
     return any(f".{_PACKED_GROUP_META}." in f".{key}" for key in state_dict_metadata)
@@ -2202,9 +2239,7 @@ def _load_base_checkpoint(
             print_diff_in_state_dicts(state_dict_metadata, state_dict)
 
         planner = default_planner.DefaultLoadPlanner(allow_partial_load=allow_partial_load)
-        torch.distributed.checkpoint.load_state_dict(
-            state_dict=state_dict, storage_reader=fs_storage_reader, planner=planner
-        )
+        _load_fsdp_dtensor_checkpoint(state_dict, fs_storage_reader, planner)
         if unpack is not None:
             state_dict = unpack()
 
