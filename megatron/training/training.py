@@ -5036,6 +5036,12 @@ def train(
             if args.manual_gc and args.manual_gc_eval:
                 # Collect only the objects created and used in evaluation.
                 gc.collect(generation=0)
+            # Return evaluation's host memory before training (and a checkpoint save, which follows
+            # an evaluation at a common interval) needs it: a full collection, then glibc's freed
+            # heap back to the OS. MEGATRON_MALLOC_TRIM=0 skips it.
+            if os.environ.get("MEGATRON_MALLOC_TRIM", "1") == "1":
+                gc.collect()
+                _malloc_trim(f"after the evaluation at iteration {iteration}")
             if should_disable_forward_pre_hook(args):
                 enable_forward_pre_hook(model)
                 pre_hook_enabled = True
@@ -5434,6 +5440,7 @@ def evaluate_and_print_results(
         )
         # Timelimit hit during evaluation
         if timelimit:
+            _release_valid_iterator(iterator)
             return
         if args.moe_masked_layer_validation:
             run_masked_layer_validation(
@@ -5447,6 +5454,8 @@ def evaluate_and_print_results(
                 pg_collection=pg_collection,
                 p2p_communicator=p2p_communicator,
             )
+        # full validation: this set's loader workers exit now (one set's pool alive at a time)
+        _release_valid_iterator(iterator)
         string = f' validation{suffix} loss at {prefix} | '
         for key in total_loss_dict:
             string += '{} value: {:.6E} | '.format(key, total_loss_dict[key].item())
@@ -5481,6 +5490,56 @@ def evaluate_and_print_results(
         print_rank_last('-' * length)
         print_rank_last(string)
         print_rank_last('-' * length)
+
+
+class _FullValidationIterator:
+    """Full validation (--full-validation): every evaluation pass reads its set from the start, and
+    release() shuts the loader's workers down after the pass. Persistent workers otherwise stay alive
+    from the first validation on -- a pool per fixed validation set (7) on top of the training
+    loader's, per rank -- and held ~120 GB more host memory per node; the checkpoint save that
+    followed the step-6000 validation then took down a 256-node run (2026-11-04, v4_2ph: the
+    rendezvous store on rank 0's node stopped answering; a save without the validation passed).
+    MEGATRON_VALID_RELEASE_WORKERS=0: the previous cyclic iterator (persistent workers)."""
+
+    def __init__(self, dataloader):
+        self.dataloader = dataloader
+        self._it = None
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._it is None:
+            self._it = iter(self.dataloader)
+        try:
+            return next(self._it)
+        except StopIteration:
+            # a rank with fewer samples than the longest (eval_iters is the max over DP ranks) wraps
+            self._it = iter(self.dataloader)
+            try:
+                return next(self._it)
+            except StopIteration:
+                raise RuntimeError("full validation: the validation dataloader produced no data")
+
+    def release(self):
+        """Shut the loader's workers down (the next pass starts the set and its workers anew)."""
+        it, self._it = self._it, None
+        if it is None:
+            return
+        shutdown = getattr(it, "_shutdown_workers", None)
+        if shutdown is not None:
+            shutdown()
+        if getattr(self.dataloader, "_iterator", None) is it:
+            # persistent workers: the DataLoader caches its iterator; a fresh one starts new workers
+            self.dataloader._iterator = None
+
+
+def _release_valid_iterator(iterator):
+    """release() a full-validation iterator (also under its RerunDataIterator wrapper)."""
+    inner = getattr(iterator, "iterable", iterator)
+    release = getattr(inner, "release", None)
+    if release is not None:
+        release()
 
 
 def cyclic_iter(iterable):
@@ -5769,17 +5828,20 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
                 )
                 args.eval_iters = eval_iters_tensor.item()
 
+        def _valid_iterator(dl):
+            if not args.full_validation:
+                return _get_iterator(dl_type, dl)
+            if os.environ.get("MEGATRON_VALID_RELEASE_WORKERS", "1") == "1":
+                return RerunDataIterator(_FullValidationIterator(dl))
+            return _get_iterator("cyclic", dl)
+
         if args.multiple_validation_sets:
             if valid_dataloaders[0] is None:
                 valid_data_iterators = [None] * len(valid_dataloaders)
             else:
-                valid_dl_type = "cyclic" if args.full_validation else dl_type
-                valid_data_iterators = [
-                    _get_iterator(valid_dl_type, dl) for dl in valid_dataloaders
-                ]
+                valid_data_iterators = [_valid_iterator(dl) for dl in valid_dataloaders]
         elif valid_dataloaders[0] is not None:
-            valid_dl_type = "cyclic" if args.full_validation else dl_type
-            valid_data_iterators = _get_iterator(valid_dl_type, valid_dataloaders[0])
+            valid_data_iterators = _valid_iterator(valid_dataloaders[0])
         else:
             valid_data_iterators = None
     else:
