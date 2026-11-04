@@ -479,7 +479,24 @@ class OptimizerConfig:
 
     muown_expert_spectral_cap: float = 0.0
     """muown_classical: hold every routed-expert matrix at sigma_max <= this factor x its init
-    sigma_max (per shape) after each step (deflation of the top singular directions; 0 = off)."""
+    sigma_max (per shape) after each step (the matrix scaled by min(1, cap / sigma_max); 0 = off).
+    With muown_expert_spectral_cap_end, the factor at the start of the ramp."""
+
+    muown_expert_spectral_cap_end: float = 0.0
+    """muown_classical: the spectral-cap factor at the end of the ramp (0 = no ramp: the cap stays
+    at muown_expert_spectral_cap). The factor moves geometrically from muown_expert_spectral_cap
+    to this value over muown_expert_spectral_cap_ramp_steps optimizer steps, so a cap introduced
+    in a running training first holds the largest matrices near their size and then tightens in
+    steps of equal ratio instead of one cut."""
+
+    muown_expert_spectral_cap_ramp_start: int = 0
+    """muown_classical: the optimizer step (the per-parameter Adam/Muown step counter: iteration + 1
+    for a run without skipped steps) at which the spectral-cap ramp starts; the start factor
+    applies before it."""
+
+    muown_expert_spectral_cap_ramp_steps: int = 0
+    """muown_classical: length of the spectral-cap ramp in optimizer steps (0 with a ramp end set:
+    the end factor applies from the ramp start on)."""
 
     muown_expert_orthogonal: bool = False
     """muown_classical: after each step, replace every routed-expert matrix's direction part

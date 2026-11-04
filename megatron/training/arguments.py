@@ -2978,8 +2978,20 @@ def _add_regularization_args(parser):
                        'weight balancing).')
     group.add_argument('--muown-expert-spectral-cap', type=float, default=0.0,
                        help='muown_classical: hold every routed-expert matrix at sigma_max <= this '
-                       'factor x its init sigma_max (per shape) after each step (deflation of the '
-                       'top singular directions; 0 = off).')
+                       'factor x its init sigma_max (per shape) after each step (the matrix scaled '
+                       'by min(1, cap / sigma_max); 0 = off). With --muown-expert-spectral-cap-end, '
+                       'the factor at the start of the ramp.')
+    group.add_argument('--muown-expert-spectral-cap-end', type=float, default=0.0,
+                       help='muown_classical: the spectral-cap factor at the end of the ramp '
+                       '(0 = no ramp). The factor moves geometrically from '
+                       '--muown-expert-spectral-cap to this value over '
+                       '--muown-expert-spectral-cap-ramp-steps optimizer steps.')
+    group.add_argument('--muown-expert-spectral-cap-ramp-start', type=int, default=0,
+                       help='muown_classical: the optimizer step (the parameters\' step counter: '
+                       'iteration + 1 without skipped steps) at which the spectral-cap ramp '
+                       'starts.')
+    group.add_argument('--muown-expert-spectral-cap-ramp-steps', type=int, default=0,
+                       help='muown_classical: length of the spectral-cap ramp in optimizer steps.')
     group.add_argument('--muown-expert-stable-rank-floor', type=float, default=0.0,
                        help='muown_classical: hold every routed-expert matrix at stable rank '
                        '|W|_F^2 / sigma_max^2 >= this value after each step (rank-1 deflation of '

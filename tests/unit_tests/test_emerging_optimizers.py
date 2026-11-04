@@ -2620,6 +2620,52 @@ def test_muown_classical_spectral_cap_holds_expert_matrices(batched):
 
 
 @pytest.mark.parametrize("batched", [False, True])
+def test_muown_classical_spectral_cap_ramp(batched):
+    """spectral_cap -> spectral_cap_end over the ramp, geometric in the optimizer step: the start
+    factor before the ramp, the end factor after it; an expert matrix pushed past every cap
+    follows the factor (sigma_max = factor x its init sigma_max, the power-iteration tolerance)."""
+    from megatron.core.optimizer.emerging_optimizers import TensorParallelMuownClassical
+
+    torch.manual_seed(0)
+    expert = torch.nn.Parameter(torch.randn(48, 96, device='cuda') * 0.02)
+    expert.allreduce = False
+    opt = TensorParallelMuownClassical(
+        params=[expert], lr=0.05, momentum=0.95, nesterov=True, betas=(0.9, 0.95),
+        num_ns_steps=5, scale_mode="shape_scaling", pg_collection=None, tp_mode="duplicated",
+        batched_step=batched, spectral_cap=2.0, spectral_cap_end=1.2,
+        spectral_cap_ramp_start=150, spectral_cap_ramp_steps=150)
+    assert opt._cap_factor(None) == 2.0
+    assert opt._cap_factor(1) == 2.0 and opt._cap_factor(150) == 2.0
+    assert abs(opt._cap_factor(225) - (2.0 * 1.2) ** 0.5) < 1e-12  # half way: the geometric mean
+    assert opt._cap_factor(300) == 1.2 and opt._cap_factor(10 ** 6) == 1.2
+    ref = opt._spectral_ref[(48, 96)]
+    direction = torch.randn(48, 1, device='cuda') @ torch.randn(1, 96, device='cuda')
+    smax = lambda w: float(torch.linalg.matrix_norm(w.detach().float(), ord=2))
+    seen = {}
+    for step in range(1, 351):
+        expert.grad = -direction.clone()
+        opt.step()
+        assert opt.state[expert]["step"] == step
+        if step in (140, 225, 260, 350):
+            seen[step] = smax(expert) / ref
+    for step, ratio in seen.items():
+        factor = opt._cap_factor(step)
+        assert 0.97 * factor < ratio < 1.02 * factor, (step, ratio, factor)
+    with pytest.raises(ValueError, match="spectral_cap_end needs"):
+        TensorParallelMuownClassical(params=[torch.nn.Parameter(torch.randn(4, 4, device='cuda'))],
+                                     spectral_cap_end=2.0)
+    with pytest.raises(ValueError, match="ramp_start"):
+        TensorParallelMuownClassical(params=[torch.nn.Parameter(torch.randn(4, 4, device='cuda'))],
+                                     spectral_cap=2.0, spectral_cap_end=1.0,
+                                     spectral_cap_ramp_steps=-1)
+    # no ramp end: a constant factor whatever the step
+    const = TensorParallelMuownClassical(
+        params=[torch.nn.Parameter(torch.randn(4, 4, device='cuda'))], spectral_cap=3.0,
+        spectral_cap_ramp_start=5, spectral_cap_ramp_steps=10)
+    assert const._cap_factor(1) == const._cap_factor(100) == 3.0
+
+
+@pytest.mark.parametrize("batched", [False, True])
 def test_muown_classical_expert_orthogonal(batched):
     """expert_orthogonal: under a persistent rank-1 gradient the expert matrix's direction part
     keeps all singular values at 1 (its row norms = |g|), while the dense one collapses."""

@@ -140,20 +140,25 @@ def test_muown_classical_row_sharded_stable_rank_floor(mesh):
             assert srank > 0.8 * r_min, srank  # power-iteration sigma at a small gap
 
 
-def test_muown_classical_row_sharded_spectral_cap(mesh):
+@pytest.mark.parametrize("ramp", [False, True])
+def test_muown_classical_row_sharded_spectral_cap(mesh, ramp):
     """The spectral cap on row shards: init references from all-reduced row sums, the cap on
-    the full matrices at their owners; sharded and unsharded steps agree."""
+    the full matrices at their owners; sharded and unsharded steps agree (also on a cap ramp,
+    whose factor the owners take from the optimizer step)."""
     os.environ["ANGULAR_MUOWN_COMPACT_CKPT"] = "1"
     rank = mesh.get_rank()
     options = dict(lr=0.05, nesterov=True, split_qkv=False, fp32_matmul_prec="highest",
                    scale_mode="spectral", extra_scale_factor=0.2)
+    if ramp:  # 1.6 -> 1.2 over steps 2-5
+        options.update(spectral_cap_end=1.2, spectral_cap_ramp_start=2, spectral_cap_ramp_steps=3)
     torch.manual_seed(13)
     fulls = [torch.nn.Parameter(torch.randn(shape, device="cuda") * 0.2) for shape, _ in LAYOUTS]
     shards = [_shard(f.detach(), counts, mesh) for f, (_, counts) in zip(fulls, LAYOUTS)]
     for p in fulls + shards:
         p.allreduce = False
-    reference = TensorParallelMuownClassical(fulls, spectral_cap=1.2, **options)
-    sharded = TensorParallelMuownClassical(shards, spectral_cap=1.2, **options)
+    cap = 1.6 if ramp else 1.2
+    reference = TensorParallelMuownClassical(fulls, spectral_cap=cap, **options)
+    sharded = TensorParallelMuownClassical(shards, spectral_cap=cap, **options)
     for k, v in reference._spectral_ref.items():
         assert abs(sharded._spectral_ref[k] - v) < 1e-5 * v, (k, v, sharded._spectral_ref[k])
     for step in range(6):
