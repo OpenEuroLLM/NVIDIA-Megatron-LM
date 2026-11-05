@@ -3,6 +3,7 @@
 import logging
 from typing import Literal, Optional
 
+import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
@@ -15,7 +16,10 @@ from megatron.core.fusions.liger_fused_linear_cross_entropy import (
 )
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
-from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.core.models.common.language_module.language_module import (
+    LanguageModule,
+    OutputZLossLoggingHelper,
+)
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
@@ -470,13 +474,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 hidden_states = hidden_states * self.config.mup_output_mult
             weight = output_weight if output_weight is not None else self.output_layer.weight
             assert weight is not None
-            return liger_fused_linear_cross_entropy(
-                hidden_states,
-                weight,
-                labels,
-                loss_mask,
-                self.config.liger_fused_linear_cross_entropy_chunk_size,
-            )
+            return self._liger_loss(hidden_states, weight, labels, loss_mask)
         logits, _ = self.output_layer(
             hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
         )
@@ -484,6 +482,32 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         if labels is None:
             return logits.transpose(0, 1).contiguous()
         return self.compute_language_model_loss(labels, logits)
+
+    def _liger_loss(self, hidden_states, weight, labels, loss_mask):
+        """Per-token CE of the Liger fused head + loss; in training with output_z_loss_coeff the
+        z-loss coeff * logZ^2 enters the gradients (in the kernel) and mean(logZ^2) over the
+        unmasked tokens is logged as output_z_loss, as compute_language_model_loss does."""
+        coeff = self.config.output_z_loss_coeff
+        with_z = bool(coeff) and self.training
+        out = liger_fused_linear_cross_entropy(
+            hidden_states,
+            weight,
+            labels,
+            loss_mask,
+            self.config.liger_fused_linear_cross_entropy_chunk_size,
+            lse_square_scale=float(coeff) if with_z else 0.0,
+        )
+        if not with_z:
+            return out
+        loss, z_loss = out
+        if loss_mask is not None:
+            n_tokens = loss_mask.float().sum().clamp_min(1.0)
+        else:
+            n_tokens = torch.tensor(float(z_loss.numel()), device=z_loss.device)
+        OutputZLossLoggingHelper.save_loss_to_tracker(
+            (z_loss.float().sum() / coeff / n_tokens).detach(), avg_group=self.pg_collection.dp_cp
+        )
+        return loss
 
     def build_schedule_plan(
         self,
@@ -835,13 +859,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 hidden_states = hidden_states * self.config.mup_output_mult
             weight = output_weight if output_weight is not None else self.output_layer.weight
             assert weight is not None
-            return liger_fused_linear_cross_entropy(
-                hidden_states,
-                weight,
-                labels,
-                loss_mask,
-                self.config.liger_fused_linear_cross_entropy_chunk_size,
-            )
+            return self._liger_loss(hidden_states, weight, labels, loss_mask)
 
         logits, _ = self.output_layer(
             hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output

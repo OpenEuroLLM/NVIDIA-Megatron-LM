@@ -2437,14 +2437,18 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
         # The Liger fused LM-head + CE returns the loss before the logits exist,
-        # so the logit softcap and the z-loss (both applied to the logits) would
-        # be skipped without a word.
+        # so the logit softcap (applied to the logits) would be skipped without a
+        # word; the z-loss is computed in the Liger kernel (fixed-chunk path).
         if self.liger_fused_linear_cross_entropy:
             assert self.final_logit_softcapping is None, (
                 "liger_fused_linear_cross_entropy does not apply final_logit_softcapping"
             )
-            assert not self.output_z_loss_coeff, (
-                "liger_fused_linear_cross_entropy does not add the output z-loss"
+            # the z-loss is added in the Liger kernel on the fixed-chunk path only
+            assert not self.output_z_loss_coeff or (
+                self.liger_fused_linear_cross_entropy_chunk_size is not None
+            ), (
+                "the output z-loss under liger_fused_linear_cross_entropy needs "
+                "liger_fused_linear_cross_entropy_chunk_size"
             )
         if self.loop_block_layers:
             unique = self.loop_prelude_layers + self.loop_block_layers + self.loop_coda_layers

@@ -43,11 +43,18 @@ class _LigerFixedChunkLinearCrossEntropy(torch.autograd.Function):
     our 262k vocabulary/H=512 model this creates 512 chunks at MBS=32 and
     repeats the output-head gradient accumulation 512 times. An opt-in chunk
     trades otherwise available temporary memory for much fewer launches.
+
+    ``lse_square_scale`` > 0 adds the output z-loss ``scale * logsumexp^2`` per token inside the
+    kernel (its gradient ``2 scale lse softmax`` lands in the chunk's dlogits, as Megatron's
+    native z-loss). The kernel adds it to the loss value as well; it is subtracted again here,
+    so the returned loss is the pure cross entropy (Megatron's convention: the logged lm loss
+    stays CE) and the per-token z-loss is the second output (0 for ignored targets).
     """
 
     @staticmethod
     @amp_custom_fwd
-    def forward(ctx, input_: torch.Tensor, weight: torch.Tensor, target: torch.Tensor, chunk_size: int):
+    def forward(ctx, input_: torch.Tensor, weight: torch.Tensor, target: torch.Tensor, chunk_size: int,
+                lse_square_scale: float = 0.0):
         assert liger_fused_ce_ops is not None
         if chunk_size <= 0 or chunk_size & (chunk_size - 1):
             raise ValueError(f"Liger chunk size must be a positive power of two, got {chunk_size}")
@@ -64,6 +71,8 @@ class _LigerFixedChunkLinearCrossEntropy(torch.autograd.Function):
         grad_input = torch.zeros_like(input_)
         grad_weight = torch.zeros_like(weight) if input_.requires_grad and weight.requires_grad else None
         loss_1d = torch.zeros(batch_tokens, dtype=torch.float32, device=input_.device)
+        with_z = lse_square_scale > 0.0
+        z_loss_1d = torch.zeros_like(loss_1d) if with_z else None
         # `reduction="none"` does not use this scalar to scale loss or
         # gradients; ignored targets are handled directly in Liger's Triton
         # kernel. Keeping it a shape-derived Python integer avoids a device
@@ -78,6 +87,7 @@ class _LigerFixedChunkLinearCrossEntropy(torch.autograd.Function):
             logits_chunk = (input_chunk @ weight.t()).contiguous()
             target_chunk = target[start_idx:end_idx].contiguous()
             loss_chunk = loss_1d[start_idx:end_idx]
+            z_chunk = z_loss_1d[start_idx:end_idx] if with_z else None
             n_rows = logits_chunk.shape[0]
             liger_fused_ce_ops.liger_cross_entropy_kernel[(n_rows,)](
                 X_ptr=logits_chunk,
@@ -86,7 +96,7 @@ class _LigerFixedChunkLinearCrossEntropy(torch.autograd.Function):
                 Y_stride=target_chunk.stride(-1),
                 weight_ptr=None,
                 loss_ptr=loss_chunk,
-                z_loss_ptr=None,
+                z_loss_ptr=z_chunk,
                 loss_stride=loss_chunk.stride(-1),
                 token_accuracy_ptr=None,
                 token_accuracy_stride=0,
@@ -97,11 +107,11 @@ class _LigerFixedChunkLinearCrossEntropy(torch.autograd.Function):
                 sum_non_ignore_weight=total_n_non_ignore,
                 weight_sum=0.0,
                 ignore_index=-100,
-                lse_square_scale=0.0,
+                lse_square_scale=float(lse_square_scale),
                 label_smoothing=0.0,
                 reduction="none",
                 softcap=None,
-                RETURN_Z_LOSS=False,
+                RETURN_Z_LOSS=with_z,
                 RETURN_TOKEN_ACCURACY=False,
                 RETURN_PREDICTED_TOKENS=False,
                 HAS_WEIGHT=False,
@@ -120,11 +130,16 @@ class _LigerFixedChunkLinearCrossEntropy(torch.autograd.Function):
                     grad_weight += torch.mm(logits_chunk.t(), input_chunk).float()
 
         ctx.save_for_backward(grad_input.detach(), grad_weight.detach() if grad_weight is not None else None)
-        return loss_1d
+        if not with_z:
+            return loss_1d, None
+        # the kernel's loss is CE + z: report CE (the gradients above keep the z term)
+        loss_1d.sub_(z_loss_1d)
+        ctx.mark_non_differentiable(z_loss_1d)
+        return loss_1d, z_loss_1d
 
     @staticmethod
     @amp_custom_bwd
-    def backward(ctx, grad_output: torch.Tensor):
+    def backward(ctx, grad_output: torch.Tensor, grad_z_loss=None):
         assert liger_fused_ce_ops is not None
         grad_input, grad_weight = ctx.saved_tensors
         # Liger's helper first builds a device scalar and calls ``torch.equal``
@@ -155,7 +170,7 @@ class _LigerFixedChunkLinearCrossEntropy(torch.autograd.Function):
                 BLOCK_SIZE=block_size,
                 num_warps=num_warps,
             )
-        return grad_input, grad_weight, None, None
+        return grad_input, grad_weight, None, None, None
 
 
 def liger_fused_linear_cross_entropy(
@@ -164,7 +179,8 @@ def liger_fused_linear_cross_entropy(
     labels: torch.Tensor,
     loss_mask: torch.Tensor | None = None,
     chunk_size: int | None = None,
-) -> torch.Tensor:
+    lse_square_scale: float = 0.0,
+):
     """Return per-token LM loss without materialising full-vocabulary logits.
 
     Args:
@@ -176,9 +192,14 @@ def liger_fused_linear_cross_entropy(
             entries are converted to Liger's ignore index before the fused
             backward pass. Megatron's pretraining datasets use a binary mask.
 
+        lse_square_scale: the output z-loss coefficient (0 = off; needs ``chunk_size``). The
+            z-loss enters the gradients only; the returned loss is the pure cross entropy.
+
     Returns:
         Per-token losses of shape ``[batch, sequence]``, matching Megatron's
-        normal ``compute_language_model_loss`` contract.
+        normal ``compute_language_model_loss`` contract. With ``lse_square_scale`` > 0 a
+        tuple ``(loss, z_loss)``: ``z_loss`` the per-token ``scale * logsumexp^2`` of shape
+        ``[batch, sequence]`` (0 for masked tokens), no gradient.
 
     Liger's ``reduction='none'`` is intentional: Megatron applies the dataset
     loss mask after the model forward. Released Liger 0.8.0 does not apply a
@@ -218,12 +239,21 @@ def liger_fused_linear_cross_entropy(
     if loss_mask is not None:
         labels = labels.masked_fill(loss_mask == 0, -100)
     targets_1d = labels.transpose(0, 1).contiguous().reshape(-1)
+    z_loss_1d = None
     if chunk_size is None:
+        if lse_square_scale > 0.0:
+            raise NotImplementedError(
+                "the output z-loss under Liger needs --liger-fused-linear-cross-entropy-chunk-size"
+            )
         loss_1d = LigerFusedLinearCrossEntropyLoss(reduction="none")(
             output_weight, inputs_2d, targets_1d
         )
     else:
-        loss_1d = _LigerFixedChunkLinearCrossEntropy.apply(
-            inputs_2d, output_weight, targets_1d, chunk_size
+        loss_1d, z_loss_1d = _LigerFixedChunkLinearCrossEntropy.apply(
+            inputs_2d, output_weight, targets_1d, chunk_size, lse_square_scale
         )
-    return loss_1d.view(sequence_length, micro_batch_size).transpose(0, 1).contiguous()
+    loss = loss_1d.view(sequence_length, micro_batch_size).transpose(0, 1).contiguous()
+    if lse_square_scale <= 0.0:
+        return loss
+    z_loss = z_loss_1d.view(sequence_length, micro_batch_size).transpose(0, 1).contiguous()
+    return loss, z_loss
