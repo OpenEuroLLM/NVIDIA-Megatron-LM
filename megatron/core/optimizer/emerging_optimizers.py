@@ -1839,8 +1839,8 @@ class TensorParallelAngularMuown(TensorParallelMuon):
             lw.mul_(c.to(lw.dtype))
             g = local(self.state[p]["g"])
             g.mul_(c.to(g.dtype))
-        if log and n_scaled is not None:
-            logger.info(
+        if log and n_scaled is not None:  # a debug switch: warning level (info is not shown)
+            logger.warning(
                 "forward spectral cap at step %s: %d of %d local expert matrices scaled",
                 step, int(n_scaled.item()), n_seen,
             )
