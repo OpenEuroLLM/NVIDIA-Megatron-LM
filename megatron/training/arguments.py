@@ -2992,6 +2992,10 @@ def _add_regularization_args(parser):
                        'starts.')
     group.add_argument('--muown-expert-spectral-cap-ramp-steps', type=int, default=0,
                        help='muown_classical: length of the spectral-cap ramp in optimizer steps.')
+    group.add_argument('--muown-expert-bound-interval', type=int, default=1,
+                       help='muown_classical: apply the routed-expert bounds (floor, cap, '
+                       'orthogonal) every this many optimizer steps (on Megatron-FSDP each '
+                       'application exchanges every expert matrix with its owner rank).')
     group.add_argument('--muown-expert-stable-rank-floor', type=float, default=0.0,
                        help='muown_classical: hold every routed-expert matrix at stable rank '
                        '|W|_F^2 / sigma_max^2 >= this value after each step (rank-1 deflation of '

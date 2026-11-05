@@ -140,8 +140,8 @@ def test_muown_classical_row_sharded_stable_rank_floor(mesh):
             assert srank > 0.8 * r_min, srank  # power-iteration sigma at a small gap
 
 
-@pytest.mark.parametrize("ramp", [False, True])
-def test_muown_classical_row_sharded_spectral_cap(mesh, ramp):
+@pytest.mark.parametrize("ramp,interval", [(False, 1), (True, 1), (True, 2)])
+def test_muown_classical_row_sharded_spectral_cap(mesh, ramp, interval):
     """The spectral cap on row shards: init references from all-reduced row sums, the cap on
     the full matrices at their owners; sharded and unsharded steps agree (also on a cap ramp,
     whose factor the owners take from the optimizer step)."""
@@ -151,6 +151,7 @@ def test_muown_classical_row_sharded_spectral_cap(mesh, ramp):
                    scale_mode="spectral", extra_scale_factor=0.2)
     if ramp:  # 1.6 -> 1.2 over steps 2-5
         options.update(spectral_cap_end=1.2, spectral_cap_ramp_start=2, spectral_cap_ramp_steps=3)
+    options.update(bound_interval=interval)  # 2: the owners' exchange runs on even steps only
     torch.manual_seed(13)
     fulls = [torch.nn.Parameter(torch.randn(shape, device="cuda") * 0.2) for shape, _ in LAYOUTS]
     shards = [_shard(f.detach(), counts, mesh) for f, (_, counts) in zip(fulls, LAYOUTS)]

@@ -498,6 +498,13 @@ class OptimizerConfig:
     """muown_classical: length of the spectral-cap ramp in optimizer steps (0 with a ramp end set:
     the end factor applies from the ramp start on)."""
 
+    muown_expert_bound_interval: int = 1
+    """muown_classical: apply the routed-expert bounds (stable-rank floor, spectral cap, orthogonal
+    directions) every this many optimizer steps instead of every step. On Megatron-FSDP the bounds
+    send every expert matrix's rows to its owner rank and back (~0.8 s per step at 256 nodes for
+    the v4 main run); a runaway expert grows by well under 0.1 % per step, so an interval of ~20
+    lets a matrix overshoot the cap by ~1 % between applications at 1/20 of the cost."""
+
     muown_expert_orthogonal: bool = False
     """muown_classical: after each step, replace every routed-expert matrix's direction part
     (the row-normalized weight) by its polar factor at kept row norms: all singular values of the

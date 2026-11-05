@@ -1548,7 +1548,8 @@ class TensorParallelAngularMuown(TensorParallelMuon):
             _angular_muown_u_recompose(p, g, u_step, u_step_norm_sq)
             if v_norm is not None:
                 v_norm.copy_(u_step_norm_sq.sqrt().clamp_min(ANGULAR_MUOWN_EPS))
-            if self._bound_on() and reduce_group is None and _is_expert_param(p):
+            if (self._bound_on() and reduce_group is None and _is_expert_param(p)
+                    and self._bound_due(step)):
                 self._bound_(p.data, g=g, step=step)
 
     # ------------------------------------------------------------------
@@ -1716,7 +1717,7 @@ class TensorParallelAngularMuown(TensorParallelMuon):
                 u_step_norm_sq, op=torch.distributed.ReduceOp.SUM, group=reduce_group
             )
         _angular_muown_u_recompose(w_b, g_b, u_step, u_step_norm_sq)
-        if floor and self._bound_on() and reduce_group is None:
+        if floor and self._bound_on() and reduce_group is None and self._bound_due(step):
             experts = [i for i, p in enumerate(params) if _is_expert_param(p)]
             if len(experts) == len(params):
                 self._bound_(w_b, g=g_b, step=step)
@@ -1800,6 +1801,10 @@ class TensorParallelAngularMuown(TensorParallelMuon):
     def _bound_on(self) -> bool:
         return self._stable_rank_floor > 1.0 or self._spectral_cap > 0.0 or self._expert_orthogonal
 
+    def _bound_due(self, step: Optional[int]) -> bool:
+        """Apply the expert bounds at this optimizer step (every ``bound_interval`` steps)?"""
+        return step is None or self._bound_interval <= 1 or step % self._bound_interval == 0
+
     def _cap_factor(self, step: Optional[int]) -> float:
         """The spectral-cap factor at optimizer ``step``: ``spectral_cap``, or on a ramp the
         geometric interpolation to ``spectral_cap_end`` (None: the start factor)."""
@@ -1882,6 +1887,8 @@ class TensorParallelAngularMuown(TensorParallelMuon):
             return
         # one step for all: every parameter steps together (and a skipped step skips them all)
         step = self.state[experts[0]].get("step")
+        if not self._bound_due(step):
+            return  # the same decision on every rank: the exchange is skipped everywhere
 
         def floor_fn(stack, metadata):  # returns the change: exactly 0 where nothing is capped
             floored = stack.clone()
@@ -2061,7 +2068,8 @@ class TensorParallelMuownClassical(TensorParallelAngularMuown):
         self, params: ParamsT, v_weight_decay: float = 0.0, g_weight_decay: float = 0.0,
         stable_rank_floor: float = 0.0, spectral_cap: float = 0.0,
         expert_orthogonal: bool = False, spectral_cap_end: float = 0.0,
-        spectral_cap_ramp_start: int = 0, spectral_cap_ramp_steps: int = 0, **kwargs
+        spectral_cap_ramp_start: int = 0, spectral_cap_ramp_steps: int = 0,
+        bound_interval: int = 1, **kwargs
     ) -> None:
         """``v_weight_decay`` (not in the Muown paper, default off): decoupled weight decay on v,
         v <- v - lr (update + lambda v). v / ||v|| does not depend on ||v||, so it only shrinks the
@@ -2092,6 +2100,10 @@ class TensorParallelMuownClassical(TensorParallelAngularMuown):
         running training can so start just above its largest matrices (freezing their growth)
         and tighten by a constant ratio per step instead of cutting them in one step.
 
+        ``bound_interval`` (default 1): apply the expert bounds (floor, cap, orthogonal) only at
+        optimizer steps divisible by it -- on Megatron-FSDP every application exchanges all expert
+        matrices with their owner ranks.
+
         ``expert_orthogonal`` (default off): after each step, the routed-expert matrices'
         direction parts are replaced by their polar factor at kept row norms (Muon-like weight
         balancing: every singular value of U is 1); exclusive with the floor and the cap."""
@@ -2112,6 +2124,8 @@ class TensorParallelMuownClassical(TensorParallelAngularMuown):
             raise ValueError("spectral_cap_end needs spectral_cap (the ramp's start factor)")
         if spectral_cap_ramp_start < 0 or spectral_cap_ramp_steps < 0:
             raise ValueError("spectral_cap_ramp_start / _steps must be nonnegative")
+        if bound_interval < 1:
+            raise ValueError("bound_interval must be >= 1")
         if expert_orthogonal and (stable_rank_floor > 1.0 or spectral_cap > 0.0):
             raise ValueError("expert_orthogonal excludes stable_rank_floor and spectral_cap")
         super().__init__(params, **kwargs)
@@ -2121,6 +2135,7 @@ class TensorParallelMuownClassical(TensorParallelAngularMuown):
         self._spectral_cap = float(spectral_cap)
         self._spectral_cap_end = float(spectral_cap_end)
         self._spectral_cap_ramp = (int(spectral_cap_ramp_start), int(spectral_cap_ramp_steps))
+        self._bound_interval = int(bound_interval)
         self._expert_orthogonal = bool(expert_orthogonal)
         self._spectral_ref: Dict[tuple, float] = {}
         if self._spectral_cap > 0.0:
@@ -2316,6 +2331,7 @@ def _muown_classical_config_to_kwargs(config, model_chunks, pg_collection) -> Di
     kwargs["spectral_cap_end"] = getattr(config, "muown_expert_spectral_cap_end", 0.0)
     kwargs["spectral_cap_ramp_start"] = getattr(config, "muown_expert_spectral_cap_ramp_start", 0)
     kwargs["spectral_cap_ramp_steps"] = getattr(config, "muown_expert_spectral_cap_ramp_steps", 0)
+    kwargs["bound_interval"] = getattr(config, "muown_expert_bound_interval", 1)
     kwargs["expert_orthogonal"] = getattr(config, "muown_expert_orthogonal", False)
     return kwargs
 

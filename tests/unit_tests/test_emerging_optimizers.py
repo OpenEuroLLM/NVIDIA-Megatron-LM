@@ -2666,6 +2666,39 @@ def test_muown_classical_spectral_cap_ramp(batched):
 
 
 @pytest.mark.parametrize("batched", [False, True])
+def test_muown_classical_bound_interval(batched):
+    """bound_interval: the cap is applied only at optimizer steps divisible by the interval -- an
+    expert matrix pushed past the cap exceeds it in between and is back at the cap on every due
+    step; a dense matrix is never bounded."""
+    from megatron.core.optimizer.emerging_optimizers import TensorParallelMuownClassical
+
+    torch.manual_seed(0)
+    expert = torch.nn.Parameter(torch.randn(48, 96, device='cuda') * 0.02)
+    expert.allreduce = False
+    opt = TensorParallelMuownClassical(
+        params=[expert], lr=0.05, momentum=0.95, nesterov=True, betas=(0.9, 0.95),
+        num_ns_steps=5, scale_mode="shape_scaling", pg_collection=None, tp_mode="duplicated",
+        batched_step=batched, spectral_cap=1.5, bound_interval=5)
+    assert not opt._bound_due(3) and opt._bound_due(5) and opt._bound_due(None)
+    ref = opt._spectral_ref[(48, 96)]
+    direction = torch.randn(48, 1, device='cuda') @ torch.randn(1, 96, device='cuda')
+    smax = lambda w: float(torch.linalg.matrix_norm(w.detach().float(), ord=2))
+    over_between = False
+    for step in range(1, 301):
+        expert.grad = -direction.clone()
+        opt.step()
+        ratio = smax(expert) / ref
+        if step % 5 == 0:
+            assert ratio < 1.02 * 1.5, (step, ratio)
+        elif step > 100 and ratio > 1.03 * 1.5:
+            over_between = True
+    assert over_between  # the cap really is skipped between due steps
+    with pytest.raises(ValueError, match="bound_interval"):
+        TensorParallelMuownClassical(params=[torch.nn.Parameter(torch.randn(4, 4, device='cuda'))],
+                                     spectral_cap=2.0, bound_interval=0)
+
+
+@pytest.mark.parametrize("batched", [False, True])
 def test_muown_classical_expert_orthogonal(batched):
     """expert_orthogonal: under a persistent rank-1 gradient the expert matrix's direction part
     keeps all singular values at 1 (its row norms = |g|), while the dense one collapses."""
