@@ -634,7 +634,14 @@ class MoonEPGroupedMLP(MegatronModule):
 
     def _gathered_weights(self):
         # through the submodules' __call__ (DDP's param-gather pre-hooks, see _ExpertWeights)
-        return self.linear_fc1() + self.linear_fc2()
+        fc1, fc2 = self.linear_fc1(), self.linear_fc2()
+        from megatron.core.transformer.moe import expert_forward_cap
+
+        if expert_forward_cap.armed():
+            # the spectral cap measured on the gathered full matrices (Megatron-FSDP,
+            # muown_expert_spectral_cap_source=forward): once per armed optimizer step
+            expert_forward_cap.measure((fc1, fc2))
+        return fc1 + fc2
 
     def forward(self, permuted_hidden, tokens_per_expert, permuted_probs, **_):
         from megatron.core.transformer import arch_metrics

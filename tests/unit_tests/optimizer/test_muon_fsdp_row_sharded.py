@@ -184,6 +184,75 @@ def test_muown_classical_row_sharded_spectral_cap(mesh, ramp, interval):
         assert float(torch.linalg.matrix_norm(f.detach(), ord=2)) < 1.05 * cap
 
 
+@pytest.mark.parametrize("interval", [1, 2])
+def test_muown_classical_row_sharded_forward_cap(mesh, interval):
+    """spectral_cap_source=forward: the scales the experts' forward measures on the gathered full
+    matrices (expert_forward_cap) are applied to each rank's rows and g at the due optimizer step,
+    with no exchange; the sharded run equals an unsharded one scaled by hand with the same scales,
+    and the pushed matrices end at the cap (lagging one step)."""
+    from megatron.core.transformer.moe import expert_forward_cap as efc
+
+    efc.STATE.reset()
+    os.environ["ANGULAR_MUOWN_COMPACT_CKPT"] = "1"
+    rank = mesh.get_rank()
+    options = dict(lr=0.05, nesterov=True, split_qkv=False, fp32_matmul_prec="highest",
+                   scale_mode="spectral", extra_scale_factor=0.2)
+    torch.manual_seed(13)
+    fulls = [torch.nn.Parameter(torch.randn(shape, device="cuda") * 0.2) for shape, _ in LAYOUTS]
+    shards = [_shard(f.detach(), counts, mesh) for f, (_, counts) in zip(fulls, LAYOUTS)]
+    for p in fulls + shards:
+        p.allreduce = False
+    reference = TensorParallelMuownClassical(fulls, **options)  # no cap: scaled by hand below
+    sharded = TensorParallelMuownClassical(shards, spectral_cap=1.2, spectral_cap_source="forward",
+                                           bound_interval=interval, **options)
+    # the forward's gathered weights: other parameter objects, linked as Megatron-FSDP does
+    proxies = [torch.nn.Parameter(f.detach().clone()) for f in fulls]
+    for sh, q in zip(shards, proxies):
+        sh.orig_param = q
+    applied = 0
+    for step in range(1, 11):
+        with torch.no_grad():  # the forward gathers the current full weights and measures them
+            for q, f in zip(proxies, fulls):
+                q.copy_(f)
+        by_shape = {}
+        for q in proxies:
+            by_shape.setdefault(tuple(q.shape), []).append(q)
+        efc.measure(list(by_shape.values()))
+        scales = dict(efc.take_scales(step))
+        torch.manual_seed(300 + step)
+        _set_grads(fulls, shards, rank)
+        for f in fulls:  # a shared rank-1 push: grows sigma_max past the cap
+            f.grad.add_(-3.0 * torch.outer(torch.ones(f.shape[0], device="cuda"),
+                                           torch.ones(f.shape[1], device="cuda")))
+        for f, sh, (_, counts) in zip(fulls, shards, LAYOUTS):
+            lo, hi = _rows(counts, rank)
+            if hi > lo:
+                sh.grad = DTensor.from_local(f.grad[lo:hi].clone(), device_mesh=sh.device_mesh,
+                                             placements=[Shard(0)], run_check=False,
+                                             shape=f.shape, stride=f.stride())
+        reference.step()
+        with torch.no_grad():  # the due step's scales after the update, by hand
+            for f, q in zip(fulls, proxies):
+                c = scales.get(id(q))
+                if c is not None:
+                    f.mul_(c)
+                    reference.state[f]["g"].mul_(c)
+                    applied += int(float(c) < 1.0)
+        sharded.step()
+        for f, sh, (_, counts) in zip(fulls, shards, LAYOUTS):
+            lo, hi = _rows(counts, rank)
+            torch.testing.assert_close(local(sh).detach(), f.detach()[lo:hi])
+            torch.testing.assert_close(local(sharded.state[sh]["g"]),
+                                       reference.state[f]["g"][lo:hi])
+        if step % interval:
+            assert not scales  # nothing armed for steps that are not due
+    assert applied > 0  # the push really drove matrices past the cap
+    for f in fulls:  # measured before the due step's update (and lr 0.05 grows sigma fast)
+        cap = 1.2 * sharded._spectral_ref[tuple(f.shape)]
+        assert float(torch.linalg.matrix_norm(f.detach(), ord=2)) < (1.3 if interval == 1 else 2.0) * cap
+    efc.STATE.reset()
+
+
 def test_muown_classical_row_sharded_expert_orthogonal(mesh):
     """Muon-like expert weight balancing on row shards: the polar factor of the full matrix at
     its owner; sharded and unsharded steps agree."""

@@ -1796,7 +1796,74 @@ class TensorParallelAngularMuown(TensorParallelMuon):
             stack = torch.stack([direction_of[id(p)] for p in batch["params"]])
             self._batch_post(group, batch, ctx, stack, floor=False)
         if self._bound_on():
-            self._row_sharded_floor(params)
+            if self._cap_source == "forward":
+                self._apply_forward_cap(params)
+            else:
+                self._row_sharded_floor(params)
+
+    @torch.no_grad()
+    def _apply_forward_cap(self, params: list) -> None:
+        """The scales the experts' forward measured for this optimizer step (expert_forward_cap)
+        on each rank's local fp32 rows and row magnitudes g: W = g U / |U|, so W -> c W is
+        g -> c g with the stored weight following. Purely local."""
+        from megatron.core.transformer.moe import expert_forward_cap
+
+        experts = [p for p in params if _is_expert_param(p)]
+        if not experts:
+            return
+        step = self.state[experts[0]].get("step")
+        scales = expert_forward_cap.take_scales(step)
+        if not scales:
+            if expert_forward_cap.STATE.step == step and not getattr(self, "_fwdcap_warned", False):
+                # armed for this step, but no forward measured anything: experts without the
+                # measurement hook (only MoonEPGroupedMLP has it) -- the cap would do nothing
+                logger.warning(
+                    "muown_expert_spectral_cap_source=forward: nothing measured for step %s "
+                    "(the routed experts are not MoonEPGroupedMLP?): the cap is NOT applied", step
+                )
+                self._fwdcap_warned = True
+            return
+        n_scaled, n_seen = None, 0
+        log = os.environ.get("MEGATRON_FWDCAP_LOG", "0") == "1"
+        for p in experts:
+            c = scales.get(id(getattr(p, "orig_param", p)))
+            if c is None:
+                continue
+            n_seen += 1
+            if log:
+                below = (c < 1.0).float()
+                n_scaled = below if n_scaled is None else n_scaled + below
+            lw = local(p)
+            if lw.numel() == 0:
+                continue
+            lw.mul_(c.to(lw.dtype))
+            g = local(self.state[p]["g"])
+            g.mul_(c.to(g.dtype))
+        if log and n_scaled is not None:
+            logger.info(
+                "forward spectral cap at step %s: %d of %d local expert matrices scaled",
+                step, int(n_scaled.item()), n_seen,
+            )
+
+    def _arm_forward_cap(self) -> None:
+        """After a step: arm the forward measurement for the next optimizer step if it is due."""
+        from megatron.core.transformer.moe import expert_forward_cap
+
+        step = None
+        for group in self.param_groups:
+            for p in group["params"]:
+                if _is_expert_param(p) and p in self.state and "step" in self.state[p]:
+                    step = self.state[p]["step"]
+                    break
+            if step is not None:
+                break
+        if step is None:
+            return
+        nxt = int(step) + 1
+        if self._spectral_cap > 0.0 and self._bound_due(nxt):
+            expert_forward_cap.arm(nxt, {s: self._expert_cap(s, nxt) for s in self._spectral_ref})
+        else:
+            expert_forward_cap.disarm()
 
     def _bound_on(self) -> bool:
         return self._stable_rank_floor > 1.0 or self._spectral_cap > 0.0 or self._expert_orthogonal
@@ -2069,7 +2136,7 @@ class TensorParallelMuownClassical(TensorParallelAngularMuown):
         stable_rank_floor: float = 0.0, spectral_cap: float = 0.0,
         expert_orthogonal: bool = False, spectral_cap_end: float = 0.0,
         spectral_cap_ramp_start: int = 0, spectral_cap_ramp_steps: int = 0,
-        bound_interval: int = 1, **kwargs
+        bound_interval: int = 1, spectral_cap_source: str = "owner", **kwargs
     ) -> None:
         """``v_weight_decay`` (not in the Muown paper, default off): decoupled weight decay on v,
         v <- v - lr (update + lambda v). v / ||v|| does not depend on ||v||, so it only shrinks the
@@ -2104,6 +2171,12 @@ class TensorParallelMuownClassical(TensorParallelAngularMuown):
         optimizer steps divisible by it -- on Megatron-FSDP every application exchanges all expert
         matrices with their owner ranks.
 
+        ``spectral_cap_source`` (default ``owner``): on Megatron-FSDP row shards, ``forward``
+        measures the cap on the full expert matrices of the next forward pass
+        (megatron/core/transformer/moe/expert_forward_cap.py) and scales each rank's local rows
+        and g by min(1, cap / sigma_max) at the due step -- no exchange. Unsharded parameters
+        keep the local bound.
+
         ``expert_orthogonal`` (default off): after each step, the routed-expert matrices'
         direction parts are replaced by their polar factor at kept row norms (Muon-like weight
         balancing: every singular value of U is 1); exclusive with the floor and the cap."""
@@ -2126,6 +2199,10 @@ class TensorParallelMuownClassical(TensorParallelAngularMuown):
             raise ValueError("spectral_cap_ramp_start / _steps must be nonnegative")
         if bound_interval < 1:
             raise ValueError("bound_interval must be >= 1")
+        if spectral_cap_source not in ("owner", "forward"):
+            raise ValueError(f"spectral_cap_source must be owner or forward, got {spectral_cap_source}")
+        if spectral_cap_source == "forward" and (stable_rank_floor > 1.0 or expert_orthogonal):
+            raise ValueError("spectral_cap_source=forward supports the spectral cap only")
         if expert_orthogonal and (stable_rank_floor > 1.0 or spectral_cap > 0.0):
             raise ValueError("expert_orthogonal excludes stable_rank_floor and spectral_cap")
         super().__init__(params, **kwargs)
@@ -2136,6 +2213,7 @@ class TensorParallelMuownClassical(TensorParallelAngularMuown):
         self._spectral_cap_end = float(spectral_cap_end)
         self._spectral_cap_ramp = (int(spectral_cap_ramp_start), int(spectral_cap_ramp_steps))
         self._bound_interval = int(bound_interval)
+        self._cap_source = spectral_cap_source
         self._expert_orthogonal = bool(expert_orthogonal)
         self._spectral_ref: Dict[tuple, float] = {}
         if self._spectral_cap > 0.0:
@@ -2144,6 +2222,13 @@ class TensorParallelMuownClassical(TensorParallelAngularMuown):
             if "u_lr" in group:
                 raise ValueError("Muown uses the ordinary lr, not u_lr")
             group.pop("u_lr_multiplier", None)
+
+    @torch.no_grad()
+    def step(self, closure: Optional[Callable] = None) -> Optional[float]:
+        out = super().step(closure)
+        if self._cap_source == "forward" and self._spectral_cap > 0.0:
+            self._arm_forward_cap()  # the next due step's measurement, in the coming forward
+        return out
 
     @torch.no_grad()
     def _init_group(self, group: dict, skip_non_grad_params: bool = True) -> None:
@@ -2332,6 +2417,7 @@ def _muown_classical_config_to_kwargs(config, model_chunks, pg_collection) -> Di
     kwargs["spectral_cap_ramp_start"] = getattr(config, "muown_expert_spectral_cap_ramp_start", 0)
     kwargs["spectral_cap_ramp_steps"] = getattr(config, "muown_expert_spectral_cap_ramp_steps", 0)
     kwargs["bound_interval"] = getattr(config, "muown_expert_bound_interval", 1)
+    kwargs["spectral_cap_source"] = getattr(config, "muown_expert_spectral_cap_source", "owner")
     kwargs["expert_orthogonal"] = getattr(config, "muown_expert_orthogonal", False)
     return kwargs
 

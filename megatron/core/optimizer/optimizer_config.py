@@ -498,6 +498,14 @@ class OptimizerConfig:
     """muown_classical: length of the spectral-cap ramp in optimizer steps (0 with a ramp end set:
     the end factor applies from the ramp start on)."""
 
+    muown_expert_spectral_cap_source: str = "owner"
+    """muown_classical on Megatron-FSDP: where the spectral cap measures sigma_max. ``owner``: the
+    updated fp32 matrices at their owner ranks (every expert matrix sent there and back per
+    application). ``forward``: the full matrices the experts' forward gathers anyway (MoonEP
+    experts; with FP8 expert gather their FP8 round trip) -- the scale min(1, cap / sigma_max) is
+    applied to each rank's local rows at the next due optimizer step, no matrix moves
+    (megatron/core/transformer/moe/expert_forward_cap.py). Cap only (no floor / orthogonal)."""
+
     muown_expert_bound_interval: int = 1
     """muown_classical: apply the routed-expert bounds (stable-rank floor, spectral cap, orthogonal
     directions) every this many optimizer steps instead of every step. On Megatron-FSDP the bounds
