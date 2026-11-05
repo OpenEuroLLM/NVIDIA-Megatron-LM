@@ -23,7 +23,9 @@ _spec.loader.exec_module(ps)
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def qkv(b=1, hq=8, g=2, L=640, d=32, seed=0, dtype=torch.float32):
+def qkv(b=1, hq=8, g=2, L=640, d=32, seed=0, dtype=torch.float64):
+    """float64 by default: exact comparisons (the NGC container forces TF32 for fp32 GEMMs, which flips
+    near-tied page selections between differently shaped calls)."""
     gen = torch.Generator().manual_seed(seed)
     q = torch.randn(b, hq, L, d, generator=gen).to(DEV, dtype)
     k = torch.randn(b, g, L, d, generator=gen).to(DEV, dtype)
@@ -36,9 +38,9 @@ def masked_reference(q, k, v, allowed, scale, bias=None):
     b, hq, s, d = q.shape
     g = k.shape[1]
     rep = hq // g
-    kk = k.repeat_interleave(rep, 1).float()
-    vv = v.repeat_interleave(rep, 1).float()
-    logits = torch.einsum("bhsd,bhld->bhsl", q.float(), kk) * scale
+    kk = k.repeat_interleave(rep, 1).double()
+    vv = v.repeat_interleave(rep, 1).double()
+    logits = torch.einsum("bhsd,bhld->bhsl", q.double(), kk) * scale
     if bias is not None:
         logits = logits + bias[:, None]
     logits = logits.masked_fill(~allowed[:, None], float("-inf"))
@@ -58,20 +60,20 @@ def test_full_budget_is_dense(selector):
     cfg = ps.PageSparseConfig(selector=selector, page=32, topk=64, window=64, sink_pages=1, query_chunk=100,
                               score_chunk=50)
     out = ps.page_sparse_attention(q, k, v, cfg)
-    torch.testing.assert_close(out.float(), dense_reference(q, k, v), atol=2e-5, rtol=2e-5)
+    torch.testing.assert_close(out.double(), dense_reference(q, k, v), atol=1e-9, rtol=1e-9)
 
 
 def test_compress_one_full_budget_is_dense():
     q, k, v = qkv()
     cfg = ps.PageSparseConfig(selector="compress_mean", page=32, topk=64, window=64, compress=1)
     out = ps.page_sparse_attention(q, k, v, cfg)
-    torch.testing.assert_close(out.float(), dense_reference(q, k, v), atol=2e-5, rtol=2e-5)
+    torch.testing.assert_close(out.double(), dense_reference(q, k, v), atol=1e-9, rtol=1e-9)
 
 
 def test_dense_selector_bottom_right():
     q, k, v = qkv()
     out = ps.page_sparse_attention(q[:, :, -100:], k, v, ps.PageSparseConfig(selector="dense"), q_offset=540)
-    torch.testing.assert_close(out.float(), dense_reference(q[:, :, -100:], k, v, 540), atol=2e-5, rtol=2e-5)
+    torch.testing.assert_close(out, dense_reference(q[:, :, -100:], k, v, 540), atol=1e-9, rtol=1e-9)
 
 
 def test_window_matches_mask():
@@ -83,7 +85,7 @@ def test_window_matches_mask():
     pos = torch.arange(L, device=DEV)
     kp, qp = pos // page, pos // page
     allowed = (pos[None, :] <= pos[:, None]) & ((kp[None, :] < 1) | (kp[None, :] >= qp[:, None] - wp))
-    torch.testing.assert_close(out.float(), masked_reference(q, k, v, allowed[None], q.shape[-1] ** -0.5),
+    torch.testing.assert_close(out, masked_reference(q, k, v, allowed[None], q.shape[-1] ** -0.5),
                                atol=2e-5, rtol=2e-5)
 
 
@@ -168,3 +170,21 @@ def test_budget():
     cfg = ps.PageSparseConfig(selector="page_mean", page=64, topk=32, window=512, sink_pages=1)
     assert cfg.budget == 64 + 512 + 64 + 2048
     assert math.isclose(ps.PageSparseConfig(selector="window").budget, 64 + 512 + 64)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="FlexAttention needs a GPU")
+@pytest.mark.parametrize("selector", ["window", "page_mean", "quest", "oracle"])
+def test_flex_matches_gathered(selector):
+    q, k, v = qkv(L=1024, d=32, dtype=torch.float32)  # FlexAttention: fp32 (TF32 on the NGC container)
+    q, k, v = (t.clone().requires_grad_() for t in (q, k, v))
+    cfg = ps.PageSparseConfig(selector=selector, page=64, topk=3, window=128, sink_pages=1)
+    for off in (0, 300):
+        qq = q[:, :, off:]
+        a = ps.flex_page_sparse_attention(qq, k, v, cfg, q_offset=off)
+        ref = ps.page_sparse_attention(qq, k, v, cfg, q_offset=off)
+        assert float((a - ref).abs().max() / ref.abs().max()) < 1e-2
+    g = torch.randn_like(a)
+    ga = torch.autograd.grad((a * g).sum(), (q, k, v))
+    gb = torch.autograd.grad((ref * g).sum(), (q, k, v))
+    for x, y in zip(ga, gb):  # the largest error relative to the gradient's scale
+        assert float((x - y).abs().max() / y.abs().max()) < 1e-2

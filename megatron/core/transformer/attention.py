@@ -426,6 +426,16 @@ class Attention(MegatronModule, ABC):
             softmax_scale=self.config.softmax_scale,
             pg_collection=self.pg_collection,
         )
+        if getattr(self.config, "page_sparse_selector", None) and self.attention_type == "self":
+            # page-sparse attention instead of the configured core attention (same call, same output)
+            from megatron.core.transformer.experimental_attention_variant.page_sparse_attention import (
+                PageSparseCoreAttention,
+            )
+
+            self.core_attention = PageSparseCoreAttention(
+                config=tmp_config, layer_number=self.layer_number, softmax_scale=self.config.softmax_scale,
+                pg_collection=self.pg_collection,
+            )
 
         # Length-dependent attention temperature (attention_length_scaling): "ssmax" learns one
         # s per head (Scalable-Softmax: logits * s log n), initialised to 1 / log(base) -- scale 1
@@ -1727,6 +1737,8 @@ class Attention(MegatronModule, ABC):
         # ==================================
 
         nvtx_range_push(suffix="core_attention")
+        if hasattr(self.core_attention, "set_hidden"):  # page_sparse_selector "indexer": its input
+            self.core_attention.set_hidden(hidden_states)
         core_attn_manager = off_interface(
             self.offload_core_attention and self.training, query, "core_attn"
         )

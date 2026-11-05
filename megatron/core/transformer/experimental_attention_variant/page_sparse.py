@@ -37,6 +37,11 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+def _acc(x: torch.Tensor) -> torch.Tensor:
+    """The accumulation dtype: fp32, float64 kept (exact tests: the NGC container forces TF32 for fp32 GEMMs)."""
+    return x if x.dtype == torch.float64 else x.float()
+
+
 SELECTORS = ("dense", "window", "page_mean", "quest", "oracle", "token_topk", "compress_mean", "indexer")
 
 
@@ -72,7 +77,7 @@ def page_pool(k: torch.Tensor, page: int, kind: str = "mean"):
     b, g, L, d = k.shape
     P = -(-L // page)
     pad = P * page - L
-    kf = k.float()
+    kf = _acc(k)
     if kind == "mean":
         x = F.pad(kf, (0, 0, 0, pad)).view(b, g, P, page, d).sum(3)
         cnt = torch.full((P,), float(page), device=k.device)
@@ -101,8 +106,8 @@ def _causal_probs(q, k, q_pos, scale, k_lo=0):
     b, hq, sq, d = q.shape
     g = k.shape[1]
     rep = hq // g
-    kk = k[:, :, k_lo:].float()
-    logits = torch.einsum("bgrsd,bgld->bgrsl", q.float().view(b, g, rep, sq, d), kk) * scale
+    kk = _acc(k[:, :, k_lo:])
+    logits = torch.einsum("bgrsd,bgld->bgrsl", _acc(q).view(b, g, rep, sq, d), kk) * scale
     kpos = k_lo + torch.arange(kk.shape[2], device=q.device)
     logits = logits.masked_fill(kpos[None, None, None, None, :] > q_pos[None, None, None, :, None], float("-inf"))
     return torch.softmax(logits, -1).view(b, hq, sq, -1)
@@ -114,11 +119,11 @@ def page_scores(q, k, cfg: PageSparseConfig, q_offset: int, scale: float, indexe
     g, L = k.shape[1], k.shape[2]
     rep = hq // g
     P = -(-L // cfg.page)
-    qg = q.float().view(b, g, rep, s, d)
+    qg = _acc(q).view(b, g, rep, s, d)
     if cfg.selector == "indexer":
         if indexer_scores is None:
             raise ValueError("selector 'indexer' needs indexer_scores (PageIndexer)")
-        return indexer_scores.float()
+        return _acc(indexer_scores)
     if cfg.selector == "page_mean":
         kp = page_pool(k, cfg.page, "mean")
         return torch.einsum("bgrsd,bgpd->bsp", qg, kp) * scale
@@ -218,9 +223,9 @@ def attend_gathered(q, k, v, tok, tok_ok, scale, bias=None, query_chunk=512):
         flat = idx.reshape(b, 1, sc_ * K, 1).expand(b, g, sc_ * K, d)
         kg = torch.gather(k, 2, flat).view(b, g, sc_, K, d)
         vg = torch.gather(v, 2, flat).view(b, g, sc_, K, d)
-        logits = torch.einsum("bgrsd,bgskd->bgrsk", qc.view(b, g, rep, sc_, d).float(), kg.float()) * scale
+        logits = torch.einsum("bgrsd,bgskd->bgrsk", _acc(qc.view(b, g, rep, sc_, d)), _acc(kg)) * scale
         if bc is not None:
-            logits = logits + bc[:, None, None].float()
+            logits = logits + bc[:, None, None].to(logits.dtype)
         logits = logits.masked_fill(~ok[:, None, None], float("-inf"))
         p = torch.softmax(logits, -1).nan_to_num(0.0)
         o = torch.einsum("bgrsk,bgskd->bgrsd", p.to(vg.dtype), vg)
@@ -250,15 +255,15 @@ def _compress_mean_attention(q, k, v, cfg, q_offset, scale):
     tok, tok_ok = select_tokens(q, k, raw_cfg, q_offset, scale)
     # compressed entries of the full groups; entry e covers tokens [e m, (e + 1) m)
     Lc = L // m
-    kc = k[:, :, : Lc * m].view(b, g, Lc, m, d).float().mean(3).to(k.dtype)
-    vc = v[:, :, : Lc * m].view(b, g, Lc, m, d).float().mean(3).to(v.dtype)
+    kc = _acc(k[:, :, : Lc * m].view(b, g, Lc, m, d)).mean(3).to(k.dtype)
+    vc = _acc(v[:, :, : Lc * m].view(b, g, Lc, m, d)).mean(3).to(v.dtype)
     pos, cur = _query_pages(s, q_offset, cfg, dev)
     lo = cfg.sink_pages * page
     first_window = (cur - cfg.window // page) * page
     e = torch.arange(Lc, device=dev)
     cand = (e[None, :] * m >= lo) & ((e[None, :] + 1) * m <= first_window[:, None])
     n = cfg.topk * page // m
-    sc = torch.einsum("bgrsd,bged->bse", q.float().view(b, g, hq // g, s, d), kc.float())
+    sc = torch.einsum("bgrsd,bged->bse", _acc(q).view(b, g, hq // g, s, d), _acc(kc))
     sc = sc.masked_fill(~cand[None], float("-inf"))
     val, sel = sc.topk(min(n, max(Lc, 1)), dim=-1) if Lc else (sc[..., :0], sc[..., :0].long())
     sel_ok = torch.isfinite(val)
@@ -267,7 +272,8 @@ def _compress_mean_attention(q, k, v, cfg, q_offset, scale):
     vv = torch.cat([v, vc], 2)
     idx = torch.cat([tok, L + sel.clamp(min=0)], -1)
     ok = torch.cat([tok_ok, sel_ok], -1)
-    bias = torch.cat([torch.zeros_like(tok, dtype=torch.float32), torch.full_like(sel, math.log(m), dtype=torch.float32)], -1)
+    bdt = torch.float64 if q.dtype == torch.float64 else torch.float32
+    bias = torch.cat([torch.zeros_like(tok, dtype=bdt), torch.full_like(sel, math.log(m), dtype=bdt)], -1)
     return attend_gathered(q, kk, vv, idx, ok, scale, bias, cfg.query_chunk)
 
 
@@ -345,3 +351,77 @@ def indexer_kl_loss(scores: torch.Tensor, target_mass: torch.Tensor, cand: torch
     logp = torch.log_softmax(scores.float().masked_fill(~cand, float("-inf")), -1)
     kl = (t * (torch.log(t.clamp(min=1e-20)) - logp.masked_fill(~cand, 0.0))).sum(-1)
     return (kl * has).sum() / has.sum().clamp(min=1)
+
+
+# --------------------------------------------------------------------------- fast backend: FlexAttention
+PAGE_SELECTORS = ("window", "page_mean", "quest", "oracle", "indexer")
+_FLEX = {}
+
+
+def _flex():
+    if "fn" not in _FLEX:
+        from torch.nn.attention.flex_attention import flex_attention
+
+        _FLEX["fn"] = torch.compile(flex_attention, dynamic=False)
+    return _FLEX["fn"]
+
+
+def select_pages(q, k, cfg: PageSparseConfig, q_offset: int = 0, scale: float | None = None,
+                 indexer_scores=None):
+    """Every query's pages as a [b, s, P] bool (sinks, selection, window), the page selectors only."""
+    if cfg.selector not in PAGE_SELECTORS:
+        raise ValueError(f"select_pages: {cfg.selector!r} is not a page selector")
+    b, hq, s, d = q.shape
+    L = k.shape[2]
+    P = -(-L // cfg.page)
+    scale = d**-0.5 if scale is None else scale
+    dev = q.device
+    pos, cur = _query_pages(s, q_offset, cfg, dev)
+    p = torch.arange(P, device=dev)
+    wp = cfg.window // cfg.page
+    allowed = ((p[None, :] < cfg.sink_pages) | ((p[None, :] >= cur[:, None] - wp) & (p[None, :] <= cur[:, None])))
+    allowed = allowed & (p[None, :] <= cur[:, None])
+    allowed = allowed[None].expand(b, s, P).clone()
+    if cfg.selector != "window" and cfg.topk > 0:
+        cand = candidate_mask(s, P, q_offset, cfg, dev)
+        sc = page_scores(q, k, cfg, q_offset, scale, indexer_scores).masked_fill(~cand[None], float("-inf"))
+        val, sel = sc.topk(min(cfg.topk, P), dim=-1)
+        allowed.scatter_(-1, sel, torch.isfinite(val) | allowed.gather(-1, sel))
+    return allowed
+
+
+def flex_page_sparse_attention(q, k, v, cfg: PageSparseConfig, q_offset: int = 0, scale: float | None = None,
+                               indexer_scores=None, q_block: int = 128):
+    """:func:`page_sparse_attention` for the page selectors through FlexAttention (fused Triton forward and
+    backward): the block mask lists, per block of ``q_block`` queries, the union of their pages (built from the
+    selection, never by evaluating the dense mask); the per-token mask makes it exact. One batch row (b = 1)."""
+    from torch.nn.attention.flex_attention import BlockMask
+
+    b, hq, s, d = q.shape
+    g, L = k.shape[1], k.shape[2]
+    if b != 1:
+        raise ValueError("flex_page_sparse_attention: one sequence (b = 1)")
+    scale = d**-0.5 if scale is None else scale
+    page = cfg.page
+    with torch.no_grad():
+        allowed = select_pages(q, k, cfg, q_offset, scale, indexer_scores)[0]  # [s, P]
+        P = allowed.shape[1]
+        nq = -(-s // q_block)
+        blk = F.pad(allowed, (0, 0, 0, nq * q_block - s)).view(nq, q_block, P).any(1)  # [nq, P]
+        kv_num = blk.sum(-1).to(torch.int32)
+        kv_idx = torch.argsort((~blk).to(torch.int8), dim=-1, stable=True).to(torch.int32)  # selected first
+        allowed_i = allowed.to(torch.int8)
+
+    def mask_mod(bi, hi, qi, ki):
+        return (ki <= qi + q_offset) & (allowed_i[qi, ki // page] > 0)
+
+    bm = BlockMask.from_kv_blocks(kv_num[None, None], kv_idx[None, None], BLOCK_SIZE=(q_block, page),
+                                  mask_mod=mask_mod, seq_lengths=(s, L))
+    # kernel tiles that divide the block mask's blocks (else inductor may pick e.g. a decode kernel's 256-row
+    # tile for a short chunk); smaller ones on consumer GPUs (~100 KB of shared memory)
+    smem = torch.cuda.get_device_properties(q.device).shared_memory_per_block_optin
+    tile = 32 if smem < 160 * 1024 and d >= 128 else 64
+    opts = {"BLOCK_M": min(tile, q_block), "BLOCK_N": min(tile, page)}
+    if tile == 32:
+        opts["num_stages"] = 1
+    return _flex()(q, k, v, block_mask=bm, scale=scale, enable_gqa=hq != g, kernel_options=opts)

@@ -575,6 +575,49 @@ class TransformerConfig(ModelParallelConfig):
     attention_length_scaling_base: int = 8192
     """The length where the scaling is 1 (the training sequence length)."""
 
+    page_sparse_selector: Optional[str] = None
+    """Page-sparse attention for the self-attention layers (experimental_attention_variant/page_sparse.py):
+    every query attends to the sink pages, a local window and ``page_sparse_topk`` earlier pages chosen by
+    this selector -- dense, window, page_mean, quest, oracle, token_topk, compress_mean (CSA2-like), indexer
+    (a learned PageIndexer) -- ONE selection per token for all heads. None: the configured core attention."""
+
+    page_sparse_page: int = 64
+    """Page size (tokens) of page_sparse_selector."""
+
+    page_sparse_topk: int = 32
+    """Selected pages per query (token_topk: page_sparse_topk * page tokens; compress_mean: that many tokens'
+    worth of compressed entries)."""
+
+    page_sparse_window: int = 512
+    """Local window (tokens, a multiple of the page) before the query's own page."""
+
+    page_sparse_sink_pages: int = 1
+    """Always-attended pages at the sequence (document) start."""
+
+    page_sparse_compress: int = 4
+    """compress_mean: tokens per mean-pooled entry."""
+
+    page_sparse_indexer_heads: int = 4
+    """indexer: index-query heads."""
+
+    page_sparse_indexer_dim: int = 64
+    """indexer: index key / query dim (the GPU index per page at inference)."""
+
+    page_sparse_indexer_loss_coeff: float = 0.0
+    """indexer: weight of the KL to the dense attention's page mass (0: trained only through the LM loss,
+    which does not reach the selection)."""
+
+    page_sparse_dense_forward: bool = False
+    """indexer warm-up: the LM keeps dense attention while the indexer learns the dense page mass."""
+
+    page_sparse_backend: str = "flex"
+    """page selectors' kernel: "flex" (FlexAttention, fused Triton forward / backward, a block mask of each
+    query block's page union) or "gathered" (the exact torch reference); token_topk / compress_mean are
+    always gathered."""
+
+    page_sparse_flex_q_block: int = 64
+    """flex: queries per block-mask row (smaller: tighter page unions, more blocks)."""
+
     linear_kronlstm_forget_offset: float = 0.0
     """KronLSTM: a fixed extra decay per step on every forget channel (log|f| - offset); 0.012 is
     the polar forget gate's init cap without its angle."""
@@ -2246,6 +2289,18 @@ class TransformerConfig(ModelParallelConfig):
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
         details.
         """
+
+        if self.page_sparse_selector is not None:
+            selectors = ("dense", "window", "page_mean", "quest", "oracle", "token_topk", "compress_mean",
+                         "indexer")
+            if self.page_sparse_selector not in selectors:
+                raise ValueError(f"page_sparse_selector must be one of {selectors}")
+            if self.page_sparse_window % self.page_sparse_page:
+                raise ValueError("page_sparse_window must be a multiple of page_sparse_page")
+            if self.page_sparse_backend not in ("flex", "gathered"):
+                raise ValueError("page_sparse_backend must be flex or gathered")
+            if self.page_sparse_dense_forward and self.page_sparse_selector != "indexer":
+                raise ValueError("page_sparse_dense_forward is the indexer warm-up (page_sparse_selector indexer)")
 
         if self.moe_expert_post_act_norm or self.mlp_post_act_norm:
             if self.use_te_activation_func:
