@@ -23,7 +23,8 @@ rows of the (concatenated) table are sharded like a vocab-parallel embedding (ma
 local lookup, then all-reduce); the small projections, norms and conv are replicated
 across TP ranks (tp_replicated.py) and the layer runs on the whole sequence, so it
 also works with sequence parallelism. Under context parallelism Engram gathers the
-whole sequence (see ``cp_group``); packed sequences with CP are not supported. Packed
+whole sequence (see ``cp_group``); a packed batch under CP is split instead: each rank computes
+its contiguous piece of the token stream from a short halo (``_forward_cp_packed``). Packed
 batches (document masking: THD, ``[t, 1, h]``) restart the n-grams and the causal conv at
 every document: a token's history never reaches into the previous document, exactly as
 at the sequence start.
@@ -641,21 +642,34 @@ class EngramLayer(MegatronModule):
                 "EngramLayer needs the token ids; HybridStack passes them on the pipeline "
                 "stages that hold `N` layers."
             )
-        positions = None
-        if packed_seq_params is not None:
-            positions = self._document_positions(packed_seq_params)
         ctx = None
         if self.residual_scheme is not None:
             hidden_states, ctx = self.residual_scheme.read(hidden_states, self._depth_state)
         h = gather_replicated_input(hidden_states, self.config, self.tp_group)  # [s, b, h]
         input_ids = self._input_ids
-        if self.cp_group is not None:
+        if self.cp_group is not None and packed_seq_params is not None:
+            y = self._forward_cp_packed(h, input_ids, packed_seq_params)
+        elif self.cp_group is not None:
             from megatron.core.ssm import fla_cp
 
             h = fla_cp.full_sequence(h, self.cp_group)
             input_ids = fla_cp.full_sequence(
                 input_ids.transpose(0, 1), self.cp_group, differentiable=False
             ).transpose(0, 1)
+            y = fla_cp.local_sequence(self._engram(h, input_ids, None), self.cp_group)
+        else:
+            positions = None
+            if packed_seq_params is not None:
+                positions = self._document_positions(packed_seq_params)
+            y = self._engram(h, input_ids, positions)
+        y = scatter_replicated_output(y, self.config, self.tp_group)
+        if self.residual_scheme is not None:
+            return self.residual_scheme.write(y, ctx, self._depth_state, self.layer_number)
+        return hidden_states + y
+
+    def _engram(self, h: torch.Tensor, input_ids: torch.Tensor, positions) -> torch.Tensor:
+        """The layer's output ``Y`` for hidden states ``h`` [s, b, h] and token ids [b, s]; ``positions`` [s]
+        (batch 1): every token's position within its document (packed batches), else None."""
         e = self._memory(
             input_ids, None if positions is None else positions.unsqueeze(0)
         ).to(h.dtype)
@@ -684,13 +698,30 @@ class EngramLayer(MegatronModule):
             conv = self.conv1d(F.pad(conv_in.permute(1, 2, 0), (pad, 0))).permute(2, 0, 1)
         else:
             conv = self._document_conv(conv_in, positions)
-        y = F.silu(conv) + v
-        if self.cp_group is not None:
-            y = fla_cp.local_sequence(y, self.cp_group)
-        y = scatter_replicated_output(y, self.config, self.tp_group)
-        if self.residual_scheme is not None:
-            return self.residual_scheme.write(y, ctx, self._depth_state, self.layer_number)
-        return hidden_states + y
+        return F.silu(conv) + v
+
+    def _forward_cp_packed(self, h, input_ids, packed_seq_params) -> torch.Tensor:
+        """A packed batch under context parallelism (THD layout, ``h`` [t / cp, 1, h], ids [1, t / cp]): this
+        rank computes the Engram of ITS contiguous piece of the token stream (lookups and compute split over
+        the CP ranks), from a halo of the tokens before it -- the n-gram history of the conv's reach plus the
+        conv's reach, ``(kernel - 1) * dilation + max order - 1`` tokens -- with every token's position within
+        its document (global boundaries), so the result equals the single-rank one."""
+        from megatron.core.ssm import fla_cp
+
+        if input_ids.shape[0] != 1 or h.shape[1] != 1:
+            raise ValueError(f"Engram: packed sequences need batch 1, got ids {tuple(input_ids.shape)}")
+        cu = packed_seq_params.cu_seqlens_q_padded
+        if cu is None:
+            cu = packed_seq_params.cu_seqlens_q
+        st = fla_cp.thd_stream(cu, self.cp_group)
+        halo = (self.kernel_size - 1) * self.dilation + max(self.orders) - 1
+        lo = max(0, st.rank * st.n - halo)
+        hi = (st.rank + 1) * st.n
+        h_seg = st.full(h[:, 0])[lo:hi].unsqueeze(1)  # [seg, 1, h]
+        ids_seg = st.full(input_ids[0], differentiable=False)[lo:hi].unsqueeze(0)  # [1, seg]
+        pos_seg = document_positions(cu, st.total)[lo:hi]
+        y = self._engram(h_seg, ids_seg, pos_seg)[st.rank * st.n - lo:]  # this rank's piece [n, 1, h]
+        return st.from_stream(y[:, 0]).unsqueeze(1)
 
     def _document_positions(self, packed_seq_params) -> torch.Tensor:
         """Position within its document of every token of a packed ``[1, t]`` batch."""

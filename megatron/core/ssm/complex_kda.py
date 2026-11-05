@@ -143,8 +143,9 @@ class _MegatronSelfAttentionAdapter(MegatronModule):
     """Shared plumbing: layout, the ``(output, bias)`` contract, TP replication.
 
     The fla layer owns plain nn.Linear projections, so under TP>1 every TP rank runs
-    the whole layer (megatron/core/ssm/tp_replicated.py). Context parallelism is not
-    supported.
+    the whole layer (megatron/core/ssm/tp_replicated.py). Under context parallelism the
+    Complex KDA layer runs its piece of the token stream with FLA's CP kernels (fla_cp.py),
+    packed batches (document masking) included.
     """
 
     def __init__(self, config: TransformerConfig, pg_collection=None):
@@ -200,15 +201,14 @@ class _MegatronSelfAttentionAdapter(MegatronModule):
         Megatron believe it applied a rotary embedding the layer never saw.
         """
         kw = {}
-        if packed_seq_params is not None:
+        if packed_seq_params is not None and self.cp_group is None:
             kw["cu_seqlens"] = self._cu_seqlens(hidden_states, packed_seq_params)
         hidden_states = gather_replicated_input(hidden_states, self.config, self.tp_group)
         if self.cp_group is not None:
-            if kw:
-                raise NotImplementedError(
-                    "complex_kda: packed sequences with context parallelism are not wired yet"
-                )
-            y = self._forward_cp(hidden_states)
+            if packed_seq_params is not None:  # the boundaries go to FLA's CP context
+                y = self._forward_cp_packed(hidden_states, packed_seq_params)
+            else:
+                y = self._forward_cp(hidden_states)
             return scatter_replicated_output(y, self.config, self.tp_group), None
         # (s, b, h) -> (b, s, h)
         x = hidden_states.transpose(0, 1).contiguous()
@@ -242,6 +242,27 @@ class _MegatronSelfAttentionAdapter(MegatronModule):
         out = self.layer(x)
         out = out[0] if isinstance(out, tuple) else out
         return fla_cp.local_sequence(out.transpose(0, 1).contiguous(), group)
+
+    def _forward_cp_packed(self, hidden_states, packed_seq_params):
+        """A packed ``[t / cp, 1, h]`` batch in Megatron's THD CP layout -> the same: the layer runs its piece
+        of the token stream with FLA's CP kernels; the recurrence and the short convolutions restart at every
+        document, also where a document spans ranks (fla_cp.ThdStream)."""
+        from megatron.core.ssm import fla_cp
+
+        if not isinstance(self.layer, ComplexKimiDeltaAttention):
+            raise NotImplementedError(
+                f"{type(self.layer).__name__}: packed sequences with context parallelism"
+            )
+        if hidden_states.shape[1] != 1:
+            raise ValueError(f"packed sequences need batch 1 ([t, 1, h]), got {tuple(hidden_states.shape)}")
+        cu = packed_seq_params.cu_seqlens_q_padded
+        if cu is None:
+            cu = packed_seq_params.cu_seqlens_q
+        st = fla_cp.thd_stream(cu, self.cp_group)
+        x = st.to_stream(hidden_states[:, 0]).unsqueeze(0)  # [1, t / cp, h]
+        out = self.layer(x, cp_context=st.fla_context(self.layer.conv_size))
+        y = out[0] if isinstance(out, tuple) else out
+        return st.from_stream(y[0]).unsqueeze(1)
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Replicated tensors: the layer is a full copy on every TP rank."""
