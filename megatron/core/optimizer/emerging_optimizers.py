@@ -1814,7 +1814,8 @@ class TensorParallelAngularMuown(TensorParallelMuon):
         step = self.state[experts[0]].get("step")
         scales = expert_forward_cap.take_scales(step)
         if not scales:
-            if expert_forward_cap.STATE.step == step and not getattr(self, "_fwdcap_warned", False):
+            if (expert_forward_cap.STATE.step == step and not expert_forward_cap.STATE.measured
+                    and not getattr(self, "_fwdcap_warned", False)):
                 # armed for this step, but no forward measured anything: experts without the
                 # measurement hook (only MoonEPGroupedMLP has it) -- the cap would do nothing
                 logger.warning(
@@ -1826,7 +1827,9 @@ class TensorParallelAngularMuown(TensorParallelMuon):
         n_scaled, n_seen = None, 0
         log = os.environ.get("MEGATRON_FWDCAP_LOG", "0") == "1"
         for p in experts:
-            c = scales.get(id(getattr(p, "orig_param", p)))
+            # consumed: a second call in the same step (another round / group holding the
+            # parameter, a repeated step) must not scale the matrix again
+            c = scales.pop(id(getattr(p, "orig_param", p)), None)
             if c is None:
                 continue
             n_seen += 1
@@ -1841,8 +1844,9 @@ class TensorParallelAngularMuown(TensorParallelMuon):
             g.mul_(c.to(g.dtype))
         if log and n_scaled is not None:  # a debug switch: warning level (info is not shown)
             logger.warning(
-                "forward spectral cap at step %s: %d of %d local expert matrices scaled",
-                step, int(n_scaled.item()), n_seen,
+                "forward spectral cap at step %s: %d of %d local expert matrices scaled "
+                "(this call: %d expert params, optimizer %x)",
+                step, int(n_scaled.item()), n_seen, len(experts), id(self),
             )
 
     def _arm_forward_cap(self) -> None:

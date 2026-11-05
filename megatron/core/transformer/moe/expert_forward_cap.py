@@ -31,7 +31,7 @@ from typing import Dict, Iterable, List, Optional
 import torch
 
 _WARM_ITERS = 3  # power iterations from the previous step's right singular vector
-_COLD_ITERS = 12  # from the column sums of |W| (first measurement of a matrix)
+_COLD_ITERS = 16  # from the all-ones vector (first measurement of a matrix after a start)
 _CHUNK = 32  # matrices per batched power iteration when they are not one contiguous stack
 
 
@@ -135,8 +135,9 @@ def measure(groups: Iterable[List[torch.nn.Parameter]]) -> None:
             warm = all(id(p) in STATE.vectors for p in ps)
             if warm:
                 v0 = torch.stack([STATE.vectors[id(p)] for p in ps])
-            else:  # column sums of |W|: deterministic, and close to the top direction
-                v0 = w.abs().float().sum(dim=1)
+            else:  # deterministic on every rank, and no temporary of the stack's size (|W|'s
+                # column sums cost a full fp32 copy: ~1.1 GB per layer at 90 experts)
+                v0 = torch.ones(w.shape[0], w.shape[2], dtype=torch.float32, device=w.device)
             sigma, v = _sigma_max(w, v0, _WARM_ITERS if warm else _COLD_ITERS)
             scale = (cap / sigma.clamp_min(1e-30)).clamp_max(1.0)
             for j, p in enumerate(ps):
