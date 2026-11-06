@@ -380,3 +380,115 @@ class TestEngramAccounting:
         )
         (override,) = [v for k, v in overrides.items() if k.attr == "is_engram_table"]
         assert override == {"wd_mult": 0.0, "max_lr": 5e-3, "min_lr": 5e-4}
+
+
+# ---- auxiliary lookups (engram_aux_ngram_orders: a second token map, e.g. accent-preserving) ----
+
+
+def test_aux_lookups_keep_the_main_hash():
+    """The auxiliary lookups append sizes / multipliers; the main ones do not change."""
+    base = _config(engram_hash_per_layer=True)
+    aux = _config(engram_hash_per_layer=True, engram_aux_ngram_orders=[2, 3], engram_aux_num_heads=3,
+                  engram_aux_table_size=700)
+    sizes, sizes_aux = engram_table_sizes(base), engram_table_sizes(aux)
+    assert sizes_aux[: len(sizes)] == sizes and len(sizes_aux) == len(sizes) + 2 * 3
+    assert len(set(sizes_aux)) == len(sizes_aux) and min(sizes_aux[len(sizes):]) >= 700
+    assert torch.equal(engram_hash_multipliers(aux, 4), engram_hash_multipliers(base, 4))
+    m = engram_hash_multipliers(aux, 4, aux=True)
+    assert m.shape == (2 * 3, 3) and not torch.equal(m[:4, :3], engram_hash_multipliers(base, 4))
+
+
+@pytest.mark.internal
+class TestEngramAux:
+    """A layer with auxiliary lookups and zero key / value columns for them computes exactly the
+    layer without (the function-preserving widening of widen_engram_aux.py); the new columns get
+    gradients (their rows are random), so the auxiliary memory can come in."""
+
+    @pytest.fixture(scope="function", autouse=True)
+    def setup_method(self, tmp_path):
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+        model_parallel_cuda_manual_seed(123)
+        self.pg = ProcessGroupCollection(
+            tp=parallel_state.get_tensor_model_parallel_group(),
+            cp=parallel_state.get_context_parallel_group(),
+        )
+        import numpy as np
+
+        self.map_main = str(tmp_path / "main.npy")
+        self.map_aux = str(tmp_path / "aux.npy")
+        rng = np.random.default_rng(0)
+        np.save(self.map_main, rng.integers(0, 30000, 50048).astype(np.int32))   # coarse
+        np.save(self.map_aux, rng.integers(0, 40000, 50048).astype(np.int32))    # finer
+        yield
+        Utils.destroy_model_parallel()
+
+    def _pair(self, **kw):
+        base_cfg = _config(engram_token_map=self.map_main, **kw)
+        aux_cfg = _config(engram_token_map=self.map_main, engram_aux_ngram_orders=[2, 3],
+                          engram_aux_num_heads=3, engram_aux_table_size=600,
+                          engram_aux_token_map=self.map_aux, **kw)
+        base = EngramLayer(base_cfg, layer_number=1, pg_collection=self.pg).cuda()
+        aux = EngramLayer(aux_cfg, layer_number=1, pg_collection=self.pg).cuda()
+        n_main = base.table.shape[0]
+        cols = base.key_proj.weight.shape[1]
+        with torch.no_grad():
+            base.table.normal_()
+            base.conv1d.weight.normal_()
+            aux.table[: sum(base.sizes)] = base.table[: sum(base.sizes)]
+            for name in ("key_proj", "value_proj"):
+                w = getattr(aux, name).weight
+                w.zero_()
+                w[:, :cols] = getattr(base, name).weight
+            for name in ("hidden_norm", "key_norm", "conv1d", "conv_norm"):
+                if getattr(base, name, None) is not None:
+                    getattr(aux, name).load_state_dict(getattr(base, name).state_dict())
+        assert aux.key_proj.weight.shape[1] == cols + 6 * base.embed_dim
+        assert torch.equal(aux.row_offsets[: base.n_main], base.row_offsets)
+        return base, aux, n_main
+
+    @pytest.mark.parametrize("sign", [False, True])
+    def test_zero_columns_preserve_the_function(self, sign):
+        kw = dict(engram_sign_hash=True, engram_sign_table_size=64) if sign else {}
+        base, aux, _ = self._pair(engram_hash_per_layer=True, **kw)
+        torch.manual_seed(0)
+        ids = torch.randint(0, 50000, (2, 24), device="cuda")
+        h = torch.randn(24, 2, HIDDEN, device="cuda")
+        base.set_input_ids(ids)
+        aux.set_input_ids(ids)
+        torch.testing.assert_close(aux(h), base(h), rtol=0, atol=0)
+        # packed documents too (positions restart both lookup sets)
+        lens = [5, 1, 11, 7]
+        idp = torch.randint(0, 50000, (1, sum(lens)), device="cuda")
+        hp = torch.randn(sum(lens), 1, HIDDEN, device="cuda")
+        cu = torch.tensor([0] + list(torch.tensor(lens).cumsum(0)), dtype=torch.int32).cuda()
+        params = PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu,
+                                 max_seqlen_q=max(lens), max_seqlen_kv=max(lens))
+        base.set_input_ids(idp)
+        aux.set_input_ids(idp)
+        torch.testing.assert_close(aux(hp, packed_seq_params=params),
+                                   base(hp, packed_seq_params=params), rtol=0, atol=0)
+
+    def test_new_columns_get_gradients_and_use_the_aux_map(self):
+        base, aux, _ = self._pair()
+        torch.manual_seed(1)
+        ids = torch.randint(0, 50000, (2, 24), device="cuda")
+        h = torch.randn(24, 2, HIDDEN, device="cuda")
+        aux.set_input_ids(ids)
+        aux(h).square().sum().backward()
+        cols = base.key_proj.weight.shape[1]
+        for name in ("key_proj", "value_proj"):
+            g = getattr(aux, name).weight.grad
+            assert g[:, cols:].abs().sum() > 0, name
+        # the auxiliary rows follow the auxiliary map: two ids with the same main but
+        # different aux canonical id hit the same main rows, other aux rows
+        import numpy as np
+
+        main_map, aux_map = np.load(self.map_main), np.load(self.map_aux)
+        same = np.flatnonzero(main_map == main_map[7])
+        other = [int(t) for t in same if aux_map[t] != aux_map[7]]
+        if other:
+            a = torch.tensor([[3, 7]], device="cuda")
+            b = torch.tensor([[3, other[0]]], device="cuda")
+            ra, rb = aux._lookup_rows(a), aux._lookup_rows(b)
+            assert torch.equal(ra[..., : aux.n_main], rb[..., : aux.n_main])
+            assert not torch.equal(ra[..., aux.n_main:], rb[..., aux.n_main:])

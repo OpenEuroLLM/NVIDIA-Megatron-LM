@@ -66,6 +66,8 @@ _HASH_SEED = 0x5EED_E46A
 # Fixed seeds of the sign hash (engram_sign_hash): its multipliers and its +-1 table.
 _SIGN_HASH_SEED = 0x516E_0BAD
 _SIGN_TABLE_SEED = 0x516E_7AB1
+# Offset of the auxiliary lookups' hash / sign-hash seeds (engram_aux_ngram_orders).
+_AUX_SEED_OFFSET = 0xA0C5
 # A token-id offset so that the "before the sequence start" filler (0) is distinct.
 _PAD_ID = 0
 
@@ -83,27 +85,54 @@ def _is_prime(n: int) -> bool:
     return True
 
 
+def engram_aux_num_heads(config: TransformerConfig) -> int:
+    return getattr(config, "engram_aux_num_heads", 0) or config.engram_num_heads
+
+
+def engram_aux_orders(config: TransformerConfig) -> list[int]:
+    return list(getattr(config, "engram_aux_ngram_orders", None) or [])
+
+
 def engram_table_sizes(config: TransformerConfig) -> list[int]:
-    """Distinct primes >= engram_table_size, one per (order, head), in lookup order."""
+    """Distinct primes, one per lookup in lookup order: >= engram_table_size for every (order,
+    head) of the main lookups, then >= engram_aux_table_size for the auxiliary ones (distinct
+    from the main primes). The main sizes do not depend on the auxiliary lookups."""
     sizes, candidate = [], config.engram_table_size
     for _ in range(len(config.engram_ngram_orders) * config.engram_num_heads):
         while not _is_prime(candidate):
             candidate += 1
         sizes.append(candidate)
         candidate += 1
+    aux = len(engram_aux_orders(config)) * engram_aux_num_heads(config)
+    candidate = getattr(config, "engram_aux_table_size", 0) or config.engram_table_size
+    used = set(sizes)
+    for _ in range(aux):
+        while not _is_prime(candidate) or candidate in used:
+            candidate += 1
+        sizes.append(candidate)
+        used.add(candidate)
+        candidate += 1
     return sizes
 
 
 def engram_hash_multipliers(
-    config: TransformerConfig, layer_number: Optional[int] = None, seed: int = _HASH_SEED
+    config: TransformerConfig,
+    layer_number: Optional[int] = None,
+    seed: int = _HASH_SEED,
+    aux: bool = False,
 ) -> torch.Tensor:
     """[orders * heads, max_order] odd int64 multipliers (< 2**31), deterministic; per
-    layer under ``engram_hash_per_layer``. ``seed``: the row hash's, or the sign hash's."""
+    layer under ``engram_hash_per_layer``. ``seed``: the row hash's, or the sign hash's.
+    ``aux``: the auxiliary lookups' (engram_aux_ngram_orders), from their own seed."""
     if config.engram_hash_per_layer:
         seed += 10007 * int(layer_number or 0)
+    if aux:
+        seed += _AUX_SEED_OFFSET
+        orders, heads = engram_aux_orders(config), engram_aux_num_heads(config)
+    else:
+        orders, heads = config.engram_ngram_orders, config.engram_num_heads
     rng = np.random.default_rng(seed)
-    n_lookups = len(config.engram_ngram_orders) * config.engram_num_heads
-    mult = rng.integers(1 << 20, 1 << 31, size=(n_lookups, max(config.engram_ngram_orders)))
+    mult = rng.integers(1 << 20, 1 << 31, size=(len(orders) * heads, max(orders)))
     return torch.from_numpy(mult | 1).to(torch.int64)
 
 
@@ -201,8 +230,11 @@ class EngramLayer(MegatronModule):
 
         self.orders = list(config.engram_ngram_orders)
         self.num_heads = config.engram_num_heads
+        self.aux_orders = engram_aux_orders(config)
+        self.aux_heads = engram_aux_num_heads(config) if self.aux_orders else 0
+        self.n_main = len(self.orders) * self.num_heads
         self.embed_dim = config.engram_embed_dim
-        self.sizes = engram_table_sizes(config)
+        self.sizes = engram_table_sizes(config)  # main lookups, then the auxiliary ones
         offsets = np.cumsum([0] + self.sizes[:-1])
         self.register_buffer(
             "row_offsets", torch.tensor(offsets, dtype=torch.int64), persistent=False
@@ -221,6 +253,21 @@ class EngramLayer(MegatronModule):
         if config.engram_token_map is not None:
             token_map = torch.from_numpy(np.load(config.engram_token_map).astype(np.int64))
         self.register_buffer("token_map", token_map, persistent=False)
+        if self.aux_orders:
+            self.register_buffer(
+                "aux_hash_mult", engram_hash_multipliers(config, layer_number, aux=True),
+                persistent=False,
+            )
+            if config.engram_sign_hash:
+                self.register_buffer(
+                    "aux_sign_mult",
+                    engram_hash_multipliers(config, layer_number, seed=_SIGN_HASH_SEED, aux=True),
+                    persistent=False,
+                )
+            aux_map = None
+            if getattr(config, "engram_aux_token_map", None) is not None:
+                aux_map = torch.from_numpy(np.load(config.engram_aux_token_map).astype(np.int64))
+            self.register_buffer("aux_token_map", aux_map, persistent=False)
 
         rows = sum(self.sizes)
         device = torch.cuda.current_device()
@@ -360,6 +407,28 @@ class EngramLayer(MegatronModule):
         self.config.output_layer_init_method(self.value_proj.weight)
         nn.init.zeros_(self.conv1d.weight)  # starts as Y = v~
 
+    def _lookup_rows(self, ids, positions=None, sign: bool = False):
+        """[b, s] token ids -> [b, s, L] rows of every lookup, WITHOUT the row offsets: the main
+        lookups (engram_token_map ids, their multipliers and sizes), then the auxiliary ones
+        (engram_aux_token_map ids, their own multipliers and sizes). ``sign``: the sign hash's
+        rows into the fixed sign table instead."""
+        mapped = ids if self.token_map is None else self.token_map[ids]
+        if sign:
+            mult, sizes = self.sign_mult, [self.config.engram_sign_table_size] * self.n_main
+        else:
+            mult, sizes = self.hash_mult, self.sizes[: self.n_main]
+        rows = engram_hash(mapped, self.orders, self.num_heads, mult, sizes, positions=positions)
+        if not self.aux_orders:
+            return rows
+        aux_ids = ids if self.aux_token_map is None else self.aux_token_map[ids]
+        n_aux = len(self.aux_orders) * self.aux_heads
+        if sign:
+            mult, sizes = self.aux_sign_mult, [self.config.engram_sign_table_size] * n_aux
+        else:
+            mult, sizes = self.aux_hash_mult, self.sizes[self.n_main :]
+        aux = engram_hash(aux_ids, self.aux_orders, self.aux_heads, mult, sizes, positions=positions)
+        return torch.cat([rows, aux], dim=-1)
+
     def step_lookup_supported(self) -> bool:
         """The step-level lookup (engram_sharded.py): sharded tables, TP 1, no CP."""
         return self.sharded and self.tp_group.size() == 1 and self.cp_group is None
@@ -367,10 +436,7 @@ class EngramLayer(MegatronModule):
     def _hashed_rows(self, ids, cu):
         ids = ids.reshape(1, -1)
         positions = document_positions(cu.to(ids.device).reshape(-1), ids.shape[1]).unsqueeze(0)
-        mapped = ids if self.token_map is None else self.token_map[ids]
-        rows = engram_hash(
-            mapped, self.orders, self.num_heads, self.hash_mult, self.sizes, positions=positions
-        )
+        rows = self._lookup_rows(ids, positions)
         return (rows + self.row_offsets).reshape(-1), (ids.data_ptr(), ids.numel())
 
     def stash_step_groups(self, tokens_list, cu_seqlens_list, group_size: int) -> None:
@@ -493,11 +559,7 @@ class EngramLayer(MegatronModule):
         for ids, cu in zip(tokens_list, cu_seqlens_list):
             ids = ids.reshape(1, -1)
             positions = document_positions(cu.to(ids.device).reshape(-1), ids.shape[1]).unsqueeze(0)
-            mapped = ids if self.token_map is None else self.token_map[ids]
-            rows = engram_hash(
-                mapped, self.orders, self.num_heads, self.hash_mult, self.sizes, positions=positions
-            )
-            rows = (rows + self.row_offsets).reshape(-1)
+            rows = (self._lookup_rows(ids, positions) + self.row_offsets).reshape(-1)
             rows_all.append(rows)
             sizes.append(rows.numel())
             keys.append((ids.data_ptr(), ids.numel()))
@@ -569,11 +631,7 @@ class EngramLayer(MegatronModule):
                 emb = StepRowGather.apply(anchor, step["values"], step["grad"], inverse)
                 b, s = input_ids.shape
                 return emb.reshape(b, s, -1).transpose(0, 1)
-        ids = input_ids if self.token_map is None else self.token_map[input_ids]
-        rows = engram_hash(
-            ids, self.orders, self.num_heads, self.hash_mult, self.sizes, positions=positions
-        )
-        rows = rows + self.row_offsets  # [b, s, L] global row ids
+        rows = self._lookup_rows(input_ids, positions) + self.row_offsets  # [b, s, L] global rows
         if self.sharded:
             return self._sharded_memory(rows)
         local = rows - self.row_start
@@ -592,12 +650,7 @@ class EngramLayer(MegatronModule):
         from an independent hash of the same (canonical) n-grams into the fixed sign table.
         Applied to e_t in every lookup path (direct, step, grouped); constant, so autograd
         carries the sign into the row gradients."""
-        ids = input_ids if self.token_map is None else self.token_map[input_ids]
-        n_lookups = len(self.orders) * self.num_heads
-        rows = engram_hash(
-            ids, self.orders, self.num_heads, self.sign_mult,
-            [self.config.engram_sign_table_size] * n_lookups, positions=positions,
-        )  # [b, s, L]
+        rows = self._lookup_rows(input_ids, positions, sign=True)  # [b, s, L]
         signs = F.embedding(rows, self.sign_table)  # [b, s, L, dim]
         b, s = input_ids.shape
         return signs.reshape(b, s, -1).transpose(0, 1)
@@ -714,7 +767,7 @@ class EngramLayer(MegatronModule):
         if cu is None:
             cu = packed_seq_params.cu_seqlens_q
         st = fla_cp.thd_stream(cu, self.cp_group)
-        halo = (self.kernel_size - 1) * self.dilation + max(self.orders) - 1
+        halo = (self.kernel_size - 1) * self.dilation + max(self.orders + self.aux_orders) - 1
         lo = max(0, st.rank * st.n - halo)
         hi = (st.rank + 1) * st.n
         h_seg = st.full(h[:, 0])[lo:hi].unsqueeze(1)  # [seg, 1, h]

@@ -1215,8 +1215,10 @@ def num_floating_point_operations(
             num_short_conv_layers=num_short_conv_layers,
             short_conv_kernel_size=args.short_conv_kernel_size,
             num_engram_layers=num_engram_layers,
-            engram_mem_dim=(
-                args.engram_embed_dim * len(args.engram_ngram_orders) * args.engram_num_heads
+            engram_mem_dim=args.engram_embed_dim * (
+                len(args.engram_ngram_orders) * args.engram_num_heads
+                + len(getattr(args, "engram_aux_ngram_orders", None) or [])
+                * (getattr(args, "engram_aux_num_heads", 0) or args.engram_num_heads)
             ),
             engram_conv_kernel_size=args.engram_conv_kernel_size,
             num_pkm_layers=num_pkm_layers,
