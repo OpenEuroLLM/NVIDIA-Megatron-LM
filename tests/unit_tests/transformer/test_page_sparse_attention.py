@@ -178,6 +178,9 @@ def test_variant_cp_matches_single_rank(name):
         for i in range(3):
             torch.testing.assert_close(loc[i].grad, full[i].grad[st.local_idx], atol=1e-8, rtol=1e-8)
         for (n, p), pr in zip(att.named_parameters(), ref.parameters()):
+            if pr.grad is None:  # e.g. csa2's indexer without its loss (the selection carries no gradient)
+                assert p.grad is None, n
+                continue
             g = p.grad.clone()
             torch.distributed.all_reduce(g, group=cp_group)
             torch.testing.assert_close(g, pr.grad, atol=1e-8, rtol=1e-8, msg=lambda m: f"{n}: {m}")
