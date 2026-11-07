@@ -70,12 +70,17 @@ class PageSparseConfig:
     # selects at every B-th token). A page union per block of B: block-sparse kernels attend just the budget.
     # Chunk-invariant when chunks start at multiples of B (a chunk starting mid-block anchors at its first query).
     select_block: int = 1
+    # how a block's selection is scored: "first" = its first query's scores; "prev_max" = the max over the first
+    # query and every query of the previous block (causal: all precede the block; decode knows them)
+    select_score: str = "first"
 
     def __post_init__(self):
         if self.selector not in SELECTORS + VARIANT_SELECTORS:
             raise ValueError(f"unknown selector {self.selector!r}; one of {SELECTORS + VARIANT_SELECTORS}")
         if self.window % self.page:
             raise ValueError("window must be a multiple of page")
+        if self.select_score not in ("first", "prev_max"):
+            raise ValueError("select_score must be first or prev_max")
 
     @property
     def budget(self) -> int:
@@ -170,9 +175,21 @@ def selection_scores(q, k, cfg: PageSparseConfig, q_offset: int, scale: float, i
     if cfg.hier_group > 0:
         sc = hierarchical_restrict(sc, q, k, cfg, q_offset, scale)
     if cfg.select_block > 1:
+        B = cfg.select_block
         pos = q_offset + torch.arange(s, device=q.device)
-        anchor = ((pos // cfg.select_block) * cfg.select_block - q_offset).clamp(min=0)
-        sc = sc[:, anchor]
+        anchor = ((pos // B) * B - q_offset).clamp(min=0)
+        if cfg.select_score == "prev_max":
+            # per absolute block: the max over its queries in this chunk; block i's selection then uses
+            # max(block i - 1, block i's first query)
+            blk = pos // B - q_offset // B  # [s] local block index
+            nb = int(blk[-1]) + 1
+            bmax = sc.new_full((sc.shape[0], nb, sc.shape[2]), float("-inf"))
+            bmax = bmax.scatter_reduce(1, blk[None, :, None].expand_as(sc), sc, reduce="amax", include_self=True)
+            prev = torch.cat([bmax.new_full(bmax[:, :1].shape, float("-inf")), bmax[:, :-1]], 1)  # [b, nb, P]
+            first = sc[:, anchor]
+            sc = torch.maximum(first, prev[:, blk])
+        else:
+            sc = sc[:, anchor]
     return sc
 
 

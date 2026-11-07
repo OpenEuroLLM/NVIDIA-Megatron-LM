@@ -273,3 +273,25 @@ def test_lsa_flex_matches_reference(off):
     gr = torch.autograd.grad((run() * g).sum(), (q, k, v))
     for x, y in zip(gf, gr):
         assert float((x - y).abs().max() / y.abs().max()) < 2e-2
+
+
+@pytest.mark.parametrize("selector", ["page_mean", "quest"])
+def test_block_selection_prev_max(selector):
+    """select_score prev_max: a block's scores are the max over its first query and the previous block's queries
+    (exactly their per-query maximum), and the attention stays causal."""
+    q, k, v, _ = qkvx(L=512)
+    cfg = ps.PageSparseConfig(selector=selector, page=16, topk=3, window=16, sink_pages=1, select_block=32,
+                              select_score="prev_max")
+    sc = ps.selection_scores(q, k, cfg, 0, D**-0.5)
+    flat = ps.selection_scores(q, k, ps.PageSparseConfig(selector=selector, page=16, topk=3, window=16,
+                                                         sink_pages=1), 0, D**-0.5)
+    t = 300
+    a = (t // 32) * 32
+    want = torch.maximum(flat[:, a], flat[:, a - 32:a].amax(1))
+    torch.testing.assert_close(sc[:, t], want)
+    full = ps.page_sparse_attention(q, k, v, cfg)
+    k2, v2 = k.clone(), v.clone()
+    k2[:, :, 300:] += 1.0
+    v2[:, :, 300:] -= 1.0
+    torch.testing.assert_close(ps.page_sparse_attention(q, k2, v2, cfg)[:, :, :300], full[:, :, :300],
+                               atol=1e-10, rtol=1e-10)

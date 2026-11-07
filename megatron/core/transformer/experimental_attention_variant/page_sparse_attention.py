@@ -37,6 +37,7 @@ class PageSparseCoreAttention(MegatronModule):
             window=config.page_sparse_window, sink_pages=config.page_sparse_sink_pages,
             compress=config.page_sparse_compress, hier_group=config.page_sparse_hier_group,
             hier_topk=config.page_sparse_hier_topk, select_block=config.page_sparse_select_block,
+            select_score=config.page_sparse_select_score,
         )
         cp = pg_collection.cp if pg_collection is not None else None
         self.cp_group = cp if cp is not None and cp.size() > 1 else None

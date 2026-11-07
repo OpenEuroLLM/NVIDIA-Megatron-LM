@@ -640,6 +640,10 @@ class TransformerConfig(ModelParallelConfig):
     selects, the rest reuse it; V4.1's Reuse). Flex then attends just the budget per block (page_sparse_flex_q_block
     = B or a divisor)."""
 
+    page_sparse_select_score: str = "first"
+    """Block selection score: first (the block's first query) or prev_max (max over it and the previous block's
+    queries; causal)."""
+
     page_sparse_hier_group: int = 0
     """Hierarchical (coarse-to-fine) page selection: pages per group, scored first (0: flat)."""
 
