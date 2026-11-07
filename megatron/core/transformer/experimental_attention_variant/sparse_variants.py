@@ -155,7 +155,14 @@ class NSA(nn.Module):
         win_cfg = ps.PageSparseConfig(selector="window", page=cfg.page, window=cfg.window, sink_pages=0)
         if self.flex and q.is_cuda:
             with torch.no_grad():  # the importances only (no probabilities out of the fused kernel)
-                _, imp = _attend_entries(q.detach(), kc.detach(), vc.detach(), ok, scale, reduce=importance)
+                if cfg.select_block > 1:  # block-wise: only the anchors select (select_block x fewer rows)
+                    anchor = ((pos // cfg.select_block) * cfg.select_block - q_offset).clamp(min=0)
+                    uniq, inv = torch.unique(anchor, return_inverse=True)
+                    _, imp = _attend_entries(q[:, :, uniq].detach(), kc.detach(), vc.detach(), ok[uniq], scale,
+                                             reduce=importance)
+                    imp = imp[:, inv]  # rows of non-anchors carry their anchor's (only the anchors' are read)
+                else:
+                    _, imp = _attend_entries(q.detach(), kc.detach(), vc.detach(), ok, scale, reduce=importance)
             o_cmp = self._flex_entries(q, kc, vc, q_offset, scale)
             o_slc = ps.flex_page_sparse_attention(q, k, v, sel_cfg, q_offset, scale, imp, 64)
             o_win = ps.flex_page_sparse_attention(q, k, v, win_cfg, q_offset, scale, None, 64)
