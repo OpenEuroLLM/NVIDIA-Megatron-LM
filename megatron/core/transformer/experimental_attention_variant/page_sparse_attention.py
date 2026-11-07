@@ -60,12 +60,16 @@ class PageSparseCoreAttention(MegatronModule):
                                                  window=self.cfg.window, page=self.cfg.page,
                                                  sink_pages=self.cfg.sink_pages,
                                                  index_heads=config.page_sparse_indexer_heads,
-                                                 index_dim=config.page_sparse_indexer_dim))
+                                                 index_dim=config.page_sparse_indexer_dim,
+                                                 select_block=config.page_sparse_select_block))
+            self.variant.flex = config.page_sparse_backend == "flex"
         elif self.cfg.selector == "lsa":
             self.variant = sv.LSA(sv.LSAConfig(pool=config.page_sparse_lsa_pool, block=config.page_sparse_lsa_block,
                                                buckets=config.page_sparse_lsa_buckets, topk=self.cfg.topk,
                                                window=self.cfg.window, page=self.cfg.page,
-                                               sink_pages=self.cfg.sink_pages))
+                                               sink_pages=self.cfg.sink_pages,
+                                               select_block=config.page_sparse_select_block))
+            self.variant.flex = config.page_sparse_backend == "flex"
         self.flex = config.page_sparse_backend == "flex" and self.cfg.selector in ps.PAGE_SELECTORS
         self.q_block = config.page_sparse_flex_q_block
         self.loss_coeff = float(config.page_sparse_indexer_loss_coeff or 0.0)

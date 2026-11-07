@@ -208,6 +208,8 @@ class CSA2Config:
     sink_pages: int = 1
     index_heads: int = 4
     index_dim: int = 64
+    select_block: int = 1  # > 1: one entry selection per block of queries (its first query's); the flex path
+    kv_block: int = 64  # flex: entries per block-mask block (smaller: sparser unions; bf16 bwd needs H100 smem)
 
 
 class CSA2(nn.Module):
@@ -221,6 +223,7 @@ class CSA2(nn.Module):
         self.idx_q = nn.Linear(hidden, cfg.index_heads * cfg.index_dim, bias=False)
         self.idx_w = nn.Linear(hidden, cfg.index_heads, bias=False)
         self.idx_k = nn.Linear(kv_channels, cfg.index_dim, bias=False)
+        self.flex = False  # FlexAttention (CUDA, select_block > 1); the exact reference otherwise
 
     def token_features(self, x):
         """Per-token features of the KEY side, gathered with the keys under context parallelism: [t, g]."""
@@ -236,9 +239,12 @@ class CSA2(nn.Module):
         vc = (ps._acc(v[:, :, : Lc * m]).view(1, g, Lc, m, d) * w[..., None]).sum(3).to(v.dtype)
         return kc, vc
 
-    def _candidates(self, s, Lc, q_offset, device):
+    def _candidates(self, s, Lc, q_offset, device, pos=None):
+        """[s, Lc]: the entries a query may select (after the sinks, fully before its window); ``pos`` the
+        queries' absolute positions (default q_offset .. q_offset + s - 1)."""
         cfg = self.cfg
-        pos = q_offset + torch.arange(s, device=device)
+        if pos is None:
+            pos = q_offset + torch.arange(s, device=device)
         first_window = (pos // cfg.page - cfg.window // cfg.page) * cfg.page
         e = torch.arange(Lc, device=device)
         lo = cfg.sink_pages * cfg.page
@@ -253,12 +259,22 @@ class CSA2(nn.Module):
         w = ps._acc(self.idx_w(xq))
         return torch.einsum("bshn,bsh->bsn", torch.relu(torch.einsum("bshd,bnd->bshn", qi, ki)), w)
 
+    def _anchors(self, s, q_offset, device):
+        """Each query's anchor (its selection block's first query, or the chunk's first) as a local index, and
+        the distinct anchors."""
+        B = self.cfg.select_block
+        pos = q_offset + torch.arange(s, device=device)
+        anchor = ((pos // B) * B - q_offset).clamp(min=0)
+        return anchor, torch.unique(anchor)
+
     def forward(self, q, k, v, xq, z, q_offset: int, scale: float, chunk: int = 1024):
         cfg = self.cfg
         _, hq, s, d = q.shape
         L = k.shape[2]
         kc, vc = self.compress(k, v, z)
         Lc = kc.shape[2]
+        if self.flex and q.is_cuda and cfg.select_block > 1:
+            return self._forward_flex(q, k, v, xq, kc, vc, q_offset, scale)
         raw_cfg = ps.PageSparseConfig(selector="window", page=cfg.page, window=cfg.window,
                                       sink_pages=cfg.sink_pages)
         tok, tok_ok = ps.select_tokens(q, k, raw_cfg, q_offset, scale)
@@ -273,10 +289,64 @@ class CSA2(nn.Module):
                 vals.append(val)
                 sels.append(sel)
         val, sel = torch.cat(vals, 1), torch.cat(sels, 1)
+        if cfg.select_block > 1:  # every query uses its anchor's selection
+            anchor, _ = self._anchors(s, q_offset, q.device)
+            val, sel = val[:, anchor], sel[:, anchor]
         kk, vv = torch.cat([k, kc], 2), torch.cat([v, vc], 2)
         idx = torch.cat([tok, L + sel.clamp(min=0)], -1)
         ok = torch.cat([tok_ok, torch.isfinite(val)], -1)
         return ps.attend_gathered(q, kk, vv, idx, ok, scale, None)
+
+    def _forward_flex(self, q, k, v, xq, kc, vc, q_offset, scale):
+        """Raw sinks + window and the selected entries as two FlexAttention calls, merged by their LSEs. The
+        selection: the anchors' (one per block of select_block queries) top entries."""
+        from torch.nn.attention.flex_attention import BlockMask
+
+        cfg = self.cfg
+        _, hq, s, d = q.shape
+        g, Lc = kc.shape[1], kc.shape[2]
+        B, kv_block = cfg.select_block, cfg.kv_block
+        raw_cfg = ps.PageSparseConfig(selector="window", page=cfg.page, window=cfg.window,
+                                      sink_pages=cfg.sink_pages)
+        o_raw, l_raw = ps.flex_page_sparse_attention(q, k, v, raw_cfg, q_offset, scale, None, B, return_lse=True)
+        n = min(cfg.topk_entries, Lc)
+        if n == 0:
+            return o_raw
+        nq = -(-s // B)
+        with torch.no_grad():
+            # query block i holds positions [i B, (i + 1) B) of the chunk's block grid (offset q_offset % B)
+            first = (q_offset // B) * B
+            blk_anchor = (first + torch.arange(nq + 1, device=q.device) * B - q_offset).clamp(min=0)
+            blk_anchor = blk_anchor[blk_anchor < s]
+            cand = self._candidates(len(blk_anchor), Lc, 0, q.device, pos=q_offset + blk_anchor)
+            sc = self.index_scores(xq[:, blk_anchor], kc).masked_fill(~cand[None], float("-inf"))[0]
+            val, top = sc.topk(n, dim=-1)
+            selected = torch.zeros(len(blk_anchor), Lc, dtype=torch.bool, device=q.device)
+            selected.scatter_(-1, top, torch.isfinite(val))
+            # the flex query blocks are aligned to the chunk start: map each to its selection block
+            qpos = q_offset + torch.arange(s, device=q.device)
+            qsel = (qpos // B - q_offset // B).to(torch.int32)  # [s] -> row of `selected`
+            nkb = -(-Lc // kv_block)
+            fq = -(-s // B)
+            # flex rows of B queries starting at the chunk start: a row may straddle two selection blocks
+            sel_blocks = torch.nn.functional.pad(selected, (0, nkb * kv_block - Lc)).view(-1, nkb, kv_block).any(-1)
+            r = torch.arange(fq, device=q.device)
+            lo = qsel[r * B].long()
+            hi = qsel[((r + 1) * B).clamp(max=s) - 1].long()  # a row spans at most two selection blocks
+            rows = sel_blocks[lo] | sel_blocks[hi]
+            kv_num = rows.sum(-1).to(torch.int32)
+            kv_idx = torch.argsort((~rows).to(torch.int8), dim=-1, stable=True).to(torch.int32)
+            sel_i8 = selected.to(torch.int8)
+
+        def mask_mod(bi, hi, qi, ki):
+            return sel_i8[qsel[qi], ki] > 0
+
+        bm = BlockMask.from_kv_blocks(kv_num[None, None], kv_idx[None, None], BLOCK_SIZE=(B, kv_block),
+                                      mask_mod=mask_mod, seq_lengths=(s, Lc))
+        o_ent, l_ent = ps._flex()(q, kc.to(q.dtype), vc.to(q.dtype), block_mask=bm, scale=scale,
+                                  enable_gqa=hq != g, return_lse=True,
+                                  kernel_options=ps.flex_kernel_options(q, B, kv_block))
+        return ps.merge_attention([(o_raw, l_raw), (o_ent, l_ent)])
 
     def indexer_loss(self, q, k, xq, z, q_offset: int, scale: float, chunk: int = 256):
         """KL(dense attention mass per compressed entry || softmax(index scores)) over the candidates."""
@@ -287,6 +357,21 @@ class CSA2(nn.Module):
         Lc = L // m
         with torch.no_grad():
             kc, _ = self.compress(k.detach(), k.detach(), z.detach())
+        if cfg.select_block > 1:  # only the anchors select: their KL alone (select_block x cheaper)
+            _, anchors = self._anchors(s, q_offset, q.device)
+            total, count = 0.0, 0
+            for c0 in range(0, len(anchors), chunk):
+                a = anchors[c0:c0 + chunk]
+                cand = self._candidates(len(a), Lc, 0, q.device, pos=q_offset + a)
+                if not bool(cand.any()):
+                    continue
+                with torch.no_grad():
+                    pr = ps._causal_probs(q[:, :, a].detach(), k.detach(), q_offset + a, scale)[..., : Lc * m]
+                    target = pr.view(1, hq, len(a), Lc, m).sum(-1).mean(1)
+                has = int((cand & (target[0] > 0)).any(-1).sum())
+                lc = ps.indexer_kl_loss(self.index_scores(xq[:, a], kc), target, cand)
+                total, count = total + lc * has, count + has
+            return total / max(count, 1) if count else xq.sum() * 0.0
         pos = q_offset + torch.arange(s, device=q.device)
         total, count = 0.0, 0
         for c0 in range(0, s, chunk):  # a query chunk at a time; checkpointed: the [c, Lc] scores are not kept
@@ -323,6 +408,8 @@ class LSAConfig:
     page: int = 64  # window / sink granularity
     sink_pages: int = 1
     max_members: int = 0  # pooled keys kept per bucket (0: 4x the mean, block / buckets); bounds the gather
+    select_block: int = 1  # > 1: one bucket selection per block of queries (its first query's); the flex path
+    kv_block: int = 64  # flex: bucket-ordered keys per block-mask block
 
 
 class LSA(nn.Module):
@@ -331,6 +418,7 @@ class LSA(nn.Module):
     def __init__(self, cfg: LSAConfig):
         super().__init__()
         self.cfg = cfg
+        self.flex = False  # FlexAttention over the keys in bucket order (CUDA, select_block > 1)
 
     @torch.no_grad()
     def index(self, k):
@@ -389,13 +477,14 @@ class LSA(nn.Module):
         nb = cent.shape[0]
         if nb == 0:
             return ps.attend_gathered(q, k, v, tok, tok_ok, scale, None)
+        if self.flex and q.is_cuda and cfg.select_block > 1:
+            return self._forward_flex(q, k, v, q_offset, scale, (cent, mem, mem_ok, last))
         pos = q_offset + torch.arange(s, device=q.device)
-        first_window = (pos // cfg.page - cfg.window // cfg.page) * cfg.page
         with torch.no_grad():
-            qn = F.normalize(ps._acc(q[0]).view(g, rep, s, d), dim=-1)
-            sc = torch.einsum("grsd,ngd->grsn", qn, cent.to(qn.dtype)).amax(1).sum(0)  # [s, nb]
-            usable = last[None, :] < first_window[:, None]  # buckets of blocks that end before the window
-            sc = sc.masked_fill(~usable, float("-inf"))
+            sc = self._bucket_scores(q, cent, last, pos)
+            if cfg.select_block > 1:  # every query uses its anchor's selection
+                anchor = ((pos // cfg.select_block) * cfg.select_block - q_offset).clamp(min=0)
+                sc = sc[anchor]
             kb = min(cfg.topk, nb)
             val, sel = sc.topk(kb, dim=-1)  # [s, kb]
             stok = mem[sel].view(s, -1)  # [s, kb * M * pool]
@@ -404,3 +493,65 @@ class LSA(nn.Module):
         idx = torch.cat([tok, stok[None]], -1)
         ok = torch.cat([tok_ok, sok[None]], -1)
         return ps.attend_gathered(q, k, v, idx, ok, scale, None)
+
+    def _bucket_scores(self, q, cent, last, pos):
+        """[n, nb]: cosine of the queries (at absolute positions pos) to the centroids, max over each KV group's
+        heads, summed over the groups; -inf for buckets not fully before the query's window."""
+        cfg = self.cfg
+        _, hq, n, d = q.shape
+        g = cent.shape[1]
+        qn = F.normalize(ps._acc(q[0]).view(g, hq // g, n, d), dim=-1)
+        sc = torch.einsum("grsd,ngd->grsn", qn, cent.to(qn.dtype)).amax(1).sum(0)
+        first_window = (pos // cfg.page - cfg.window // cfg.page) * cfg.page
+        return sc.masked_fill(~(last[None, :] < first_window[:, None]), float("-inf"))
+
+    def _forward_flex(self, q, k, v, q_offset, scale, index):
+        """Raw sinks + window, and the selected buckets over the keys permuted into bucket order (each bucket a
+        contiguous span), as two FlexAttention calls merged by their LSEs."""
+        from torch.nn.attention.flex_attention import BlockMask
+
+        cfg = self.cfg
+        _, hq, s, d = q.shape
+        g = k.shape[1]
+        B, kv_block = cfg.select_block, cfg.kv_block
+        cent, mem, mem_ok, last = index
+        raw_cfg = ps.PageSparseConfig(selector="window", page=cfg.page, window=cfg.window,
+                                      sink_pages=cfg.sink_pages)
+        o_raw, l_raw = ps.flex_page_sparse_attention(q, k, v, raw_cfg, q_offset, scale, None, B, return_lse=True)
+        with torch.no_grad():
+            nb = cent.shape[0]
+            ok = mem_ok & (mem >= cfg.sink_pages * cfg.page)  # the sinks are attended already
+            perm = mem[ok]  # member tokens, bucket by bucket
+            bucket_of = torch.arange(nb, device=q.device).repeat_interleave(ok.sum(-1))
+            Lp = perm.numel()
+            if Lp == 0:
+                return o_raw
+            # one selection per block of B queries (the block's first query, or the chunk's first)
+            first = (q_offset // B) * B
+            anchors = (first + torch.arange(-(-s // B) + 1, device=q.device) * B - q_offset).clamp(min=0)
+            anchors = anchors[anchors < s]
+            sc = self._bucket_scores(q[:, :, anchors], cent, last, q_offset + anchors)
+            val, top = sc.topk(min(cfg.topk, nb), dim=-1)
+            selected = torch.zeros(len(anchors), nb, dtype=torch.bool, device=q.device)
+            selected.scatter_(-1, top, torch.isfinite(val))
+            qpos = q_offset + torch.arange(s, device=q.device)
+            qsel = (qpos // B - q_offset // B).to(torch.int32)
+            nkb = -(-Lp // kv_block)
+            per_key = F.pad(selected[:, bucket_of], (0, nkb * kv_block - Lp))  # [rows, Lp]
+            sel_blocks = per_key.view(len(anchors), nkb, kv_block).any(-1)
+            fq = -(-s // B)
+            r = torch.arange(fq, device=q.device)
+            rows = sel_blocks[qsel[r * B].long()] | sel_blocks[qsel[((r + 1) * B).clamp(max=s) - 1].long()]
+            kv_num = rows.sum(-1).to(torch.int32)
+            kv_idx = torch.argsort((~rows).to(torch.int8), dim=-1, stable=True).to(torch.int32)
+            sel_i8 = selected.to(torch.int8)
+            bucket_i = bucket_of.to(torch.int32)
+
+        def mask_mod(bi, hi, qi, ki):
+            return sel_i8[qsel[qi], bucket_i[ki]] > 0
+
+        bm = BlockMask.from_kv_blocks(kv_num[None, None], kv_idx[None, None], BLOCK_SIZE=(B, kv_block),
+                                      mask_mod=mask_mod, seq_lengths=(s, Lp))
+        o_sel, l_sel = ps._flex()(q, k[:, :, perm], v[:, :, perm], block_mask=bm, scale=scale, enable_gqa=hq != g,
+                                  return_lse=True, kernel_options=ps.flex_kernel_options(q, B, kv_block))
+        return ps.merge_attention([(o_raw, l_raw), (o_sel, l_sel)])

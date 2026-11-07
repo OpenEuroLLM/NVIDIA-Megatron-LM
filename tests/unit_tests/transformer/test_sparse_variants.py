@@ -200,3 +200,76 @@ def test_nsa_flex_matches_reference(select_block):
                              (q, k, v, nsa.ck, nsa.gate.weight))
     for a, b in zip(gf, gr):
         assert float((a - b).abs().max() / b.abs().max()) < 2e-2
+
+
+def test_csa2_block_selection_reference():
+    """select_block: every query uses its block's first query's entries; causal; chunk-invariant at aligned cuts;
+    the indexer loss is the anchors' KL."""
+    q, k, v, x = qkvx()
+    cfg = sv.CSA2Config(compress=2, topk_entries=6, window=16, page=16, sink_pages=1, index_heads=2, index_dim=8,
+                        select_block=32)
+    csa = sv.CSA2(H, G, D, cfg).to(DEV, torch.float64)
+    full = _run("csa2", csa, q, k, v, x)
+    a = _run("csa2", csa, q[:, :, :128], k[:, :, :128], v[:, :, :128], x[:, :128], 0)
+    b = _run("csa2", csa, q[:, :, 128:], k, v, x, 128)
+    torch.testing.assert_close(torch.cat([a, b], 2), full, atol=1e-10, rtol=1e-10)
+    k2 = k.clone()
+    k2[:, :, 200:] += 1.0
+    torch.testing.assert_close(_run("csa2", csa, q, k2, v, x)[:, :, :200], full[:, :, :200], atol=1e-10, rtol=1e-10)
+    loss = csa.indexer_loss(q, k, x, csa.token_features(x), 0, D**-0.5)
+    loss.backward()
+    assert torch.isfinite(loss) and csa.idx_q.weight.grad.abs().sum() > 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="FlexAttention needs a GPU")
+@pytest.mark.parametrize("off", [0, 128, 144])
+def test_csa2_flex_matches_reference(off):
+    """CSA2's flex path (raw + entries, LSE-merged) equals the block-selection reference, fwd and bwd (fp32);
+    off 144 starts the chunk mid-block (the chunk's first query anchors its partial block in both)."""
+    q, k, v, x = (t.float().clone().requires_grad_() for t in qkvx(L=512))
+    cfg = sv.CSA2Config(compress=2, topk_entries=6, window=32, page=16, sink_pages=1, index_heads=2, index_dim=8,
+                        select_block=32, kv_block=16)
+    csa = sv.CSA2(H, G, D, cfg).to(DEV)
+    torch.nn.init.normal_(csa.z.weight, std=0.3)
+
+    def run():
+        return csa(q[:, :, off:], k, v, x[:, off:], csa.token_features(x), off, D**-0.5)
+
+    ref = run()
+    csa.flex = True
+    out = run()
+    assert float((out - ref).abs().max() / ref.abs().max()) < 1e-2
+    g = torch.randn_like(ref)
+    gf = torch.autograd.grad((out * g).sum(), (q, k, v, csa.z.weight))
+    csa.flex = False
+    gr = torch.autograd.grad((run() * g).sum(), (q, k, v, csa.z.weight))
+    for a, b in zip(gf, gr):
+        assert float((a - b).abs().max() / b.abs().max()) < 2e-2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="FlexAttention needs a GPU")
+@pytest.mark.parametrize("off", [0, 128, 144])
+def test_lsa_flex_matches_reference(off):
+    """LSA's flex path (keys in bucket order, LSE-merged with the raw part) equals the block-selection
+    reference, forward and backward (fp32); the reference is causal and chunk-invariant at aligned cuts."""
+    q, k, v, _ = (t.float().clone().requires_grad_() for t in qkvx(L=512))
+    lsa = sv.LSA(sv.LSAConfig(pool=2, block=16, buckets=4, iters=3, topk=2, window=32, page=16, sink_pages=1,
+                              select_block=32, kv_block=16))
+
+    def run():
+        return lsa(q[:, :, off:], k, v, off, D**-0.5)
+
+    ref = run()
+    if off == 0:
+        a = lsa(q[:, :, :128], k[:, :, :128], v[:, :, :128], 0, D**-0.5)
+        b = lsa(q[:, :, 128:], k, v, 128, D**-0.5)
+        torch.testing.assert_close(torch.cat([a, b], 2), ref, atol=1e-5, rtol=1e-5)
+    lsa.flex = True
+    out = run()
+    assert float((out - ref).abs().max() / ref.abs().max()) < 1e-2
+    g = torch.randn_like(ref)
+    gf = torch.autograd.grad((out * g).sum(), (q, k, v))
+    lsa.flex = False
+    gr = torch.autograd.grad((run() * g).sum(), (q, k, v))
+    for x, y in zip(gf, gr):
+        assert float((x - y).abs().max() / y.abs().max()) < 2e-2

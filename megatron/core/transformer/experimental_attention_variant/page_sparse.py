@@ -446,7 +446,7 @@ def select_pages(q, k, cfg: PageSparseConfig, q_offset: int = 0, scale: float | 
 
 
 def flex_page_sparse_attention(q, k, v, cfg: PageSparseConfig, q_offset: int = 0, scale: float | None = None,
-                               indexer_scores=None, q_block: int = 128):
+                               indexer_scores=None, q_block: int = 128, return_lse: bool = False):
     """:func:`page_sparse_attention` for the page selectors through FlexAttention (fused Triton forward and
     backward): the block mask lists, per block of ``q_block`` queries, the union of their pages (built from the
     selection, never by evaluating the dense mask); the per-token mask makes it exact. One batch row (b = 1)."""
@@ -472,8 +472,18 @@ def flex_page_sparse_attention(q, k, v, cfg: PageSparseConfig, q_offset: int = 0
 
     bm = BlockMask.from_kv_blocks(kv_num[None, None], kv_idx[None, None], BLOCK_SIZE=(q_block, page),
                                   mask_mod=mask_mod, seq_lengths=(s, L))
-    return _flex()(q, k, v, block_mask=bm, scale=scale, enable_gqa=hq != g,
+    return _flex()(q, k, v, block_mask=bm, scale=scale, enable_gqa=hq != g, return_lse=return_lse,
                    kernel_options=flex_kernel_options(q, q_block, page))
+
+
+def merge_attention(parts):
+    """Exact merge of attentions over disjoint key sets: [(out [b, hq, s, d], lse [b, hq, s])] -> out. A part
+    whose rows saw no key (lse -inf) contributes nothing."""
+    lse = torch.stack([p[1].float() for p in parts])  # [n, b, hq, s]
+    m = lse.amax(0).clamp(min=-1e30)
+    w = torch.exp(lse - m).nan_to_num(0.0)
+    w = w / w.sum(0).clamp(min=1e-30)
+    return sum(p[0].float() * w[i][..., None] for i, p in enumerate(parts)).to(parts[0][0].dtype)
 
 
 def flex_kernel_options(q, q_block: int, kv_block: int) -> dict:
