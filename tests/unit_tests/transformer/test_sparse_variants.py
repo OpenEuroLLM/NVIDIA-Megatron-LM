@@ -260,10 +260,12 @@ def test_lsa_flex_matches_reference(off):
         return lsa(q[:, :, off:], k, v, off, D**-0.5)
 
     ref = run()
-    if off == 0:
-        a = lsa(q[:, :, :128], k[:, :, :128], v[:, :, :128], 0, D**-0.5)
-        b = lsa(q[:, :, 128:], k, v, 128, D**-0.5)
-        torch.testing.assert_close(torch.cat([a, b], 2), ref, atol=1e-5, rtol=1e-5)
+    if off == 0:  # float64: the clustering under forced TF32 rounds differently per chunk size
+        q64, k64, v64, _ = qkvx(L=512)
+        full = lsa(q64, k64, v64, 0, D**-0.5)
+        a = lsa(q64[:, :, :128], k64[:, :, :128], v64[:, :, :128], 0, D**-0.5)
+        b = lsa(q64[:, :, 128:], k64, v64, 128, D**-0.5)
+        torch.testing.assert_close(torch.cat([a, b], 2), full, atol=1e-10, rtol=1e-10)
     lsa.flex = True
     out = run()
     assert float((out - ref).abs().max() / ref.abs().max()) < 1e-2
