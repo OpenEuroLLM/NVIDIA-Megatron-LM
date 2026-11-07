@@ -23,6 +23,13 @@ and the KV fetch per token small). Selectors (``PageSparseConfig.selector``):
                    ``topk * page // compress`` entries of highest q . k_c attended with a log(compress) bias
 ``indexer``        pages scored by a learned :class:`PageIndexer` (lightning-indexer form on page-pooled index keys)
 
+Hierarchical (coarse-to-fine) selection for every page selector (``hier_group`` > 0): groups of ``hier_group``
+pages are scored first (the same selector on group-pooled keys; the indexer by its best page), and the pages are
+chosen only within each query's ``hier_topk`` best groups -- the per-query cost of a flat score over P pages
+becomes P / hier_group + hier_topk * hier_group (10M tokens: the index scan stays small).
+
+The trained variants NSA, CSA2 and LSA live in sparse_variants.py, on these primitives.
+
 Pure torch (no Megatron imports): the HF export loads this file as is. The gathered-key implementation is exact
 and differentiable (training at small scale; ``torch.utils.checkpoint`` per query chunk under autograd); fast
 kernels replace :func:`attend_gathered` later with the same selection.
@@ -43,6 +50,7 @@ def _acc(x: torch.Tensor) -> torch.Tensor:
 
 
 SELECTORS = ("dense", "window", "page_mean", "quest", "oracle", "token_topk", "compress_mean", "indexer")
+VARIANT_SELECTORS = ("nsa", "csa2", "lsa")  # trained modules of sparse_variants.py (PageSparseCoreAttention)
 
 
 @dataclass
@@ -55,10 +63,12 @@ class PageSparseConfig:
     compress: int = 4
     query_chunk: int = 512  # queries per gathered-attention block
     score_chunk: int = 128  # queries per dense-score block (oracle, token_topk)
+    hier_group: int = 0  # hierarchical selection: pages per group (0: flat)
+    hier_topk: int = 8  # groups kept per query
 
     def __post_init__(self):
-        if self.selector not in SELECTORS:
-            raise ValueError(f"unknown selector {self.selector!r}; one of {SELECTORS}")
+        if self.selector not in SELECTORS + VARIANT_SELECTORS:
+            raise ValueError(f"unknown selector {self.selector!r}; one of {SELECTORS + VARIANT_SELECTORS}")
         if self.window % self.page:
             raise ValueError("window must be a multiple of page")
 
@@ -144,6 +154,28 @@ def page_scores(q, k, cfg: PageSparseConfig, q_offset: int, scale: float, indexe
     raise ValueError(f"page_scores: selector {cfg.selector!r} does not score pages")
 
 
+def hierarchical_restrict(sc, q, k, cfg: PageSparseConfig, q_offset: int, scale: float):
+    """Fine page scores sc [b, s, P] (candidates already masked to -inf) -> the same with every page outside the
+    query's ``hier_topk`` best groups of ``hier_group`` pages masked too. Group scores: the selector on
+    group-pooled keys (page_mean / quest / oracle), the best page's score otherwise (indexer)."""
+    G = cfg.hier_group
+    b, s, P = sc.shape
+    ng = -(-P // G)
+    if cfg.selector in ("page_mean", "quest", "oracle"):
+        coarse_cfg = PageSparseConfig(selector=cfg.selector, page=cfg.page * G, topk=cfg.topk, window=0,
+                                      sink_pages=0, score_chunk=cfg.score_chunk)
+        coarse = page_scores(q, k, coarse_cfg, q_offset, scale)  # [b, s, ng]
+        # a group counts only where it has a candidate page
+        has = torch.isfinite(F.pad(sc, (0, ng * G - P), value=float("-inf")).view(b, s, ng, G)).any(-1)
+        coarse = coarse[..., :ng].masked_fill(~has, float("-inf"))
+    else:
+        coarse = F.pad(sc, (0, ng * G - P), value=float("-inf")).view(b, s, ng, G).amax(-1)
+    val, top = coarse.topk(min(cfg.hier_topk, ng), dim=-1)
+    keep = torch.zeros(b, s, ng, dtype=torch.bool, device=sc.device).scatter_(-1, top, torch.isfinite(val))
+    keep = keep.repeat_interleave(G, -1)[..., :P]
+    return sc.masked_fill(~keep, float("-inf"))
+
+
 def select_tokens(q, k, cfg: PageSparseConfig, q_offset: int = 0, scale: float | None = None,
                   indexer_scores=None):
     """The keys of every query: (token indices [b, s, K] long, valid [b, s, K] bool): the sink pages, then the
@@ -168,6 +200,8 @@ def select_tokens(q, k, cfg: PageSparseConfig, q_offset: int = 0, scale: float |
     elif cfg.selector != "window" and cfg.topk > 0:
         cand = candidate_mask(s, P, q_offset, cfg, dev)
         sc = page_scores(q, k, cfg, q_offset, scale, indexer_scores).masked_fill(~cand[None], float("-inf"))
+        if cfg.hier_group > 0:
+            sc = hierarchical_restrict(sc, q, k, cfg, q_offset, scale)
         val, sel = sc.topk(min(cfg.topk, P), dim=-1)
         sel, _ = torch.sort(torch.where(torch.isfinite(val), sel, P + 1), dim=-1)  # page order: contiguous fetches
         pages.append(sel)
@@ -288,6 +322,8 @@ def page_sparse_attention(q, k, v, cfg: PageSparseConfig, q_offset: int = 0, sca
         return dense_attention(q, k, v, q_offset, scale)
     if cfg.selector == "compress_mean":
         return _compress_mean_attention(q, k, v, cfg, q_offset, scale)
+    if cfg.selector in VARIANT_SELECTORS:
+        raise ValueError(f"{cfg.selector}: a trained module (sparse_variants.py), not a page selector")
     tok, tok_ok = select_tokens(q, k, cfg, q_offset, scale, indexer_scores)
     return attend_gathered(q, k, v, tok, tok_ok, scale, None, cfg.query_chunk)
 
@@ -385,6 +421,8 @@ def select_pages(q, k, cfg: PageSparseConfig, q_offset: int = 0, scale: float | 
     if cfg.selector != "window" and cfg.topk > 0:
         cand = candidate_mask(s, P, q_offset, cfg, dev)
         sc = page_scores(q, k, cfg, q_offset, scale, indexer_scores).masked_fill(~cand[None], float("-inf"))
+        if cfg.hier_group > 0:
+            sc = hierarchical_restrict(sc, q, k, cfg, q_offset, scale)
         val, sel = sc.topk(min(cfg.topk, P), dim=-1)
         allowed.scatter_(-1, sel, torch.isfinite(val) | allowed.gather(-1, sel))
     return allowed

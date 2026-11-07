@@ -635,6 +635,33 @@ class TransformerConfig(ModelParallelConfig):
     page_sparse_flex_q_block: int = 64
     """flex: queries per block-mask row (smaller: tighter page unions, more blocks)."""
 
+    page_sparse_hier_group: int = 0
+    """Hierarchical (coarse-to-fine) page selection: pages per group, scored first (0: flat)."""
+
+    page_sparse_hier_topk: int = 8
+    """Hierarchical selection: groups kept per query (pages are chosen only within them)."""
+
+    page_sparse_nsa_block: int = 32
+    """nsa: compression block (tokens); page_sparse_page is the selection block."""
+
+    page_sparse_nsa_stride: int = 16
+    """nsa: compression stride."""
+
+    page_sparse_nsa_select_window: int = 64
+    """nsa: local tokens (whole pages) of the selection branch; page_sparse_window is the window branch."""
+
+    page_sparse_csa2_topk_entries: int = 512
+    """csa2: selected compressed entries (page_sparse_compress tokens each); page_sparse_window = the raw SWA."""
+
+    page_sparse_lsa_pool: int = 4
+    """lsa: tokens per pooled key."""
+
+    page_sparse_lsa_block: int = 512
+    """lsa: pooled keys per cluster block."""
+
+    page_sparse_lsa_buckets: int = 32
+    """lsa: buckets per cluster block (page_sparse_topk buckets are selected)."""
+
     linear_kronlstm_forget_offset: float = 0.0
     """KronLSTM: a fixed extra decay per step on every forget channel (log|f| - offset); 0.012 is
     the polar forget gate's init cap without its angle."""
@@ -2309,15 +2336,18 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.page_sparse_selector is not None:
             selectors = ("dense", "window", "page_mean", "quest", "oracle", "token_topk", "compress_mean",
-                         "indexer")
+                         "indexer", "nsa", "csa2", "lsa")
             if self.page_sparse_selector not in selectors:
                 raise ValueError(f"page_sparse_selector must be one of {selectors}")
             if self.page_sparse_window % self.page_sparse_page:
                 raise ValueError("page_sparse_window must be a multiple of page_sparse_page")
             if self.page_sparse_backend not in ("flex", "gathered"):
                 raise ValueError("page_sparse_backend must be flex or gathered")
-            if self.page_sparse_dense_forward and self.page_sparse_selector != "indexer":
-                raise ValueError("page_sparse_dense_forward is the indexer warm-up (page_sparse_selector indexer)")
+            if self.page_sparse_dense_forward and self.page_sparse_selector not in ("indexer", "csa2"):
+                raise ValueError("page_sparse_dense_forward is the indexer warm-up (selector indexer or csa2)")
+            if self.page_sparse_hier_group and self.page_sparse_selector not in (
+                    "page_mean", "quest", "oracle", "indexer"):
+                raise ValueError("page_sparse_hier_group: page selectors only (page_mean, quest, oracle, indexer)")
 
         if self.moe_expert_post_act_norm or self.mlp_post_act_norm:
             if self.use_te_activation_func:

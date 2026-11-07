@@ -2,7 +2,7 @@
 """The hybrid stack under context parallelism on packed (THD) batches: NoPE attention (TE, THD + p2p CP),
 Complex KDA and Engram (fla_cp.ThdStream), MoE and mHC-4 at CP=2 give each rank's tokens the logits and the
 (CP-summed) parameter gradients that CP=1 gives them -- documents spanning the ranks' stream pieces; TE's ring
-attention, an all-gathered dense attention and page-sparse attention. 2 GPUs:
+attention, an all-gathered dense attention, page-sparse attention and the trained NSA / CSA2 / LSA. 2 GPUs:
 
     python -m torch.distributed.run --nproc-per-node 2 -m pytest -q tests/unit_tests/models/test_hybrid_cp_packed.py
 """
@@ -73,7 +73,15 @@ def _positions():
     # the page selection, like the expert routing, flips at near ties between the layouts' roundings
     (dict(page_sparse_selector="page_mean", page_sparse_page=16, page_sparse_topk=2, page_sparse_window=16),
      0.15, 0.02),
-], ids=["te_dense", "allgather_dense", "page_sparse"])
+    # the trained variants (sparse_variants.py): their own parameters, key-side features gathered under CP
+    (dict(page_sparse_selector="nsa", page_sparse_page=16, page_sparse_topk=2, page_sparse_window=32,
+          page_sparse_nsa_block=16, page_sparse_nsa_stride=8, page_sparse_nsa_select_window=16), 0.15, 0.02),
+    (dict(page_sparse_selector="csa2", page_sparse_page=16, page_sparse_window=16, page_sparse_compress=2,
+          page_sparse_csa2_topk_entries=8, page_sparse_indexer_heads=2, page_sparse_indexer_dim=8,
+          page_sparse_indexer_loss_coeff=0.1), 0.15, 0.02),
+    (dict(page_sparse_selector="lsa", page_sparse_page=16, page_sparse_topk=2, page_sparse_window=16,
+          page_sparse_lsa_pool=2, page_sparse_lsa_block=8, page_sparse_lsa_buckets=4), 0.15, 0.02),
+], ids=["te_dense", "allgather_dense", "page_sparse", "nsa", "csa2", "lsa"])
 def test_cp_matches_single_rank(attention, max_err, mean_max):
     faulthandler.dump_traceback_later(360, exit=True, file=sys.stderr)  # a hang prints every thread's stack
     # CP=1 reference on every rank (the whole batch)
