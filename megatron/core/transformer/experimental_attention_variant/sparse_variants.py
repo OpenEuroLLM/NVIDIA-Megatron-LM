@@ -208,9 +208,9 @@ class CSA2(nn.Module):
         """xq [1, s, hidden], kc [1, g, Lc, d] -> [1, s, Lc] (lightning-indexer form, keys from the main KV)."""
         cfg = self.cfg
         s = xq.shape[1]
-        qi = self.idx_q(xq).view(1, s, cfg.index_heads, cfg.index_dim).float()
-        ki = self.idx_k(kc.float().mean(1).to(self.idx_k.weight.dtype)).float()  # [1, Lc, dim]
-        w = self.idx_w(xq).float()
+        qi = ps._acc(self.idx_q(xq).view(1, s, cfg.index_heads, cfg.index_dim))
+        ki = ps._acc(self.idx_k(ps._acc(kc).mean(1).to(self.idx_k.weight.dtype)))  # [1, Lc, dim]
+        w = ps._acc(self.idx_w(xq))
         return torch.einsum("bshn,bsh->bsn", torch.relu(torch.einsum("bshd,bnd->bshn", qi, ki)), w)
 
     def forward(self, q, k, v, xq, z, q_offset: int, scale: float, chunk: int = 1024):

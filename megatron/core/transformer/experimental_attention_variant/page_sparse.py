@@ -65,6 +65,11 @@ class PageSparseConfig:
     score_chunk: int = 128  # queries per dense-score block (oracle, token_topk)
     hier_group: int = 0  # hierarchical selection: pages per group (0: flat)
     hier_topk: int = 8  # groups kept per query
+    # selection granularity: 1 = every query selects its own pages; B > 1 = one selection per block of B queries
+    # (absolute positions), made by the block's first query and reused by the rest (V4.1's "Reuse"; decode
+    # selects at every B-th token). A page union per block of B: block-sparse kernels attend just the budget.
+    # Chunk-invariant when chunks start at multiples of B (a chunk starting mid-block anchors at its first query).
+    select_block: int = 1
 
     def __post_init__(self):
         if self.selector not in SELECTORS + VARIANT_SELECTORS:
@@ -154,6 +159,23 @@ def page_scores(q, k, cfg: PageSparseConfig, q_offset: int, scale: float, indexe
     raise ValueError(f"page_scores: selector {cfg.selector!r} does not score pages")
 
 
+def selection_scores(q, k, cfg: PageSparseConfig, q_offset: int, scale: float, indexer_scores=None):
+    """The selector's page scores [b, s, P] with everything a query may not select at -inf: pages outside its
+    candidates, outside its best groups (``hier_group``), and -- with ``select_block`` -- the scores of its
+    block's anchor (the block's first query, or the chunk's first if the block started in an earlier chunk)."""
+    s, L = q.shape[2], k.shape[2]
+    P = -(-L // cfg.page)
+    cand = candidate_mask(s, P, q_offset, cfg, q.device)
+    sc = page_scores(q, k, cfg, q_offset, scale, indexer_scores).masked_fill(~cand[None], float("-inf"))
+    if cfg.hier_group > 0:
+        sc = hierarchical_restrict(sc, q, k, cfg, q_offset, scale)
+    if cfg.select_block > 1:
+        pos = q_offset + torch.arange(s, device=q.device)
+        anchor = ((pos // cfg.select_block) * cfg.select_block - q_offset).clamp(min=0)
+        sc = sc[:, anchor]
+    return sc
+
+
 def hierarchical_restrict(sc, q, k, cfg: PageSparseConfig, q_offset: int, scale: float):
     """Fine page scores sc [b, s, P] (candidates already masked to -inf) -> the same with every page outside the
     query's ``hier_topk`` best groups of ``hier_group`` pages masked too. Group scores: the selector on
@@ -198,14 +220,12 @@ def select_tokens(q, k, cfg: PageSparseConfig, q_offset: int = 0, scale: float |
     if cfg.selector == "token_topk":
         sel_tok, sel_tok_ok = _token_topk(q, k, cfg, pos, scale)
     elif cfg.selector != "window" and cfg.topk > 0:
-        cand = candidate_mask(s, P, q_offset, cfg, dev)
-        sc = page_scores(q, k, cfg, q_offset, scale, indexer_scores).masked_fill(~cand[None], float("-inf"))
-        if cfg.hier_group > 0:
-            sc = hierarchical_restrict(sc, q, k, cfg, q_offset, scale)
+        sc = selection_scores(q, k, cfg, q_offset, scale, indexer_scores)
         val, sel = sc.topk(min(cfg.topk, P), dim=-1)
         sel, _ = torch.sort(torch.where(torch.isfinite(val), sel, P + 1), dim=-1)  # page order: contiguous fetches
         pages.append(sel)
-        pages_ok.append(sel < P)
+        # a block's selection may reach into a later query's window (attended there already: no duplicates)
+        pages_ok.append((sel < P) & (sel < (cur - wp)[None, :, None]))
     pages.append(win)
     pages_ok.append(win_ok)
 
@@ -419,10 +439,7 @@ def select_pages(q, k, cfg: PageSparseConfig, q_offset: int = 0, scale: float | 
     allowed = allowed & (p[None, :] <= cur[:, None])
     allowed = allowed[None].expand(b, s, P).clone()
     if cfg.selector != "window" and cfg.topk > 0:
-        cand = candidate_mask(s, P, q_offset, cfg, dev)
-        sc = page_scores(q, k, cfg, q_offset, scale, indexer_scores).masked_fill(~cand[None], float("-inf"))
-        if cfg.hier_group > 0:
-            sc = hierarchical_restrict(sc, q, k, cfg, q_offset, scale)
+        sc = selection_scores(q, k, cfg, q_offset, scale, indexer_scores)
         val, sel = sc.topk(min(cfg.topk, P), dim=-1)
         allowed.scatter_(-1, sel, torch.isfinite(val) | allowed.gather(-1, sel))
     return allowed

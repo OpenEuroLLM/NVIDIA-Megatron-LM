@@ -147,4 +147,33 @@ def test_csa2_query_chunks():
                                atol=1e-12, rtol=1e-12)
     a = csa.indexer_loss(q, k, x, z, 0, D**-0.5, chunk=40)
     b = csa.indexer_loss(q, k, x, z, 0, D**-0.5, chunk=1024)
-    torch.testing.assert_close(a, b, atol=1e-10, rtol=1e-10)
+    torch.testing.assert_close(a, b, atol=1e-6, rtol=1e-6)  # indexer_kl_loss is fp32
+
+
+@pytest.mark.parametrize("selector", ["page_mean", "quest", "oracle"])
+def test_block_selection(selector):
+    """select_block: every query of a block attends the anchor's selection (+ its own sinks / window), causal,
+    chunk-invariant at block-aligned cuts, and block 1 is the per-query selection."""
+    q, k, v, _ = qkvx(L=512)
+    kw = dict(selector=selector, page=16, topk=3, window=16, sink_pages=1)
+    flat = ps.page_sparse_attention(q, k, v, ps.PageSparseConfig(**kw))
+    torch.testing.assert_close(ps.page_sparse_attention(q, k, v, ps.PageSparseConfig(**kw, select_block=1)), flat)
+    cfg = ps.PageSparseConfig(**kw, select_block=32)
+    full = ps.page_sparse_attention(q, k, v, cfg)
+    tok, ok = ps.select_tokens(q, k, cfg)
+    for t in (100, 300, 511):  # the selected part equals the anchor's minus the query's own window pages
+        a = (t // 32) * 32
+        sel_t = set(tok[0, t, 16:16 + 48][ok[0, t, 16:16 + 48]].tolist())
+        sel_a = set(tok[0, a, 16:16 + 48][ok[0, a, 16:16 + 48]].tolist())
+        first_window = (t // 16 - 1) * 16
+        assert sel_t == {x for x in sel_a if x < first_window}
+        all_t = tok[0, t][ok[0, t]]
+        assert all_t.unique().numel() == all_t.numel()  # no key twice
+    k2, v2 = k.clone(), v.clone()
+    k2[:, :, 300:] += 1.0
+    v2[:, :, 300:] -= 1.0
+    torch.testing.assert_close(ps.page_sparse_attention(q, k2, v2, cfg)[:, :, :300], full[:, :, :300],
+                               atol=1e-10, rtol=1e-10)
+    a = ps.page_sparse_attention(q[:, :, :192], k[:, :, :192], v[:, :, :192], cfg, 0)
+    b = ps.page_sparse_attention(q[:, :, 192:], k, v, cfg, 192)
+    torch.testing.assert_close(torch.cat([a, b], 2), full, atol=1e-10, rtol=1e-10)
