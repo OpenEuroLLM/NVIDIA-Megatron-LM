@@ -472,11 +472,16 @@ def flex_page_sparse_attention(q, k, v, cfg: PageSparseConfig, q_offset: int = 0
 
     bm = BlockMask.from_kv_blocks(kv_num[None, None], kv_idx[None, None], BLOCK_SIZE=(q_block, page),
                                   mask_mod=mask_mod, seq_lengths=(s, L))
-    # kernel tiles that divide the block mask's blocks (else inductor may pick e.g. a decode kernel's 256-row
-    # tile for a short chunk); smaller ones on consumer GPUs (~100 KB of shared memory)
+    return _flex()(q, k, v, block_mask=bm, scale=scale, enable_gqa=hq != g,
+                   kernel_options=flex_kernel_options(q, q_block, page))
+
+
+def flex_kernel_options(q, q_block: int, kv_block: int) -> dict:
+    """Kernel tiles that divide the block mask's blocks (else inductor may pick e.g. a decode kernel's 256-row
+    tile for a short chunk); smaller ones on consumer GPUs (~100 KB of shared memory)."""
     smem = torch.cuda.get_device_properties(q.device).shared_memory_per_block_optin
-    tile = 32 if smem < 160 * 1024 and d >= 128 else 64
-    opts = {"BLOCK_M": min(tile, q_block), "BLOCK_N": min(tile, page)}
+    tile = 32 if smem < 160 * 1024 and q.shape[-1] >= 128 else 64
+    opts = {"BLOCK_M": min(tile, q_block), "BLOCK_N": min(tile, kv_block)}
     if tile == 32:
         opts["num_stages"] = 1
-    return _flex()(q, k, v, block_mask=bm, scale=scale, enable_gqa=hq != g, kernel_options=opts)
+    return opts

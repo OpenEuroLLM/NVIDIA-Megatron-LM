@@ -177,3 +177,26 @@ def test_block_selection(selector):
     a = ps.page_sparse_attention(q[:, :, :192], k[:, :, :192], v[:, :, :192], cfg, 0)
     b = ps.page_sparse_attention(q[:, :, 192:], k, v, cfg, 192)
     torch.testing.assert_close(torch.cat([a, b], 2), full, atol=1e-10, rtol=1e-10)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="FlexAttention needs a GPU")
+@pytest.mark.parametrize("select_block", [1, 16])
+def test_nsa_flex_matches_reference(select_block):
+    """NSA's flex path (three FlexAttention branches) equals the reference, forward and backward (fp32)."""
+    q, k, v, x = (t.float().clone().requires_grad_() for t in qkvx(L=512))
+    cfg = sv.NSAConfig(block=16, stride=8, page=16, topk=3, sink_pages=1, select_window=16, window=32,
+                       gate_init=(0.0, 0.0, 0.0), select_block=select_block)
+    nsa = sv.NSA(H, HQ, D, cfg).to(DEV)
+    for off in (0, 128):
+        ref = nsa(q[:, :, off:], k, v, x[:, off:], off, D**-0.5)
+        nsa.flex = True
+        out = nsa(q[:, :, off:], k, v, x[:, off:], off, D**-0.5)
+        nsa.flex = False
+        assert float((out - ref).abs().max() / ref.abs().max()) < 1e-2
+    g = torch.randn_like(ref)
+    gr = torch.autograd.grad((ref * g).sum(), (q, k, v, nsa.ck, nsa.gate.weight))
+    nsa.flex = True
+    gf = torch.autograd.grad((nsa(q[:, :, 128:], k, v, x[:, 128:], 128, D**-0.5) * g).sum(),
+                             (q, k, v, nsa.ck, nsa.gate.weight))
+    for a, b in zip(gf, gr):
+        assert float((a - b).abs().max() / b.abs().max()) < 2e-2

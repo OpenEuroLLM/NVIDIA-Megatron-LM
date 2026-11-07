@@ -90,6 +90,7 @@ class NSAConfig:
     select_window: int = 64  # local pages of the selection branch (tokens before the query's page)
     window: int = 512  # sliding-window branch
     gate_init: tuple = (-3.0, 3.0, -3.0)  # (compression, selection, window) gate biases
+    select_block: int = 1  # the selection branch's granularity (page_sparse.PageSparseConfig.select_block)
 
 
 class NSA(nn.Module):
@@ -98,6 +99,7 @@ class NSA(nn.Module):
         if cfg.block > cfg.page or cfg.block % cfg.stride:
             raise ValueError("NSA: block <= page and a multiple of stride")
         self.cfg, self.hq, self.d = cfg, num_heads, kv_channels
+        self.flex = False  # FlexAttention for the three branches (CUDA); the exact reference otherwise
         d, b = kv_channels, cfg.block
         self.pos = nn.Parameter(torch.zeros(b, d))  # intra-block position embedding
         # the compressors: [block * d] -> d, initialised to the block mean
@@ -147,15 +149,53 @@ class NSA(nn.Module):
                 imp.scatter_add_(-1, p1.expand(1, mass.shape[1], -1), mass * (1 - f0.to(mass.dtype)))
             return imp
 
-        o_cmp, imp = _attend_entries(q, kc, vc, ok, scale, reduce=importance)
         sel_cfg = ps.PageSparseConfig(selector="indexer", page=cfg.page, topk=cfg.topk,
-                                      window=cfg.select_window, sink_pages=cfg.sink_pages)
-        o_slc = ps.page_sparse_attention(q, k, v, sel_cfg, q_offset, scale, indexer_scores=imp)
+                                      window=cfg.select_window, sink_pages=cfg.sink_pages,
+                                      select_block=cfg.select_block)
         win_cfg = ps.PageSparseConfig(selector="window", page=cfg.page, window=cfg.window, sink_pages=0)
-        o_win = ps.page_sparse_attention(q, k, v, win_cfg, q_offset, scale)
+        if self.flex and q.is_cuda:
+            with torch.no_grad():  # the importances only (no probabilities out of the fused kernel)
+                _, imp = _attend_entries(q.detach(), kc.detach(), vc.detach(), ok, scale, reduce=importance)
+            o_cmp = self._flex_entries(q, kc, vc, q_offset, scale)
+            o_slc = ps.flex_page_sparse_attention(q, k, v, sel_cfg, q_offset, scale, imp, 64)
+            o_win = ps.flex_page_sparse_attention(q, k, v, win_cfg, q_offset, scale, None, 64)
+        else:
+            o_cmp, imp = _attend_entries(q, kc, vc, ok, scale, reduce=importance)
+            o_slc = ps.page_sparse_attention(q, k, v, sel_cfg, q_offset, scale, indexer_scores=imp)
+            o_win = ps.page_sparse_attention(q, k, v, win_cfg, q_offset, scale)
         gt = torch.sigmoid(ps._acc(self.gate(xq))).view(1, s, hq, 3).permute(0, 2, 1, 3)  # [1, hq, s, 3]
         out = gt[..., 0:1] * ps._acc(o_cmp) + gt[..., 1:2] * ps._acc(o_slc) + gt[..., 2:3] * ps._acc(o_win)
         return out.to(q.dtype)
+
+
+    def _flex_entries(self, q, kc, vc, q_offset, scale, q_block=64, kv_block=64):
+        """The compression branch through FlexAttention: entry e (tokens [e stride, e stride + block)) is visible
+        to the queries at or after its last token; queries without a visible entry get zeros."""
+        from torch.nn.attention.flex_attention import BlockMask
+
+        cfg = self.cfg
+        _, hq, s, d = q.shape
+        g, n = kc.shape[1], kc.shape[2]
+        if n == 0:
+            return torch.zeros_like(q)
+        nq, nk = -(-s // q_block), -(-n // kv_block)
+        last_q = q_offset + torch.arange(nq, device=q.device).clamp(max=nq) * q_block + q_block - 1
+        last_q = last_q.clamp(max=q_offset + s - 1)
+        n_vis = ((last_q - cfg.block + 1).div(cfg.stride, rounding_mode="floor") + 1).clamp(0, n)
+        kv_num = (-(-n_vis // kv_block)).to(torch.int32)
+        kv_idx = torch.arange(nk, device=q.device, dtype=torch.int32).expand(nq, nk).contiguous()
+        blk, st = cfg.block, cfg.stride
+
+        def mask_mod(bi, hi, qi, ki):
+            return ki * st + blk - 1 <= qi + q_offset
+
+        bm = BlockMask.from_kv_blocks(kv_num[None, None], kv_idx[None, None], BLOCK_SIZE=(q_block, kv_block),
+                                      mask_mod=mask_mod, seq_lengths=(s, n))
+        out = ps._flex()(q, kc.to(q.dtype), vc.to(q.dtype), block_mask=bm, scale=scale, enable_gqa=hq != g,
+                         kernel_options=ps.flex_kernel_options(q, q_block, kv_block))
+        # rows without a visible entry: zeros (as the reference), whatever the kernel leaves there
+        pos = q_offset + torch.arange(s, device=q.device)
+        return out.masked_fill((pos < blk - 1)[None, None, :, None], 0.0)
 
 
 # ----------------------------------------------------------------------------------------------- CSA2

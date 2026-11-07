@@ -50,7 +50,9 @@ class PageSparseCoreAttention(MegatronModule):
             self.variant = sv.NSA(config.hidden_size, config.num_attention_heads, kv, sv.NSAConfig(
                 block=config.page_sparse_nsa_block, stride=config.page_sparse_nsa_stride, page=self.cfg.page,
                 topk=self.cfg.topk, sink_pages=self.cfg.sink_pages,
-                select_window=config.page_sparse_nsa_select_window, window=self.cfg.window))
+                select_window=config.page_sparse_nsa_select_window, window=self.cfg.window,
+                select_block=config.page_sparse_select_block))
+            self.variant.flex = config.page_sparse_backend == "flex"
         elif self.cfg.selector == "csa2":
             self.variant = sv.CSA2(config.hidden_size, config.num_query_groups or config.num_attention_heads, kv,
                                    sv.CSA2Config(compress=self.cfg.compress,
