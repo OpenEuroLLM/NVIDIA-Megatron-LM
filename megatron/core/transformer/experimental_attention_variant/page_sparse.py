@@ -113,9 +113,10 @@ def _query_pages(s: int, q_offset: int, cfg: PageSparseConfig, device):
     return pos, pos // cfg.page
 
 
-def candidate_mask(s: int, P: int, q_offset: int, cfg: PageSparseConfig, device) -> torch.Tensor:
-    """[s, P]: the pages a selector may choose for each query (after the sinks, before the window)."""
-    _, cur = _query_pages(s, q_offset, cfg, device)
+def candidate_mask(s: int, P: int, q_offset: int, cfg: PageSparseConfig, device, pos=None) -> torch.Tensor:
+    """[s, P]: the pages a selector may choose for each query (after the sinks, before the window); ``pos`` the
+    queries' absolute positions (default q_offset .. q_offset + s - 1)."""
+    cur = (_query_pages(s, q_offset, cfg, device)[0] if pos is None else pos) // cfg.page
     p = torch.arange(P, device=device)
     first_window = cur - cfg.window // cfg.page
     return (p[None, :] >= cfg.sink_pages) & (p[None, :] < first_window[:, None])
@@ -133,8 +134,9 @@ def _causal_probs(q, k, q_pos, scale, k_lo=0):
     return torch.softmax(logits, -1).view(b, hq, sq, -1)
 
 
-def page_scores(q, k, cfg: PageSparseConfig, q_offset: int, scale: float, indexer_scores=None):
-    """Selector scores [b, s, P] of every page for every query (higher = more important)."""
+def page_scores(q, k, cfg: PageSparseConfig, q_offset: int, scale: float, indexer_scores=None, pos=None):
+    """Selector scores [b, s, P] of every page for every query (higher = more important); ``pos`` the queries'
+    absolute positions (default q_offset .. q_offset + s - 1; the oracle's causal mask)."""
     b, hq, s, d = q.shape
     g, L = k.shape[1], k.shape[2]
     rep = hq // g
@@ -153,7 +155,8 @@ def page_scores(q, k, cfg: PageSparseConfig, q_offset: int, scale: float, indexe
         return (torch.einsum("bgrsd,bgpd->bsp", qg.clamp(min=0), hi)
                 + torch.einsum("bgrsd,bgpd->bsp", qg.clamp(max=0), lo)) * scale
     if cfg.selector == "oracle":
-        pos, _ = _query_pages(s, q_offset, cfg, q.device)
+        if pos is None:
+            pos, _ = _query_pages(s, q_offset, cfg, q.device)
         out = []
         for c0 in range(0, s, cfg.score_chunk):
             c1 = min(s, c0 + cfg.score_chunk)
@@ -170,6 +173,19 @@ def selection_scores(q, k, cfg: PageSparseConfig, q_offset: int, scale: float, i
     block's anchor (the block's first query, or the chunk's first if the block started in an earlier chunk)."""
     s, L = q.shape[2], k.shape[2]
     P = -(-L // cfg.page)
+    if cfg.select_block > 1 and cfg.select_score == "first":  # score the anchors only (select_block x cheaper)
+        B = cfg.select_block
+        pos = q_offset + torch.arange(s, device=q.device)
+        anchor = ((pos // B) * B - q_offset).clamp(min=0)
+        uniq, inv = torch.unique(anchor, return_inverse=True)
+        apos = q_offset + uniq
+        cand = candidate_mask(len(uniq), P, q_offset, cfg, q.device, pos=apos)
+        idx = None if indexer_scores is None else indexer_scores[:, uniq]
+        sc = page_scores(q[:, :, uniq], k, cfg, q_offset, scale, idx, pos=apos).masked_fill(~cand[None],
+                                                                                         float("-inf"))
+        if cfg.hier_group > 0:
+            sc = hierarchical_restrict(sc, q[:, :, uniq], k, cfg, q_offset, scale, pos=apos)
+        return sc[:, inv]
     cand = candidate_mask(s, P, q_offset, cfg, q.device)
     sc = page_scores(q, k, cfg, q_offset, scale, indexer_scores).masked_fill(~cand[None], float("-inf"))
     if cfg.hier_group > 0:
@@ -193,7 +209,7 @@ def selection_scores(q, k, cfg: PageSparseConfig, q_offset: int, scale: float, i
     return sc
 
 
-def hierarchical_restrict(sc, q, k, cfg: PageSparseConfig, q_offset: int, scale: float):
+def hierarchical_restrict(sc, q, k, cfg: PageSparseConfig, q_offset: int, scale: float, pos=None):
     """Fine page scores sc [b, s, P] (candidates already masked to -inf) -> the same with every page outside the
     query's ``hier_topk`` best groups of ``hier_group`` pages masked too. Group scores: the selector on
     group-pooled keys (page_mean / quest / oracle), the best page's score otherwise (indexer)."""
@@ -203,7 +219,7 @@ def hierarchical_restrict(sc, q, k, cfg: PageSparseConfig, q_offset: int, scale:
     if cfg.selector in ("page_mean", "quest", "oracle"):
         coarse_cfg = PageSparseConfig(selector=cfg.selector, page=cfg.page * G, topk=cfg.topk, window=0,
                                       sink_pages=0, score_chunk=cfg.score_chunk)
-        coarse = page_scores(q, k, coarse_cfg, q_offset, scale)  # [b, s, ng]
+        coarse = page_scores(q, k, coarse_cfg, q_offset, scale, pos=pos)  # [b, s, ng]
         # a group counts only where it has a candidate page
         has = torch.isfinite(F.pad(sc, (0, ng * G - P), value=float("-inf")).view(b, s, ng, G)).any(-1)
         coarse = coarse[..., :ng].masked_fill(~has, float("-inf"))
@@ -479,16 +495,27 @@ def flex_page_sparse_attention(q, k, v, cfg: PageSparseConfig, q_offset: int = 0
         allowed = select_pages(q, k, cfg, q_offset, scale, indexer_scores)[0]  # [s, P]
         P = allowed.shape[1]
         nq = -(-s // q_block)
-        blk = F.pad(allowed, (0, 0, 0, nq * q_block - s)).view(nq, q_block, P).any(1)  # [nq, P]
-        kv_num = blk.sum(-1).to(torch.int32)
-        kv_idx = torch.argsort((~blk).to(torch.int8), dim=-1, stable=True).to(torch.int32)  # selected first
+        rows = F.pad(allowed, (0, 0, 0, nq * q_block - s)).view(nq, q_block, P)
+        blk = rows.any(1)  # [nq, P]: pages some query of the block attends
+        # full blocks (no mask_mod): pages every query of the block attends entirely -- allowed for all of them
+        # (padding rows count as allowed) and wholly before the block's first query
+        pad_ok = (torch.arange(nq * q_block, device=q.device) >= s).view(nq, q_block, 1)
+        first_q = q_offset + torch.arange(nq, device=q.device) * q_block
+        before = (torch.arange(P, device=q.device)[None, :] + 1) * page <= first_q[:, None] + 1
+        full = (rows | pad_ok).all(1) & before & blk
+        part = blk & ~full
+        kv_num = part.sum(-1).to(torch.int32)
+        kv_idx = torch.argsort((~part).to(torch.int8), dim=-1, stable=True).to(torch.int32)
+        full_num = full.sum(-1).to(torch.int32)
+        full_idx = torch.argsort((~full).to(torch.int8), dim=-1, stable=True).to(torch.int32)
         allowed_i = allowed.to(torch.int8)
 
     def mask_mod(bi, hi, qi, ki):
         return (ki <= qi + q_offset) & (allowed_i[qi, ki // page] > 0)
 
-    bm = BlockMask.from_kv_blocks(kv_num[None, None], kv_idx[None, None], BLOCK_SIZE=(q_block, page),
-                                  mask_mod=mask_mod, seq_lengths=(s, L))
+    bm = BlockMask.from_kv_blocks(kv_num[None, None], kv_idx[None, None], full_num[None, None],
+                                  full_idx[None, None], BLOCK_SIZE=(q_block, page), mask_mod=mask_mod,
+                                  seq_lengths=(s, L))
     return _flex()(q, k, v, block_mask=bm, scale=scale, enable_gqa=hq != g, return_lse=return_lse,
                    kernel_options=flex_kernel_options(q, q_block, page))
 

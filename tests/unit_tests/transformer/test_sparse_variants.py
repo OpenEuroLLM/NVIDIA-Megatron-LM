@@ -297,3 +297,21 @@ def test_block_selection_prev_max(selector):
     v2[:, :, 300:] -= 1.0
     torch.testing.assert_close(ps.page_sparse_attention(q, k2, v2, cfg)[:, :, :300], full[:, :, :300],
                                atol=1e-10, rtol=1e-10)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="FlexAttention needs a GPU")
+@pytest.mark.parametrize("selector", ["page_mean", "quest", "oracle"])
+@pytest.mark.parametrize("off", [0, 144])
+def test_block_selection_flex(selector, off):
+    """Block-wise selection through flex (full blocks without mask_mod: every query of the block attends the
+    page) equals the gathered reference, fwd and bwd (fp32), at aligned and mid-block chunk starts."""
+    q, k, v, _ = (t.float().clone().requires_grad_() for t in qkvx(L=512))
+    cfg = ps.PageSparseConfig(selector=selector, page=16, topk=3, window=32, sink_pages=1, select_block=32)
+    a = ps.flex_page_sparse_attention(q[:, :, off:], k, v, cfg, off, D**-0.5, None, 32)
+    ref = ps.page_sparse_attention(q[:, :, off:], k, v, cfg, off, D**-0.5)
+    assert float((a - ref).abs().max() / ref.abs().max()) < 1e-2
+    g = torch.randn_like(a)
+    ga = torch.autograd.grad((a * g).sum(), (q, k, v))
+    gb = torch.autograd.grad((ref * g).sum(), (q, k, v))
+    for x, y in zip(ga, gb):
+        assert float((x - y).abs().max() / y.abs().max()) < 2e-2
