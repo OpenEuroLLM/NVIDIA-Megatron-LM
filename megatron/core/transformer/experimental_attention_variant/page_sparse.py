@@ -478,15 +478,29 @@ def _flex():
     every length, and a static compile recompiles per length until dynamo's recompile limit, then falls back to
     the eager math path that materialises the whole score matrix (the s3 smoke: 48 GiB at 64k)."""
     if "fn" not in _FLEX:
-        import torch._dynamo
         from torch.nn.attention.flex_attention import flex_attention
 
-        cfg = torch._dynamo.config
-        for name in ("recompile_limit", "cache_size_limit"):  # a margin for the per-call-site graphs
-            if hasattr(cfg, name):
-                setattr(cfg, name, max(getattr(cfg, name), 64))
-        _FLEX["fn"] = torch.compile(flex_attention, dynamic=True)
+        compiled = torch.compile(flex_attention, dynamic=True)
+
+        def call(q, k, v, **kwargs):
+            # contiguous inputs: dynamic shapes do not cover strides, and the callers pass both permuted THD views
+            # (batch stride g * d) and contiguous copies (LSA's bucket order) -- each layout a recompile otherwise
+            _raise_recompile_limit()
+            return compiled(q.contiguous(), k.contiguous(), v.contiguous(), **kwargs)
+
+        _FLEX["fn"] = call
     return _FLEX["fn"]
+
+
+def _raise_recompile_limit(limit: int = 64) -> None:
+    """A margin for the per-call-site graphs, re-asserted on every call: the s3 smoke still hit the default 8 with
+    a one-time setting (something in the training stack resets dynamo's config)."""
+    import torch._dynamo
+
+    cfg = torch._dynamo.config
+    for name in ("recompile_limit", "cache_size_limit"):
+        if hasattr(cfg, name) and getattr(cfg, name) < limit:
+            setattr(cfg, name, limit)
 
 
 def select_pages(q, k, cfg: PageSparseConfig, q_offset: int = 0, scale: float | None = None,

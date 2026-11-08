@@ -355,16 +355,26 @@ def test_flex_selection_reuse(per_group):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="FlexAttention needs a GPU")
 def test_flex_many_lengths_stay_compiled():
-    """Packed documents have every length: flex compiles with dynamic shapes, so a run of distinct lengths and
-    offsets neither exhausts dynamo's recompile limit (-> the eager math fallback) nor changes the results."""
+    """Packed documents have every length and the callers pass two memory layouts: flex compiles with dynamic
+    shapes on contiguous inputs, so distinct lengths, offsets and layouts neither exhaust dynamo's recompile limit
+    (-> the eager math fallback) nor change the results."""
     from torch._dynamo.utils import counters
 
     counters.clear()  # this test's graphs only
     cfg = ps.PageSparseConfig(selector="page_mean", page=16, topk=3, window=32, sink_pages=1, select_block=32)
-    for L, off in [(130, 0), (257, 0), (300, 44), (512, 0), (333, 100), (190, 0), (450, 64), (275, 0), (380, 0),
-                   (222, 30)]:
+    for i, (L, off) in enumerate([(130, 0), (257, 0), (300, 44), (512, 0), (333, 100), (190, 0), (450, 64),
+                                  (275, 0), (380, 0), (222, 30)]):
         q, k, v, _ = (t.float() for t in qkvx(L=L, seed=L))
+        if i % 2:  # the THD layout: permuted views of [L, heads, d] (batch stride heads * d), as in training
+            q, k, v = (t[0].permute(1, 0, 2).contiguous().permute(1, 0, 2).unsqueeze(0) for t in (q, k, v))
         a = ps.flex_page_sparse_attention(q[:, :, off:], k, v, cfg, off, D**-0.5, None, 32)
         ref = ps.page_sparse_attention(q[:, :, off:], k, v, cfg, off, D**-0.5)
         assert float((a - ref).abs().max() / ref.abs().max()) < 1e-2, (L, off)
     assert counters["stats"]["unique_graphs"] <= 4, dict(counters["stats"])  # 10 lengths, few graphs
+    # a reset of dynamo's config elsewhere (the training stack hit the default 8 in the s3 smoke): every flex call
+    # restores the margin before dynamo checks it
+    import torch._dynamo
+
+    torch._dynamo.config.recompile_limit = 8
+    ps.flex_page_sparse_attention(q, k, v, cfg, 0, D**-0.5, None, 32)
+    assert torch._dynamo.config.recompile_limit >= 64
