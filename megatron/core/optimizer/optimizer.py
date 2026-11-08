@@ -837,8 +837,10 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
                 timers('optimizer-unscale-and-check-inf').stop()
 
             # We are done with scaling gradients
-            # so we can update the loss scale.
-            self.grad_scaler.update(found_inf_flag)
+            # so we can update the loss scale (a scaler shared in a chain: the chain updates it
+            # once, after every optimizer has unscaled by the same scale).
+            if not getattr(self, '_defer_grad_scaler_update', False):
+                self.grad_scaler.update(found_inf_flag)
 
             return found_inf_flag
 
@@ -1663,6 +1665,15 @@ class ChainedOptimizer(MegatronOptimizer):
         else:
             self.is_stub_optimizer = True
         self.chained_optimizers = chained_optimizers
+        # One loss scaler shared by several optimizers (the emerging-optimizer chain under fp16):
+        # each unscales by it, and prepare_grads updates it once per step.
+        scalers = [getattr(optimizer, 'grad_scaler', None) for optimizer in chained_optimizers]
+        scalers = [scaler for scaler in scalers if scaler is not None]
+        self._shared_grad_scaler = None
+        if len(scalers) > 1 and all(scaler is scalers[0] for scaler in scalers):
+            self._shared_grad_scaler = scalers[0]
+            for optimizer in chained_optimizers:
+                optimizer._defer_grad_scaler_update = True
 
     @property
     def optimizer(self):
@@ -1958,6 +1969,8 @@ class ChainedOptimizer(MegatronOptimizer):
         found_inf_flag = False
         for optimizer in self.chained_optimizers:
             found_inf_flag |= optimizer.prepare_grads()
+        if self._shared_grad_scaler is not None:
+            self._shared_grad_scaler.update(found_inf_flag)
 
         return found_inf_flag
 

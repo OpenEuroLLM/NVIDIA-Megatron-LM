@@ -67,7 +67,7 @@ from .emerging_optimizers import (
     _create_emerging_optimizer,
     _get_qkv_split_shapes,
 )
-from .grad_scaler import ConstantGradScaler, DynamicGradScaler
+from .grad_scaler import ConstantGradScaler, DynamicGradScaler, MegatronGradScaler
 from .layer_wise_optimizer import LayerWiseDistributedOptimizer, is_managed_by_layer_wise_optimizer
 from .optimizer import (
     ChainedOptimizer,
@@ -608,6 +608,23 @@ def _get_param_groups_and_buffers(
     return param_groups, buffers
 
 
+def _make_grad_scaler(config: OptimizerConfig) -> Optional[MegatronGradScaler]:
+    """The loss scaler of ``config``: constant with a loss scale, dynamic under fp16 without one,
+    else None (bf16 / fp32)."""
+    if config.loss_scale:
+        return ConstantGradScaler(config.loss_scale)
+    if config.fp16:
+        return DynamicGradScaler(
+            initial_scale=config.initial_loss_scale,
+            min_scale=config.min_loss_scale,
+            growth_factor=2.0,
+            backoff_factor=0.5,
+            growth_interval=config.loss_scale_window,
+            hysteresis=config.hysteresis,
+        )
+    return None
+
+
 def _get_megatron_optimizer_based_on_param_groups(
     config: OptimizerConfig,
     model_chunks: List[MegatronModule],
@@ -621,6 +638,7 @@ def _get_megatron_optimizer_based_on_param_groups(
     distributed_optimizer_instance_id: Optional[int] = 0,
     pg_collection: Optional[ProcessGroupCollection] = None,
     skip_megatron_wrapping: bool = False,
+    grad_scaler: Optional[MegatronGradScaler] = None,
 ) -> Union[MegatronOptimizer, Tuple[Optional[torch.optim.Optimizer], Optional[Callable]]]:
     """Get Megatron optimizer based on parameter groups.
 
@@ -641,6 +659,8 @@ def _get_megatron_optimizer_based_on_param_groups(
             ``(optimizer, init_state_fn)`` tuple of the raw PyTorch optimizer
             without any Megatron wrapping. Useful when the caller
             (e.g. LayerWiseDistributedOptimizer) performs its own wrapping.
+        grad_scaler (MegatronGradScaler, optional): a loss scaler shared with other optimizers
+            of a chain (the emerging-optimizer chain under fp16); by default one of its own.
 
     Returns:
         Instance of MegatronOptimizer, or ``(optimizer, init_state_fn)`` when
@@ -838,23 +858,9 @@ def _get_megatron_optimizer_based_on_param_groups(
         #       dynamic scaler.
         #    otherwise we are running in bf16 with no loss-scale so
         #       leave it as None.
-        grad_scaler = None
-
-        # Constant loss scale.
-        if config.loss_scale:
-            grad_scaler = ConstantGradScaler(config.loss_scale)
-
-        # Dynamic loss scale.
-        else:
-            if config.fp16:
-                grad_scaler = DynamicGradScaler(
-                    initial_scale=config.initial_loss_scale,
-                    min_scale=config.min_loss_scale,
-                    growth_factor=2.0,
-                    backoff_factor=0.5,
-                    growth_interval=config.loss_scale_window,
-                    hysteresis=config.hysteresis,
-                )
+        # A caller's shared scaler takes precedence.
+        if grad_scaler is None:
+            grad_scaler = _make_grad_scaler(config)
 
         optimizer_args = [optimizer, config, grad_scaler, init_state_fn]
         if config.use_distributed_optimizer:
@@ -1142,8 +1148,13 @@ def _get_megatron_emerging_optimizer(
     )
     if eopt_name not in _EMERGING_OPTIMIZERS:
         raise ValueError(f"Unsupported emerging optimizer: {eopt_name}")
-    if config.fp16:
-        raise ValueError('emerging optimizer with fp16 is not supported.')
+    if config.fp16 and use_layer_wise:
+        raise ValueError('emerging optimizer with fp16: not with the layer-wise optimizer.')
+    # fp16: ONE loss scaler for every optimizer of the chain (the emerging optimizer's groups and
+    # the Adam groups, dense and expert). The loss is scaled by the first optimizer's scale, so
+    # every optimizer must unscale by it; ChainedOptimizer updates a shared scaler once per step
+    # with the overflow of any of them (separate scalers drift apart after an overflow in one).
+    shared_grad_scaler = _make_grad_scaler(config) if config.fp16 else None
 
     if pg_collection is None:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -1235,9 +1246,9 @@ def _get_megatron_emerging_optimizer(
             if use_layer_wise:
                 layer_wise_base_results.append((optimizer, init_state_fn))
                 continue
-            if config.bf16:
+            if config.bf16 or config.fp16:
                 optimizer = Float16OptimizerWithFloat16Params(
-                    optimizer, config, None, init_state_fn
+                    optimizer, config, shared_grad_scaler, init_state_fn
                 )
             else:
                 optimizer = FP32Optimizer(optimizer, config, init_state_fn)
@@ -1303,6 +1314,7 @@ def _get_megatron_emerging_optimizer(
                     model_parallel_group=model_parallel_group,
                     pg_collection=pg_collection,
                     skip_megatron_wrapping=use_layer_wise,
+                    grad_scaler=shared_grad_scaler,
                 )
                 if use_layer_wise:
                     layer_wise_base_results.append(result)

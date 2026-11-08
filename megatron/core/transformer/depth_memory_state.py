@@ -521,6 +521,10 @@ def make_workspace(config, total_edges: int):
             span=config.depth_memory_window,
             running_covariance_dtype=config.depth_memory_covariance_dtype,
         )
+        if getattr(config, "fp16", False):
+            # FP16 training: the kernels' 16-bit tapes and state (M, residuals, reads, DY / DV)
+            # in FP16, the stream's type (cute_kernels with storage_dtype)
+            settings["storage_dtype"] = "float16"
         if getattr(config, "depth_memory_unwind", False):
             # full recompute: the per-edge tapes travel in the stream as records, the recomputed
             # layers read from the running state, nothing of the state is checkpointed; the

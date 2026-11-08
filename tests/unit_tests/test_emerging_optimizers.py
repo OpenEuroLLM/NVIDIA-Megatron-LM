@@ -274,15 +274,17 @@ class TestMuonOptimizerMultiRank:
         model.requires_grad_(True)
         model = self.create_ddp_model(model)
 
-        # Test 1: FP16 should raise exception
+        # Test 1: FP16 with the layer-wise optimizer should raise exception (the standard
+        # chain supports it: test_get_megatron_optimizer_fp16_shared_scaler)
         optimizer_config_fp16 = OptimizerConfig(
             optimizer='muon',
             lr=0.01,
             fp16=True,  # This should cause an exception
             use_distributed_optimizer=False,
+            use_layer_wise_distributed_optimizer=True,
         )
 
-        with pytest.raises(Exception, match='emerging optimizer with fp16 is not supported'):
+        with pytest.raises(Exception, match='emerging optimizer with fp16: not with the layer-wise'):
             get_megatron_optimizer(config=optimizer_config_fp16, model_chunks=[model])
 
         # Test 3: Invalid num_ns_steps should raise exception
@@ -430,6 +432,76 @@ def test_muon_optimizer_different_modes_single_rank(mode):
     assert not torch.equal(
         model.weight.data, original_weight
     ), f"Weight should be updated with mode={mode}"
+
+
+class TestEmergingOptimizerFp16:
+    """fp16 with the emerging-optimizer chain (any world size)."""
+
+    @pytest.fixture(autouse=True)
+    def setup_and_teardown(self):
+        Utils.initialize_model_parallel()
+        yield
+        Utils.destroy_model_parallel()
+
+    def create_ddp_model(self, model):
+        ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
+        return DistributedDataParallel(
+            TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
+        )
+
+    def test_get_megatron_optimizer_fp16_shared_scaler(self):
+        """fp16: every optimizer of the emerging chain (Muon matrices, Adam biases) unscales by
+        ONE dynamic loss scaler, which the chain updates once per step; an overflow in any group
+        skips the whole step and backs the scale off once."""
+        model = Net().half().cuda()
+        model.requires_grad_(True)
+        model = self.create_ddp_model(model)
+        optimizer_config = OptimizerConfig(
+            optimizer='muon',
+            lr=0.01,
+            fp16=True,
+            initial_loss_scale=2.0**10,
+            hysteresis=1,
+            loss_scale_window=2,
+            use_distributed_optimizer=False,
+            muon_tp_mode="duplicated",
+        )
+        optimizer = get_megatron_optimizer(
+            config=optimizer_config, model_chunks=[model], use_gloo_process_groups=True
+        )
+        scalers = [opt.grad_scaler for opt in optimizer.chained_optimizers]
+        assert len(scalers) >= 2, "a Muon and an Adam optimizer"
+        assert all(scaler is scalers[0] for scaler in scalers)
+        assert optimizer._shared_grad_scaler is scalers[0]
+        scaler = scalers[0]
+
+        def backward(poison=None):
+            optimizer.zero_grad()
+            output = model(torch.randn(16, 80, dtype=torch.half, device='cuda'))
+            (output.float().sum() * optimizer.get_loss_scale()).backward()
+            if poison is not None:
+                poison.main_grad[0].fill_(float('inf'))
+
+        # A clean step updates every parameter; two clean steps grow the scale once (window 2,
+        # one update per step: per-optimizer updates would have grown it after the first step)
+        before = {name: p.data.clone() for name, p in model.named_parameters()}
+        backward()
+        success, _, _ = optimizer.step()
+        assert success
+        assert all(not torch.equal(p.data, before[n]) for n, p in model.named_parameters())
+        assert scaler.scale.item() == 2.0**10
+        backward()
+        assert optimizer.step()[0]
+        assert scaler.scale.item() == 2.0**11
+
+        # An overflow in an Adam-managed bias skips the step for everyone, halving the scale once
+        bias = model.module.fc5.bias
+        before = {name: p.data.clone() for name, p in model.named_parameters()}
+        backward(poison=bias)
+        success, _, _ = optimizer.step()
+        assert not success
+        assert all(torch.equal(p.data, before[n]) for n, p in model.named_parameters())
+        assert scaler.scale.item() == 2.0**10
 
 
 @pytest.mark.skipif(
