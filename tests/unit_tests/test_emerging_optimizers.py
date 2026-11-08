@@ -274,18 +274,7 @@ class TestMuonOptimizerMultiRank:
         model.requires_grad_(True)
         model = self.create_ddp_model(model)
 
-        # Test 1: FP16 with the layer-wise optimizer should raise exception (the standard
-        # chain supports it: test_get_megatron_optimizer_fp16_shared_scaler)
-        optimizer_config_fp16 = OptimizerConfig(
-            optimizer='muon',
-            lr=0.01,
-            fp16=True,  # This should cause an exception
-            use_distributed_optimizer=False,
-            use_layer_wise_distributed_optimizer=True,
-        )
-
-        with pytest.raises(Exception, match='emerging optimizer with fp16: not with the layer-wise'):
-            get_megatron_optimizer(config=optimizer_config_fp16, model_chunks=[model])
+        # (fp16 is supported: TestEmergingOptimizerFp16)
 
         # Test 3: Invalid num_ns_steps should raise exception
         optimizer_config_invalid_ns = OptimizerConfig(
@@ -443,19 +432,33 @@ class TestEmergingOptimizerFp16:
         yield
         Utils.destroy_model_parallel()
 
-    def create_ddp_model(self, model):
+    def create_ddp_model(self, model, layer_wise):
+        if layer_wise:
+            # the precomputed layout: LayerWise (Muon) chained with a DistributedOptimizer (Adam)
+            from megatron.training.training import wrap_model_chunks_with_ddp
+
+            return wrap_model_chunks_with_ddp(
+                [model],
+                TransformerConfig(num_attention_heads=1, num_layers=1),
+                DistributedDataParallelConfig(),
+                use_layer_wise_distributed_optimizer=True,
+            )[0]
         ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
         return DistributedDataParallel(
             TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
         )
 
-    def test_get_megatron_optimizer_fp16_shared_scaler(self):
-        """fp16: every optimizer of the emerging chain (Muon matrices, Adam biases) unscales by
-        ONE dynamic loss scaler, which the chain updates once per step; an overflow in any group
-        skips the whole step and backs the scale off once."""
+    @pytest.mark.parametrize("layer_wise", [False, True])
+    def test_get_megatron_optimizer_fp16_shared_scaler(self, layer_wise):
+        """fp16: every optimizer of the emerging chain (Muon matrices, Adam biases; inside the
+        layer-wise optimizer too) unscales by ONE dynamic loss scaler, which the outermost chain
+        updates once per step; an overflow in any group skips the whole step and backs the
+        scale off once."""
+        from megatron.core.optimizer.optimizer import ChainedOptimizer, _descendant_optimizers
+
         model = Net().half().cuda()
         model.requires_grad_(True)
-        model = self.create_ddp_model(model)
+        model = self.create_ddp_model(model, layer_wise)
         optimizer_config = OptimizerConfig(
             optimizer='muon',
             lr=0.01,
@@ -464,15 +467,20 @@ class TestEmergingOptimizerFp16:
             hysteresis=1,
             loss_scale_window=2,
             use_distributed_optimizer=False,
+            use_layer_wise_distributed_optimizer=layer_wise,
             muon_tp_mode="duplicated",
         )
         optimizer = get_megatron_optimizer(
             config=optimizer_config, model_chunks=[model], use_gloo_process_groups=True
         )
-        scalers = [opt.grad_scaler for opt in optimizer.chained_optimizers]
+        below = _descendant_optimizers(optimizer.chained_optimizers)
+        leaves = [opt for opt in below if not isinstance(opt, ChainedOptimizer)]
+        scalers = [opt.grad_scaler for opt in leaves]
         assert len(scalers) >= 2, "a Muon and an Adam optimizer"
         assert all(scaler is scalers[0] for scaler in scalers)
         assert optimizer._shared_grad_scaler is scalers[0]
+        assert all(opt._defer_grad_scaler_update for opt in below)
+        assert not getattr(optimizer, '_defer_grad_scaler_update', False)
         scaler = scalers[0]
 
         def backward(poison=None):

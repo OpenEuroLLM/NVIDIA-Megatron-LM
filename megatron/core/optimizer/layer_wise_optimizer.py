@@ -454,6 +454,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         pg_collection: Optional[ProcessGroupCollection] = None,
         init_state_fn_list: Optional[List[Callable]] = None,
         model_chunks: Optional[List] = None,
+        grad_scaler=None,
     ) -> None:
         """
         Initialize LayerWiseDistributedOptimizer.
@@ -464,6 +465,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             pg_collection: ProcessGroupCollection.
             init_state_fn_list: List of init state functions.
             model_chunks: DDP-wrapped model chunks.
+            grad_scaler: fp16 -- the loss scaler shared with the rest of the optimizer chain
+                (every wrapped optimizer unscales by it; the outermost chain updates it).
         """
 
         self.pg_collection = pg_collection
@@ -522,10 +525,12 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 optimizers
             ), "init_state_fn_list must be the same length as optimizers if provided"
 
-        # Wrap base torch optimizers with Float16 for bf16 training.
+        # Wrap base torch optimizers with Float16 for bf16 / fp16 training.
         # Callers pass base optimizers; wrapping happens here *after*
         # shard_params so master weights are only created for the local shard.
-        if config.bf16:
+        if config.fp16:
+            assert grad_scaler is not None, 'fp16 expects a (shared) grad scaler.'
+        if config.bf16 or config.fp16:
             for i in range(len(optimizers)):
                 opt = optimizers[i]
                 if isinstance(opt, (Float16OptimizerWithFloat16Params, FP32Optimizer)):
@@ -534,7 +539,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                         f'got {type(opt).__name__}. Do not pre-wrap with Megatron optimizers.'
                     )
                 optimizers[i] = Float16OptimizerWithFloat16Params(
-                    opt, config, None, init_state_fn_list[i] if init_state_fn_list else None
+                    opt, config, grad_scaler, init_state_fn_list[i] if init_state_fn_list else None
                 )
 
         super().__init__(optimizers)

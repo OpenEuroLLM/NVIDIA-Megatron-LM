@@ -1635,6 +1635,25 @@ class ProxyDict:
                 yield (idx, inner_key), value
 
 
+def _descendant_optimizers(optimizers) -> list:
+    """``optimizers`` and, for the chained ones, every optimizer below them."""
+    found = []
+    for optimizer in optimizers:
+        found.append(optimizer)
+        if isinstance(optimizer, ChainedOptimizer):
+            found += _descendant_optimizers(optimizer.chained_optimizers)
+    return found
+
+
+def _leaf_grad_scalers(optimizers) -> list:
+    """The grad scalers of the non-chained optimizers below ``optimizers`` (None where unset)."""
+    return [
+        getattr(optimizer, 'grad_scaler', None)
+        for optimizer in _descendant_optimizers(optimizers)
+        if not isinstance(optimizer, ChainedOptimizer)
+    ]
+
+
 class ChainedOptimizer(MegatronOptimizer):
     """ChainedOptimizer is designed for a collection of optimizers.
 
@@ -1665,14 +1684,16 @@ class ChainedOptimizer(MegatronOptimizer):
         else:
             self.is_stub_optimizer = True
         self.chained_optimizers = chained_optimizers
-        # One loss scaler shared by several optimizers (the emerging-optimizer chain under fp16):
-        # each unscales by it, and prepare_grads updates it once per step.
-        scalers = [getattr(optimizer, 'grad_scaler', None) for optimizer in chained_optimizers]
-        scalers = [scaler for scaler in scalers if scaler is not None]
+        # One loss scaler for every optimizer below (the emerging-optimizer chain under fp16,
+        # nested chains such as the layer-wise optimizer included): each unscales by it, and
+        # prepare_grads updates it once per step with the overflow of any rank -- in the
+        # outermost chain, which defers every optimizer below (an enclosing chain built later
+        # defers this one in turn). Separate scalers (the standard MoE fp16 chain) stay as they are.
+        scalers = [scaler for scaler in _leaf_grad_scalers(chained_optimizers) if scaler is not None]
         self._shared_grad_scaler = None
-        if len(scalers) > 1 and all(scaler is scalers[0] for scaler in scalers):
+        if scalers and all(scaler is scalers[0] for scaler in scalers):
             self._shared_grad_scaler = scalers[0]
-            for optimizer in chained_optimizers:
+            for optimizer in _descendant_optimizers(chained_optimizers):
                 optimizer._defer_grad_scaler_update = True
 
     @property
@@ -1969,7 +1990,16 @@ class ChainedOptimizer(MegatronOptimizer):
         found_inf_flag = False
         for optimizer in self.chained_optimizers:
             found_inf_flag |= optimizer.prepare_grads()
-        if self._shared_grad_scaler is not None:
+        if getattr(self, '_shared_grad_scaler', None) is not None and not getattr(
+            self, '_defer_grad_scaler_update', False
+        ):
+            # Every rank skips together: the optimizers reduce their overflow flags over their
+            # own groups only (the layer-wise one: the model-parallel group, while each data-
+            # parallel rank owns other parameters).
+            if torch.distributed.is_initialized():
+                flag = torch.tensor([float(found_inf_flag)], device='cuda')
+                torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MAX)
+                found_inf_flag = bool(flag.item() > 0)
             self._shared_grad_scaler.update(found_inf_flag)
 
         return found_inf_flag

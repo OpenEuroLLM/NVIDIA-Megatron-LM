@@ -1148,12 +1148,11 @@ def _get_megatron_emerging_optimizer(
     )
     if eopt_name not in _EMERGING_OPTIMIZERS:
         raise ValueError(f"Unsupported emerging optimizer: {eopt_name}")
-    if config.fp16 and use_layer_wise:
-        raise ValueError('emerging optimizer with fp16: not with the layer-wise optimizer.')
     # fp16: ONE loss scaler for every optimizer of the chain (the emerging optimizer's groups and
-    # the Adam groups, dense and expert). The loss is scaled by the first optimizer's scale, so
-    # every optimizer must unscale by it; ChainedOptimizer updates a shared scaler once per step
-    # with the overflow of any of them (separate scalers drift apart after an overflow in one).
+    # the Adam groups, dense and expert; inside the layer-wise optimizer too). The loss is scaled
+    # by the first optimizer's scale, so every optimizer must unscale by it; the outermost
+    # ChainedOptimizer updates a shared scaler once per step with the overflow of any of them on
+    # any rank (separate scalers drift apart after an overflow in one).
     shared_grad_scaler = _make_grad_scaler(config) if config.fp16 else None
 
     if pg_collection is None:
@@ -1293,6 +1292,7 @@ def _get_megatron_emerging_optimizer(
                     distributed_optimizer_instance_id=0,
                     pg_collection=pg_collection,
                     skip_megatron_wrapping=False,
+                    grad_scaler=shared_grad_scaler,
                 )
                 # TODO(deyuf): ChainedOptimizer currently asserts all sub-optimizers
                 # share the same config. Reset to the top-level config so the
@@ -1336,6 +1336,7 @@ def _get_megatron_emerging_optimizer(
             pg_collection,
             init_state_fn_list=list(init_fns),
             model_chunks=model_chunks,
+            grad_scaler=shared_grad_scaler,
         )
         # LayerWise owns Muon-managed params; DistOpt instances in ``results``
         # own the rest. Chain them so the training loop sees one optimizer.
