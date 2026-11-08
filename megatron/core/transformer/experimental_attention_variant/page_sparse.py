@@ -474,10 +474,18 @@ _FLEX = {}
 
 
 def _flex():
+    """The compiled FlexAttention, with dynamic shapes: packed documents (and CP chunks, entry / bucket counts) have
+    every length, and a static compile recompiles per length until dynamo's recompile limit, then falls back to
+    the eager math path that materialises the whole score matrix (the s3 smoke: 48 GiB at 64k)."""
     if "fn" not in _FLEX:
+        import torch._dynamo
         from torch.nn.attention.flex_attention import flex_attention
 
-        _FLEX["fn"] = torch.compile(flex_attention, dynamic=False)
+        cfg = torch._dynamo.config
+        for name in ("recompile_limit", "cache_size_limit"):  # a margin for the per-call-site graphs
+            if hasattr(cfg, name):
+                setattr(cfg, name, max(getattr(cfg, name), 64))
+        _FLEX["fn"] = torch.compile(flex_attention, dynamic=True)
     return _FLEX["fn"]
 
 

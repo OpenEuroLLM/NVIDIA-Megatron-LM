@@ -351,3 +351,20 @@ def test_flex_selection_reuse(per_group):
     _, sel = ps.page_sparse_attention(q, k, v, cfg, return_selection=True)
     ref2 = ps.page_sparse_attention(q2, k2, v2, cfg, selection=sel)
     assert float((b - ref2).abs().max() / ref2.abs().max()) < 1e-2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="FlexAttention needs a GPU")
+def test_flex_many_lengths_stay_compiled():
+    """Packed documents have every length: flex compiles with dynamic shapes, so a run of distinct lengths and
+    offsets neither exhausts dynamo's recompile limit (-> the eager math fallback) nor changes the results."""
+    from torch._dynamo.utils import counters
+
+    counters.clear()  # this test's graphs only
+    cfg = ps.PageSparseConfig(selector="page_mean", page=16, topk=3, window=32, sink_pages=1, select_block=32)
+    for L, off in [(130, 0), (257, 0), (300, 44), (512, 0), (333, 100), (190, 0), (450, 64), (275, 0), (380, 0),
+                   (222, 30)]:
+        q, k, v, _ = (t.float() for t in qkvx(L=L, seed=L))
+        a = ps.flex_page_sparse_attention(q[:, :, off:], k, v, cfg, off, D**-0.5, None, 32)
+        ref = ps.page_sparse_attention(q[:, :, off:], k, v, cfg, off, D**-0.5)
+        assert float((a - ref).abs().max() / ref.abs().max()) < 1e-2, (L, off)
+    assert counters["stats"]["unique_graphs"] <= 4, dict(counters["stats"])  # 10 lengths, few graphs
