@@ -644,6 +644,13 @@ class TransformerConfig(ModelParallelConfig):
     """Block selection score: first (the block's first query) or prev_max (max over it and the previous block's
     queries; causal)."""
 
+    page_sparse_per_group: bool = False
+    """One page selection per KV group (from that group's query heads and keys) instead of one for all heads."""
+
+    page_sparse_share_source: int = 0
+    """Share one selection across the attention layers: the layer with this layer number selects, the others reuse
+    it (0: every layer selects; page selectors; no pipeline parallelism)."""
+
     page_sparse_hier_group: int = 0
     """Hierarchical (coarse-to-fine) page selection: pages per group, scored first (0: flat)."""
 
@@ -2354,6 +2361,11 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError("page_sparse_backend must be flex or gathered")
             if self.page_sparse_dense_forward and self.page_sparse_selector not in ("indexer", "csa2"):
                 raise ValueError("page_sparse_dense_forward is the indexer warm-up (selector indexer or csa2)")
+            if self.page_sparse_share_source:
+                if self.page_sparse_selector not in ("window", "page_mean", "quest", "oracle", "indexer"):
+                    raise ValueError("page_sparse_share_source: page selectors only")
+                if self.pipeline_model_parallel_size > 1:
+                    raise ValueError("page_sparse_share_source needs pipeline_model_parallel_size 1")
             if self.page_sparse_hier_group and self.page_sparse_selector not in (
                     "page_mean", "quest", "oracle", "indexer"):
                 raise ValueError("page_sparse_hier_group: page selectors only (page_mean, quest, oracle, indexer)")

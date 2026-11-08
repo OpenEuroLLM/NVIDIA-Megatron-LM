@@ -15,7 +15,11 @@ like the MoE aux losses); ``page_sparse_dense_forward`` keeps the LM on dense at
 ``nsa`` / ``csa2`` / ``lsa``: the trained variants of sparse_variants.py (NSA's compression + selection + window
 branches with gates; CSA2's learned m:1 main-KV compression, lightning indexer on the compressed keys -- KL
 warm-up like ``indexer`` -- and raw SWA; LSA's clustered key index). ``page_sparse_hier_*``: coarse-to-fine
-selection for the page selectors.
+selection for the page selectors. ``page_sparse_per_group``: one selection per KV group.
+``page_sparse_share_source``: the attention layer of that layer number selects, the other attention layers reuse
+its selection (one index shared across layers, V4.1-style): the source clears and fills a per-forward store, the
+others read it -- valid while the source runs before them on the same micro-batch (forward, and full recompute
+without pipeline parallelism).
 """
 
 from __future__ import annotations
@@ -25,6 +29,10 @@ import torch
 from megatron.core.transformer.experimental_attention_variant import page_sparse as ps
 from megatron.core.transformer.experimental_attention_variant import sparse_variants as sv
 from megatron.core.transformer.module import MegatronModule
+
+
+# the shared selection of the current micro-batch: (document start, query offset) -> the source layer's selection
+_SHARED_SELECTION: dict = {}
 
 
 class PageSparseCoreAttention(MegatronModule):
@@ -37,8 +45,9 @@ class PageSparseCoreAttention(MegatronModule):
             window=config.page_sparse_window, sink_pages=config.page_sparse_sink_pages,
             compress=config.page_sparse_compress, hier_group=config.page_sparse_hier_group,
             hier_topk=config.page_sparse_hier_topk, select_block=config.page_sparse_select_block,
-            select_score=config.page_sparse_select_score,
+            select_score=config.page_sparse_select_score, per_group=config.page_sparse_per_group,
         )
+        self.share_source = config.page_sparse_share_source  # 0: every layer selects for itself
         cp = pg_collection.cp if pg_collection is not None else None
         self.cp_group = cp if cp is not None and cp.size() > 1 else None
         kv = config.kv_channels or config.hidden_size // config.num_attention_heads
@@ -82,7 +91,20 @@ class PageSparseCoreAttention(MegatronModule):
         self._hidden = hidden_states
 
     # ------------------------------------------------------------------ one document / sequence
-    def _attend(self, q, k, v, q_offset, xq, kpages, kfeat=None):
+    def _page_select(self, fn, key, *args, **kwargs):
+        """A page selector's attention ``fn``, sharing the selection across layers when configured."""
+        if not self.share_source:
+            return fn(*args, **kwargs)
+        if self.layer_number == self.share_source:
+            out, sel = fn(*args, return_selection=True, **kwargs)
+            _SHARED_SELECTION[key] = sel
+            return out
+        if key not in _SHARED_SELECTION:
+            raise RuntimeError(f"page_sparse_share_source {self.share_source}: no selection for {key} -- the source "
+                               "layer must run before this one on the same micro-batch")
+        return fn(*args, selection=_SHARED_SELECTION[key], **kwargs)
+
+    def _attend(self, q, k, v, q_offset, xq, kpages, kfeat=None, key=(0, 0)):
         """q [1, hq, sq, d] at positions q_offset.., k / v [1, g, L, d]; xq [1, sq, h] and kpages [1, P, dim]
         for the indexer; kfeat [1, L, F] the key side's per-token features (csa2: the compression weights).
         Returns (out [1, hq, sq, d], indexer loss or None)."""
@@ -113,13 +135,16 @@ class PageSparseCoreAttention(MegatronModule):
             return ps.dense_attention(q, k, v, q_offset, self.scale), loss
         sel_scores = None if scores is None else scores.detach()  # no gradient through the selection
         if self.flex and q.is_cuda:
-            return ps.flex_page_sparse_attention(q, k, v, self.cfg, q_offset, self.scale, sel_scores,
-                                                 self.q_block), loss
-        return ps.page_sparse_attention(q, k, v, self.cfg, q_offset, self.scale, sel_scores), loss
+            return self._page_select(ps.flex_page_sparse_attention, key, q, k, v, self.cfg, q_offset, self.scale,
+                                     sel_scores, self.q_block), loss
+        return self._page_select(ps.page_sparse_attention, key, q, k, v, self.cfg, q_offset, self.scale,
+                                 sel_scores), loss
 
     def forward(self, query, key, value, attention_mask=None, attn_mask_type=None, attention_bias=None,
                 packed_seq_params=None, **kwargs):
         thd = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
+        if self.share_source and self.layer_number == self.share_source:
+            _SHARED_SELECTION.clear()  # a new micro-batch (or its recompute): the source refills
         if attention_bias is not None:
             raise NotImplementedError("page_sparse_selector: attention_bias")
         out, losses = (self._forward_thd if thd else self._forward_sbhd)(query, key, value, packed_seq_params)
@@ -152,7 +177,7 @@ class PageSparseCoreAttention(MegatronModule):
                 xq = self._hidden[:, i].unsqueeze(0)
                 if self.cfg.selector == "csa2":
                     kf = self.variant.token_features(xq)
-            o, loss = self._attend(q, k, v, 0, xq, kp, kf)
+            o, loss = self._attend(q, k, v, 0, xq, kp, kf, key=(i, 0))
             outs.append(o[0].permute(1, 0, 2).reshape(s, hq * d))
             if loss is not None:
                 losses.append((loss, s))
@@ -202,7 +227,7 @@ class PageSparseCoreAttention(MegatronModule):
                 xq = None if x is None else x[lo:lo + n].unsqueeze(0)
                 kpc = None if kp is None else kp[:, : -(-end // self.cfg.page)]
                 kfc = None if kf is None else kf[:, :end]
-                o, loss = self._attend(q, kd[:, :, :end], vd[:, :, :end], off, xq, kpc, kfc)
+                o, loss = self._attend(q, kd[:, :, :end], vd[:, :, :end], off, xq, kpc, kfc, key=(a, off))
                 pieces.append(o[0].permute(1, 0, 2).reshape(n, hq * d))
                 if loss is not None:
                     losses.append((loss, n))

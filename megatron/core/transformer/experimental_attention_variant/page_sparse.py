@@ -73,6 +73,8 @@ class PageSparseConfig:
     # how a block's selection is scored: "first" = its first query's scores; "prev_max" = the max over the first
     # query and every query of the previous block (causal: all precede the block; decode knows them)
     select_score: str = "first"
+    # one selection per KV group (from that group's query heads and keys) instead of one for all heads
+    per_group: bool = False
 
     def __post_init__(self):
         if self.selector not in SELECTORS + VARIANT_SELECTORS:
@@ -364,21 +366,45 @@ def _compress_mean_attention(q, k, v, cfg, q_offset, scale):
     return attend_gathered(q, kk, vv, idx, ok, scale, bias, cfg.query_chunk)
 
 
+def _per_group(fn, q, k, v, selection, return_selection, **kw):
+    """``fn`` once per KV group on that group's query heads and keys (``per_group``): outputs concatenated over
+    the heads, selections as a list per group."""
+    g = k.shape[1]
+    rep = q.shape[1] // g
+    outs, sels = [], []
+    for gi in range(g):
+        r = fn(q[:, gi * rep:(gi + 1) * rep], k[:, gi:gi + 1], v[:, gi:gi + 1],
+               selection=None if selection is None else selection[gi], return_selection=True, **kw)
+        outs.append(r[0])
+        sels.append(r[1])
+    if isinstance(outs[0], tuple):  # (out, lse)
+        out = (torch.cat([o[0] for o in outs], 1), torch.cat([o[1] for o in outs], 1))
+    else:
+        out = torch.cat(outs, 1)
+    return (out, sels) if return_selection else out
+
+
 def page_sparse_attention(q, k, v, cfg: PageSparseConfig, q_offset: int = 0, scale: float | None = None,
-                          indexer_scores=None):
+                          indexer_scores=None, selection=None, return_selection: bool = False):
     """Sparse causal attention of queries q [b, hq, s, d] at absolute positions q_offset .. q_offset + s - 1 over
     keys / values k, v [b, g, L, d] at positions 0 .. L - 1 (one sequence; L >= q_offset + s, GQA: hq % g == 0).
-    Returns [b, hq, s, d]."""
+    Returns [b, hq, s, d]. ``selection``: the (tokens, valid) of an earlier call to reuse (a shared index across
+    layers); ``return_selection``: also return this call's (a list per group with ``per_group``)."""
     d = q.shape[-1]
     scale = d**-0.5 if scale is None else scale
+    if cfg.per_group and k.shape[1] > 1 and cfg.selector not in ("dense", "compress_mean"):
+        return _per_group(page_sparse_attention, q, k, v, selection, return_selection, cfg=cfg, q_offset=q_offset,
+                          scale=scale, indexer_scores=indexer_scores)
     if cfg.selector == "dense":
         return dense_attention(q, k, v, q_offset, scale)
     if cfg.selector == "compress_mean":
         return _compress_mean_attention(q, k, v, cfg, q_offset, scale)
     if cfg.selector in VARIANT_SELECTORS:
         raise ValueError(f"{cfg.selector}: a trained module (sparse_variants.py), not a page selector")
-    tok, tok_ok = select_tokens(q, k, cfg, q_offset, scale, indexer_scores)
-    return attend_gathered(q, k, v, tok, tok_ok, scale, None, cfg.query_chunk)
+    if selection is None:
+        selection = select_tokens(q, k, cfg, q_offset, scale, indexer_scores)
+    out = attend_gathered(q, k, v, selection[0], selection[1], scale, None, cfg.query_chunk)
+    return (out, selection) if return_selection else out
 
 
 def dense_attention(q, k, v, q_offset: int = 0, scale: float | None = None):
@@ -479,10 +505,12 @@ def select_pages(q, k, cfg: PageSparseConfig, q_offset: int = 0, scale: float | 
 
 
 def flex_page_sparse_attention(q, k, v, cfg: PageSparseConfig, q_offset: int = 0, scale: float | None = None,
-                               indexer_scores=None, q_block: int = 128, return_lse: bool = False):
+                               indexer_scores=None, q_block: int = 128, return_lse: bool = False, selection=None,
+                               return_selection: bool = False):
     """:func:`page_sparse_attention` for the page selectors through FlexAttention (fused Triton forward and
     backward): the block mask lists, per block of ``q_block`` queries, the union of their pages (built from the
-    selection, never by evaluating the dense mask); the per-token mask makes it exact. One batch row (b = 1)."""
+    selection, never by evaluating the dense mask); the per-token mask makes it exact. One batch row (b = 1).
+    ``selection``: an earlier call's allowed pages [s, P] to reuse; ``return_selection``: also return this one's."""
     from torch.nn.attention.flex_attention import BlockMask
 
     b, hq, s, d = q.shape
@@ -490,9 +518,14 @@ def flex_page_sparse_attention(q, k, v, cfg: PageSparseConfig, q_offset: int = 0
     if b != 1:
         raise ValueError("flex_page_sparse_attention: one sequence (b = 1)")
     scale = d**-0.5 if scale is None else scale
+    if cfg.per_group and g > 1 and cfg.selector != "window":
+        return _per_group(flex_page_sparse_attention, q, k, v, selection, return_selection, cfg=cfg,
+                          q_offset=q_offset, scale=scale, indexer_scores=indexer_scores, q_block=q_block,
+                          return_lse=return_lse)
     page = cfg.page
     with torch.no_grad():
-        allowed = select_pages(q, k, cfg, q_offset, scale, indexer_scores)[0]  # [s, P]
+        allowed = selection if selection is not None else select_pages(q, k, cfg, q_offset, scale,
+                                                                        indexer_scores)[0]  # [s, P]
         P = allowed.shape[1]
         nq = -(-s // q_block)
         rows = F.pad(allowed, (0, 0, 0, nq * q_block - s)).view(nq, q_block, P)
@@ -516,8 +549,9 @@ def flex_page_sparse_attention(q, k, v, cfg: PageSparseConfig, q_offset: int = 0
     bm = BlockMask.from_kv_blocks(kv_num[None, None], kv_idx[None, None], full_num[None, None],
                                   full_idx[None, None], BLOCK_SIZE=(q_block, page), mask_mod=mask_mod,
                                   seq_lengths=(s, L))
-    return _flex()(q, k, v, block_mask=bm, scale=scale, enable_gqa=hq != g, return_lse=return_lse,
-                   kernel_options=flex_kernel_options(q, q_block, page))
+    out = _flex()(q, k, v, block_mask=bm, scale=scale, enable_gqa=hq != g, return_lse=return_lse,
+                  kernel_options=flex_kernel_options(q, q_block, page))
+    return (out, allowed) if return_selection else out
 
 
 def merge_attention(parts):

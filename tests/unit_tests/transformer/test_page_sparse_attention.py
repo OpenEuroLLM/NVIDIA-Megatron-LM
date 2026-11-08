@@ -130,6 +130,34 @@ def test_variant_thd_matches_per_document(single, name):
     torch.testing.assert_close(out, _reference(att, q, k, v, x), atol=1e-10, rtol=1e-10)
 
 
+def test_shared_selection_across_layers(single):
+    """page_sparse_share_source: the source layer's selection (per document) is what a later layer attends with;
+    a consumer before its source on a micro-batch is an error."""
+    from megatron.core.transformer.experimental_attention_variant import page_sparse_attention as psa
+
+    kw = dict(page_sparse_selector="page_mean", page_sparse_page=32, page_sparse_topk=2, page_sparse_window=32,
+              page_sparse_backend="gathered", page_sparse_share_source=1)
+    src = PageSparseCoreAttention(_config(**kw), 1, pg_collection=single)
+    dst = PageSparseCoreAttention(_config(**kw), 3, pg_collection=single)
+    psa._SHARED_SELECTION.clear()
+    q1, k1, v1, _ = _inputs(6)
+    q2, k2, v2, _ = _inputs(7)
+    with pytest.raises(RuntimeError):
+        dst(q2, k2, v2, packed_seq_params=_packed(LENGTHS))
+    src(q1, k1, v1, packed_seq_params=_packed(LENGTHS))
+    out = dst(q2, k2, v2, packed_seq_params=_packed(LENGTHS))
+    ref, a = [], 0
+    for n in LENGTHS:
+        d1 = [t[a:a + n].permute(1, 0, 2).unsqueeze(0) for t in (q1, k1, v1)]
+        d2 = [t[a:a + n].permute(1, 0, 2).unsqueeze(0) for t in (q2, k2, v2)]
+        _, sel = ps.page_sparse_attention(*d1, src.cfg, 0, D**-0.5, return_selection=True)
+        o = ps.page_sparse_attention(*d2, src.cfg, 0, D**-0.5, selection=sel)
+        ref.append(o[0].permute(1, 0, 2).reshape(n, HQ * D))
+        a += n
+    torch.testing.assert_close(out, torch.cat(ref), atol=1e-10, rtol=1e-10)
+    psa._SHARED_SELECTION.clear()
+
+
 def test_csa2_indexer_loss_rides_on_the_output(single):
     q, k, v, x = _inputs(4)
     x = x.double()

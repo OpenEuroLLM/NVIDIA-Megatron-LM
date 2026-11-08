@@ -315,3 +315,39 @@ def test_block_selection_flex(selector, off):
     gb = torch.autograd.grad((ref * g).sum(), (q, k, v))
     for x, y in zip(ga, gb):
         assert float((x - y).abs().max() / y.abs().max()) < 2e-2
+
+
+@pytest.mark.parametrize("selector", ["page_mean", "quest", "oracle"])
+def test_per_group_selection(selector):
+    """per_group: each KV group's heads attend the pages that group's own queries / keys select -- the shared
+    selection run on that group alone; selections can differ between the groups."""
+    q, k, v, _ = qkvx(L=512)
+    kw = dict(selector=selector, page=16, topk=3, window=16, sink_pages=1, select_block=32)
+    out, sels = ps.page_sparse_attention(q, k, v, ps.PageSparseConfig(**kw, per_group=True), return_selection=True)
+    rep = HQ // G
+    for gi in range(G):
+        ref = ps.page_sparse_attention(q[:, gi * rep:(gi + 1) * rep], k[:, gi:gi + 1], v[:, gi:gi + 1],
+                                       ps.PageSparseConfig(**kw))
+        torch.testing.assert_close(out[:, gi * rep:(gi + 1) * rep], ref, atol=1e-12, rtol=1e-12)
+    assert len(sels) == G
+    # reusing the returned selections reproduces the output (the shared-index path)
+    again = ps.page_sparse_attention(q, k, v, ps.PageSparseConfig(**kw, per_group=True), selection=sels)
+    torch.testing.assert_close(again, out, atol=1e-12, rtol=1e-12)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="FlexAttention needs a GPU")
+@pytest.mark.parametrize("per_group", [False, True])
+def test_flex_selection_reuse(per_group):
+    """flex: a returned selection reused on other queries / keys (another layer) equals the gathered reference
+    given the same tokens; per_group through flex equals the gathered per-group path."""
+    q, k, v, _ = (t.float() for t in qkvx(L=512))
+    cfg = ps.PageSparseConfig(selector="page_mean", page=16, topk=3, window=32, sink_pages=1, select_block=32,
+                              per_group=per_group)
+    a, allowed = ps.flex_page_sparse_attention(q, k, v, cfg, 0, D**-0.5, None, 32, return_selection=True)
+    ref = ps.page_sparse_attention(q, k, v, cfg)
+    assert float((a - ref).abs().max() / ref.abs().max()) < 1e-2
+    q2, k2, v2, _ = (t.float() for t in qkvx(L=512, seed=7))  # "the next layer"
+    b = ps.flex_page_sparse_attention(q2, k2, v2, cfg, 0, D**-0.5, None, 32, selection=allowed)
+    _, sel = ps.page_sparse_attention(q, k, v, cfg, return_selection=True)
+    ref2 = ps.page_sparse_attention(q2, k2, v2, cfg, selection=sel)
+    assert float((b - ref2).abs().max() / ref2.abs().max()) < 1e-2
