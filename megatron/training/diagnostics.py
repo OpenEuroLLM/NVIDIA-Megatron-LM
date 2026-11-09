@@ -305,6 +305,11 @@ class TrainingDiagnostics:
                 if self.want_weights:
                     self._weight_params.append((param, self._weight_slots(name, layer), is_fsdp))
 
+        if self.want_weights:
+            for table, li in getattr(self, "_hidden_tables", []):
+                name = f"decoder.layers.{li}.engram.table"
+                self._weight_params.append((table, self._weight_slots(name, li), True))
+
         self._stat_replica_factor = float(
             max(1, int(getattr(self.args, "num_distributed_optimizer_instances", 1) or 1))
         )
@@ -457,13 +462,30 @@ class TrainingDiagnostics:
         from megatron.core.transformer.transformer_layer import TransformerLayer
 
         out: Dict[int, int] = {}
+        self._hidden_tables = []  # (param, layer): Engram tables Megatron-FSDP unregistered
         for chunk in model:
             for module in chunk.modules():
-                if not isinstance(module, TransformerLayer):
-                    continue
-                li = min(max(int(module.layer_number) - 1, 0), self.num_layers - 1)
-                for param in module.parameters(recurse=True):
-                    out[id(param)] = li
+                # TransformerLayers, and EVERY sublayer of a hybrid block (Engram, Mamba / CKDA, MoE /
+                # MLP, short conv, ...): each is built with the global `layer_number`
+                # (i + 1 + pp offset) and kept in the block's `layers` list. Only TransformerLayers
+                # used to be mapped, so e.g. the Engram sublayers fell into the "other" bucket.
+                layers = [module] if isinstance(module, TransformerLayer) else []
+                if isinstance(getattr(module, "layers", None), torch.nn.ModuleList):
+                    layers += list(module.layers)
+                for layer in layers:
+                    number = getattr(layer, "layer_number", None)
+                    if not isinstance(number, int):
+                        continue
+                    li = min(max(number - 1, 0), self.num_layers - 1)
+                    for param in layer.parameters(recurse=True):
+                        out[id(param)] = li
+                    # engram_table_parallel="dp" tables under Megatron-FSDP are unregistered
+                    # (mcore_fsdp_adapter.hide_sharded_tables): not in named_parameters()
+                    for sub in layer.modules():
+                        for table in sub.__dict__.get("_fsdp_hidden_tables", ()):
+                            if id(table) not in out:
+                                out[id(table)] = li
+                                self._hidden_tables.append((table, li))
         return out
 
     def _gain_slot(self, family: str, layer: int | None) -> int:
