@@ -37,6 +37,9 @@ default). On a diagnostic iteration the cost is:
 
   * gains / grad norms / non-finite: one pass over parameters, all of it on
     device, and exactly ONE all-reduce each of a small fixed-size tensor.
+  * weight stats / gains: one pass over the LOCAL shards (Megatron-FSDP) plus a
+    few small all-reduces; `MEGATRON_DIAG_WEIGHT_EVERY=N` takes them on every
+    N-th diagnostic iteration only (weights move slowly).
   * activations: two reductions per transformer layer over one microbatch's
     hidden states. That is memory-bandwidth bound and measurably not free —
     roughly 20 GB of reads for a 64-layer 32B model — so it runs on the FIRST
@@ -47,6 +50,8 @@ There is exactly one device-to-host copy per diagnostic iteration: the stats
 accumulate into preallocated device tensors and are read back once, in `emit`.
 """
 
+import os
+import re
 from typing import Dict, List, Tuple
 
 import torch
@@ -78,11 +83,32 @@ ACT_SLOTS_PER_LAYER = len(ACT_SLOT_NAMES)
 N_ACT_STATS = 3  # rms denominator, mean, non-finite count
 N_ACT_HI = 2  # abs max, max (reduced with MAX); min is reduced separately with MIN
 
-# Weight families, per layer, plus the two big non-layer matrices. Stats are
-# min / max / mean / rms of the FULL (TP-gathered) matrix.
-WEIGHT_FAMILIES = ("linear_qkv", "linear_proj", "linear_fc1", "linear_fc2")
-WEIGHT_EXTRAS = ("embedding", "output_layer")
-N_WEIGHT_SUMS = 3  # sum, sum of squares, count
+# Weight families per layer: a regex on the parameter name, FIRST match wins (shared experts
+# before experts before the dense MLP), plus "all" = every parameter of the layer (norm gains,
+# biases, mHC / Engram parameters included). Outside the layers: the GRAD_EXTRAS buckets. Stats
+# are over the FULL parameter (TP shards / Megatron-FSDP shards / experts on other EP ranks
+# combined): min / max / mean / std / rms / norm, and for 2-D matrices the row-norm max / mean
+# (the rows of muown's magnitudes; a runaway router row or expert shows as max >> mean).
+WEIGHT_FAMILY_PATTERNS = (
+    ("router", r"\.router\.weight$"),
+    ("shared_fc1", r"\.shared_experts\.linear_fc1\.weight$"),
+    ("shared_fc2", r"\.shared_experts\.linear_fc2\.weight$"),
+    ("experts_fc1", r"\.experts\.linear_fc1\.weight\d*$"),
+    ("experts_fc2", r"\.experts\.linear_fc2\.weight\d*$"),
+    ("linear_qkv", r"linear_qkv\.weight$"),
+    ("linear_proj", r"linear_proj\.weight$"),
+    ("linear_fc1", r"linear_fc1\.weight$"),
+    ("linear_fc2", r"linear_fc2\.weight$"),
+    ("mixer_qkv", r"\.layer\.[qkv]_proj\.weight$"),
+    ("mixer_out", r"\.layer\.o_proj\.weight$"),
+    ("mixer_gates", r"\.layer\.[fgb]_proj\.(\d+\.)?weight$"),
+    ("engram", r"(key_proj\.weight|value_proj\.weight|\.table)$"),
+)
+WEIGHT_FAMILIES = tuple(f for f, _ in WEIGHT_FAMILY_PATTERNS) + ("all",)
+_WEIGHT_FAMILY_RE = tuple((f, re.compile(r)) for f, r in WEIGHT_FAMILY_PATTERNS)
+WEIGHT_EXTRAS = ("embedding", "output_layer", "final_norm", "other")
+N_WEIGHT_SUMS = 5  # sum, sum of squares, count, sum of row norms, row count
+N_GAIN_SUMS = 3  # sum, sum of squares, count
 
 # FP8 delayed-scaling metadata of the four TE GEMM modules of every layer:
 # window-max amax and current scale of the GEMM input, the weight and the
@@ -174,6 +200,13 @@ class TrainingDiagnostics:
         self._w_sum: torch.Tensor | None = None  # [slots, N_WEIGHT_SUMS]
         self._w_min: torch.Tensor | None = None  # [slots]
         self._w_max: torch.Tensor | None = None  # [slots]
+        self._w_rowmax: torch.Tensor | None = None  # [slots] max row norm
+        # (slot, is_fsdp, params) groups and (family slot, "all" slot) folds, built on first use
+        self._w_groups = None
+        self._w_folds: List[Tuple[int, int]] = []
+        self._g_groups = None
+        # weight stats and gains on every N-th diagnostic iteration only (weights move slowly)
+        self.weight_every = max(1, int(os.environ.get("MEGATRON_DIAG_WEIGHT_EVERY", "1") or 1))
         self._fp8_amax: torch.Tensor | None = None  # [slots, 3]: input, weight, grad
         self._fp8_scale: torch.Tensor | None = None  # [slots, 3]
         # logits: [7] = sum, sum of squares, element count, sum of per-token max logit,
@@ -186,14 +219,14 @@ class TrainingDiagnostics:
         self._tok_max: torch.Tensor | None = None
         self._tok_records: List[Dict[str, "object"]] = []
         self._have_logits = False
-        # (param, weight_slot) for every 2-D+ weight this rank holds a shard of
-        self._weight_params: List[Tuple[torch.nn.Parameter, int]] = []
+        # (param, weight slots, is_fsdp) for every parameter this rank holds (a shard of)
+        self._weight_params: List[Tuple[torch.nn.Parameter, List[int], bool]] = []
         # (te_module, fp8_slot) for the four GEMM modules of every layer this rank owns
         self._fp8_modules: List[Tuple[torch.nn.Module, int]] = []
 
         # --- static maps, built once in setup() -------------------------------
-        # (param, gain_slot) for every norm gain this rank owns
-        self._gain_params: List[Tuple[torch.nn.Parameter, int]] = []
+        # (param, gain_slot, is_fsdp) for every norm gain this rank owns (a shard of)
+        self._gain_params: List[Tuple[torch.nn.Parameter, int, bool]] = []
         # (param, grad_slot, sub_range) for every gradient piece this rank should
         # count. sub_range is None when the whole parameter counts.
         self._grad_entries: List[Tuple[torch.nn.Parameter, int, Tuple[int, int] | None]] = []
@@ -230,7 +263,9 @@ class TrainingDiagnostics:
         n_grad_slots = self.num_layers + len(GRAD_EXTRAS)
         n_act_slots = ACT_SLOTS_PER_LAYER * self.num_layers + 1
 
-        self._gain_buf = torch.zeros(n_gain_slots, N_GAIN_STATS, dtype=torch.float32, device=dev)
+        self._gain_buf = torch.zeros(n_gain_slots, N_GAIN_SUMS, dtype=torch.float32, device=dev)
+        self._gain_min = torch.full((n_gain_slots,), float("inf"), dtype=torch.float32, device=dev)
+        self._gain_max = torch.full((n_gain_slots,), float("-inf"), dtype=torch.float32, device=dev)
         self._grad_buf = torch.zeros(n_grad_slots, dtype=torch.float32, device=dev)
         self._act_buf = torch.zeros(n_act_slots, N_ACT_STATS, dtype=torch.float32, device=dev)
         self._act_seen = torch.zeros(n_act_slots, dtype=torch.float32, device=dev)
@@ -241,6 +276,7 @@ class TrainingDiagnostics:
         self._w_sum = torch.zeros(n_weight_slots, N_WEIGHT_SUMS, dtype=torch.float32, device=dev)
         self._w_min = torch.full((n_weight_slots,), float("inf"), dtype=torch.float32, device=dev)
         self._w_max = torch.full((n_weight_slots,), float("-inf"), dtype=torch.float32, device=dev)
+        self._w_rowmax = torch.zeros(n_weight_slots, dtype=torch.float32, device=dev)
         n_fp8_slots = len(FP8_MODULES) * self.num_layers
         self._fp8_amax = torch.zeros(n_fp8_slots, 3, dtype=torch.float32, device=dev)
         self._fp8_scale = torch.zeros(n_fp8_slots, 3, dtype=torch.float32, device=dev)
@@ -254,15 +290,39 @@ class TrainingDiagnostics:
                 layer = global_layer.get(id(param))
                 slot_of[id(param)] = self._grad_slot(name, layer)
 
+                # sharded = every rank holds a disjoint piece: Megatron-FSDP DTensor shards, and the
+                # Engram tables under engram_table_parallel="dp" (each row has one owner rank)
+                is_fsdp = bool(
+                    getattr(param, "__fsdp_param__", False)
+                    or getattr(param, "engram_sharded_table", False)
+                    or getattr(param, "is_engram_table", False)
+                )
                 if self.want_gains and param.dim() == 1:
                     family = _classify_gain(name)
                     if family is not None:
-                        self._gain_params.append((param, self._gain_slot(family, layer)))
+                        self._gain_params.append((param, self._gain_slot(family, layer), is_fsdp))
 
-                if self.want_weights and param.dim() >= 2:
-                    wslot = self._weight_slot(name, layer)
-                    if wslot is not None:
-                        self._weight_params.append((param, wslot))
+                if self.want_weights:
+                    self._weight_params.append((param, self._weight_slots(name, layer), is_fsdp))
+
+        self._stat_replica_factor = float(
+            max(1, int(getattr(self.args, "num_distributed_optimizer_instances", 1) or 1))
+        )
+        if (self.want_weights or self.want_gains) and torch.distributed.get_rank() == 0:
+            fam_count = [0] * len(WEIGHT_FAMILIES)
+            for _p, slots, _f in self._weight_params:
+                for slot in slots:
+                    if slot < len(WEIGHT_FAMILIES) * self.num_layers:
+                        fam_count[slot // self.num_layers] += 1
+            n_fsdp = sum(1 for _p, _s, f in self._weight_params if f)
+            print(
+                f"[diagnostics] weight stats: {len(self._weight_params)} parameters "
+                f"({n_fsdp} Megatron-FSDP: local shards, / {self._stat_replica_factor:g} HSDP "
+                f"instances), every {self.weight_every} diagnostic iteration(s); per family: "
+                + ", ".join(f"{f}={c}" for f, c in zip(WEIGHT_FAMILIES, fam_count) if c)
+                + f"; norm gains: {len(self._gain_params)}",
+                flush=True,
+            )
 
         if self.want_grads:
             self._build_grad_map(model, optimizer, slot_of)
@@ -417,19 +477,19 @@ class TrainingDiagnostics:
             return min(layer, self.num_layers - 1)
         return self.num_layers + GRAD_EXTRAS.index(_classify_grad_bucket(name))
 
-    def _weight_slot(self, name: str, layer: int | None) -> int | None:
-        """Slot of a 2-D weight, or None for matrices we do not track (e.g. MoE)."""
+    def _weight_slots(self, name: str, layer: int | None) -> List[int]:
+        """Weight-stat slots of a parameter: its family (first matching pattern) and "all" of its
+        layer, or one GRAD_EXTRAS bucket outside the layers."""
         if layer is not None:
-            for fi, family in enumerate(WEIGHT_FAMILIES):
-                if name.endswith(f"{family}.weight"):
-                    return fi * self.num_layers + min(layer, self.num_layers - 1)
-            return None
+            li = min(layer, self.num_layers - 1)
+            slots = [WEIGHT_FAMILIES.index("all") * self.num_layers + li]
+            for fi, (_family, rx) in enumerate(_WEIGHT_FAMILY_RE):
+                if rx.search(name):
+                    slots.insert(0, fi * self.num_layers + li)
+                    break
+            return slots
         base = len(WEIGHT_FAMILIES) * self.num_layers
-        if "word_embeddings" in name:
-            return base + WEIGHT_EXTRAS.index("embedding")
-        if "output_layer" in name:
-            return base + WEIGHT_EXTRAS.index("output_layer")
-        return None
+        return [base + WEIGHT_EXTRAS.index(_classify_grad_bucket(name))]
 
     def _build_fp8_map(self, model):
         """(module, slot) for the four TE GEMM modules of every layer on this rank."""
@@ -702,42 +762,128 @@ class TrainingDiagnostics:
         """
         if not self._is_diag_iter:
             return
-        if self.want_gains:
+        weight_iter = (iteration // self.interval) % self.weight_every == 0
+        if self.want_gains and weight_iter:
             self._collect_gains()
         if self.want_grads:
             self._collect_grad_norms()
         if self.want_nonfinite:
             self._collect_nonfinite()
-        if self.want_weights:
+        if self.want_weights and weight_iter:
             self._collect_weights()
         if self.want_token_dump and self._tok_records:
             self._write_token_dump(iteration)
         if self.want_fp8:
             self._collect_fp8_meta()
 
-    def _collect_weights(self):
-        """min / max / sum / sum-of-squares / count of every tracked weight matrix.
+    @staticmethod
+    def _local_values(param):
+        """This rank's piece of a parameter: the local shard of a (Megatron-FSDP) DTensor, else the
+        tensor itself; and whether it holds WHOLE rows (dim 0 sharded or not sharded)."""
+        local = getattr(param, "_local_tensor", None)
+        if local is None:
+            return param.detach(), True
+        rows_whole = True
+        for placement in getattr(param, "placements", ()) or ():
+            dim = getattr(placement, "dim", None)
+            if dim is not None and dim != 0:  # Shard(d>0) splits rows
+                rows_whole = False
+        return local.detach(), rows_whole
 
-        Weight matrices are SHARDED across TP, PARTITIONED across PP and
-        REPLICATED across DP/CP (the bf16 model copy is complete on every DP rank
-        even under the distributed optimizer). Reducing over the model-parallel
-        group -- all TP x PP ranks of ONE data-parallel replica -- therefore sees
-        every element exactly once: SUM for the sums, MIN/MAX for the extremes.
+    @staticmethod
+    def _build_groups(entries):
+        """Group (param, slots, is_fsdp) entries by (primary slot, is_fsdp) -- the slot every value
+        is measured in once -- and collect the (slot, parent slot) pairs to fold afterwards (a
+        family slot into its layer's "all" slot), so no parameter is read twice."""
+        groups: Dict[Tuple[int, bool], List[torch.nn.Parameter]] = {}
+        folds = set()
+        for param, slots, is_fsdp in entries:
+            slots = slots if isinstance(slots, list) else [slots]
+            groups.setdefault((slots[0], is_fsdp), []).append(param)
+            for parent in slots[1:]:
+                folds.add((slots[0], parent))
+        return [(slot, f, ps) for (slot, f), ps in sorted(groups.items())], sorted(folds)
+
+    def _accumulate(self, groups, sums, vmin, vmax, rowmax=None):
+        """sum / sum of squares / count (+ row norms) per slot from the LOCAL pieces, ONE pass per
+        slot over its parameters concatenated (a few kernels per slot, not per parameter: 10k
+        parameters per rank in the v4 run), separately for sharded and other parameters. Returns
+        (sharded_sums, other_sums); min / max / row max go in place (an empty local piece adds
+        nothing, +-inf stay the identities)."""
+        f32 = torch.float32
+        fsdp_sums = torch.zeros_like(sums)
+        other_sums = torch.zeros_like(sums)
+        tp_world = mpu.get_tensor_model_parallel_world_size()
+        for slot, is_fsdp, params in groups:
+            locs = [self._local_values(p) for p in params]
+            locs = [(v, whole) for v, whole in locs if v.numel() > 0]
+            if not locs:
+                continue
+            flat = locs[0][0].reshape(-1) if len(locs) == 1 else torch.cat([v.reshape(-1) for v, _ in locs])
+            target = fsdp_sums if is_fsdp else other_sums
+            target[slot, 0] += flat.sum(dtype=f32)
+            target[slot, 1] += torch.linalg.vector_norm(flat, dtype=f32).square()
+            target[slot, 2] += float(flat.numel())
+            lo, hi = torch.aminmax(flat)
+            vmin[slot] = torch.minimum(vmin[slot], lo.to(f32))
+            vmax[slot] = torch.maximum(vmax[slot], hi.to(f32))
+            # row norms need whole rows: an FSDP dim-0 shard, or TP=1 (row-parallel TP splits rows)
+            if (
+                rowmax is not None
+                and all(v.dim() == 2 and whole for v, whole in locs)
+                and (is_fsdp or tp_world == 1)
+            ):
+                if len({v.shape[1] for v, _ in locs}) == 1:
+                    mat = locs[0][0] if len(locs) == 1 else torch.cat([v for v, _ in locs])
+                    rn = torch.linalg.vector_norm(mat, dim=1, dtype=f32)
+                else:
+                    rn = torch.cat([torch.linalg.vector_norm(v, dim=1, dtype=f32) for v, _ in locs])
+                target[slot, 3] += rn.sum()
+                target[slot, 4] += float(rn.numel())
+                rowmax[slot] = torch.maximum(rowmax[slot], rn.max())
+        return fsdp_sums, other_sums
+
+    @staticmethod
+    def _fold(folds, sums, vmin, vmax):
+        """Add every folded slot's sums / count and extremes into its parent ("all" of the layer),
+        after the reduction; row-norm columns stay per family."""
+        for child, parent in folds:
+            sums[parent, 0:3] += sums[child, 0:3]
+            vmin[parent] = torch.minimum(vmin[parent], vmin[child])
+            vmax[parent] = torch.maximum(vmax[parent], vmax[child])
+
+    def _reduce_sums(self, fsdp_sums, other_sums, other_group):
+        """Megatron-FSDP shards partition each parameter across all ranks (experts: across the
+        expert-DP mesh, different experts on different EP ranks), so a WORLD sum sees every element
+        once per HSDP instance. Other parameters are complete on every DP rank: reduce them over
+        `other_group` only (TP x PP for weights: TP shards / PP stages; PP for replicated gains)."""
+        torch.distributed.all_reduce(fsdp_sums, op=torch.distributed.ReduceOp.SUM)
+        if self._stat_replica_factor != 1.0:
+            fsdp_sums.div_(self._stat_replica_factor)
+        torch.distributed.all_reduce(other_sums, op=torch.distributed.ReduceOp.SUM, group=other_group)
+        return fsdp_sums + other_sums
+
+    def _collect_weights(self):
+        """sum / sum of squares / count / row norms / min / max of every parameter, per slot.
+
+        The values are this rank's LOCAL piece of each parameter (`_local_values`): under
+        Megatron-FSDP every rank holds a disjoint shard, so the old "full matrix on every DP rank,
+        reduce over the model-parallel group" rule counted ONE shard per slot. MIN / MAX / row max
+        over the world are exact whatever the replication.
         """
-        self._w_sum.zero_()
         self._w_min.fill_(float("inf"))
         self._w_max.fill_(float("-inf"))
-        for param, slot in self._weight_params:
-            v = param.detach().float()
-            self._w_sum[slot, 0] += v.sum()
-            self._w_sum[slot, 1] += v.pow(2).sum()
-            self._w_sum[slot, 2] += float(v.numel())
-            self._w_min[slot] = torch.minimum(self._w_min[slot], v.min())
-            self._w_max[slot] = torch.maximum(self._w_max[slot], v.max())
-        group = mpu.get_model_parallel_group()
-        torch.distributed.all_reduce(self._w_sum, op=torch.distributed.ReduceOp.SUM, group=group)
-        torch.distributed.all_reduce(self._w_min, op=torch.distributed.ReduceOp.MIN, group=group)
-        torch.distributed.all_reduce(self._w_max, op=torch.distributed.ReduceOp.MAX, group=group)
+        self._w_rowmax.zero_()
+        if self._w_groups is None:
+            self._w_groups, self._w_folds = self._build_groups(self._weight_params)
+        fsdp_sums, other_sums = self._accumulate(
+            self._w_groups, self._w_sum, self._w_min, self._w_max, self._w_rowmax
+        )
+        self._w_sum.copy_(self._reduce_sums(fsdp_sums, other_sums, mpu.get_model_parallel_group()))
+        torch.distributed.all_reduce(self._w_min, op=torch.distributed.ReduceOp.MIN)
+        torch.distributed.all_reduce(self._w_max, op=torch.distributed.ReduceOp.MAX)
+        torch.distributed.all_reduce(self._w_rowmax, op=torch.distributed.ReduceOp.MAX)
+        self._fold(self._w_folds, self._w_sum, self._w_min, self._w_max)
         self._have_weights = True
 
     def _collect_fp8_meta(self):
@@ -782,24 +928,25 @@ class TrainingDiagnostics:
         self._have_fp8 = True
 
     def _collect_gains(self):
-        self._gain_buf.zero_()
-        for param, slot in self._gain_params:
-            v = param.detach().float()
-            self._gain_buf[slot, 0] = v.mean()
-            self._gain_buf[slot, 1] = v.std() if v.numel() > 1 else torch.zeros((), device=v.device)
-            self._gain_buf[slot, 2] = v.min()
-            self._gain_buf[slot, 3] = v.max()
-        # Norm gains are REPLICATED across TP, DP and CP and PARTITIONED across
-        # PP, so every rank of a pipeline stage already holds identical values
-        # for that stage's layers and the stages' slots are disjoint. Reducing
-        # over the pipeline group alone is therefore exact and needs no
-        # duplicate filtering — reducing over the world would multiply every
-        # slot by tp*dp*cp.
-        torch.distributed.all_reduce(
-            self._gain_buf,
-            op=torch.distributed.ReduceOp.SUM,
-            group=mpu.get_pipeline_model_parallel_group(),
+        """mean / std / min / max of every norm gain per slot, from sums over the LOCAL pieces.
+
+        Norm gains are replicated across TP / DP / CP and partitioned across PP -- unless
+        Megatron-FSDP shards them (then every rank holds a disjoint piece and the old per-rank
+        mean / std summed over the pipeline group described one shard). Sums / counts reduce exactly
+        either way (`_reduce_sums`); min / max over the world.
+        """
+        self._gain_min.fill_(float("inf"))
+        self._gain_max.fill_(float("-inf"))
+        if self._g_groups is None:
+            self._g_groups, _ = self._build_groups(self._gain_params)
+        fsdp_sums, other_sums = self._accumulate(
+            self._g_groups, self._gain_buf, self._gain_min, self._gain_max
         )
+        self._gain_buf.copy_(
+            self._reduce_sums(fsdp_sums, other_sums, mpu.get_pipeline_model_parallel_group())
+        )
+        torch.distributed.all_reduce(self._gain_min, op=torch.distributed.ReduceOp.MIN)
+        torch.distributed.all_reduce(self._gain_max, op=torch.distributed.ReduceOp.MAX)
         self._have_gains = True
 
     def _grad_of(self, param):
@@ -912,28 +1059,38 @@ class TrainingDiagnostics:
             self._gn_min = float("inf")
 
         if self._have_gains:
-            g = self._gain_buf.cpu()
+            gs = self._gain_buf.double().cpu()
+            gmin = self._gain_min.cpu()
+            gmax = self._gain_max.cpu()
+            n = gs[:, 2].clamp_min(1.0)
+            mean = gs[:, 0] / n
+            std = (gs[:, 1] / n - mean * mean).clamp_min(0).sqrt()
+            present = gs[:, 2] > 0
             for fi, family in enumerate(GAIN_FAMILIES):
-                block = g[fi * self.num_layers : (fi + 1) * self.num_layers]
-                if float(block.abs().sum()) == 0.0:
+                lo_slot, hi_slot = fi * self.num_layers, (fi + 1) * self.num_layers
+                if not bool(present[lo_slot:hi_slot].any()):
                     continue  # family absent from this model
                 for li in range(self.num_layers):
+                    slot = lo_slot + li
+                    if not bool(present[slot]):
+                        continue
                     p = f"diag/gain/{family}/layer_{li:02d}"
-                    logs[f"{p}/mean"] = float(block[li, 0])
-                    logs[f"{p}/std"] = float(block[li, 1])
-                    logs[f"{p}/min"] = float(block[li, 2])
-                    logs[f"{p}/max"] = float(block[li, 3])
+                    logs[f"{p}/mean"] = float(mean[slot])
+                    logs[f"{p}/std"] = float(std[slot])
+                    logs[f"{p}/min"] = float(gmin[slot])
+                    logs[f"{p}/max"] = float(gmax[slot])
                 # Alarm-able summaries: the extremes over layers, and WHICH layer.
-                logs[f"diag/gain/{family}/min_over_layers"] = float(block[:, 2].min())
-                logs[f"diag/gain/{family}/max_over_layers"] = float(block[:, 3].max())
-                logs[f"diag/gain/{family}/argmax_layer"] = float(block[:, 3].argmax())
-                logs[f"diag/gain/{family}/argmin_layer"] = float(block[:, 2].argmin())
-            final = g[len(GAIN_FAMILIES) * self.num_layers]
-            if float(final.abs().sum()) != 0.0:
-                logs["diag/gain/final_norm/mean"] = float(final[0])
-                logs["diag/gain/final_norm/std"] = float(final[1])
-                logs["diag/gain/final_norm/min"] = float(final[2])
-                logs["diag/gain/final_norm/max"] = float(final[3])
+                bmin, bmax = gmin[lo_slot:hi_slot], gmax[lo_slot:hi_slot]
+                logs[f"diag/gain/{family}/min_over_layers"] = float(bmin.min())
+                logs[f"diag/gain/{family}/max_over_layers"] = float(bmax.max())
+                logs[f"diag/gain/{family}/argmax_layer"] = float(bmax.argmax())
+                logs[f"diag/gain/{family}/argmin_layer"] = float(bmin.argmin())
+            final = len(GAIN_FAMILIES) * self.num_layers
+            if bool(present[final]):
+                logs["diag/gain/final_norm/mean"] = float(mean[final])
+                logs["diag/gain/final_norm/std"] = float(std[final])
+                logs["diag/gain/final_norm/min"] = float(gmin[final])
+                logs["diag/gain/final_norm/max"] = float(gmax[final])
             self._have_gains = False
 
         if self._have_grads:
@@ -1003,18 +1160,30 @@ class TrainingDiagnostics:
             self._have_acts = False
 
         if self._have_weights:
-            s = self._w_sum.cpu()
+            s = self._w_sum.double().cpu()
             wmin = self._w_min.cpu()
             wmax = self._w_max.cpu()
+            wrow = self._w_rowmax.cpu()
 
             def weight_logs(prefix: str, slot: int):
                 n = float(s[slot, 2])
                 if n <= 0.0:
                     return
+                mean = float(s[slot, 0] / n)
+                msq = float(s[slot, 1] / n)
                 logs[f"{prefix}/min"] = float(wmin[slot])
                 logs[f"{prefix}/max"] = float(wmax[slot])
-                logs[f"{prefix}/mean"] = float(s[slot, 0] / n)
-                logs[f"{prefix}/rms"] = float((s[slot, 1] / n).clamp_min(0).sqrt())
+                logs[f"{prefix}/mean"] = mean
+                logs[f"{prefix}/std"] = max(msq - mean * mean, 0.0) ** 0.5
+                logs[f"{prefix}/rms"] = max(msq, 0.0) ** 0.5
+                logs[f"{prefix}/norm"] = max(float(s[slot, 1]), 0.0) ** 0.5
+                rows = float(s[slot, 4])
+                if rows > 0.0:
+                    rmean = float(s[slot, 3]) / rows
+                    logs[f"{prefix}/rownorm_max"] = float(wrow[slot])
+                    logs[f"{prefix}/rownorm_mean"] = rmean
+                    if rmean > 0.0:
+                        logs[f"{prefix}/rownorm_ratio"] = float(wrow[slot]) / rmean
 
             for fi, family in enumerate(WEIGHT_FAMILIES):
                 absmax_per_layer = []
@@ -1030,6 +1199,10 @@ class TrainingDiagnostics:
             base = len(WEIGHT_FAMILIES) * self.num_layers
             for ei, extra in enumerate(WEIGHT_EXTRAS):
                 weight_logs(f"diag/weight/{extra}", base + ei)
+            # every parameter exactly once ("all" of each layer + the extras): the model's weight norm
+            all_lo = WEIGHT_FAMILIES.index("all") * self.num_layers
+            total_sq = float(s[all_lo : all_lo + self.num_layers, 1].sum() + s[base:, 1].sum())
+            logs["diag/weight/total_norm"] = max(total_sq, 0.0) ** 0.5
             self._have_weights = False
 
         if self._have_fp8:
