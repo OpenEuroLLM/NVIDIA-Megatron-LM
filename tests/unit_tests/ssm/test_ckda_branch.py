@@ -81,7 +81,6 @@ def _config(**overrides):
         hidden_size=HIDDEN,
         num_attention_heads=HEADS,
         num_query_groups=2,
-        group_query_attention=True,
         kv_channels=2 * HEAD_DIM,  # the attention's head dim: twice complex_kda's, as in the main run
         qk_layernorm=True,
         attention_output_gate=True,
