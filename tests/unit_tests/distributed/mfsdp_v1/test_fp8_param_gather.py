@@ -197,3 +197,48 @@ def _training_step_check(double_buffer, world):
         torch.distributed.all_gather_into_tensor(g, s)
         assert torch.all(g == g[0]), "unsharded FP8 weights differ between ranks"
     assert abs(losses["fp8"] - losses["bf16"]) <= 0.05 * abs(losses["bf16"]) + 1e-6, losses
+
+
+# --------------------------------------------------------------------------- INT4 (fsdp_param_gather_format)
+from megatron.core.distributed.fsdp.src.megatron_fsdp import int4_param_gather as i4  # noqa: E402
+
+
+@pytest.mark.parametrize("n", [1, 2, 127, 128, 129, 1001, 4096 * 37 + 5])
+def test_int4_kernels_match_reference(n):
+    """INT4 packing on 3 'ranks' and the Triton dequantization equal the plain-torch round trip bit for bit;
+    the error stays within amax / 14 of each 128-element block; at most 15 levels per block."""
+    torch.manual_seed(n)
+    world = 3
+    shards = []
+    for _ in range(world):
+        x = torch.randn(n, device="cuda") * (10 ** torch.empty(n, device="cuda").uniform_(-3, 1))
+        if n > 300:
+            x[128:256] = 0
+        shards.append(x.to(torch.bfloat16))
+    packed = torch.cat([i4.quantize_pack(s) for s in shards])
+    assert packed.numel() == world * i4.packed_layout(n)[2]
+    out = torch.empty(world * n, dtype=torch.bfloat16, device="cuda")
+    i4.dequantize_unpack(packed, n, world, out)
+    ref = torch.cat([i4.quantize_dequantize_reference(s) for s in shards])
+    assert torch.equal(out, ref)
+    for r in range(world):
+        assert _block_error(out[r * n : (r + 1) * n], shards[r]) <= i4.max_relative_error_bound() + 1e-2
+    blk = torch.nn.functional.pad(ref[:n].float(), (0, (-n) % 128)).view(-1, 128)
+    assert max(len(torch.unique(b)) for b in blk) <= 15
+
+
+def test_int4_all_gather_matches_reference():
+    """int4_all_gather_into_tensor == every rank's INT4 round trip, identical on every rank."""
+    _init_dist()
+    world = torch.distributed.get_world_size()
+    rank = torch.distributed.get_rank()
+    n = 3 * 128 + 17
+    torch.manual_seed(4321 + rank)
+    shard = (torch.randn(n, device="cuda") * (rank + 1)).to(torch.bfloat16)
+    out = torch.empty(world * n, dtype=torch.bfloat16, device="cuda")
+    i4.int4_all_gather_into_tensor(out, shard, group=None).wait()
+    exact = torch.empty_like(out)
+    torch.distributed.all_gather_into_tensor(exact, shard)
+    ref = torch.cat([i4.quantize_dequantize_reference(exact[r * n : (r + 1) * n]) for r in range(world)])
+    assert torch.equal(out, ref)
+    assert not torch.equal(out, exact)

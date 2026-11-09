@@ -141,6 +141,12 @@ class DistributedDataParallelConfig:
       outer-group parameter gather.
     """
 
+    fsdp_param_gather_format: str = "fp8"
+    """The wire format of fsdp_fp8_param_gather: "fp8" (E4M3, one fp32 scale per 128 elements) or "int4"
+      (symmetric INT4, one fp32 scale per 128, megatron_fsdp/int4_param_gather.py: ~0.53 bytes per element;
+      the forward runs on the INT4 weights -- quantization-aware training for W4A16 deployment).
+    """
+
     fsdp_double_buffer: bool = False
     """If true, use persistently allocated double buffers for the 
       temporary memory needed in the Megatron FSDP communications.

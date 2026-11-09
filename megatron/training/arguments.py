@@ -3738,6 +3738,10 @@ def _add_distributed_args(parser):
                             'scale per 128 elements (~1.03 instead of 2 bytes per element); the '
                             'GEMMs stay bf16 on the dequantized weights. experts: only '
                             'expert-parallel buckets; all: every bf16 bucket.')
+    group.add_argument('--fsdp-param-gather-format', type=str, default='fp8', choices=['fp8', 'int4'],
+                       help='Wire format of --fsdp-fp8-param-gather: fp8 (E4M3) or int4 (symmetric, one '
+                            'fp32 scale per 128 elements, ~0.53 bytes per element; the forward runs on '
+                            'the INT4 weights: quantization-aware training for W4A16 deployment).')
     group.add_argument('--suggested-communication-unit-size', type=int, default=None,
                    help='Specifies the number of elements to communicate at once during FSDP (Fully Sharded Data Parallel) operations. '
                         'This flag also affects FSDP all-gather prefetch behavior. Setting a larger value increases the communication buffer size, '

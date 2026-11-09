@@ -4754,7 +4754,11 @@ class AllGatherPipeline:
         local bf16 shard, all-gather the packed shards, dequantize into the bucket, all on the
         current (all-gather) stream; the handle orders the consumer after the dequantization."""
         from .fp8_param_gather import fp8_all_gather_into_tensor
+        from .int4_param_gather import int4_all_gather_into_tensor
 
+        fmt = getattr(self.buffer.ddp_config, "fsdp_param_gather_format", "fp8") or "fp8"
+        assert fmt in ("fp8", "int4"), f"fsdp_param_gather_format={fmt!r}"
+        gather = int4_all_gather_into_tensor if fmt == "int4" else fp8_all_gather_into_tensor
         bucket_key = self.get_bucket_key(bucket_id, bwd)
         self.bucket_can_be_released[bucket_key] = False
         if self.bucket_status[bucket_key] in (
@@ -4772,13 +4776,13 @@ class AllGatherPipeline:
             # printed, not logged at INFO (the default log level filters it)
             if torch.distributed.get_rank() == 0:
                 print(
-                    f"fsdp_fp8_param_gather: bucket {bucket_id} through FP8 "
+                    f"fsdp_fp8_param_gather: bucket {bucket_id} through {fmt.upper()} "
                     f"({bucket.data.numel()} elements, "
                     f"expert={self.buffer.parameter_groups[bucket_id].is_expert_param}, "
                     f"group size {wbuf.data_parallel_group.size()})",
                     flush=True,
                 )
-        param_gather_event = fp8_all_gather_into_tensor(
+        param_gather_event = gather(
             output_tensor=bucket.data,
             input_tensor=wbuf.get_shard_from_local_buffer(),
             group=wbuf.data_parallel_group,
