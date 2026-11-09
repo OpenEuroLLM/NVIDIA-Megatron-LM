@@ -3681,6 +3681,8 @@ def training_log(
             track_names.append("global_load_balancing_loss")
         if args.moe_z_loss_coeff is not None:
             track_names.append("z_loss")
+        if getattr(args, "moe_router_log_stay_rate", False):
+            track_names.append("stay_rate")
 
         if is_hybrid_model(args):
             from operator import itemgetter
