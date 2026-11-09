@@ -351,6 +351,7 @@ class TopKRouter(Router):
         gather_size = gather_group.size() if gather_group is not None else 1
 
         should_update_beta = self.training and torch.is_grad_enabled()
+        should_log_stay = torch.is_grad_enabled()  # the routing below runs under no_grad
 
         with torch.no_grad():
             logits_fp32 = logits.detach().to(dtype=torch.float32)
@@ -377,7 +378,7 @@ class TopKRouter(Router):
             full_indices, beta_local = qb_dual_update(
                 full_logits, self.topk, self.qb_beta, update_beta=should_update_beta
             )
-            self._log_stay_rate(full_indices)
+            self._log_stay_rate(full_indices, log=should_log_stay)
             if should_update_beta:
                 self.qb_beta_accum.add_(beta_local)
                 self.qb_beta_count.add_(1)
@@ -410,9 +411,11 @@ class TopKRouter(Router):
         prev[bsz:] = mask[:-bsz]
         return self.config.moe_router_stay_bonus * prev
 
-    def _log_stay_rate(self, indices: torch.Tensor) -> None:
-        """moe/stay_rate: the share of each token's experts the previous token selected too."""
-        if not self.config.moe_router_log_stay_rate or not torch.is_grad_enabled():
+    def _log_stay_rate(self, indices: torch.Tensor, log: Optional[bool] = None) -> None:
+        """moe/stay_rate: the share of each token's experts the previous token selected too. Recorded once per
+        micro-batch: with grad enabled (the training forward, or the recompute of a no-grad checkpointed one);
+        ``log`` overrides the check for callers inside no_grad."""
+        if not self.config.moe_router_log_stay_rate or not (torch.is_grad_enabled() if log is None else log):
             return
         bsz = getattr(self, "_stay_bsz", 1) or 1
         if indices.shape[0] <= bsz:

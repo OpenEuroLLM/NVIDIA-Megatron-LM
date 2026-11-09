@@ -76,3 +76,24 @@ def test_stay_bonus(mp, balancing, moderate):
     torch.testing.assert_close(pm[rows], p0[rows])
     _, mh = run(50.0)  # huge bonus: each token takes its predecessor's plain selection, the first tokens their own
     assert torch.equal(mh[bsz:], m0[:-bsz]) and torch.equal(mh[:bsz], m0[:bsz])
+
+
+@pytest.mark.parametrize("balancing", ["qb", "topk"])
+def test_stay_rate_metric(mp, balancing):
+    """moe_router_log_stay_rate records the stay rate of the final selection in a grad-enabled forward (the
+    quantile-balancing routing itself runs under no_grad), nothing under no_grad."""
+    from megatron.core.transformer.moe.moe_logging import destroy_moe_metrics_tracker, get_moe_metrics_tracker
+
+    seq, bsz = 128, 2
+    x = torch.randn(seq, bsz, 32, generator=torch.Generator().manual_seed(2)).cuda().bfloat16()
+    r = _router(balancing, 0.1)
+    r.config.moe_router_log_stay_rate = True
+    r.set_layer_number(1)
+    destroy_moe_metrics_tracker()
+    with torch.no_grad():
+        r(x)
+    assert "stay_rate" not in get_moe_metrics_tracker().metrics
+    _, m = r(x)
+    got = float(get_moe_metrics_tracker().metrics["stay_rate"].values[0])
+    assert abs(got - _stay(m, bsz)) < 1e-5 and got > 0
+    destroy_moe_metrics_tracker()
