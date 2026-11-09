@@ -483,6 +483,25 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             return logits.transpose(0, 1).contiguous()
         return self.compute_language_model_loss(labels, logits)
 
+    def _mtp_fused_loss_fn(self, output_weight):
+        """The MTP depths' per-token loss through the Liger fused head (no [s, b, vocab] logits, on the
+        positions process_mtp_loss samples), or None (the plain output layer)."""
+        if not self.config.liger_fused_linear_cross_entropy:
+            return None
+        weight = output_weight if output_weight is not None else self.output_layer.weight
+        if self.config.mtp_detach_heads:
+            weight = weight.detach()
+        mult = self.config.mup_output_mult
+
+        def fn(hidden, labels, loss_mask):
+            if mult != 1.0:
+                hidden = hidden * mult
+            return liger_fused_linear_cross_entropy(
+                hidden, weight, labels, loss_mask, self.config.liger_fused_linear_cross_entropy_chunk_size
+            )
+
+        return fn
+
     def _liger_loss(self, hidden_states, weight, labels, loss_mask):
         """Per-token CE of the Liger fused head + loss; in training with output_z_loss_coeff the
         z-loss coeff * logZ^2 enters the gradients (in the kernel) and mean(logZ^2) over the
@@ -825,6 +844,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     packed_seq_params=packed_seq_params,
                     scale_logits_fn=self._scale_logits if self.config.use_mup else None,
                     input_ids=input_ids,
+                    fused_loss_fn=self._mtp_fused_loss_fn(output_weight),
                 )
         sequence_parallel_override = False
         if (

@@ -772,6 +772,7 @@ def process_mtp_loss(
     packed_seq_params: Optional[PackedSeqParams] = None,
     scale_logits_fn: Optional[Callable[[Tensor], Tensor]] = None,
     input_ids: Optional[Tensor] = None,
+    fused_loss_fn: Optional[Callable] = None,
 ) -> Tensor:
     """Process Multi-Token Prediction (MTP) loss computation.
 
@@ -797,6 +798,10 @@ def process_mtp_loss(
             ``labels`` is None (e.g. RL training), by rolling left to match the SFT
             label convention (``label[i] = input_id[i + 1]``). Ignored when ``labels``
             is provided.
+        fused_loss_fn (Optional[Callable]): ``(hidden [s, b, h], labels [b, s], loss_mask [b, s]) ->
+            per-token loss [b, s]`` without materialised logits (the fused linear cross entropy); then
+            the loss runs on every ``config.mtp_loss_stride``-th position only and no acceptance
+            counts are logged.
 
     Returns:
         Tensor: Updated hidden states after MTP loss processing (first chunk only).
@@ -837,26 +842,47 @@ def process_mtp_loss(
     # correctly scaled relative to the main loss gradients in finalize_model_grads.
     original_num_tokens = loss_mask.sum()
 
+    stride = max(1, int(getattr(config, "mtp_loss_stride", 1) or 1))
     for mtp_layer_number in range(config.mtp_num_layers):
-        mtp_logits, _ = output_layer(
-            hidden_states_list[mtp_layer_number + 1],
-            weight=output_weight,
-            runtime_gather_output=runtime_gather_output,
-        )
-        if scale_logits_fn is not None:
-            mtp_logits = scale_logits_fn(mtp_logits)
         mtp_labels, _ = roll_tensor(
             mtp_labels, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
         )
         loss_mask, num_tokens = roll_tensor(
             loss_mask, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
         )
+        if fused_loss_fn is not None:
+            # the vocabulary head on every stride-th position only (offset by the depth, so the
+            # depths cover different positions); normalised by the sampled token count
+            depth_hidden = hidden_states_list[mtp_layer_number + 1]
+            pos = torch.arange(mtp_layer_number % stride, depth_hidden.shape[0], stride,
+                               device=depth_hidden.device)
+            sub_mask = loss_mask[:, pos]
+            mtp_loss = sub_mask * fused_loss_fn(depth_hidden[pos], mtp_labels[:, pos], sub_mask)
+            num_tokens = sub_mask.sum()
+            if is_training:
+                mtp_loss_for_log = (
+                    torch.sum(mtp_loss) * (num_tokens > 0).to(mtp_loss.dtype)
+                ) / num_tokens.clamp(min=1)
+                MTPLossLoggingHelper.save_metrics_to_tracker(
+                    mtp_loss_for_log,
+                    torch.zeros((), device=mtp_loss.device),
+                    torch.zeros((), device=mtp_loss.device),
+                    mtp_layer_number,
+                    config.mtp_num_layers,
+                    avg_group=parallel_state.get_data_parallel_group(with_context_parallel=True),
+                )
+        else:
+            mtp_logits, _ = output_layer(
+                hidden_states_list[mtp_layer_number + 1],
+                weight=output_weight,
+                runtime_gather_output=runtime_gather_output,
+            )
+            if scale_logits_fn is not None:
+                mtp_logits = scale_logits_fn(mtp_logits)
+            mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
+            mtp_loss = loss_mask * mtp_loss
 
-        mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
-
-        mtp_loss = loss_mask * mtp_loss
-
-        if is_training:
+        if is_training and fused_loss_fn is None:
             mtp_loss_for_log = (
                 torch.sum(mtp_loss) * (num_tokens > 0).to(mtp_loss.dtype)
             ) / num_tokens.clamp(min=1)
@@ -980,7 +1006,8 @@ class MultiTokenPredictionLayer(MegatronModule):
                     f"The supported attention mask types are {SUPPORTED_ATTN_MASK}."
                 )
 
-        self.enorm = self.submodules.enorm(
+        self.latent = bool(config.mtp_latent)
+        self.enorm = None if self.latent else self.submodules.enorm(
             config=self.config,
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
@@ -997,7 +1024,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         # so the input's shape is [s, b, 2*h].
         # The output will be send to the following transformer layer,
         # so the output's shape should be [s, b, h].
-        self.eh_proj = build_module(
+        self.eh_proj = None if self.latent else build_module(
             self.submodules.eh_proj,
             self.config.hidden_size * 2,
             self.config.hidden_size,
@@ -1108,10 +1135,10 @@ class MultiTokenPredictionLayer(MegatronModule):
                 cp_group=self.cp_group,
                 packed_seq_params=packed_seq_params,
             )
-        # embedding
-        decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
+        # embedding (none in latent space: the depth reads only the previous depth's hidden state)
+        decoder_input = None if self.latent else embedding(input_ids=input_ids, position_ids=position_ids)
 
-        if self.config.mtp_detach_heads:
+        if self.config.mtp_detach_heads and decoder_input is not None:
             decoder_input = decoder_input.detach()
 
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
@@ -1129,6 +1156,9 @@ class MultiTokenPredictionLayer(MegatronModule):
         """
         Concatenate the tokens before sending to transformer layer.
         """
+        if self.latent:  # the normalised previous depth only (TP 1: nothing to gather / scatter)
+            hidden_states = apply_module(self.hnorm)(hidden_states)
+            return make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
         decoder_input = apply_module(self.enorm)(decoder_input)
         decoder_input = make_viewless_tensor(inp=decoder_input, requires_grad=True, keep_graph=True)
         hidden_states = apply_module(self.hnorm)(hidden_states)
