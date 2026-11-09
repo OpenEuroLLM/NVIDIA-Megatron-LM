@@ -81,6 +81,8 @@ def _config(**overrides):
         hidden_size=HIDDEN,
         num_attention_heads=HEADS,
         num_query_groups=2,
+        add_bias_linear=False,
+        normalization="RMSNorm",
         kv_channels=2 * HEAD_DIM,  # the attention's head dim: twice complex_kda's, as in the main run
         qk_layernorm=True,
         attention_output_gate=True,
@@ -112,7 +114,8 @@ def _layer(**overrides):
 
     torch.manual_seed(0)
     model_parallel_cuda_manual_seed(0)
-    return ComplexKDA(_config(**overrides), layer_number=1).cuda()
+    # bf16 throughout, as Float16Module holds the model
+    return ComplexKDA(_config(**overrides), layer_number=1).cuda().bfloat16()
 
 
 def _x(seq=64, batch=2):
