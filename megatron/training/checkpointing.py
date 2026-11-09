@@ -1637,13 +1637,41 @@ def _is_state_scalar(value):
     return not isinstance(value, (torch.Tensor, dict, list))
 
 
-class _MetadataOnceReader(FileSystemReader):
-    """A FileSystemReader that reads ``.metadata`` once: the fsdp_dtensor load reads it for the
-    key comparison and DCP's load again, on every rank."""
+# One unpickled ``.metadata`` per process, shared by the readers of one load: the args load, the
+# rerun-state check and the fsdp_dtensor state load each read it otherwise (322 MB, ~11 s unpickle
+# per read at 1024 ranks of the 84B v4 run). Keyed by path + mtime + size; dropped when the load ends.
+_METADATA_CACHE: dict = {}
 
-    def read_metadata(self):
+
+def _metadata_cache_key(path):
+    try:
+        st = os.stat(os.path.join(os.fspath(path), ".metadata"))
+    except (OSError, TypeError):
+        return None
+    return (os.path.realpath(os.fspath(path)), st.st_mtime_ns, st.st_size)
+
+
+def _drop_metadata_cache():
+    _METADATA_CACHE.clear()
+
+
+class _MetadataOnceReader(FileSystemReader):
+    """A FileSystemReader that reads ``.metadata`` once per process (see ``_METADATA_CACHE``): the
+    fsdp_dtensor load reads it for the args, the rerun-state check, the key comparison and DCP's
+    load, on every rank."""
+
+    def read_metadata(self, *args, **kwargs):
         if not hasattr(self, "_metadata_once"):
-            self._metadata_once = super().read_metadata()
+            key = None if (args or kwargs) else _metadata_cache_key(self.path)
+            metadata = _METADATA_CACHE.get(key) if key is not None else None
+            if metadata is None:
+                metadata = super().read_metadata(*args, **kwargs)
+                if key is not None:
+                    _METADATA_CACHE.clear()
+                    _METADATA_CACHE[key] = metadata
+            elif getattr(metadata, "storage_meta", None) is not None:
+                metadata.storage_meta.load_id = self.load_id
+            self._metadata_once = metadata
         return self._metadata_once
 
     def read_data(self, plan, planner):
@@ -2253,8 +2281,14 @@ def _load_base_checkpoint(
     elif ckpt_format == 'fsdp_dtensor':
         assert HAVE_MEGATRON_FSDP, 'Should not be called if Megatron-FSDP is not available.'
         if rank0:
+            # three small pickled items: read locally on every rank (no_dist, no central plan
+            # over the 1M-item metadata), through the per-process metadata cache
             state_dict = {'args': None, 'iteration': None, 'checkpoint_version': None}
-            torch.distributed.checkpoint.load(state_dict=state_dict, checkpoint_id=checkpoint_name)
+            torch.distributed.checkpoint.load(
+                state_dict=state_dict,
+                storage_reader=_MetadataOnceReader(checkpoint_name),
+                no_dist=True,
+            )
             return state_dict, checkpoint_name, release, CheckpointType.FSDP_DTENSOR
 
         state_dict = sharded_state_dict
@@ -2866,7 +2900,7 @@ def load_checkpoint(
         }
         load_kwargs['sharded_state_dict'] = sharded_state_dict
     elif args.ckpt_format == 'fsdp_dtensor':
-        reader = FileSystemReader(get_load_checkpoint_path_by_args(args))
+        reader = _MetadataOnceReader(get_load_checkpoint_path_by_args(args))
         try:
             state_dict_metadata = reader.read_metadata().state_dict_metadata
         except FileNotFoundError:
@@ -3257,6 +3291,7 @@ def load_checkpoint(
     _gtp_remat_r = mpu.get_gtp_weight_remat_rank()
     _gtp_remat_w = mpu.get_gtp_weight_remat_world_size()
     _load_phase("rest_until_loaded")
+    _drop_metadata_cache()
     _load_timing_report()
     print_rank_0(
         f'  successfully loaded checkpoint from {load_dir} '
