@@ -1563,6 +1563,60 @@ def _save_phase(tag, t0=[None]):
     t0[0] = now
 
 
+# MEGATRON_DEBUG_LOAD_TIMING=1: per-rank duration of every phase of a checkpoint load, reported as
+# min / max over all ranks at the end (stragglers and barrier waits show as max >> min). Fixed tag
+# order: every rank reduces the same vector.
+_LOAD_TAGS = (
+    "args_rank0_dcp_load",
+    "rerun_check_read_metadata",
+    "generate_state_dict_incl_dummy_optimizer_step",
+    "preprocess_fsdp_dtensor_state_dict",
+    "read_metadata",
+    "packed_template",
+    "print_diff_in_state_dicts",
+    "dcp_load_plan_read_barrier",
+    "  of_which_read_data",
+    "unpack_restore",
+    "model_load_state_dict",
+    "optimizer_load_state_dict",
+    "rest_until_loaded",
+)
+_LOAD_TIMES: dict = {}
+_LOAD_T0 = [None]
+
+
+def _load_timing_on() -> bool:
+    return os.environ.get("MEGATRON_DEBUG_LOAD_TIMING", "0") == "1"
+
+
+def _load_phase(tag):
+    """Close the current load phase under `tag` (this rank's wall time since the previous mark)."""
+    if not _load_timing_on():
+        return
+    now = time()
+    if tag == "start":
+        _LOAD_TIMES.clear()
+    elif _LOAD_T0[0] is not None:
+        _LOAD_TIMES[tag] = _LOAD_TIMES.get(tag, 0.0) + (now - _LOAD_T0[0])
+    _LOAD_T0[0] = now
+
+
+def _load_timing_report():
+    """min / max over all ranks of every load phase (one small all-reduce pair; every rank calls)."""
+    if not _load_timing_on() or not torch.distributed.is_initialized():
+        return
+    vals = torch.tensor(
+        [_LOAD_TIMES.get(t, 0.0) for t in _LOAD_TAGS], dtype=torch.float64, device="cuda"
+    )
+    vmax, vmin = vals.clone(), vals.clone()
+    torch.distributed.all_reduce(vmax, op=torch.distributed.ReduceOp.MAX)
+    torch.distributed.all_reduce(vmin, op=torch.distributed.ReduceOp.MIN)
+    total = sum(v for t, v in zip(_LOAD_TAGS, vmax.tolist()) if not t.startswith(" "))
+    for tag, lo, hi in zip(_LOAD_TAGS, vmin.tolist(), vmax.tolist()):
+        print_rank_0(f"[load-timing] {tag}: min {lo:.1f} s, max {hi:.1f} s")
+    print_rank_0(f"[load-timing] sum of the per-phase maxima: {total:.1f} s")
+
+
 # fsdp_dtensor optimizer state: one pickled item per optimizer for the parameter-group metadata and
 # for the per-parameter non-tensor state (``step``), instead of one DCP item per leaf
 _PACKED_GROUP_META = "param_to_group_meta_packed"
@@ -1591,6 +1645,16 @@ class _MetadataOnceReader(FileSystemReader):
         if not hasattr(self, "_metadata_once"):
             self._metadata_once = super().read_metadata()
         return self._metadata_once
+
+    def read_data(self, plan, planner):
+        if not _load_timing_on():
+            return super().read_data(plan, planner)
+        t0 = time()
+        fut = super().read_data(plan, planner)
+        fut.wait()
+        tag = "  of_which_read_data"
+        _LOAD_TIMES[tag] = _LOAD_TIMES.get(tag, 0.0) + (time() - t0)
+        return fut
 
 
 def _load_fsdp_dtensor_checkpoint(state_dict, storage_reader, planner):
@@ -2199,9 +2263,12 @@ def _load_base_checkpoint(
         )
         raw_model_state_dict = state_dict['model'].copy() if 'model' in state_dict else None
         model = state_dict.pop('_model')
+        _load_phase("generate_state_dict_incl_dummy_optimizer_step")
         state_dict = preprocess_fsdp_dtensor_state_dict(args, state_dict, model[0])
+        _load_phase("preprocess_fsdp_dtensor_state_dict")
         fs_storage_reader = _MetadataOnceReader(checkpoint_name)
         state_dict_metadata = fs_storage_reader.read_metadata().state_dict_metadata
+        _load_phase("read_metadata")
         if gpt_compat_layer_maps is not None:
             from megatron.core.dist_checkpointing.gpt_checkpoint_interop import (
                 retarget_fsdp_state_dict_to_gpt_checkpoint,
@@ -2228,6 +2295,7 @@ def _load_base_checkpoint(
             state_dict, unpack = pack_fsdp_dtensor_optimizer_scalars(
                 state_dict, checkpoint_keys=state_dict_metadata
             )
+        _load_phase("packed_template")
 
         ckpt_type = CheckpointType.FSDP_DTENSOR
         allow_partial_load = not getattr(args, 'strict_fsdp_dtensor_load', False)
@@ -2237,9 +2305,11 @@ def _load_base_checkpoint(
 
             _time.sleep(rank * 0.001)  # Make that logs of different ranks do not overlap
             print_diff_in_state_dicts(state_dict_metadata, state_dict)
+        _load_phase("print_diff_in_state_dicts")
 
         planner = default_planner.DefaultLoadPlanner(allow_partial_load=allow_partial_load)
         _load_fsdp_dtensor_checkpoint(state_dict, fs_storage_reader, planner)
+        _load_phase("dcp_load_plan_read_barrier")
         if unpack is not None:
             state_dict = unpack()
 
@@ -2249,6 +2319,7 @@ def _load_base_checkpoint(
 
         if raw_model_state_dict is not None:
             state_dict['model'] = raw_model_state_dict
+        _load_phase("unpack_restore")
     else:
         raise NotImplementedError(f'checkpoint format {ckpt_format} not supported')
 
@@ -2548,9 +2619,11 @@ def load_checkpoint(
     state_dict = None
     release = False
     if args.auto_detect_ckpt_format or ckpt_format in ('torch_dist', 'fsdp_dtensor'):
+        _load_phase("start")
         state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
             load_dir, args, rank0=True, checkpointing_context=checkpointing_context
         )
+        _load_phase("args_rank0_dcp_load")
 
         ckpt_format = None
         if ckpt_type == CheckpointType.TORCH_DCP:
@@ -2798,6 +2871,7 @@ def load_checkpoint(
             state_dict_metadata = reader.read_metadata().state_dict_metadata
         except FileNotFoundError:
             state_dict_metadata = {}
+        _load_phase("rerun_check_read_metadata")
 
         gen_sd_rerun_state = {}
         gen_sd_opt_param_scheduler = None
@@ -3022,8 +3096,10 @@ def load_checkpoint(
                 and optimizer is not None
                 and not optimizer.is_stub_optimizer
             ):
+                _load_phase("model_load_state_dict")
                 optimizer.load_state_dict(state_dict['optimizer'])
                 _debug_optimizer_state(optimizer, "after load", model)
+                _load_phase("optimizer_load_state_dict")
 
             # Load distributed optimizer's custom parameter state.
             # For distributed checkpoint it's already loaded in load_state_dict above
@@ -3180,6 +3256,8 @@ def load_checkpoint(
     )
     _gtp_remat_r = mpu.get_gtp_weight_remat_rank()
     _gtp_remat_w = mpu.get_gtp_weight_remat_world_size()
+    _load_phase("rest_until_loaded")
+    _load_timing_report()
     print_rank_0(
         f'  successfully loaded checkpoint from {load_dir} '
         f'[ t {_tp_r + 1}/{_tp_w}, '
