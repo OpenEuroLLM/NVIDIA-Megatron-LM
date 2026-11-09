@@ -83,6 +83,12 @@ class TransformerConfig(ModelParallelConfig):
     mtp_use_repeated_layer: bool = False
     """Use a single MTP layer repeatedly instead of multiple separate layers."""
 
+    mtp_parallel: bool = False
+    """Parallel latent MTP (needs mtp_latent): ONE MTP layer on the decoder's hidden state predicts all
+    mtp_num_layers offsets at once -- output k = final_norm(t + P_k t) with a zero-initialised h x h P_k per
+    offset, through the shared head -- instead of mtp_num_layers sequential depths. The hybrid pattern still lists
+    mtp_num_layers depths (the depth count); only the first is built."""
+
     mtp_detach_heads: bool = False
     """If True, detach MTP head inputs from the main model graph.
     This prevents MTP loss gradients from flowing back to the main model,
@@ -2422,6 +2428,8 @@ class TransformerConfig(ModelParallelConfig):
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
         details.
         """
+        if self.mtp_parallel and not (self.mtp_latent and not self.mtp_use_repeated_layer):
+            raise ValueError("mtp_parallel needs mtp_latent (and replaces mtp_use_repeated_layer)")
 
         if self.page_sparse_selector is not None:
             selectors = ("dense", "window", "page_mean", "quest", "oracle", "token_topk", "compress_mean",

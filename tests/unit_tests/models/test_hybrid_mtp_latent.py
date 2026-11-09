@@ -149,3 +149,25 @@ def test_mtp_depths_keep_mhc(mp):
         loss = model(ids, position_ids=pos, attention_mask=None, labels=torch.roll(ids, -1, 1))
     loss.float().mean().backward()
     assert all(p.grad is not None for n, p in model.named_parameters() if n.startswith("mtp."))
+
+
+def test_parallel_latent_mtp(mp):
+    """mtp_parallel: one MTP layer predicts all offsets (output k = final_norm(t + P_k t), P_k zero-initialised):
+    only the first depth's layer exists, one projection per offset, and everything trains."""
+    model_parallel_cuda_manual_seed(123)
+    torch.manual_seed(0)
+    model = _model(mtp_parallel=True)
+    names = [n for n, _ in model.named_parameters() if n.startswith("mtp.")]
+    assert any(n.startswith("mtp.layers.0.") for n in names)
+    assert not any(n.startswith("mtp.layers.1.") for n in names), names
+    projs = [n for n in names if "parallel_proj" in n]
+    assert len(projs) == DEPTHS, projs
+    assert all(float(p.abs().sum()) == 0 for n, p in model.named_parameters() if "parallel_proj" in n)
+    ids = torch.randint(0, 128, (2, 64), device="cuda")
+    pos = torch.arange(64, device="cuda").expand(2, 64)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        loss = model(ids, position_ids=pos, attention_mask=None, labels=torch.roll(ids, -1, 1))
+    loss.float().mean().backward()
+    grads = {n: p.grad for n, p in model.named_parameters() if n.startswith("mtp.")}
+    assert all(g is not None for g in grads.values())
+    assert all(float(grads[n].abs().sum()) > 0 for n in projs)

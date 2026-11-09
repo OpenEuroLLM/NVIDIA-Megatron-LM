@@ -1118,6 +1118,18 @@ class MultiTokenPredictionLayer(MegatronModule):
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
         )
+        # mtp_parallel: this one layer predicts all mtp_num_layers offsets; output k = final_norm(t + P_k t), P_k
+        # zero-initialised (every output starts as the layer's own prediction)
+        self.parallel_proj = None
+        if getattr(self.config, "mtp_parallel", False):
+            h = self.config.hidden_size
+            self.parallel_proj = torch.nn.ModuleList(
+                [torch.nn.Linear(h, h, bias=False, dtype=self.config.params_dtype)
+                 for _ in range(self.config.mtp_num_layers)]
+            )
+            for proj in self.parallel_proj:
+                torch.nn.init.zeros_(proj.weight)
+                proj.weight.sequence_parallel = self.config.sequence_parallel
         self.offload_context = nullcontext()
 
     def get_inner_quantization_context(self) -> AbstractContextManager:
@@ -1290,6 +1302,9 @@ class MultiTokenPredictionLayer(MegatronModule):
                         padding_mask=padding_mask,
                     )
 
+        if self.parallel_proj is not None:  # [K s, b, h]: the K offsets' outputs, in depth order
+            return torch.cat([self._postprocess(hidden_states + proj(hidden_states))
+                              for proj in self.parallel_proj], dim=0)
         hidden_states = self._postprocess(hidden_states)
 
         return hidden_states
@@ -1806,8 +1821,8 @@ class MultiTokenPredictionBlock(MegatronModule):
 
         # New Mamba path: use mtp_layer_pattern and hybrid_submodules
         if self.mtp_layer_pattern is not None and self.hybrid_submodules is not None:
-            if self.mtp_use_repeated_layer:
-                # Shared/repeated layer: build one layer, use it for all depths
+            if self.mtp_use_repeated_layer or self.config.mtp_parallel:
+                # Shared/repeated layer (or the one parallel layer): build one layer
                 layer_spec = self.submodules.layer_specs[0]
                 shared_layer = build_layer_with_pattern(
                     layer_spec,
@@ -1889,6 +1904,25 @@ class MultiTokenPredictionBlock(MegatronModule):
 
         if self.config.mtp_detach_heads:
             hidden_states = hidden_states.detach()
+
+        if self.config.mtp_parallel:  # one layer, all offsets at once: [K s, b, h]
+            out, input_ids, position_ids, padding_mask = self.layers[0](
+                input_ids=input_ids,
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                padding_mask=padding_mask,
+                inference_params=inference_params,
+                rotary_pos_emb=rotary_pos_emb,
+                rotary_pos_cos=rotary_pos_cos,
+                rotary_pos_sin=rotary_pos_sin,
+                packed_seq_params=packed_seq_params,
+                sequence_len_offset=sequence_len_offset,
+                embedding=embedding,
+                **(extra_block_kwargs or {}),
+            )
+            hidden_states_list.extend(torch.chunk(out, self.config.mtp_num_layers, dim=0))
+            return torch.cat(hidden_states_list, dim=0)
 
         for iteration in range(self.config.mtp_num_layers):
             layer_idx = 0 if self.mtp_use_repeated_layer else iteration
