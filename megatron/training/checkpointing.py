@@ -1784,11 +1784,23 @@ def pack_fsdp_dtensor_optimizer_scalars(state_dict, checkpoint_keys=None):
                                 blobs[kind][tag] = blob
             group_meta = sub.get("param_to_group_meta")
             if isinstance(group_meta, dict):
+                template = {name: pickle.dumps(meta) for name, meta in group_meta.items()}
+                loaded = set()
                 for blob in blobs[_PACKED_GROUP_META].values():
                     meta = pickle.loads(blob)
                     for name, gi in meta["param_group"].items():
                         if name in group_meta:
                             group_meta[name] = meta["groups"][gi]
+                            loaded.add(name)
+                # parameters the checkpoint does not hold (added by checkpoint surgery, e.g. a
+                # ckda_branch): the loaded metadata of a parameter that shares their group in the
+                # current layout, so that the group stays consistent (lr, step, ... as trained)
+                peers = {}
+                for name in loaded:
+                    peers.setdefault(template[name], name)
+                for name in group_meta:
+                    if name not in loaded and template[name] in peers:
+                        group_meta[name] = group_meta[peers[template[name]]]
             for blob in blobs[_PACKED_STATE_SCALARS].values():
                 # every saved scalar: a template entry may lack one (an optimizer that creates its
                 # step counter at the first update)

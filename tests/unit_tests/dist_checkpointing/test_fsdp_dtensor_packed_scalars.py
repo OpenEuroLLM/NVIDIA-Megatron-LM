@@ -135,6 +135,25 @@ def test_unpack_fills_only_the_template_names(tmp_path):
     assert out['param_to_group_meta']['layers.1.mlp.experts.linear_fc1.weight3'] == _meta(0.002)
 
 
+def test_new_parameters_join_their_groups_loaded_metadata(tmp_path):
+    """Parameters the checkpoint does not hold (checkpoint surgery, e.g. a ckda_branch) take the loaded
+    group metadata of a parameter that shares their group in the template: the groups stay consistent
+    (distrib_optimizer._param2group_meta_to_param_groups) and keep the trained values."""
+    metadata = _save(tmp_path, chained=False, packed=True)
+    experts = [f'layers.1.mlp.experts.linear_fc1.weight{e}' for e in range(EXPERTS)]
+    # template lr 1.0: the two groups differ (odd index lr, even 2 lr); new.a joins the even, new.b the odd
+    template = {'model': {'w': torch.zeros(2)}, 'optimizer': _sub(1, 1.0, 0.0, experts + ['new.a', 'new.b'])}
+    sd, unpack = pack_fsdp_dtensor_optimizer_scalars(template, checkpoint_keys=metadata)
+    dcp.load(sd, checkpoint_id=str(tmp_path),
+             planner=default_planner.DefaultLoadPlanner(allow_partial_load=True))
+    out = unpack()['optimizer']
+    meta = out['param_to_group_meta']
+    assert meta['layers.1.mlp.experts.linear_fc1.weight1'] == _meta(0.002)
+    assert meta['new.a'] == _meta(0.004) and meta['new.b'] == _meta(0.002)
+    assert out['state']['new.a']['step'] == 1  # a new parameter's optimizer state starts fresh
+    assert out['state']['layers.1.mlp.experts.linear_fc1.weight1']['step'] == 4
+
+
 def _ep_sub(step, lr, experts):
     return _sub(step, lr, 0.0, [f'layers.1.mlp.experts.linear_fc1.weight{e}' for e in experts]
                 + ['decoder.final_layernorm.weight'])
