@@ -129,7 +129,13 @@ class _LigerFixedChunkLinearCrossEntropy(torch.autograd.Function):
                     # Preserve Liger's original-dtype accumulation semantics.
                     grad_weight += torch.mm(logits_chunk.t(), input_chunk).float()
 
-        ctx.save_for_backward(grad_input.detach(), grad_weight.detach() if grad_weight is not None else None)
+        # Liger scales the saved gradients by ONE upstream value (element_mul_kernel loads grad_output[0]); with
+        # Megatron's sum(loss * loss_mask) that value is 0 whenever the first token is masked, which zeroed the
+        # whole call's gradient. Take the first non-ignored token's instead (ignored rows are zero anyway; a device
+        # gather, no host sync).
+        first_valid = (target != -100).to(torch.int32).argmax().view(1)
+        ctx.save_for_backward(grad_input.detach(), grad_weight.detach() if grad_weight is not None else None,
+                              first_valid)
         if not with_z:
             return loss_1d, None
         # the kernel's loss is CE + z: report CE (the gradients above keep the z term)
@@ -141,7 +147,8 @@ class _LigerFixedChunkLinearCrossEntropy(torch.autograd.Function):
     @amp_custom_bwd
     def backward(ctx, grad_output: torch.Tensor, grad_z_loss=None):
         assert liger_fused_ce_ops is not None
-        grad_input, grad_weight = ctx.saved_tensors
+        grad_input, grad_weight, first_valid = ctx.saved_tensors
+        grad_output = grad_output.reshape(-1).index_select(0, first_valid).contiguous()
         # Liger's helper first builds a device scalar and calls ``torch.equal``
         # to skip this when grad_output is one. Both are illegal inside a full
         # CUDA graph capture. Applying the same Triton scaling kernel always is
