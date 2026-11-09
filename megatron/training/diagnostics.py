@@ -214,6 +214,8 @@ class TrainingDiagnostics:
         # (param, grad_slot) for Megatron-FSDP parameters: local DTensor shards, see _build_grad_map
         self._fsdp_grad_entries: List[Tuple[torch.nn.Parameter, int]] = []
         self._fsdp_replica_factor = 1.0
+        self._n_engram_tables = 0
+        self._last_gn: float | None = None  # global grad-norm of the last step (observe_clip)
 
     # ------------------------------------------------------------------ setup
     def setup(self, model, optimizer=None):
@@ -301,13 +303,20 @@ class TrainingDiagnostics:
         # parameters fell through to the "full gradient on every rank" path below and were
         # divided by the DP world size.
         fsdp_ids = set()
+        engram_ids = set()
         for _name, param in self._all_named_params:
+            if getattr(param, "is_engram_table", False):
+                # their own chained optimizer and gradient buffer (engram_grad), filled only in
+                # optimizer.step(); reported as the remainder diag/grad_norm/engram_tables (emit)
+                engram_ids.add(id(param))
+                continue
             if getattr(param, "__fsdp_param__", False):
                 fsdp_ids.add(id(param))
                 self._fsdp_grad_entries.append((param, slot_of[id(param)]))
         self._fsdp_replica_factor = float(
             max(1, int(getattr(self.args, "num_distributed_optimizer_instances", 1) or 1))
         )
+        self._n_engram_tables = len(engram_ids)
 
         tp_group = mpu.get_tensor_model_parallel_group()
         expert_tp_group = mpu.get_expert_tensor_parallel_group()
@@ -328,6 +337,7 @@ class TrainingDiagnostics:
             """
             return (
                 id(param) not in fsdp_ids
+                and id(param) not in engram_ids
                 and param_is_not_shared(param)
                 and param_is_not_tensor_parallel_duplicate(
                     param, tp_group=tp_group, expert_tp_group=expert_tp_group
@@ -362,10 +372,11 @@ class TrainingDiagnostics:
                 mpu.get_data_parallel_world_size(with_context_parallel=True)
             )
         if fsdp_ids and torch.distributed.get_rank() == 0:
-            other = [n for n, p in self._all_named_params if id(p) not in fsdp_ids]
+            other = [n for n, p in self._all_named_params if id(p) not in fsdp_ids | engram_ids]
             print(
                 f"[diagnostics] grad norms: {len(self._fsdp_grad_entries)} Megatron-FSDP parameters "
                 f"(local DTensor shards, / {self._fsdp_replica_factor:g} HSDP instances), "
+                f"{len(engram_ids)} Engram tables (reported as the remainder engram_tables), "
                 f"{len(self._grad_entries)} other counted (replica factor "
                 f"{self._grad_replica_factor:g}); not FSDP-managed: {other[:8]}"
                 + (f" (+{len(other) - 8} more)" if len(other) > 8 else ""),
@@ -659,10 +670,13 @@ class TrainingDiagnostics:
         clipped steps we are in. `grad_norm` is the pre-clip total norm, i.e.
         exactly the denominator of clip_coeff = clip_grad / (total_norm + 1e-6).
         """
-        if not self.want_clip or grad_norm is None:
+        if grad_norm is None:
             return
         gn = float(grad_norm)
-        if gn != gn:  # NaN
+        # the global norm of the step `collect` just ran on: emit derives the Engram tables'
+        # share from it (see emit), whether or not clip events are tracked
+        self._last_gn = gn
+        if not self.want_clip or gn != gn:  # off, or NaN
             return
         clip_grad = float(getattr(self.args, "clip_grad", 0.0) or 0.0)
         coeff = 1.0
@@ -945,7 +959,16 @@ class TrainingDiagnostics:
             # wrong, this is where it shows: the ratio drifts off 1.0 by exactly
             # the factor that was double-counted or dropped. Cheap, and it turns a
             # silent numerical bug into a visible one.
-            logs["diag/grad_norm/total_check"] = float(self._grad_buf.sum().clamp_min(0).sqrt())
+            total_sq = float(self._grad_buf.sum().clamp_min(0))
+            logs["diag/grad_norm/total_check"] = total_sq ** 0.5
+            # Engram tables (EngramTableOptimizer, chained) are in Megatron's grad-norm but their
+            # row gradients reach the owning ranks only in that optimizer's prepare_grads, i.e.
+            # inside optimizer.step(), after `collect`. Everything else is counted exactly above,
+            # so the tables' norm is the remainder (with Engram, total_check alone reads low).
+            if self._n_engram_tables and self._last_gn is not None:
+                gn = self._last_gn
+                if gn == gn:
+                    logs["diag/grad_norm/engram_tables"] = max(gn * gn - total_sq, 0.0) ** 0.5
             self._have_grads = False
 
         if self._have_acts:
