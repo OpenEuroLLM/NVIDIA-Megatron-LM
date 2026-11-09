@@ -15,7 +15,8 @@ from megatron.core.fusions import liger_fused_linear_cross_entropy as lfce  # no
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 @pytest.mark.parametrize("first_masked", [False, True])
-def test_liger_gradients_with_masked_first_token(first_masked):
+def test_liger_gradients_with_masked_first_token(monkeypatch, first_masked):
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)  # MN5 images enable TF32
     torch.manual_seed(0)
     s, b, hidden, vocab = 128, 2, 64, 1024
     h0 = torch.randn(s, b, hidden, device="cuda")

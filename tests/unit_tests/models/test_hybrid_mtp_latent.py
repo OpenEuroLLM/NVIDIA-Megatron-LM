@@ -107,7 +107,8 @@ def test_hybrid_latent_ckda_depths_train(mp):
     assert sum(".mtp." in n or n.startswith("mtp.") for n in names) > 0
     ids = torch.randint(0, 128, (2, 64), device="cuda")
     pos = torch.arange(64, device="cuda").expand(2, 64)
-    loss = model(ids, position_ids=pos, attention_mask=None, labels=torch.roll(ids, -1, 1))
+    with torch.autocast("cuda", dtype=torch.bfloat16):  # no Float16Module wrapper here
+        loss = model(ids, position_ids=pos, attention_mask=None, labels=torch.roll(ids, -1, 1))
     loss.float().mean().backward()
     mtp_grads = [p.grad for n, p in model.named_parameters() if n.startswith("mtp.")]
     assert all(g is not None for g in mtp_grads) and sum(float(g.abs().sum()) for g in mtp_grads) > 0
@@ -124,6 +125,7 @@ def test_mtp_depths_plain_residual_under_depth_memory(mp):
     assert any("ldm" in n or "depth_memory" in n for n, _ in model.named_parameters() if n.startswith("decoder."))
     ids = torch.randint(0, 128, (2, 64), device="cuda")
     pos = torch.arange(64, device="cuda").expand(2, 64)
-    loss = model(ids, position_ids=pos, attention_mask=None, labels=torch.roll(ids, -1, 1))
+    with torch.autocast("cuda", dtype=torch.bfloat16):  # no Float16Module wrapper here
+        loss = model(ids, position_ids=pos, attention_mask=None, labels=torch.roll(ids, -1, 1))
     loss.float().mean().backward()
     assert all(p.grad is not None for n, p in model.named_parameters() if n.startswith("mtp."))
