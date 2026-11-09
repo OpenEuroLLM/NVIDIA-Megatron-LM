@@ -85,7 +85,8 @@ def test_stride_samples_positions(mp):
 def _model(**kw):
     config = TransformerConfig(**{**dict(
         num_layers=4, hidden_size=64, num_attention_heads=4, num_query_groups=2, kv_channels=16,
-        linear_key_head_dim=16, linear_value_head_dim=16, linear_num_key_heads=4, linear_num_value_heads=4,
+        # head dim 64: FLA's TileLang KDA backward does not compile at 16
+        linear_key_head_dim=64, linear_value_head_dim=64, linear_num_key_heads=2, linear_num_value_heads=2,
         experimental_attention_variant="complex_kda", normalization="RMSNorm", add_bias_linear=False,
         gated_linear_unit=True, activation_func=F.silu, hidden_dropout=0.0, attention_dropout=0.0,
         num_moe_experts=4, moe_router_topk=2, moe_ffn_hidden_size=32, moe_grouped_gemm=False,
