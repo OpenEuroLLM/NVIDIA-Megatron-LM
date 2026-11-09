@@ -19,7 +19,7 @@ gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 def _sched(**kw):
     base = dict(ckda_branch_start_iteration=100, ckda_branch_alpha_hold=25, ckda_branch_alpha_ramp=175,
                 ckda_branch_alpha_end=0.0, ckda_branch_m_start=4.0, ckda_branch_m_ramp=200,
-                ckda_branch_gamma_scale=1.0, ckda_branch_log_interval=0)
+                ckda_branch_gamma_scale=1.0, ckda_branch_crossfade=False, ckda_branch_log_interval=0)
     base.update(kw)
     return SimpleNamespace(**base)
 
@@ -51,6 +51,27 @@ def test_branch_mix_gamma_zero_is_exact_and_gamma_scale_scales():
     with torch.no_grad():
         scaled.gamma.fill_(0.01)
     assert torch.allclose(mix(y, b), scaled(y, b))  # 0.1 * 1 = 0.01 * 10, m = 4 in both
+
+
+def test_crossfade_weights_add_up_to_one():
+    c = _sched(ckda_branch_crossfade=True, ckda_branch_alpha_hold=0, ckda_branch_alpha_ramp=150)
+    mix = cb.BranchMix(c, layer_number=10)
+    y, b = torch.randn(5, 2, 8), torch.randn(5, 2, 8)
+    assert torch.equal(mix(y, b), y)  # alpha 1 without a training loop: exactly the old layer
+    import megatron.core.ssm.ckda_branch as mod
+
+    for it, alpha in ((100, 1.0), (175, 0.5), (250, 0.0), (400, 0.0)):
+        orig = mod.current_iteration
+        mod.current_iteration = lambda it=it: it
+        try:
+            assert torch.allclose(mix(y, b), alpha * y + (1 - alpha) * b)  # gamma 0: weight 1 - alpha
+            with torch.no_grad():
+                mix.gamma.fill_(0.2)
+            assert torch.allclose(mix(y, b), alpha * y + (1 - alpha) * 1.2 * b)
+            with torch.no_grad():
+                mix.gamma.zero_()
+        finally:
+            mod.current_iteration = orig
 
 
 def test_has_branch_uses_zero_based_layer_indices():

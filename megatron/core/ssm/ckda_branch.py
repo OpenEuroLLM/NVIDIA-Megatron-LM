@@ -11,6 +11,8 @@ For the layers in ``config.ckda_branch_layers`` the complex_kda adapter (complex
 - ``gamma``: one learnable scale per layer, shape (1,) (Adam, no weight decay), 0 at insertion,
   so the model computes exactly what it computed before; the layer uses
   ``ckda_branch_gamma_scale * gamma`` (how fast Adam's ~lr steps move the branch's share).
+- ``ckda_branch_crossfade``: the branch's weight is ``(1 - alpha(t)) * (1 + scale * gamma)`` instead
+  (the two mixers' weights add up to 1, gamma a learnt correction of the branch's scale; m unused).
 - ``alpha(t)``: 1 for ``ckda_branch_alpha_hold`` steps after ``ckda_branch_start_iteration``,
   then linear to ``ckda_branch_alpha_end`` over ``ckda_branch_alpha_ramp`` steps.
 - ``m(t)``: an external multiplier, ``ckda_branch_m_start`` falling linearly to 1 over
@@ -134,6 +136,9 @@ class BranchMix(nn.Module):
         it = current_iteration()
         alpha, m = schedule(self.config, it)
         gamma = self.gamma * float(getattr(self.config, "ckda_branch_gamma_scale", 1.0))
+        if getattr(self.config, "ckda_branch_crossfade", False):
+            m = 1.0 - alpha  # the weights add up to 1; gamma corrects the branch's scale around 1
+            gamma = 1.0 + gamma
         out = y * alpha + b * (gamma.to(b.dtype) * m)
         every = getattr(self.config, "ckda_branch_log_interval", 0)
         if every and it is not None and it % every == 0 and self._logged != it and torch.is_grad_enabled():

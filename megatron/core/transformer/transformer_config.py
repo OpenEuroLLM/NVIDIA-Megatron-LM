@@ -1012,6 +1012,11 @@ class TransformerConfig(ModelParallelConfig):
     ckda_branch_m_ramp: int = 200
     """m falls linearly from ``ckda_branch_m_start`` to 1 over this many steps."""
 
+    ckda_branch_crossfade: bool = False
+    """Crossfade instead of the additive gamma: ``out = alpha(t) * ckda + (1 - alpha(t)) * (1 + scale *
+    gamma) * branch`` -- the two weights add up to 1 (gamma, 0 at insertion, a learnt correction of the
+    branch's scale; m unused). The hand-over completes on the alpha schedule whatever gamma learns."""
+
     ckda_branch_gamma_scale: float = 1.0
     """The layer uses ``ckda_branch_gamma_scale * gamma`` (gamma the parameter): Adam moves gamma by
     about lr per step whatever its gradient's size, so this sets how fast the branch's share of the
