@@ -659,10 +659,10 @@ class TransformerConfig(ModelParallelConfig):
     """Share one selection across the attention layers: the layer with this layer number selects, the others reuse
     it (0: every layer selects; page selectors; no pipeline parallelism)."""
 
-    page_sparse_packed_flex: bool = False
+    page_sparse_packed_flex: bool = True
     """Page selectors under flex: one FlexAttention call for every document of a packed batch (spans laid out on
-    page boundaries) instead of one call per document. 3090 Ti, 26 documents in 32k: 1.8-2.2x faster at head dim 64,
-    slower for page_mean at 128 -- off until measured on H100."""
+    page boundaries) instead of one call per document. H100, 49 documents in 64k, fwd + bwd: 10 x 128 heads
+    page_mean 164 -> 108 ms, window 133 -> 78 ms; 16 x 256 page_mean 293 -> 264 ms, window 258 -> 218 ms."""
 
     page_sparse_hier_group: int = 0
     """Hierarchical (coarse-to-fine) page selection: pages per group, scored first (0: flat)."""
