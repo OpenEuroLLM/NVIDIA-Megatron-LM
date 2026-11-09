@@ -606,6 +606,10 @@ class KronLSTM(_FLALayerWrapper):
                     forget_angle_init=config.linear_kronlstm_forget_angle_init,
                     erase_angle=config.linear_kronlstm_erase_angle,
                     signed_write=config.linear_kronlstm_signed_write,
+                    # a ckda_branch KronLSTM starts from its complex_kda layer's conv kernels: no
+                    # SiLU when that layer has none (stand-alone KronLSTM layers keep theirs)
+                    drop_silu=bool(getattr(config, "ckda_branch_from_ckda", False)
+                                   and getattr(config, "linear_drop_qkv_silu", False)),
                     output_gate_rank={"linear": "full", "lowrank": "lowrank"}[
                         config.linear_kronlstm_output_gate
                     ],

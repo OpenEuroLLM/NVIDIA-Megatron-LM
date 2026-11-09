@@ -322,6 +322,49 @@ class ComplexKDA(_MegatronSelfAttentionAdapter):
         b_proj = getattr(self.layer, "b_proj", None)
         if getattr(config, "linear_beta_adam", False) and b_proj is not None:
             b_proj.weight.use_adam_with_emerging_optimizers = True
+        # ckda_branch (ckda_branch.py): a second mixer in parallel on the listed layers
+        from megatron.core.ssm import ckda_branch as _cb
+
+        self.branch = self.branch_mix = None
+        if _cb.has_branch(config, layer_number):
+            if self.cp_group is not None:
+                raise NotImplementedError("ckda_branch: context parallelism is not wired")
+            self.branch = _cb.build_branch(config, layer_number, kwargs.get("pg_collection"))
+            self.branch_mix = _cb.BranchMix(config, layer_number)
+
+    def forward(
+        self,
+        hidden_states,
+        attention_mask=None,
+        inference_context=None,
+        rotary_pos_emb=None,
+        rotary_pos_cos=None,
+        rotary_pos_sin=None,
+        rotary_pos_cos_sin=None,
+        attention_bias=None,
+        packed_seq_params=None,
+        sequence_len_offset=None,
+        **kwargs,
+    ):
+        y, _ = super().forward(
+            hidden_states, attention_mask=attention_mask, inference_context=inference_context,
+            rotary_pos_emb=rotary_pos_emb, rotary_pos_cos=rotary_pos_cos, rotary_pos_sin=rotary_pos_sin,
+            rotary_pos_cos_sin=rotary_pos_cos_sin, attention_bias=attention_bias,
+            packed_seq_params=packed_seq_params, sequence_len_offset=sequence_len_offset, **kwargs)
+        if self.branch is None:
+            return y, None
+        if self.config.ckda_branch == "attention":
+            b, bias = self.branch(
+                hidden_states, attention_mask=attention_mask, inference_context=inference_context,
+                rotary_pos_emb=rotary_pos_emb, rotary_pos_cos=rotary_pos_cos, rotary_pos_sin=rotary_pos_sin,
+                packed_seq_params=packed_seq_params, sequence_len_offset=sequence_len_offset)
+        else:
+            b, bias = self.branch(hidden_states, attention_mask=attention_mask,
+                                  inference_context=inference_context, packed_seq_params=packed_seq_params,
+                                  sequence_len_offset=sequence_len_offset)
+        if bias is not None:
+            b = b + bias
+        return self.branch_mix(y, b), None
 
 
 class ComplexKDAHybridAttention(_MegatronSelfAttentionAdapter):

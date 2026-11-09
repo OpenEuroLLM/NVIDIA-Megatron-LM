@@ -977,6 +977,45 @@ class TransformerConfig(ModelParallelConfig):
     therefore a term a signed-vs-unsigned comparison must set deliberately
     rather than inherit."""
 
+    ckda_branch: Optional[Literal["attention", "kronlstm"]] = None
+    """A second mixer in parallel to the complex_kda mixer of the layers ``ckda_branch_layers``
+    (megatron/core/ssm/ckda_branch.py): ``out = alpha(t) * ckda(x) + m(t) * gamma * branch(x)``.
+    ``"attention"`` is Megatron's own softmax attention as the hybrid's ``*`` layers build it
+    (kv_channels, output gate, qk norm, XSA, NoPE) with ``ckda_branch_num_query_groups`` KV
+    groups; ``"kronlstm"`` is the KronLSTM layer (the ``linear_kronlstm_*`` / ``linear_fla_*``
+    settings). ``gamma`` (one per layer, 0 at insertion) makes the branch start as a no-op; the
+    branch's weights come from checkpoint surgery (scripts/korbi/production/add_ckda_branch.py)."""
+
+    ckda_branch_layers: Optional[list[int]] = None
+    """0-based indices (in the decoder's layer list, as the checkpoint keys
+    ``decoder.layers.<i>``) of the complex_kda layers that get the branch."""
+
+    ckda_branch_num_query_groups: int = 2
+    """KV groups of the attention branch (its query heads: num_attention_heads)."""
+
+    ckda_branch_start_iteration: int = 0
+    """The iteration the branch was inserted at; the schedules below count from it."""
+
+    ckda_branch_alpha_hold: int = 25
+    """Steps after insertion with alpha = 1 (the complex_kda mixer at full weight)."""
+
+    ckda_branch_alpha_ramp: int = 175
+    """Then alpha falls linearly to ``ckda_branch_alpha_end`` over this many steps."""
+
+    ckda_branch_alpha_end: float = 0.0
+    """alpha after the ramp (0: the layer is the branch alone)."""
+
+    ckda_branch_m_start: float = 4.0
+    """External multiplier m of the branch's output at insertion: the branch's contribution grows
+    m times faster than its weights alone would move it."""
+
+    ckda_branch_m_ramp: int = 200
+    """m falls linearly from ``ckda_branch_m_start`` to 1 over this many steps."""
+
+    ckda_branch_log_interval: int = 10
+    """Every this many iterations, rank 0 prints per branch layer alpha, m, gamma and the RMS of
+    both mixers' outputs (``[ckda_branch]`` lines; 0: never)."""
+
     linear_beta_adam: bool = False
     """complex_kda under a Muon-family optimizer: train the beta projection (``b_proj``,
     hidden -> one scalar per value head) with the scalar optimizer (Adam) instead of the
