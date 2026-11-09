@@ -576,6 +576,99 @@ def flex_page_sparse_attention(q, k, v, cfg: PageSparseConfig, q_offset: int = 0
     return (out, allowed) if return_selection else out
 
 
+def flex_packed_page_attention(spans, cfg: PageSparseConfig, scale: float, q_block: int = 64, selections=None,
+                               return_selection: bool = False):
+    """:func:`flex_page_sparse_attention` for many sequences at once -- ONE FlexAttention call (forward and
+    backward) for every document of a packed batch instead of one per document.
+
+    ``spans``: ``[(q [1, hq, n, d], k [1, g, L, d], v, q_offset, indexer_scores or None)]`` -- each span's queries
+    attend its own keys (a document, or a CP chunk of one: L >= q_offset + n). Each span selects its pages as before
+    (or reuses ``selections[i]``); the spans are laid out in one padded sequence, every span's queries starting at a
+    multiple of ``q_block`` and its keys at a multiple of ``page``, so the kernel's key blocks are exactly the span's
+    pages and one block mask covers them all; the per-token mask (same span, causal, selected page) keeps it exact.
+    ``per_group``: one selection per KV group, a per-head block mask. Returns the per-span outputs [1, hq, n, d]
+    (and the per-span selections)."""
+    from torch.nn.attention.flex_attention import BlockMask
+
+    page = cfg.page
+    if q_block % page and page % q_block:
+        raise ValueError("flex_packed_page_attention: q_block and page must divide one another")
+    q0, k0 = spans[0][0], spans[0][1]
+    hq, d, g = q0.shape[1], q0.shape[3], k0.shape[1]
+    rep = hq // g
+    per_group = cfg.per_group and g > 1 and cfg.selector != "window"
+    G = g if per_group else 1
+    dev = q0.device
+    with torch.no_grad():
+        sels, qoff, koff = [], [0], [0]
+        for i, (q, k, v, off, idx) in enumerate(spans):
+            sel = None if selections is None else selections[i]
+            if sel is None:
+                if per_group:
+                    sel = [select_pages(q[:, gi * rep:(gi + 1) * rep], k[:, gi:gi + 1], cfg, off, scale, idx)[0]
+                           for gi in range(g)]
+                else:
+                    sel = select_pages(q, k, cfg, off, scale, idx)[0]
+            sels.append(sel)
+            qoff.append(qoff[-1] + -(-q.shape[2] // q_block) * q_block)
+            koff.append(koff[-1] + -(-k.shape[2] // page) * page)
+        Sq, Sk = qoff[-1], koff[-1]
+        Pk, nq = Sk // page, Sq // q_block
+        allowed = torch.zeros(G, Sq, Pk, dtype=torch.bool, device=dev)
+        q_abs = torch.full((Sq,), -1, dtype=torch.int32, device=dev)  # position within the span's sequence
+        k_abs = torch.full((Sk,), 2**30, dtype=torch.int32, device=dev)
+        kend = torch.full((Pk,), 2**30, dtype=torch.int64, device=dev)  # last position of a full page
+        for i, (q, k, v, off, idx) in enumerate(spans):
+            n, L = q.shape[2], k.shape[2]
+            P = -(-L // page)
+            a, c = qoff[i], koff[i] // page
+            sel = sels[i] if per_group else [sels[i]]
+            for gi in range(G):
+                allowed[gi, a:a + n, c:c + P] = sel[gi]
+            q_abs[a:a + n] = torch.arange(off, off + n, device=dev, dtype=torch.int32)
+            k_abs[koff[i]:koff[i] + L] = torch.arange(L, device=dev, dtype=torch.int32)
+            j = torch.arange(P, device=dev)
+            kend[c:c + P] = torch.where((j + 1) * page <= L, (j + 1) * page - 1, 2**30)
+        rows = allowed.view(G, nq, q_block, Pk)
+        blk = rows.any(2)  # [G, nq, Pk]
+        pad_row = (q_abs < 0).view(1, nq, q_block, 1)
+        first_q = q_abs.view(nq, q_block)[:, 0].to(torch.int64)  # spans start at block boundaries
+        full = (rows | pad_row).all(2) & (kend[None, None, :] <= first_q[None, :, None]) & blk
+        part = blk & ~full
+        if per_group:  # one block mask row per query head
+            part, full = part.repeat_interleave(rep, 0), full.repeat_interleave(rep, 0)
+        kv_num = part.sum(-1).to(torch.int32)
+        kv_idx = torch.argsort((~part).to(torch.int8), dim=-1, stable=True).to(torch.int32)
+        full_num = full.sum(-1).to(torch.int32)
+        full_idx = torch.argsort((~full).to(torch.int8), dim=-1, stable=True).to(torch.int32)
+        allowed_i = allowed.to(torch.int8)
+
+    def pad_rows(t, to):  # [1, h, n, d] -> [1, h, to, d]
+        return F.pad(t, (0, 0, 0, to - t.shape[2]))
+
+    qp = torch.cat([pad_rows(sp[0], qoff[i + 1] - qoff[i]) for i, sp in enumerate(spans)], 2)
+    kp = torch.cat([pad_rows(sp[1], koff[i + 1] - koff[i]) for i, sp in enumerate(spans)], 2)
+    vp = torch.cat([pad_rows(sp[2], koff[i + 1] - koff[i]) for i, sp in enumerate(spans)], 2)
+
+    if per_group:
+        def mask_mod(bi, hi, qi, ki):
+            return (k_abs[ki] <= q_abs[qi]) & (allowed_i[hi // rep, qi, ki // page] > 0)
+    else:
+        allowed_2d = allowed_i[0]  # a constant index into a 3-D buffer breaks flex's compile (torch 2.10)
+
+        def mask_mod(bi, hi, qi, ki):
+            return (k_abs[ki] <= q_abs[qi]) & (allowed_2d[qi, ki // page] > 0)
+
+    H = hq if per_group else 1
+    bm = BlockMask.from_kv_blocks(kv_num.view(1, H, nq), kv_idx.view(1, H, nq, Pk), full_num.view(1, H, nq),
+                                  full_idx.view(1, H, nq, Pk), BLOCK_SIZE=(q_block, page), mask_mod=mask_mod,
+                                  seq_lengths=(Sq, Sk))
+    out = _flex()(qp, kp, vp, block_mask=bm, scale=scale, enable_gqa=hq != g,
+                  kernel_options=flex_kernel_options(qp, q_block, page))
+    outs = [out[:, :, qoff[i]:qoff[i] + sp[0].shape[2]] for i, sp in enumerate(spans)]
+    return (outs, sels) if return_selection else outs
+
+
 def merge_attention(parts):
     """Exact merge of attentions over disjoint key sets: [(out [b, hq, s, d], lse [b, hq, s])] -> out. A part
     whose rows saw no key (lse -inf) contributes nothing."""

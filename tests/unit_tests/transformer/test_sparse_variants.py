@@ -378,3 +378,31 @@ def test_flex_many_lengths_stay_compiled():
     torch._dynamo.config.recompile_limit = 8
     ps.flex_page_sparse_attention(q, k, v, cfg, 0, D**-0.5, None, 32)
     assert torch._dynamo.config.recompile_limit >= 64
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="FlexAttention needs a GPU")
+@pytest.mark.parametrize("per_group", [False, True])
+@pytest.mark.parametrize("selector", ["page_mean", "quest", "window"])
+def test_packed_flex_equals_per_span(selector, per_group):
+    """One flex call for a whole packed batch equals one call per span (documents of different lengths, CP-style
+    chunks with offsets), forward and backward; its selections, reused, give the same output again."""
+    cfg = ps.PageSparseConfig(selector=selector, page=16, topk=3, window=32, sink_pages=1, select_block=32,
+                              per_group=per_group)
+    lens = [(200, 0, 200), (77, 0, 77), (64, 96, 160), (40, 0, 40), (300, 0, 300)]  # (n, offset, keys)
+    spans, leaves = [], []
+    for i, (n, off, L) in enumerate(lens):
+        q, k, v, _ = (t.float().clone().requires_grad_() for t in qkvx(L=L, seed=10 + i))
+        leaves.append((q, k, v))
+        spans.append((q[:, :, off:off + n], k, v, off, None))
+    outs, sels = ps.flex_packed_page_attention(spans, cfg, D**-0.5, 32, return_selection=True)
+    refs = [ps.flex_page_sparse_attention(q, k, v, cfg, off, D**-0.5, None, 32) for q, k, v, off, _ in spans]
+    for o, r in zip(outs, refs):
+        assert float((o - r).abs().max() / r.abs().max()) < 1e-2
+    gs = [torch.randn_like(r) for r in refs]
+    ga = torch.autograd.grad(sum((o * g).sum() for o, g in zip(outs, gs)), [t for lv in leaves for t in lv])
+    gb = torch.autograd.grad(sum((r * g).sum() for r, g in zip(refs, gs)), [t for lv in leaves for t in lv])
+    for x, y in zip(ga, gb):
+        assert float((x - y).abs().max() / y.abs().max().clamp(min=1e-12)) < 2e-2
+    again = ps.flex_packed_page_attention(spans, cfg, D**-0.5, 32, selections=sels)
+    for o, r in zip(again, outs):  # the same selection (kernel variants round differently under forced TF32)
+        assert float((o - r).abs().max() / r.abs().max()) < 1e-2

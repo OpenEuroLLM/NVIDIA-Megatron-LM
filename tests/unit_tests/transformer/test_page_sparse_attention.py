@@ -158,6 +158,40 @@ def test_shared_selection_across_layers(single):
     psa._SHARED_SELECTION.clear()
 
 
+@pytest.mark.parametrize("extra", [{}, {"page_sparse_per_group": True}, {"page_sparse_share_source": 1}],
+                         ids=["shared_heads", "per_group", "shared_layers"])
+def test_packed_flex_thd_matches_gathered(single, extra):
+    """The flex backend on a packed batch (one flex call for every document) equals the gathered reference, forward
+    and backward (fp32); with page_sparse_share_source, a later layer reuses the source's selections."""
+    from megatron.core.transformer.experimental_attention_variant import page_sparse_attention as psa
+
+    kw = dict(page_sparse_selector="page_mean", page_sparse_page=32, page_sparse_topk=2, page_sparse_window=32,
+              page_sparse_select_block=32, page_sparse_flex_q_block=32, page_sparse_packed_flex=True, **extra)
+    flex = PageSparseCoreAttention(_config(**kw, page_sparse_backend="flex"), 1, pg_collection=single)
+    ref = PageSparseCoreAttention(_config(**kw, page_sparse_backend="gathered"), 1, pg_collection=single)
+    psa._SHARED_SELECTION.clear()
+    q, k, v, _ = _inputs(8, torch.float32)
+    dout = torch.randn(sum(LENGTHS), HQ * D, generator=torch.Generator().manual_seed(9)).cuda()
+    leaves_a = [x.clone().requires_grad_() for x in (q, k, v)]
+    leaves_b = [x.clone().requires_grad_() for x in (q, k, v)]
+    out_a = flex(*leaves_a, packed_seq_params=_packed(LENGTHS))
+    psa._SHARED_SELECTION.clear()
+    out_b = ref(*leaves_b, packed_seq_params=_packed(LENGTHS))
+    assert float((out_a - out_b).abs().max() / out_b.abs().max()) < 1e-2
+    (out_a * dout).sum().backward()
+    (out_b * dout).sum().backward()
+    for a, b in zip(leaves_a, leaves_b):
+        assert float((a.grad - b.grad).abs().max() / b.grad.abs().max()) < 2e-2
+    if extra.get("page_sparse_share_source"):  # a consumer layer after the flex source
+        psa._SHARED_SELECTION.clear()
+        flex(q, k, v, packed_seq_params=_packed(LENGTHS))
+        dst = PageSparseCoreAttention(_config(**kw, page_sparse_backend="flex"), 3, pg_collection=single)
+        q2, k2, v2, _ = _inputs(9, torch.float32)
+        out = dst(q2, k2, v2, packed_seq_params=_packed(LENGTHS))
+        assert torch.isfinite(out).all()
+    psa._SHARED_SELECTION.clear()
+
+
 def test_csa2_indexer_loss_rides_on_the_output(single):
     q, k, v, x = _inputs(4)
     x = x.double()
