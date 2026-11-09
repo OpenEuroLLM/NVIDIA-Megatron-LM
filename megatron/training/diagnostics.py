@@ -211,6 +211,9 @@ class TrainingDiagnostics:
 
         # Set in setup(), once mpu and the optimizer exist. See _build_grad_map.
         self._grad_replica_factor = 1.0
+        # (param, grad_slot) for Megatron-FSDP parameters: local DTensor shards, see _build_grad_map
+        self._fsdp_grad_entries: List[Tuple[torch.nn.Parameter, int]] = []
+        self._fsdp_replica_factor = 1.0
 
     # ------------------------------------------------------------------ setup
     def setup(self, model, optimizer=None):
@@ -288,6 +291,24 @@ class TrainingDiagnostics:
         rank holds an identical full gradient and the same world sum over-counts
         by dp*cp. There we take the whole parameter and scale the result back.
         """
+        # Megatron-FSDP parameters (`__fsdp_param__`) carry their reduced gradient as an
+        # FSDP-sharded DTensor on `param.grad` (or `param.decoupled_grad`): every rank holds a
+        # disjoint local shard, and the shards partition the parameter across its DP mesh
+        # (experts: across the expert-DP mesh, different experts on different EP ranks). The
+        # sum of squares over local shards, world all-reduced, is therefore exact -- the same
+        # rule Megatron's own grad norm uses (clip_grads.py). The only replication left is
+        # HSDP's outer instances, which hold identical shards. Without this branch FSDP
+        # parameters fell through to the "full gradient on every rank" path below and were
+        # divided by the DP world size.
+        fsdp_ids = set()
+        for _name, param in self._all_named_params:
+            if getattr(param, "__fsdp_param__", False):
+                fsdp_ids.add(id(param))
+                self._fsdp_grad_entries.append((param, slot_of[id(param)]))
+        self._fsdp_replica_factor = float(
+            max(1, int(getattr(self.args, "num_distributed_optimizer_instances", 1) or 1))
+        )
+
         tp_group = mpu.get_tensor_model_parallel_group()
         expert_tp_group = mpu.get_expert_tensor_parallel_group()
 
@@ -306,7 +327,8 @@ class TrainingDiagnostics:
             where that one tensor is 29M of the parameters). Invisible at PP=1.
             """
             return (
-                param_is_not_shared(param)
+                id(param) not in fsdp_ids
+                and param_is_not_shared(param)
                 and param_is_not_tensor_parallel_duplicate(
                     param, tp_group=tp_group, expert_tp_group=expert_tp_group
                 )
@@ -338,6 +360,16 @@ class TrainingDiagnostics:
                     self._grad_entries.append((param, slot_of[id(param)], None))
             self._grad_replica_factor = float(
                 mpu.get_data_parallel_world_size(with_context_parallel=True)
+            )
+        if fsdp_ids and torch.distributed.get_rank() == 0:
+            other = [n for n, p in self._all_named_params if id(p) not in fsdp_ids]
+            print(
+                f"[diagnostics] grad norms: {len(self._fsdp_grad_entries)} Megatron-FSDP parameters "
+                f"(local DTensor shards, / {self._fsdp_replica_factor:g} HSDP instances), "
+                f"{len(self._grad_entries)} other counted (replica factor "
+                f"{self._grad_replica_factor:g}); not FSDP-managed: {other[:8]}"
+                + (f" (+{len(other) - 8} more)" if len(other) > 8 else ""),
+                flush=True,
             )
 
     def _build_global_layer_map(self, model) -> Dict[int, int]:
@@ -774,6 +806,19 @@ class TrainingDiagnostics:
             self._grad_buf[slot] += grad.float().pow(2).sum()
         if self._grad_replica_factor != 1.0:
             self._grad_buf.div_(self._grad_replica_factor)
+        if self._fsdp_grad_entries:
+            fsdp_buf = torch.zeros_like(self._grad_buf)
+            for param, slot in self._fsdp_grad_entries:
+                grad = getattr(param, "decoupled_grad", None)
+                if grad is None:
+                    grad = param.grad
+                if grad is None:
+                    continue
+                local = getattr(grad, "_local_tensor", grad).detach()
+                fsdp_buf[slot] += local.float().pow(2).sum()
+            if self._fsdp_replica_factor != 1.0:
+                fsdp_buf.div_(self._fsdp_replica_factor)
+            self._grad_buf.add_(fsdp_buf)
         # Sums of squares from disjoint pieces (TP shards, DP shards under the
         # distributed optimizer, PP stages) add, so ONE world all-reduce gives
         # the true per-layer norm^2 on every rank.
