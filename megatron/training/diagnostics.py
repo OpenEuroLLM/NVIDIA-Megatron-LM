@@ -381,7 +381,10 @@ class TrainingDiagnostics:
         self._fsdp_replica_factor = float(
             max(1, int(getattr(self.args, "num_distributed_optimizer_instances", 1) or 1))
         )
-        self._n_engram_tables = len(engram_ids)
+        # registered Engram tables plus the ones Megatron-FSDP unregistered (hide_sharded_tables,
+        # collected by _build_global_layer_map, which runs first): with only the registered ones
+        # the count was 0 under FSDP and engram_tables was never emitted
+        self._n_engram_tables = len(engram_ids) + len(getattr(self, "_hidden_tables", []))
 
         tp_group = mpu.get_tensor_model_parallel_group()
         expert_tp_group = mpu.get_expert_tensor_parallel_group()
@@ -441,7 +444,7 @@ class TrainingDiagnostics:
             print(
                 f"[diagnostics] grad norms: {len(self._fsdp_grad_entries)} Megatron-FSDP parameters "
                 f"(local DTensor shards, / {self._fsdp_replica_factor:g} HSDP instances), "
-                f"{len(engram_ids)} Engram tables (reported as the remainder engram_tables), "
+                f"{self._n_engram_tables} Engram tables (reported as the remainder engram_tables), "
                 f"{len(self._grad_entries)} other counted (replica factor "
                 f"{self._grad_replica_factor:g}); not FSDP-managed: {other[:8]}"
                 + (f" (+{len(other) - 8} more)" if len(other) > 8 else ""),
