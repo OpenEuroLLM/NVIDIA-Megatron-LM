@@ -13,6 +13,8 @@ For the layers in ``config.ckda_branch_layers`` the complex_kda adapter (complex
   ``ckda_branch_gamma_scale * gamma`` (how fast Adam's ~lr steps move the branch's share).
 - ``ckda_branch_crossfade``: the branch's weight is ``(1 - alpha(t)) * (1 + scale * gamma)`` instead
   (the two mixers' weights add up to 1, gamma a learnt correction of the branch's scale; m unused).
+- ``ckda_branch_calibrate``: a buffer ``calib`` = RMS(ckda) / RMS(branch), measured on the first
+  training forward (all ranks), multiplies the branch's weight: it starts at the mixer's scale.
 - ``alpha(t)``: 1 for ``ckda_branch_alpha_hold`` steps after ``ckda_branch_start_iteration``,
   then linear to ``ckda_branch_alpha_end`` over ``ckda_branch_alpha_ramp`` steps.
 - ``m(t)``: an external multiplier, ``ckda_branch_m_start`` falling linearly to 1 over
@@ -131,14 +133,43 @@ class BranchMix(nn.Module):
         self.layer_number = layer_number
         self.gamma = nn.Parameter(torch.zeros(1))
         self._logged = None
+        self._calibrated = False
+        if getattr(config, "ckda_branch_calibrate", False):
+            if getattr(config, "pipeline_model_parallel_size", 1) != 1:
+                raise NotImplementedError("ckda_branch_calibrate: pipeline parallelism (the all-reduce spans every rank)")
+            # RMS(ckda) / RMS(branch), measured once (0: not yet); saved with the model, the surgery writes 0
+            self.register_buffer("calib", torch.zeros(1), persistent=True)
+        else:
+            self.calib = None
+
+    @torch.no_grad()
+    def _calibrate(self, y: torch.Tensor, b: torch.Tensor) -> None:
+        """calib = RMS(y) / RMS(b) over every rank's first training micro-batch (once; a loaded nonzero
+        value is kept). At that step alpha is 1, so the output does not depend on it (recompute-safe)."""
+        self._calibrated = True
+        if float(self.calib.float().reshape(-1)[0]) != 0.0:
+            return
+        sq = torch.stack([y.float().pow(2).sum(), b.float().pow(2).sum()])
+        if torch.distributed.is_initialized():
+            # every rank runs every layer in the same order (pipeline size 1): the default group
+            torch.distributed.all_reduce(sq)
+        ratio = (sq[0] / sq[1].clamp_min(1e-30)).sqrt()
+        self.calib.fill_(float(ratio))
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            print(f"[ckda_branch] layer {self.layer_number - 1} calibrated: branch scale "
+                  f"RMS(ckda) / RMS(branch) = {float(ratio):.4f}", flush=True)
 
     def forward(self, y: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         it = current_iteration()
         alpha, m = schedule(self.config, it)
+        if self.calib is not None and not self._calibrated and self.training:
+            self._calibrate(y, b)
         gamma = self.gamma * float(getattr(self.config, "ckda_branch_gamma_scale", 1.0))
         if getattr(self.config, "ckda_branch_crossfade", False):
             m = 1.0 - alpha  # the weights add up to 1; gamma corrects the branch's scale around 1
             gamma = 1.0 + gamma
+        if self.calib is not None:
+            gamma = gamma * self.calib.to(gamma.dtype)
         out = y * alpha + b * (gamma.to(b.dtype) * m)
         every = getattr(self.config, "ckda_branch_log_interval", 0)
         if every and it is not None and it % every == 0 and self._logged != it and torch.is_grad_enabled():

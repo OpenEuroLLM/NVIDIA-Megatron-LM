@@ -19,7 +19,8 @@ gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 def _sched(**kw):
     base = dict(ckda_branch_start_iteration=100, ckda_branch_alpha_hold=25, ckda_branch_alpha_ramp=175,
                 ckda_branch_alpha_end=0.0, ckda_branch_m_start=4.0, ckda_branch_m_ramp=200,
-                ckda_branch_gamma_scale=1.0, ckda_branch_crossfade=False, ckda_branch_log_interval=0)
+                ckda_branch_gamma_scale=1.0, ckda_branch_crossfade=False, ckda_branch_calibrate=False,
+                ckda_branch_log_interval=0)
     base.update(kw)
     return SimpleNamespace(**base)
 
@@ -72,6 +73,37 @@ def test_crossfade_weights_add_up_to_one():
                 mix.gamma.zero_()
         finally:
             mod.current_iteration = orig
+
+
+def test_calibration_matches_the_branch_to_the_mixers_rms_once():
+    import megatron.core.ssm.ckda_branch as mod
+
+    c = _sched(ckda_branch_crossfade=True, ckda_branch_alpha_hold=0, ckda_branch_alpha_ramp=150,
+               ckda_branch_calibrate=True, pipeline_model_parallel_size=1)
+    mix = cb.BranchMix(c, layer_number=10)
+    assert "calib" in mix.state_dict() and float(mix.calib) == 0.0  # persistent: the surgery writes 0
+    y, b = 3.0 * torch.randn(64, 2, 8), torch.randn(64, 2, 8)
+    mix.eval()
+    mix(y, b)
+    assert float(mix.calib) == 0.0  # not in evaluation
+    mix.train()
+    assert torch.equal(mix(y, b), y)  # alpha 1 (no training loop): the output does not depend on calib
+    want = (y.pow(2).sum() / b.pow(2).sum()).sqrt()
+    assert float(mix.calib) == pytest.approx(float(want), rel=1e-6)
+    mix(2 * y, b)  # measured once
+    assert float(mix.calib) == pytest.approx(float(want), rel=1e-6)
+    orig = mod.current_iteration
+    mod.current_iteration = lambda: 250  # after the ramp: the branch alone, at the mixer's scale
+    try:
+        assert torch.allclose(mix(y, b), float(want) * b)
+    finally:
+        mod.current_iteration = orig
+    # a loaded (nonzero) value is kept
+    other = cb.BranchMix(c, layer_number=10)
+    other.load_state_dict({"gamma": torch.zeros(1), "calib": torch.tensor([1.5])})
+    other.train()
+    other(y, b)
+    assert float(other.calib) == 1.5
 
 
 def test_has_branch_uses_zero_based_layer_indices():

@@ -1023,6 +1023,13 @@ class TransformerConfig(ModelParallelConfig):
     gamma) * branch`` -- the two weights add up to 1 (gamma, 0 at insertion, a learnt correction of the
     branch's scale; m unused). The hand-over completes on the alpha schedule whatever gamma learns."""
 
+    ckda_branch_calibrate: bool = False
+    """Scale the branch to the complex_kda mixer's output RMS: a persistent per-layer buffer
+    ``branch_mix.calib`` (0 in the surgery checkpoint = not yet measured) is set on the first training
+    forward to RMS(ckda) / RMS(branch), the sums of squares all-reduced over every rank, and multiplies
+    the branch's weight: ``(1 - alpha) * calib * (1 + scale * gamma)`` (crossfade). Needs pipeline
+    parallel size 1 (every rank runs every layer)."""
+
     ckda_branch_gamma_scale: float = 1.0
     """The layer uses ``ckda_branch_gamma_scale * gamma`` (gamma the parameter): Adam moves gamma by
     about lr per step whatever its gradient's size, so this sets how fast the branch's share of the
