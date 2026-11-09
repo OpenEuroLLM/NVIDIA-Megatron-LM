@@ -3375,7 +3375,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     # Every step, not just diagnostic ones: a clipping STREAK is only visible if
     # every step is counted. Reads the already-reduced scalar, adds no collective.
     if diagnostics is not None:
-        diagnostics.observe_clip(grad_norm)
+        diagnostics.observe_clip(grad_norm, getattr(optimizer, 'last_clip_norms', None))
     if count_zeros:
         num_zeros_in_grad = reduce_max_stat_across_model_parallel_group(
             num_zeros_in_grad, group=mp_group
