@@ -948,20 +948,17 @@ def _process_mtp_loss_fused(hidden_states, hidden_states_list, mtp_labels, loss_
     return MTPLossAutoScaler.apply(hidden_states, total)
 
 
-def _plain_residual_config(config: TransformerConfig) -> TransformerConfig:
-    """The config of an MTP depth's own HybridStack: a plain residual. The decoder's depth residual (Linear Depth
-    Memory, mHC, Block AttnRes) collapses to one stream at the decoder's exit; an MTP depth is one or a few layers
-    on that stream, and its own depth memory would allocate a full depth-memory workspace per depth outside
-    autograd (s3, LDM CuTe: ~5 GiB per depth at 64k, which recompute cannot free -- 8 latent depths OOM)."""
-    if not (getattr(config, "depth_memory", False) or getattr(config, "mhc", False)
-            or getattr(config, "attn_res", False)):
+def _mtp_depth_config(config: TransformerConfig) -> TransformerConfig:
+    """The config of an MTP depth's own HybridStack: the decoder's residual, except Linear Depth Memory. mHC and
+    Block AttnRes re-expand the decoder's collapsed hidden state into their streams inside each depth (the
+    streams are activations: recompute frees them). LDM would allocate a full depth-memory workspace per depth
+    outside autograd (s3, CuTe LDM: ~5 GiB per depth at 64k, which recompute cannot free -- 8 latent depths
+    OOM), so the depths of an LDM decoder run a plain residual."""
+    if not getattr(config, "depth_memory", False):
         return config
     plain = copy.copy(config)
     plain.depth_memory = False
-    plain.mhc = False
-    plain.attn_res = False
     return plain
-
 
 class MultiTokenPredictionLayer(MegatronModule):
     """The implementation for Multi-Token Prediction (MTP) which extends
@@ -1090,7 +1087,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
 
             self.mtp_model_layer = HybridStack(
-                config=_plain_residual_config(self.config),
+                config=_mtp_depth_config(self.config),
                 submodules=hybrid_submodules,
                 layer_type_list=validate_segment_layers(mtp_layer_pattern),
                 pp_layer_offset=0,

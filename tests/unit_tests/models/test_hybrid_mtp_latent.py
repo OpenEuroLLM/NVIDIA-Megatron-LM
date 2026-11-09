@@ -130,3 +130,22 @@ def test_mtp_depths_plain_residual_under_depth_memory(mp):
         loss = model(ids, position_ids=pos, attention_mask=None, labels=torch.roll(ids, -1, 1))
     loss.float().mean().backward()
     assert all(p.grad is not None for n, p in model.named_parameters() if n.startswith("mtp."))
+
+
+def test_mtp_depths_keep_mhc(mp):
+    """With the decoder on mHC-4 (the production residual) every MTP depth runs mHC-4 too: its own stream
+    mixers (re-expanding the decoder's collapsed hidden state), trained with the rest."""
+    model_parallel_cuda_manual_seed(123)
+    torch.manual_seed(0)
+    model = _model(mhc=True, mhc_expansion_rate=4)
+    mtp = [n for n, _ in model.named_parameters() if n.startswith("mtp.")]
+    dec = [n for n, _ in model.named_parameters() if n.startswith("decoder.")]
+    mhc_names = ("mhc", "hyper", "h_res", "h_pre", "h_post")
+    assert any(k in n for n in dec for k in mhc_names), dec
+    assert any(k in n for n in mtp for k in mhc_names), mtp
+    ids = torch.randint(0, 128, (2, 64), device="cuda")
+    pos = torch.arange(64, device="cuda").expand(2, 64)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        loss = model(ids, position_ids=pos, attention_mask=None, labels=torch.roll(ids, -1, 1))
+    loss.float().mean().backward()
+    assert all(p.grad is not None for n, p in model.named_parameters() if n.startswith("mtp."))

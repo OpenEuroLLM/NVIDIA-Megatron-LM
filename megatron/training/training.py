@@ -3725,6 +3725,14 @@ def training_log(
             output_z_loss_scale, iteration, writer, wandb_writer, total_loss_dict
         )
 
+    # Log the sparse-attention selector's indexer KL (page indexer / CSA2).
+    if getattr(args, "page_sparse_indexer_loss_coeff", 0.0):
+        from megatron.core.transformer.experimental_attention_variant.page_sparse_attention import (
+            IndexerLossLoggingHelper,
+        )
+
+        IndexerLossLoggingHelper.track_metrics(iteration, writer, wandb_writer, total_loss_dict)
+
     # Log MTP metrics.
     if args.mtp_num_layers is not None:
         mtp_loss_scale = 1 / get_num_microbatches()

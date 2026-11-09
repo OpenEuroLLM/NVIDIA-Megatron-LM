@@ -35,6 +35,43 @@ from megatron.core.transformer.module import MegatronModule
 _SHARED_SELECTION: dict = {}
 
 
+class IndexerLossLoggingHelper:
+    """The selector's indexer KL (``page_sparse_indexer_loss_coeff``: the page indexer or CSA2's lightning
+    indexer vs the dense attention mass), averaged over the attention layers, micro-batches and ranks of a step
+    and logged as ``indexer_kl``. Recorded once per micro-batch and layer: with grad enabled (the training
+    forward, or the recompute of a no-grad checkpointed one)."""
+
+    tracker = {}
+
+    @staticmethod
+    def record(loss: torch.Tensor) -> None:
+        if not torch.is_grad_enabled():
+            return
+        t = IndexerLossLoggingHelper.tracker
+        if "value" not in t:
+            t["value"] = torch.zeros(2, device=loss.device)
+        t["value"][0] += loss.detach().float()
+        t["value"][1] += 1
+
+    @staticmethod
+    def track_metrics(iteration: int, writer=None, wandb_writer=None, total_loss_dict=None,
+                      name: str = "indexer_kl") -> None:
+        """Reduce over all ranks (a collective: call on every rank when the coefficient is set), log, clear."""
+        t = IndexerLossLoggingHelper.tracker
+        if "value" not in t:
+            t["value"] = torch.zeros(2, device=torch.cuda.current_device())
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(t["value"])
+        value = t["value"][0] / t["value"][1].clamp(min=1)
+        if total_loss_dict is not None:
+            total_loss_dict[name] = total_loss_dict.get(name, 0.0) + value
+        if writer is not None:
+            writer.add_scalar(name, value, iteration)
+        if wandb_writer is not None:
+            wandb_writer.log({name: value}, iteration)
+        t["value"].zero_()
+
+
 class PageSparseCoreAttention(MegatronModule):
     def __init__(self, config, layer_number, attn_mask_type=None, attention_type=None, cp_comm_type=None,
                  softmax_scale=None, pg_collection=None, **kwargs):
@@ -177,6 +214,7 @@ class PageSparseCoreAttention(MegatronModule):
 
             n = sum(x[1] for x in losses)
             loss = sum(x[0] for x in losses) / max(n, 1)
+            IndexerLossLoggingHelper.record(loss)
             out = MoEAuxLossAutoScaler.apply(out, loss * self.loss_coeff)
         self._hidden = None
         return out
