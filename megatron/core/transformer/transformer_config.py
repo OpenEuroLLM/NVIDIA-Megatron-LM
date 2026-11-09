@@ -1012,6 +1012,11 @@ class TransformerConfig(ModelParallelConfig):
     ckda_branch_m_ramp: int = 200
     """m falls linearly from ``ckda_branch_m_start`` to 1 over this many steps."""
 
+    ckda_branch_gamma_scale: float = 1.0
+    """The layer uses ``ckda_branch_gamma_scale * gamma`` (gamma the parameter): Adam moves gamma by
+    about lr per step whatever its gradient's size, so this sets how fast the branch's share of the
+    layer can grow (1: lr per step, 8.5e-4 in the main run, ~0.2 over a 200-step hand-over)."""
+
     ckda_branch_log_interval: int = 10
     """Every this many iterations, rank 0 prints per branch layer alpha, m, gamma and the RMS of
     both mixers' outputs (``[ckda_branch]`` lines; 0: never)."""

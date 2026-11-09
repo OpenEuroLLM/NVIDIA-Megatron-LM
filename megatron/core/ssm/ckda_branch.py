@@ -9,7 +9,8 @@ For the layers in ``config.ckda_branch_layers`` the complex_kda adapter (complex
   ``ckda_branch_num_query_groups`` KV groups and a plain ``linear_qkv`` (the layer's input norm
   is the complex_kda layer's); or the KronLSTM layer (``ckda_branch="kronlstm"``).
 - ``gamma``: one learnable scale per layer, shape (1,) (Adam, no weight decay), 0 at insertion,
-  so the model computes exactly what it computed before.
+  so the model computes exactly what it computed before; the layer uses
+  ``ckda_branch_gamma_scale * gamma`` (how fast Adam's ~lr steps move the branch's share).
 - ``alpha(t)``: 1 for ``ckda_branch_alpha_hold`` steps after ``ckda_branch_start_iteration``,
   then linear to ``ckda_branch_alpha_end`` over ``ckda_branch_alpha_ramp`` steps.
 - ``m(t)``: an external multiplier, ``ckda_branch_m_start`` falling linearly to 1 over
@@ -132,19 +133,20 @@ class BranchMix(nn.Module):
     def forward(self, y: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         it = current_iteration()
         alpha, m = schedule(self.config, it)
-        out = y * alpha + b * (self.gamma.to(b.dtype) * m)
+        gamma = self.gamma * float(getattr(self.config, "ckda_branch_gamma_scale", 1.0))
+        out = y * alpha + b * (gamma.to(b.dtype) * m)
         every = getattr(self.config, "ckda_branch_log_interval", 0)
         if every and it is not None and it % every == 0 and self._logged != it and torch.is_grad_enabled():
             self._logged = it
-            self._log(it, alpha, m, y, b)
+            self._log(it, alpha, m, gamma, y, b)
         return out
 
-    def _log(self, it, alpha, m, y, b):
+    def _log(self, it, alpha, m, gamma, y, b):
         rank0 = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
         if not rank0:
             return
         with torch.no_grad():
-            g = float(self.gamma.detach().float().reshape(-1)[0])
+            g = float(gamma.detach().float().reshape(-1)[0])  # the scaled gamma the layer uses
             ry = float(y.detach().float().pow(2).mean().sqrt())
             rb = float(b.detach().float().pow(2).mean().sqrt())
         print(f"[ckda_branch] iter {it} layer {self.layer_number - 1} alpha {alpha:.4f} m {m:.3f} "
