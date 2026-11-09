@@ -371,9 +371,13 @@ class TopKRouter(Router):
 
             # Route with the previous batch's qb_beta; in training, accumulate this
             # microbatch's quantile for the next update.
+            if self.config.moe_router_stay_bonus:  # routing locality: the previous token's plain selection
+                base, _ = qb_dual_update(full_logits, self.topk, self.qb_beta, update_beta=False)
+                full_logits = full_logits + self._stay_bonus_term(base, full_logits)
             full_indices, beta_local = qb_dual_update(
                 full_logits, self.topk, self.qb_beta, update_beta=should_update_beta
             )
+            self._log_stay_rate(full_indices)
             if should_update_beta:
                 self.qb_beta_accum.add_(beta_local)
                 self.qb_beta_count.add_(1)
@@ -396,6 +400,30 @@ class TopKRouter(Router):
             fused=self.config.moe_router_fusion,
             precomputed_indices=indices,
         )
+
+    def _stay_bonus_term(self, base_indices: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
+        """[tokens, experts]: moe_router_stay_bonus on the experts the PREVIOUS token (row - micro-batch size of
+        the [seq, batch]-flattened tokens) selects in ``base_indices``; zero for the first token of a row."""
+        bsz = getattr(self, "_stay_bsz", 1) or 1
+        mask = torch.zeros_like(like).scatter_(1, base_indices.long(), 1.0)
+        prev = torch.zeros_like(like)
+        prev[bsz:] = mask[:-bsz]
+        return self.config.moe_router_stay_bonus * prev
+
+    def _log_stay_rate(self, indices: torch.Tensor) -> None:
+        """moe/stay_rate: the share of each token's experts the previous token selected too."""
+        if not self.config.moe_router_log_stay_rate or not torch.is_grad_enabled():
+            return
+        bsz = getattr(self, "_stay_bsz", 1) or 1
+        if indices.shape[0] <= bsz:
+            return
+        mask = torch.zeros(indices.shape[0], self.config.num_moe_experts, device=indices.device)
+        mask.scatter_(1, indices.long(), 1.0)
+        rate = (mask[bsz:] * mask[:-bsz]).sum() / (self.topk * (indices.shape[0] - bsz))
+        num_layers = self.config.num_layers + (self.config.mtp_num_layers or 0)
+        layer_number = self.layer_number + (self.config.num_layers if self.is_mtp_layer else 0)
+        get_moe_metrics_tracker().record("stay_rate", rate.detach(), layer_number, num_layers,
+                                         avg_group=self.tp_dp_cp_group)
 
     def get_aux_loss_coeff(self, aux_loss_type: str) -> float:
         """Return the aux loss coeff for the given auxiliary loss type.
@@ -827,6 +855,7 @@ class TopKRouter(Router):
                 with shape [num_tokens, num_experts].
         """
         seq_length, bsz = logits.shape[:2]
+        self._stay_bsz = bsz  # the previous token of a row is bsz rows earlier once flattened
         logits = logits.view(-1, self.config.num_moe_experts)
 
         # Flatten padding_mask to [num_tokens] if provided
@@ -844,6 +873,26 @@ class TopKRouter(Router):
                 padding_mask is None
             ), "Quantile balancing routing does not support padding masks yet."
             probs, routing_map = self.quantile_balancing(logits)
+        elif self.config.moe_router_stay_bonus:
+            # routing locality on the plain top-k path: the selection on score (+ expert bias) + the stay bonus
+            assert self.config.moe_router_num_groups is None, "moe_router_stay_bonus: no group-limited routing"
+            with torch.no_grad():
+                lf = logits.detach().float()
+                scores = torch.sigmoid(lf) if self.score_function == "sigmoid" else torch.softmax(lf, -1)
+                if self.expert_bias is not None:
+                    scores = scores + self.expert_bias
+                base = scores.topk(self.topk, dim=-1).indices
+                indices = (scores + self._stay_bonus_term(base, scores)).topk(self.topk, dim=-1).indices
+            probs, routing_map = topk_routing_with_score_function(
+                logits,
+                self.topk,
+                use_pre_softmax=self.config.moe_router_pre_softmax,
+                scaling_factor=self.config.moe_router_topk_scaling_factor,
+                score_function=self.score_function,
+                fused=False,
+                precomputed_indices=indices,
+            )
+            self._log_stay_rate(indices)
         else:
             probs, routing_map = topk_routing_with_score_function(
                 logits,
@@ -857,6 +906,8 @@ class TopKRouter(Router):
                 fused=self.config.moe_router_fusion,
                 router_replay=self.router_replay,
             )
+            if self.config.moe_router_log_stay_rate:
+                self._log_stay_rate(routing_map.float().topk(self.topk, dim=-1).indices)
 
         # Keep the selected map separate from the final dispatch map. Capacity dropping can
         # remove assignments, and logging both populations makes that loss visible.

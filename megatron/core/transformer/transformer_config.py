@@ -600,6 +600,17 @@ class TransformerConfig(ModelParallelConfig):
     attention_length_scaling_base: int = 8192
     """The length where the scaling is 1 (the training sequence length)."""
 
+    moe_router_stay_bonus: float = 0.0
+    """Routing locality for expert offloading: a token's expert SELECTION gets this bonus on the experts the previous
+    token selects without it (its plain top-k: parallel in training, the same rule at inference); the gate weights
+    stay the router's. Logit units with quantile balancing, score units on the plain top-k path (expert bias). Useful
+    around the score gaps: a huge bonus only copies the predecessor's plain selection. The first token of a micro-batch
+    row gets none; document and CP-chunk boundaries inside a row are not reset."""
+
+    moe_router_log_stay_rate: bool = False
+    """Log moe/stay_rate: the share of a token's selected experts the previous token selected too (per MoE layer,
+    averaged) -- the expert reuse an offload cache sees."""
+
     page_sparse_selector: Optional[str] = None
     """Page-sparse attention for the self-attention layers (experimental_attention_variant/page_sparse.py):
     every query attends to the sink pages, a local window and ``page_sparse_topk`` earlier pages chosen by
