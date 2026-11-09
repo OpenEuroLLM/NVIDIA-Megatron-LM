@@ -279,6 +279,15 @@ class TopKRouter(Router):
         if hasattr(self, 'qb_beta_accum') and self.qb_beta_accum is not None:
             if self.qb_beta_accum.dtype != torch.float32:
                 self.qb_beta_accum.data = self.qb_beta_accum.data.to(torch.float32)
+        # fp16: the token counts too. Float16Module halves them, and a count past 65504 (one
+        # popular expert over a global batch's micro-batches: 64 x 8k tokens x top-3 at s3) is
+        # inf -- the global aux loss and every gradient with it, so the loss scaler skips every
+        # step. (bf16 rounds the counts instead, ~0.4 % at thousands; left as it is.)
+        if self.config.fp16:
+            for name in ('global_tokens_per_expert', 'ga_steps', 'local_tokens_per_expert'):
+                counts = getattr(self, name, None)
+                if counts is not None and counts.dtype != torch.float32:
+                    counts.data = counts.data.to(torch.float32)
 
     def sinkhorn_load_balancing(self, logits: torch.Tensor):
         """Apply sinkhorn routing to the logits tensor.

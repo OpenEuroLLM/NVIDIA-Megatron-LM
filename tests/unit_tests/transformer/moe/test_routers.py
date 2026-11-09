@@ -638,3 +638,45 @@ def test_topk_routing_precomputed_indices_equivalence(score_function, use_pre_so
     )
     expected_map = torch.zeros_like(logits, dtype=torch.bool).scatter(1, alt_indices, True)
     assert torch.equal(map_alt, expected_map)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_fp16_router_keeps_token_counts_fp32():
+    """fp16: Float16Module halves the router's buffers; the token counts of the global aux loss
+    and of the expert bias go back to fp32 at the next forward, so a count past 65504 stays
+    finite (in fp16 it was inf, and with it the aux loss and every gradient)."""
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            num_moe_experts=4,
+            use_cpu_initialization=True,
+            moe_router_load_balancing_type="global_aux_loss",
+            moe_aux_loss_coeff=1e-4,
+            moe_router_enable_expert_bias=True,
+            moe_router_score_function="sigmoid",
+            moe_router_topk=2,
+            fp16=True,
+            params_dtype=torch.half,
+            add_bias_linear=False,
+        )
+        submodules = get_submodules(
+            get_gpt_layer_local_submodules(num_experts=4, moe_grouped_gemm=False).mlp
+        )
+        router = cast(Router, MoELayer(config, submodules).router).cuda().half()
+        router.train()
+        assert router.global_tokens_per_expert.dtype == torch.half   # as Float16Module leaves it
+        hidden = torch.randn(4096, 1, 12, device="cuda", dtype=torch.half, requires_grad=True)
+        router(hidden)
+        for name in ("global_tokens_per_expert", "ga_steps", "local_tokens_per_expert",
+                     "expert_bias"):
+            assert getattr(router, name).dtype == torch.float32, name
+        router.global_tokens_per_expert.fill_(65000.0)
+        router(hidden)
+        assert torch.isfinite(router.global_tokens_per_expert).all()
+        assert router.global_tokens_per_expert.max() > 65504
+    finally:
+        Utils.destroy_model_parallel()
