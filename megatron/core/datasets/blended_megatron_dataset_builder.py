@@ -53,6 +53,9 @@ class BlendedMegatronDatasetBuilder(object):
         self.sizes = sizes
         self.is_built_on_rank = is_built_on_rank
         self.config = config
+        # numel_low_level_dataset per prefix, recorded as the mid-level build opens each low-level
+        # dataset; the blend's empty-split check reads it instead of opening every index again
+        self._num_elements = {}
 
         log_single_rank(
             logger,
@@ -195,7 +198,9 @@ class BlendedMegatronDatasetBuilder(object):
                         # Blend according to client-specified weights and client-specified size
                         size_per_dataset = list(zip(*sizes_per_dataset_target))[i]
                         size_i = sum(size_per_dataset)
-                        empty = _empty_split_datasets(self.cls, prefixes, split[i], self.config)
+                        empty = _empty_split_datasets(
+                            self.cls, prefixes, split[i], self.config, self._num_elements
+                        )
                         if empty:
                             # drop the datasets with an empty split, renormalize the rest; their
                             # mid-level datasets were built with the original weights' surplus
@@ -473,6 +478,8 @@ class BlendedMegatronDatasetBuilder(object):
 
         # Build the split indices for the low level dataset
         num_elements = self.cls.numel_low_level_dataset(low_level_dataset)
+        if dataset_path is not None:
+            self._num_elements[dataset_path] = num_elements
 
         # Build the mid level dataset
         mid_level_datasets = []
@@ -582,12 +589,23 @@ class BlendedMegatronDatasetBuilder(object):
         return cls(*args)
 
 
-def _empty_split_datasets(cls, prefixes, split_i, config) -> List[int]:
+def _empty_split_datasets(cls, prefixes, split_i, config, num_elements=None) -> List[int]:
     """Indices of the blend's datasets whose split holds no elements, rounded as the mid-level
-    build does (round(split boundary x numel_low_level_dataset))."""
+    build does (round(split boundary x numel_low_level_dataset)).
+
+    ``num_elements`` maps prefix -> numel as the mid-level build recorded it; only a prefix it
+    lacks (a rank that builds no datasets) opens its low-level dataset, once (the count is added).
+    Re-opening every index here cost ~14 min on one rank of the 256-node v4 phase-2 start (429
+    stage datasets), with all other ranks waiting at the next barrier.
+    """
+    if num_elements is None:
+        num_elements = {}
     empty = []
     for j, prefix in enumerate(prefixes):
-        n = cls.numel_low_level_dataset(cls.build_low_level_dataset(prefix, config))
+        n = num_elements.get(prefix)
+        if n is None:
+            n = cls.numel_low_level_dataset(cls.build_low_level_dataset(prefix, config))
+            num_elements[prefix] = n
         if int(round(split_i[1] * float(n))) == int(round(split_i[0] * float(n))):
             empty.append(j)
     return empty
