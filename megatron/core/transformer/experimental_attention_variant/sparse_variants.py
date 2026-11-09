@@ -417,21 +417,49 @@ class LSAConfig:
     max_members: int = 0  # pooled keys kept per bucket (0: 4x the mean, block / buckets); bounds the gather
     select_block: int = 1  # > 1: one bucket selection per block of queries (its first query's); the flex path
     kv_block: int = 64  # flex: bucket-ordered keys per block-mask block
+    latent: bool = False  # D-LSA: cluster / score in a learned latent space (per-KV-group key and query maps)
 
 
 class LSA(nn.Module):
-    """No parameters; :meth:`index` builds the bucket index of a sequence's keys (cache it per document)."""
+    """:meth:`index` builds the bucket index of a sequence's keys (cache it per document). Without ``latent`` no
+    parameters (spherical k-means on the raw keys). With ``latent`` (the paper's learned latent space, distilled as
+    D-LSA): keys and queries are mapped per KV group (identity at init: the parameter-free LSA) before clustering /
+    scoring, and :meth:`indexer_loss` trains the maps -- KL(dense attention mass per bucket || softmax(scale x the
+    bucket scores)), the centroids recomputed differentiably from the (fixed) bucket assignment."""
 
-    def __init__(self, cfg: LSAConfig):
+    def __init__(self, cfg: LSAConfig, num_query_groups: int | None = None, kv_channels: int | None = None):
         super().__init__()
         self.cfg = cfg
         self.flex = False  # FlexAttention over the keys in bucket order (CUDA, select_block > 1)
+        self.proj_k = self.proj_q = self.logit_scale = None
+        if cfg.latent:
+            g, d = num_query_groups, kv_channels
+            eye = torch.eye(d).repeat(g, 1)  # [g d, d]: 2-D for the matrix optimizers
+            self.proj_k = nn.Parameter(eye.clone())
+            self.proj_q = nn.Parameter(eye.clone())
+            self.logit_scale = nn.Parameter(torch.full((1,), math.log(10.0)))
+
+    def _pk(self, k):
+        """k [1, g, L, d] in the latent space (each KV group's map)."""
+        if self.proj_k is None:
+            return k
+        g, d = k.shape[1], k.shape[3]
+        return torch.einsum("bgld,gde->bgle", k, self.proj_k.view(g, d, -1).to(k.dtype))
+
+    def _pq(self, q, g):
+        """q [1, hq, s, d] in the latent space (the query's KV group's map)."""
+        if self.proj_q is None:
+            return q
+        b, hq, s, d = q.shape
+        out = torch.einsum("bgrsd,gde->bgrse", q.view(b, g, hq // g, s, d), self.proj_q.view(g, d, -1).to(q.dtype))
+        return out.reshape(b, hq, s, -1)
 
     @torch.no_grad()
     def index(self, k):
         """k [1, g, L, d] -> (centroids [nb, g, d] (each KV head's part unit-norm), member tokens [nb, M] long,
         member valid [nb, M] bool, each bucket's last token [nb]) over the COMPLETE cluster blocks."""
         cfg = self.cfg
+        k = self._pk(k)
         g, L, d = k.shape[1], k.shape[2], k.shape[3]
         span = cfg.pool * cfg.block  # tokens per cluster block
         nblk = L // span
@@ -505,12 +533,54 @@ class LSA(nn.Module):
         """[n, nb]: cosine of the queries (at absolute positions pos) to the centroids, max over each KV group's
         heads, summed over the groups; -inf for buckets not fully before the query's window."""
         cfg = self.cfg
-        _, hq, n, d = q.shape
         g = cent.shape[1]
+        q = self._pq(q, g)
+        _, hq, n, d = q.shape
         qn = F.normalize(ps._acc(q[0]).view(g, hq // g, n, d), dim=-1)
         sc = torch.einsum("grsd,ngd->grsn", qn, cent.to(qn.dtype)).amax(1).sum(0)
         first_window = (pos // cfg.page - cfg.window // cfg.page) * cfg.page
         return sc.masked_fill(~(last[None, :] < first_window[:, None]), float("-inf"))
+
+    def indexer_loss(self, q, k, q_offset: int, scale: float, chunk: int = 256):
+        """D-LSA distillation: KL(dense attention mass per bucket || softmax(exp(logit_scale) x bucket scores)) for
+        the queries that select (each select block's first, or all), over the buckets fully before their window.
+        Gradients reach the key / query maps and the scale only."""
+        cfg = self.cfg
+        _, hq, s, d = q.shape
+        g, L = k.shape[1], k.shape[2]
+        with torch.no_grad():
+            _, mem, mem_ok, last = self.index(k)
+        nb = mem.shape[0]
+        if nb == 0 or self.proj_k is None:
+            return q.sum() * 0.0
+        tok = mem.clamp(max=L - 1)  # [nb, Mt]
+        kn = F.normalize(ps._acc(self._pk(k.detach()))[0], dim=-1)  # [g, L, d]
+        w = mem_ok.to(kn.dtype)
+        cent = F.normalize(torch.einsum("gnmd,nm->ngd", kn[:, tok], w), dim=-1)  # [nb, g, d]
+        if cfg.select_block > 1:
+            B = cfg.select_block
+            first = (q_offset // B) * B
+            a_all = (first + torch.arange(-(-s // B) + 1, device=q.device) * B - q_offset).clamp(min=0)
+            a_all = torch.unique(a_all[a_all < s])
+        else:
+            a_all = torch.arange(s, device=q.device)
+        total, count = 0.0, 0
+        for c0 in range(0, len(a_all), chunk):
+            a = a_all[c0:c0 + chunk]
+            pos = q_offset + a
+            first_window = (pos // cfg.page - cfg.window // cfg.page) * cfg.page
+            cand = last[None, :] < first_window[:, None]  # [n, nb]
+            if not bool(cand.any()):
+                continue
+            with torch.no_grad():
+                pr = ps._causal_probs(q[:, :, a].detach(), k.detach(), pos, scale).mean(1)[0]  # [n, L]
+                target = (pr[:, tok] * w.to(pr.dtype)).sum(-1)  # [n, nb]
+            qn = F.normalize(ps._acc(self._pq(q[:, :, a].detach(), g)[0]).view(g, hq // g, len(a), -1), dim=-1)
+            sc = torch.einsum("grnd,bgd->grnb", qn, cent).amax(1).sum(0)  # [n, nb]
+            has = int((cand & (target > 0)).any(-1).sum())
+            lc = ps.indexer_kl_loss(sc * self.logit_scale.exp(), target, cand)
+            total, count = total + lc * has, count + has
+        return total / max(count, 1) if count else q.sum() * 0.0
 
     def _forward_flex(self, q, k, v, q_offset, scale, index):
         """Raw sinks + window, and the selected buckets over the keys permuted into bucket order (each bucket a

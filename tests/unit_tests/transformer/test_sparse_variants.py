@@ -406,3 +406,36 @@ def test_packed_flex_equals_per_span(selector, per_group):
     again = ps.flex_packed_page_attention(spans, cfg, D**-0.5, 32, selections=sels)
     for o, r in zip(again, outs):  # the same selection (kernel variants round differently under forced TF32)
         assert float((o - r).abs().max() / r.abs().max()) < 1e-2
+
+
+def _dlsa(topk=3, select_block=1):
+    cfg = sv.LSAConfig(pool=2, block=8, buckets=3, iters=3, topk=topk, window=16, page=16, sink_pages=1,
+                       select_block=select_block, latent=True)
+    return sv.LSA(cfg, G, D).to(DEV, torch.float64)
+
+
+@pytest.mark.parametrize("select_block", [1, 16])
+def test_dlsa_identity_init_is_lsa(select_block):
+    """D-LSA's maps start as the identity: the same buckets, selection and output as the parameter-free LSA."""
+    q, k, v, _ = qkvx(L=256)
+    plain = sv.LSA(sv.LSAConfig(pool=2, block=8, buckets=3, iters=3, topk=3, window=16, page=16, sink_pages=1,
+                                select_block=select_block))
+    lat = _dlsa(select_block=select_block)
+    assert lat.proj_k.dim() == 2 and lat.proj_q.dim() == 2  # matrix optimizers
+    torch.testing.assert_close(lat(q, k, v, 0, D**-0.5), plain(q, k, v, 0, D**-0.5))
+
+
+def test_dlsa_distillation_trains_the_maps():
+    """The KL to the dense mass per bucket reaches both maps and the scale, and a few steps lower it."""
+    q, k, _, _ = qkvx(L=256)
+    lat = _dlsa(select_block=16)
+    opt = torch.optim.Adam(lat.parameters(), lr=3e-2)
+    losses = []
+    for _ in range(30):
+        opt.zero_grad()
+        loss = lat.indexer_loss(q, k, 0, D**-0.5)
+        loss.backward()
+        assert all(p.grad is not None and float(p.grad.abs().sum()) > 0 for p in lat.parameters())
+        opt.step()
+        losses.append(float(loss))
+    assert losses[0] > 0 and losses[-1] < 0.8 * losses[0], losses

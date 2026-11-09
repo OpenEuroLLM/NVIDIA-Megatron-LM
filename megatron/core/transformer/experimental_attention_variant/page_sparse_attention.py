@@ -115,7 +115,9 @@ class PageSparseCoreAttention(MegatronModule):
                                                buckets=config.page_sparse_lsa_buckets, topk=self.cfg.topk,
                                                window=self.cfg.window, page=self.cfg.page,
                                                sink_pages=self.cfg.sink_pages,
-                                               select_block=config.page_sparse_select_block))
+                                               select_block=config.page_sparse_select_block,
+                                               latent=config.page_sparse_lsa_latent),
+                                  config.num_query_groups or config.num_attention_heads, config.kv_channels)
             self.variant.flex = config.page_sparse_backend == "flex"
         self.flex = config.page_sparse_backend == "flex" and self.cfg.selector in ps.PAGE_SELECTORS
         self.q_block = config.page_sparse_flex_q_block
@@ -184,7 +186,12 @@ class PageSparseCoreAttention(MegatronModule):
         if self.cfg.selector == "nsa":
             return self.variant(q, k, v, xq, q_offset, self.scale), None
         if self.cfg.selector == "lsa":
-            return self.variant(q, k, v, q_offset, self.scale), None
+            loss = None
+            if self.training and self.loss_coeff > 0 and self.variant.proj_k is not None:  # D-LSA distillation
+                loss = self.variant.indexer_loss(q, k, q_offset, self.scale) * q.shape[2]
+            if self.dense_forward:
+                return ps.dense_attention(q, k, v, q_offset, self.scale), loss
+            return self.variant(q, k, v, q_offset, self.scale), loss
         if self.cfg.selector == "csa2":
             loss = None
             if self.training and self.loss_coeff > 0:

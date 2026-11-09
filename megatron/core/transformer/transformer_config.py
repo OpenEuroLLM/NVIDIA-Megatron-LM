@@ -708,6 +708,11 @@ class TransformerConfig(ModelParallelConfig):
     page_sparse_lsa_buckets: int = 32
     """lsa: buckets per cluster block (page_sparse_topk buckets are selected)."""
 
+    page_sparse_lsa_latent: bool = False
+    """lsa: D-LSA -- cluster and score in a learned latent space (per-KV-group key / query maps, identity at init),
+    trained by KL to the dense attention mass per bucket (page_sparse_indexer_loss_coeff; with
+    page_sparse_dense_forward as its warm-up)."""
+
     linear_kronlstm_forget_offset: float = 0.0
     """KronLSTM: a fixed extra decay per step on every forget channel (log|f| - offset); 0.012 is
     the polar forget gate's init cap without its angle."""
@@ -2447,8 +2452,10 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError("page_sparse_window must be a multiple of page_sparse_page")
             if self.page_sparse_backend not in ("flex", "gathered"):
                 raise ValueError("page_sparse_backend must be flex or gathered")
-            if self.page_sparse_dense_forward and self.page_sparse_selector not in ("indexer", "csa2"):
-                raise ValueError("page_sparse_dense_forward is the indexer warm-up (selector indexer or csa2)")
+            if self.page_sparse_dense_forward and not (self.page_sparse_selector in ("indexer", "csa2")
+                                                       or (self.page_sparse_selector == "lsa"
+                                                           and self.page_sparse_lsa_latent)):
+                raise ValueError("page_sparse_dense_forward is the indexer warm-up (indexer, csa2, latent lsa)")
             if self.page_sparse_share_source:
                 if self.page_sparse_selector not in ("window", "page_mean", "quest", "oracle", "indexer"):
                     raise ValueError("page_sparse_share_source: page selectors only")
