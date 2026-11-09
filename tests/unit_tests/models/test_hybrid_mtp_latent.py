@@ -49,20 +49,26 @@ def _grads(cfg, fused, seed=0):
         return F.cross_entropy(logits.transpose(0, 1).reshape(-1, V), labels.reshape(-1),
                                reduction="none").view(labels.shape)
 
-    def fused(h, labels, loss_mask):
+    def fused_fn(h, labels, loss_mask):
         return lm_loss(labels, h @ weight.t())
 
     out = process_mtp_loss(hidden, labels, mask, output_layer, weight, None, True, lm_loss, cfg,
-                           fused_loss_fn=fused if fused else None)
+                           fused_loss_fn=fused_fn if fused else None)
     out.sum().backward()  # the main chunk's own loss is zero here: only the MTP losses' gradients remain
     return hidden.grad.view(1 + DEPTHS, S, B, H)
 
 
 def test_fused_stride_one_equals_output_layer_path(mp):
+    """At stride 1 the fused path (one call over all depths) is the output-layer path up to the normalisation:
+    the depths share the mean of their token counts (B * (S - 1 - d), the rolled-out tail) instead of their own."""
     ref = _grads(_cfg(), fused=False)
     got = _grads(_cfg(), fused=True)
-    torch.testing.assert_close(got, ref, atol=1e-12, rtol=1e-10)
-    assert ref[1:].abs().sum() > 0
+    counts = torch.tensor([B * (S - 1 - d) for d in range(DEPTHS)], dtype=torch.float64)
+    ratio = counts / counts.mean()
+    torch.testing.assert_close(got[0], ref[0], atol=1e-12, rtol=1e-10)
+    for d in range(DEPTHS):
+        torch.testing.assert_close(got[1 + d], ref[1 + d] * ratio[d], atol=1e-12, rtol=1e-10)
+    assert ref[1:].abs().sum() > 0 and not torch.allclose(got, ref)
 
 
 def test_stride_samples_positions(mp):

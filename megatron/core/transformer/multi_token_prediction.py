@@ -843,6 +843,10 @@ def process_mtp_loss(
     original_num_tokens = loss_mask.sum()
 
     stride = max(1, int(getattr(config, "mtp_loss_stride", 1) or 1))
+    if fused_loss_fn is not None:
+        return _process_mtp_loss_fused(hidden_states, hidden_states_list, mtp_labels, loss_mask,
+                                       original_num_tokens, stride, is_training, fused_loss_fn, config,
+                                       cp_group, packed_seq_params)
     for mtp_layer_number in range(config.mtp_num_layers):
         mtp_labels, _ = roll_tensor(
             mtp_labels, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
@@ -850,39 +854,17 @@ def process_mtp_loss(
         loss_mask, num_tokens = roll_tensor(
             loss_mask, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
         )
-        if fused_loss_fn is not None:
-            # the vocabulary head on every stride-th position only (offset by the depth, so the
-            # depths cover different positions); normalised by the sampled token count
-            depth_hidden = hidden_states_list[mtp_layer_number + 1]
-            pos = torch.arange(mtp_layer_number % stride, depth_hidden.shape[0], stride,
-                               device=depth_hidden.device)
-            sub_mask = loss_mask[:, pos]
-            mtp_loss = sub_mask * fused_loss_fn(depth_hidden[pos], mtp_labels[:, pos], sub_mask)
-            num_tokens = sub_mask.sum()
-            if is_training:
-                mtp_loss_for_log = (
-                    torch.sum(mtp_loss) * (num_tokens > 0).to(mtp_loss.dtype)
-                ) / num_tokens.clamp(min=1)
-                MTPLossLoggingHelper.save_metrics_to_tracker(
-                    mtp_loss_for_log,
-                    torch.zeros((), device=mtp_loss.device),
-                    torch.zeros((), device=mtp_loss.device),
-                    mtp_layer_number,
-                    config.mtp_num_layers,
-                    avg_group=parallel_state.get_data_parallel_group(with_context_parallel=True),
-                )
-        else:
-            mtp_logits, _ = output_layer(
-                hidden_states_list[mtp_layer_number + 1],
-                weight=output_weight,
-                runtime_gather_output=runtime_gather_output,
-            )
-            if scale_logits_fn is not None:
-                mtp_logits = scale_logits_fn(mtp_logits)
-            mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
-            mtp_loss = loss_mask * mtp_loss
+        mtp_logits, _ = output_layer(
+            hidden_states_list[mtp_layer_number + 1],
+            weight=output_weight,
+            runtime_gather_output=runtime_gather_output,
+        )
+        if scale_logits_fn is not None:
+            mtp_logits = scale_logits_fn(mtp_logits)
+        mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
+        mtp_loss = loss_mask * mtp_loss
 
-        if is_training and fused_loss_fn is None:
+        if is_training:
             mtp_loss_for_log = (
                 torch.sum(mtp_loss) * (num_tokens > 0).to(mtp_loss.dtype)
             ) / num_tokens.clamp(min=1)
@@ -918,6 +900,51 @@ def process_mtp_loss(
             )
 
     return hidden_states
+
+
+def _process_mtp_loss_fused(hidden_states, hidden_states_list, mtp_labels, loss_mask, original_num_tokens, stride,
+                            is_training, fused_loss_fn, config, cp_group, packed_seq_params):
+    """process_mtp_loss with a fused vocabulary head: every depth's every stride-th position (offset by the depth,
+    so the depths cover different positions) in ONE fused call -- the fused head keeps an output-weight gradient
+    buffer per call, so one call per depth held mtp_num_layers [vocab, h] buffers (s3 at 8 depths: OOM). The
+    depths share one token count for the normalisation (the mean of their sampled counts, which differ by the
+    rolled-out tail only): the fused backward needs one upstream gradient value for all tokens."""
+    depths = config.mtp_num_layers
+    hs, labs, masks = [], [], []
+    for d in range(depths):
+        mtp_labels, _ = roll_tensor(
+            mtp_labels, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
+        )
+        loss_mask, _ = roll_tensor(
+            loss_mask, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
+        )
+        depth_hidden = hidden_states_list[d + 1]
+        pos = torch.arange(d % stride, depth_hidden.shape[0], stride, device=depth_hidden.device)
+        hs.append(depth_hidden[pos])
+        labs.append(mtp_labels[:, pos])
+        masks.append(loss_mask[:, pos])
+    sizes = [m.shape[1] for m in masks]
+    mask = torch.cat(masks, dim=1)
+    loss = mask * fused_loss_fn(torch.cat(hs, dim=0), torch.cat(labs, dim=1), mask)
+    counts = [m.sum() for m in masks]
+    num_tokens = torch.stack(counts).float().mean()
+    safe_num_tokens = num_tokens.clamp(min=1)
+    mtp_loss_scale = config.mtp_loss_scaling_factor / depths
+    for d, depth_loss in enumerate(torch.split(loss, sizes, dim=1)):
+        if is_training:
+            MTPLossLoggingHelper.save_metrics_to_tracker(
+                depth_loss.sum() / counts[d].clamp(min=1),
+                torch.zeros((), device=loss.device),
+                torch.zeros((), device=loss.device),
+                d,
+                depths,
+                avg_group=parallel_state.get_data_parallel_group(with_context_parallel=True),
+            )
+    if config.calculate_per_token_loss:
+        total = mtp_loss_scale * loss * (original_num_tokens / safe_num_tokens)
+    else:
+        total = mtp_loss_scale * loss / safe_num_tokens
+    return MTPLossAutoScaler.apply(hidden_states, total)
 
 
 class MultiTokenPredictionLayer(MegatronModule):
