@@ -404,6 +404,34 @@ def _has_mamba_layers(args):
     return "M" in pattern if pattern else True
 
 
+_EVAL_TOKEN_DUMP_COUNT = [0]
+
+
+def _eval_token_dump(tokens, labels, loss_mask, cu_seqlens, output_tensor):
+    """MEGATRON_EVAL_TOKEN_DUMP=<dir>: every evaluation micro-batch's per-token losses with its tokens,
+    labels, loss mask and cu_seqlens, one file per rank and micro-batch (r<rank>_<k>.pt). For export checks:
+    the very tokens scored by an HF / vLLM port. Ranks of one data-parallel group may write the same
+    micro-batch; consumers deduplicate by content."""
+    out = os.environ.get("MEGATRON_EVAL_TOKEN_DUMP")
+    if not out or output_tensor is None or not mpu.is_pipeline_last_stage(ignore_virtual=True):
+        return
+    os.makedirs(out, exist_ok=True)
+    k = _EVAL_TOKEN_DUMP_COUNT[0]
+    _EVAL_TOKEN_DUMP_COUNT[0] += 1
+    cpu = lambda t: None if t is None else t.detach().cpu()  # noqa: E731
+    torch.save(
+        {
+            "tokens": cpu(tokens),
+            "labels": cpu(labels),
+            "loss_mask": cpu(loss_mask),
+            "cu_seqlens": cpu(cu_seqlens),
+            "losses": output_tensor.detach().float().cpu(),
+            "seq_length": getattr(get_args(), "_eval_set_seq_length", None),
+        },
+        os.path.join(out, f"r{torch.distributed.get_rank():05d}_{k:05d}.pt"),
+    )
+
+
 def forward_step(data_iterator, model: HybridModel, return_schedule_plan: bool = False):
     """Forward training step.
 
@@ -487,6 +515,8 @@ def forward_step(data_iterator, model: HybridModel, return_schedule_plan: bool =
             packed_seq_params=packed_seq_params,
             loss_mask=loss_mask,
         )
+    if not model.training:
+        _eval_token_dump(tokens, labels, loss_mask, cu_seqlens, output_tensor)
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
     return output_tensor, partial(loss_func, loss_mask, model=model)
