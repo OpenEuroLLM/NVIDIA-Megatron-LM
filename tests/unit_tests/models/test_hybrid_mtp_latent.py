@@ -111,3 +111,19 @@ def test_hybrid_latent_ckda_depths_train(mp):
     loss.float().mean().backward()
     mtp_grads = [p.grad for n, p in model.named_parameters() if n.startswith("mtp.")]
     assert all(g is not None for g in mtp_grads) and sum(float(g.abs().sum()) for g in mtp_grads) > 0
+
+
+def test_mtp_depths_plain_residual_under_depth_memory(mp):
+    """With the decoder on Linear Depth Memory the MTP depths keep a plain residual: no depth-memory modules of
+    their own (each would hold a full workspace outside autograd), and they still train."""
+    model_parallel_cuda_manual_seed(123)
+    torch.manual_seed(0)
+    model = _model(depth_memory=True)
+    mtp = [n for n, _ in model.named_parameters() if n.startswith("mtp.")]
+    assert mtp and not any("ldm" in n or "depth_memory" in n for n in mtp), mtp
+    assert any("ldm" in n or "depth_memory" in n for n, _ in model.named_parameters() if n.startswith("decoder."))
+    ids = torch.randint(0, 128, (2, 64), device="cuda")
+    pos = torch.arange(64, device="cuda").expand(2, 64)
+    loss = model(ids, position_ids=pos, attention_mask=None, labels=torch.roll(ids, -1, 1))
+    loss.float().mean().backward()
+    assert all(p.grad is not None for n, p in model.named_parameters() if n.startswith("mtp."))
