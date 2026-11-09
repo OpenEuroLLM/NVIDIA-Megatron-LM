@@ -2105,6 +2105,23 @@ class ChainedOptimizer(MegatronOptimizer):
         return grad_norm
 
     @torch.no_grad()
+    def _grad_norm_of(self, optimizers: List[MegatronOptimizer]) -> float:
+        """get_grad_norm over a subset of the chained optimizers (same reductions)."""
+        if not optimizers:
+            return 0.0
+        if self.grads_states_parallel_group_is_shared():
+            grads_for_norm = []
+            for optimizer in optimizers:
+                grads_for_norm += optimizer.get_grads_for_grad_norm()
+            return float(
+                get_grad_norm_fp32(
+                    grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
+                )
+            )
+        norms = [float(optimizer.get_grad_norm() or 0.0) for optimizer in optimizers]
+        return math.sqrt(sum(x * x for x in norms))
+
+    @torch.no_grad()
     def count_zeros(self):
         if self.grads_states_parallel_group_is_shared():
             params = []
@@ -2192,7 +2209,23 @@ class ChainedOptimizer(MegatronOptimizer):
         if found_inf_flag:
             return False, None, None
 
-        grad_norm = self.get_grad_norm()
+        # --engram-clip-grad: the Engram tables (sparse-row optimizers) leave the global norm. The
+        # dense parameters are clipped with the norm of the rest, the tables with their own norm
+        # and threshold; the returned (logged) grad norm stays the total over everything.
+        engram_clip_grad = getattr(self.config, 'engram_clip_grad', None)
+        sparse_optimizers = [o for o in self.chained_optimizers if hasattr(o, 'clip_sparse_grads')]
+        separate_engram = bool(engram_clip_grad) and engram_clip_grad > 0.0 and bool(sparse_optimizers)
+        if separate_engram:
+            dense_grad_norm = self._grad_norm_of(
+                [o for o in self.chained_optimizers if o not in sparse_optimizers]
+            )
+            engram_grad_norm = self._grad_norm_of(sparse_optimizers)
+            grad_norm = math.sqrt(dense_grad_norm**2 + engram_grad_norm**2)
+        else:
+            grad_norm = self.get_grad_norm()
+            dense_grad_norm, engram_grad_norm = grad_norm, None
+        # read by the training diagnostics (clip events from the norm that was actually clipped)
+        self.last_clip_norms = {"dense": dense_grad_norm, "engram": engram_grad_norm}
         should_skip_update = False
 
         should_clip = any(
@@ -2230,16 +2263,20 @@ class ChainedOptimizer(MegatronOptimizer):
                 else:
                     main_params.append(p)
 
-            if optimizer.config.clip_grad > 0.0:
+            if separate_engram and optimizer in sparse_optimizers:
+                clip_max, clip_total = engram_clip_grad, engram_grad_norm
+            else:
+                clip_max, clip_total = optimizer.config.clip_grad, dense_grad_norm
+            if clip_max > 0.0:
                 if main_params:
                     clip_grad_by_total_norm_fp32(
                         main_params,
-                        max_norm=optimizer.config.clip_grad,
-                        total_norm=grad_norm,
+                        max_norm=clip_max,
+                        total_norm=clip_total,
                         use_decoupled_grad=use_decoupled_grad,
                     )
                 if hasattr(optimizer, "clip_sparse_grads"):  # EngramTableOptimizer
-                    optimizer.clip_sparse_grads(optimizer.config.clip_grad, grad_norm)
+                    optimizer.clip_sparse_grads(clip_max, clip_total)
                 for grad_norm_group, grouped_params in params_by_grad_norm_group.items():
                     group_grad_norm = self.grad_norms_by_group.get(grad_norm_group)
                     if group_grad_norm is None:
@@ -2255,7 +2292,7 @@ class ChainedOptimizer(MegatronOptimizer):
             if (
                 main_params
                 and math.isfinite(grad_norm_skip_threshold)
-                and grad_norm > grad_norm_skip_threshold
+                and clip_total > grad_norm_skip_threshold
             ):
                 log_single_rank(
                     logger, logging.INFO, "skipping grad norm because it's too large %s", grad_norm

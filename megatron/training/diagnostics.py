@@ -249,6 +249,7 @@ class TrainingDiagnostics:
         self._fsdp_replica_factor = 1.0
         self._n_engram_tables = 0
         self._last_gn: float | None = None  # global grad-norm of the last step (observe_clip)
+        self._last_engram_gn: float | None = None  # with --engram-clip-grad: the tables' own norm
 
     # ------------------------------------------------------------------ setup
     def setup(self, model, optimizer=None):
@@ -750,10 +751,13 @@ class TrainingDiagnostics:
         self._tok_logz = None
         self._tok_max = None
 
-    def observe_clip(self, grad_norm):
+    def observe_clip(self, grad_norm, clip_norms=None):
         """Runs EVERY step. Records whether the clip fired and how long a run of
         clipped steps we are in. `grad_norm` is the pre-clip total norm, i.e.
         exactly the denominator of clip_coeff = clip_grad / (total_norm + 1e-6).
+        `clip_norms` (ChainedOptimizer.last_clip_norms): with --engram-clip-grad the dense
+        parameters are clipped with clip_norms["dense"] and the Engram tables with their own
+        clip_norms["engram"]; the clip events then follow the dense norm.
         """
         if grad_norm is None:
             return
@@ -761,6 +765,10 @@ class TrainingDiagnostics:
         # the global norm of the step `collect` just ran on: emit derives the Engram tables'
         # share from it (see emit), whether or not clip events are tracked
         self._last_gn = gn
+        engram = (clip_norms or {}).get("engram")
+        self._last_engram_gn = None if engram is None else float(engram)
+        if engram is not None:
+            gn = float(clip_norms["dense"])
         if not self.want_clip or gn != gn:  # off, or NaN
             return
         clip_grad = float(getattr(self.args, "clip_grad", 0.0) or 0.0)
@@ -1147,7 +1155,13 @@ class TrainingDiagnostics:
             # row gradients reach the owning ranks only in that optimizer's prepare_grads, i.e.
             # inside optimizer.step(), after `collect`. Everything else is counted exactly above,
             # so the tables' norm is the remainder (with Engram, total_check alone reads low).
-            if self._n_engram_tables and self._last_gn is not None:
+            if self._last_engram_gn is not None:
+                # --engram-clip-grad: the optimizer measured the tables' norm itself
+                logs["diag/grad_norm/engram_tables"] = self._last_engram_gn
+                ecl = float(getattr(self.args, "engram_clip_grad", 0.0) or 0.0)
+                if ecl > 0.0:
+                    logs["diag/clip/engram_coeff"] = min(1.0, ecl / (self._last_engram_gn + 1.0e-6))
+            elif self._n_engram_tables and self._last_gn is not None:
                 gn = self._last_gn
                 if gn == gn:
                     logs["diag/grad_norm/engram_tables"] = max(gn * gn - total_sq, 0.0) ** 0.5

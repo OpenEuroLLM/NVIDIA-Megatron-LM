@@ -716,6 +716,12 @@ class OptimizerConfig:
     clip_grad: float = 1.0
     """Gradient clipping based on global L2 norm."""
 
+    engram_clip_grad: Optional[float] = None
+    """Clip the Engram tables (EngramTableOptimizer, chained) separately: None (default) keeps them in
+    the global norm that every parameter is clipped with; a value > 0 takes them out of it, so the
+    dense parameters are clipped with the norm of everything else (clip_grad) and the tables with
+    their own norm against this threshold. The logged grad norm stays the total over everything."""
+
     grad_norm_skip_threshold: float = float('inf')
     """Skip gradient update if the gradient norm exceeds this threshold.
 

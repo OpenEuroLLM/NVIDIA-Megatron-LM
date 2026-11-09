@@ -2911,6 +2911,12 @@ def _add_regularization_args(parser):
                        'current overrides instead of raising.')
     group.add_argument('--clip-grad', type=float, default=1.0,
                        help='Gradient clipping based on global L2 norm.')
+    group.add_argument('--engram-clip-grad', type=float, default=None,
+                       help='Clip the Engram tables separately: take them out of the global norm '
+                            '(the dense parameters are then clipped with the norm of everything '
+                            'else, --clip-grad) and clip them with their own norm against this '
+                            'threshold. Default: off (tables in the global norm). The logged grad '
+                            'norm stays the total.')
     group.add_argument('--adam-beta1', type=float, default=0.9,
                        help='First coefficient for computing running averages '
                        'of gradient and its square')
