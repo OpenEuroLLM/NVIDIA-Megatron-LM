@@ -1446,9 +1446,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             # Uniformly divide the total number of Transformer layers and checkpoint
             # the input activation of each divided chunk.
             # A method to further reduce memory usage reducing checkpoints.
-            assert (
-                self.config.recompute_num_layers == 1
-            ), "recompute_num_layers must be 1 for MTP recompute"
+            # An MTP depth is one layer: it is its own chunk whatever recompute_num_layers groups in the decoder.
             with outer_quantization_context:
                 outputs = checkpoint_handler()
         elif self.config.recompute_method == 'block':
