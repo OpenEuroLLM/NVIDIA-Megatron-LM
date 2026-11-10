@@ -2911,6 +2911,18 @@ def _add_regularization_args(parser):
                        'current overrides instead of raising.')
     group.add_argument('--clip-grad', type=float, default=1.0,
                        help='Gradient clipping based on global L2 norm.')
+    group.add_argument('--engram-clip-rownorm', type=float, default=None,
+                       help='Cap on the L2 norm of every Engram table row: after each update, '
+                            'rows above it are rescaled to it (Adam moments unchanged). Default: '
+                            'off.')
+    group.add_argument('--engram-clip-rownorm-start', type=float, default=None,
+                       help='Start of a geometric ramp down to --engram-clip-rownorm (no cap before '
+                            '--engram-clip-rownorm-ramp-start when set).')
+    group.add_argument('--engram-clip-rownorm-ramp-start', type=int, default=0,
+                       help='Table-optimizer step (~ iteration) at which the row-norm cap or its '
+                            'ramp starts.')
+    group.add_argument('--engram-clip-rownorm-ramp-steps', type=int, default=0,
+                       help='Steps of the geometric ramp of the row-norm cap.')
     group.add_argument('--engram-clip-grad', type=float, default=None,
                        help='Clip the Engram tables separately: take them out of the global norm '
                             '(the dense parameters are then clipped with the norm of everything '

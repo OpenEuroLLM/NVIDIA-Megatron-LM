@@ -66,10 +66,36 @@ class TableAdam(torch.optim.Optimizer):
     arithmetic is fp32). With the defaults this is torch.optim.Adam (no weight decay).
     """
 
-    def __init__(self, params, lr, betas, eps, rowwise_v=False, momentum_dtype=torch.float32):
+    def __init__(self, params, lr, betas, eps, rowwise_v=False, momentum_dtype=torch.float32,
+                 rownorm_cap=None, rownorm_cap_start=None, rownorm_cap_ramp_start=0,
+                 rownorm_cap_ramp_steps=0):
         super().__init__(params, dict(lr=lr, betas=betas, eps=eps))
         self.rowwise_v = rowwise_v
         self.momentum_dtype = momentum_dtype
+        # --engram-clip-rownorm: after each update, Engram table rows with an L2 norm above the
+        # cap are rescaled to it (their Adam moments stay). The cap ramps geometrically from
+        # rownorm_cap_start to rownorm_cap over rownorm_cap_ramp_steps table steps from
+        # rownorm_cap_ramp_start (the table step counts optimizer steps, ~ iterations); no cap
+        # before ramp_start when a start value is given. None: off.
+        self.rownorm_cap = rownorm_cap
+        self.rownorm_cap_start = rownorm_cap_start
+        self.rownorm_cap_ramp_start = int(rownorm_cap_ramp_start or 0)
+        self.rownorm_cap_ramp_steps = int(rownorm_cap_ramp_steps or 0)
+        self.capped_rows = None  # rows rescaled since the last report (device scalar)
+        self.max_row_norm = None  # largest row norm before capping since the last report
+
+    def cap_at(self, t: float) -> Optional[float]:
+        """The row-norm cap at table step t (None: no cap)."""
+        target = self.rownorm_cap
+        if not target or target <= 0.0:
+            return None
+        start = self.rownorm_cap_start
+        if t < self.rownorm_cap_ramp_start:
+            return None if start else target
+        if not start or self.rownorm_cap_ramp_steps <= 0:
+            return target
+        frac = min(1.0, (t - self.rownorm_cap_ramp_start) / self.rownorm_cap_ramp_steps)
+        return start * (target / start) ** frac
 
     def init_state(self, p):
         state = self.state[p]
@@ -93,6 +119,12 @@ class TableAdam(torch.optim.Optimizer):
                 t = float(state['step'])
                 step_size = group['lr'] / (1 - beta1**t)
                 bc2_sqrt = math.sqrt(1 - beta2**t)
+                cap = None
+                if getattr(p, "sharded_table_kind", "engram") == "engram":
+                    cap = self.cap_at(t)
+                if cap is not None and self.capped_rows is None:
+                    self.capped_rows = torch.zeros((), dtype=torch.float32, device=p.device)
+                    self.max_row_norm = torch.zeros((), dtype=torch.float32, device=p.device)
                 rows = max(1, _CHUNK_ELEMENTS // max(1, p.shape[-1]))
                 starts = list(range(0, p.shape[0], rows))
                 bounds = sparse.chunk_bounds(starts) if sparse is not None else None
@@ -110,6 +142,12 @@ class TableAdam(torch.optim.Optimizer):
                     v.mul_(beta2).add_(sq, alpha=1 - beta2)
                     w.addcdiv_(m32, v.sqrt().div_(bc2_sqrt).add_(group['eps']), value=-step_size)
                     m.copy_(m32)
+                    if cap is not None:
+                        n = w.float().norm(dim=-1, keepdim=True)
+                        over = n > cap
+                        w.mul_(torch.where(over, cap / n.clamp_min(1e-12), torch.ones_like(n)))
+                        self.capped_rows += over.sum()
+                        torch.maximum(self.max_row_norm, n.max(), out=self.max_row_norm)
         return None
 
 
@@ -166,10 +204,15 @@ class EngramTableOptimizer(MegatronOptimizer):
             eps=config.adam_eps,
             rowwise_v=config.engram_table_rowwise_v,
             momentum_dtype=momentum_dtype,
+            rownorm_cap=getattr(config, "engram_clip_rownorm", None),
+            rownorm_cap_start=getattr(config, "engram_clip_rownorm_start", None),
+            rownorm_cap_ramp_start=getattr(config, "engram_clip_rownorm_ramp_start", 0),
+            rownorm_cap_ramp_steps=getattr(config, "engram_clip_rownorm_ramp_steps", 0),
         )
         super().__init__(optimizer, config, init_state_fn=lambda opt, cfg=None: None)
         self.params = [p for g in optimizer.param_groups for p in g["params"]]
         self.is_stub_optimizer = False
+        self._steps_since_report = 0
 
     # ---- gradients -------------------------------------------------------------
     def get_parameters(self) -> List[torch.nn.Parameter]:
@@ -237,7 +280,37 @@ class EngramTableOptimizer(MegatronOptimizer):
         self.optimizer.step()
         for p in self.params:
             p.grad = None
+        self._report_rownorm_cap()
         return True
+
+    _REPORT_EVERY = 100
+
+    def _report_rownorm_cap(self):
+        """Every 100 steps with --engram-clip-rownorm: the rows rescaled since the last report and
+        the largest row norm before capping, over all ranks (rank 0 prints one line)."""
+        opt = self.optimizer
+        if not opt.rownorm_cap:
+            return
+        self._steps_since_report += 1
+        if self._steps_since_report < self._REPORT_EVERY:
+            return
+        device = torch.cuda.current_device()
+        capped = (opt.capped_rows if opt.capped_rows is not None
+                  else torch.zeros((), device=device)).clone()
+        biggest = (opt.max_row_norm if opt.max_row_norm is not None
+                   else torch.zeros((), device=device)).clone()
+        torch.distributed.all_reduce(capped)
+        torch.distributed.all_reduce(biggest, op=torch.distributed.ReduceOp.MAX)
+        t = max((float(opt.state[p]['step']) for p in self.params if p in opt.state), default=0.0)
+        if torch.distributed.get_rank() == 0:
+            cap = opt.cap_at(t)
+            print(f"[engram-rownorm] table step {t:.0f}: cap {cap if cap is None else round(cap, 4)}, "
+                  f"{int(capped.item())} rows rescaled in the last {self._steps_since_report} steps, "
+                  f"largest row norm before capping {biggest.item():.4f}", flush=True)
+        if opt.capped_rows is not None:
+            opt.capped_rows.zero_()
+            opt.max_row_norm.zero_()
+        self._steps_since_report = 0
 
     @torch.no_grad()
     def step(self):

@@ -722,6 +722,20 @@ class OptimizerConfig:
     dense parameters are clipped with the norm of everything else (clip_grad) and the tables with
     their own norm against this threshold. The logged grad norm stays the total over everything."""
 
+    engram_clip_rownorm: Optional[float] = None
+    """Cap on the L2 norm of every Engram table row: after each update, rows above it are rescaled
+    to it (their Adam moments stay). None (default): off."""
+
+    engram_clip_rownorm_start: Optional[float] = None
+    """Start value of a geometric ramp down to engram_clip_rownorm (None: the target from the
+    ramp start on; with a start value there is no cap before the ramp start)."""
+
+    engram_clip_rownorm_ramp_start: int = 0
+    """Table-optimizer step (~ iteration) at which the cap (or its ramp) starts."""
+
+    engram_clip_rownorm_ramp_steps: int = 0
+    """Length of the geometric ramp from engram_clip_rownorm_start to engram_clip_rownorm."""
+
     grad_norm_skip_threshold: float = float('inf')
     """Skip gradient update if the gradient norm exceeds this threshold.
 
