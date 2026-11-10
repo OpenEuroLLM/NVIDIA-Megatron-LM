@@ -35,14 +35,19 @@ import torch
 from torch import nn
 
 def current_iteration() -> int | None:
-    """The training loop's iteration (args.curr_iteration), or None outside training."""
+    """The model's iteration: the training loop's (args.curr_iteration) or, when later, the loaded
+    checkpoint's (args.iteration) -- an evaluation-only run (train_iters = the checkpoint's step) never
+    enters the loop and leaves curr_iteration at 0, which would evaluate the start of the hand-over
+    (alpha 1) instead of the checkpoint's mix. None outside Megatron (unit tests, inference)."""
     try:
         from megatron.training import get_args
 
-        it = getattr(get_args(), "curr_iteration", None)
-        return int(it) if it is not None else None
+        args = get_args()
     except Exception:  # no args (unit tests, inference): the schedules use their start values
         return None
+    its = [int(v) for v in (getattr(args, "curr_iteration", None), getattr(args, "iteration", None))
+           if v is not None]
+    return max(its) if its else None
 
 
 def schedule(config, iteration: int | None) -> tuple[float, float]:

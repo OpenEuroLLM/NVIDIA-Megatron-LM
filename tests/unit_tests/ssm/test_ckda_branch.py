@@ -106,6 +106,18 @@ def test_calibration_matches_the_branch_to_the_mixers_rms_once():
     assert float(other.calib) == 1.5
 
 
+def test_current_iteration_takes_the_loaded_checkpoints_step_in_an_eval_only_run(monkeypatch):
+    import megatron.training as mt
+
+    args = SimpleNamespace(curr_iteration=0, iteration=23400)  # eval-only: the loop never ran
+    monkeypatch.setattr(mt, "get_args", lambda: args, raising=False)
+    assert cb.current_iteration() == 23400
+    args.curr_iteration, args.iteration = 23450, 23300  # training: the loop's step
+    assert cb.current_iteration() == 23450
+    args.curr_iteration = None
+    assert cb.current_iteration() == 23300
+
+
 def test_has_branch_uses_zero_based_layer_indices():
     c = SimpleNamespace(ckda_branch="attention", ckda_branch_layers=[9, 25])
     assert cb.has_branch(c, 10) and cb.has_branch(c, 26) and not cb.has_branch(c, 9)
