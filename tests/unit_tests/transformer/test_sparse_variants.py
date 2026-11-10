@@ -439,3 +439,17 @@ def test_dlsa_distillation_trains_the_maps():
         opt.step()
         losses.append(float(loss))
     assert losses[0] > 0 and losses[-1] < 0.8 * losses[0], losses
+
+
+def test_selector_losses_reach_all_params_without_candidates():
+    """Too short for any candidate: the D-LSA / CSA2 losses are zero but still give every selector parameter a
+    (zero) gradient -- a rank without one would hang Megatron-FSDP's gradient reduce-scatter."""
+    q, k, v, x = qkvx(L=24)
+    lat = _dlsa(select_block=16)
+    lat.indexer_loss(q, k, 0, D**-0.5).backward()
+    assert all(p.grad is not None and float(p.grad.abs().sum()) == 0 for p in lat.parameters())
+    csa = sv.CSA2(H, G, D, sv.CSA2Config(compress=2, topk_entries=4, window=16, page=16, sink_pages=1)).to(
+        DEV, torch.float64)
+    loss = csa.indexer_loss(q, k, x, csa.token_features(x), 0, D**-0.5)
+    loss.backward()
+    assert all(p.grad is not None for p in csa.parameters())

@@ -206,6 +206,18 @@ class NSA(nn.Module):
 
 
 # ----------------------------------------------------------------------------------------------- CSA2
+def _zero_loss(module: nn.Module, like: torch.Tensor) -> torch.Tensor:
+    """A zero loss that still reaches every trainable parameter of ``module`` (zero gradients): a rank whose
+    sequences give no candidates (all shorter than the selector's span) must produce gradients for the selector's
+    parameters too, or Megatron-FSDP's reduce-scatter of them waits forever on the other ranks (the D-LSA warm-up
+    hung at its first step)."""
+    out = like.sum() * 0.0
+    for p in module.parameters():
+        if p.requires_grad:
+            out = out + p.sum() * 0.0
+    return out
+
+
 @dataclass
 class CSA2Config:
     compress: int = 2
@@ -378,7 +390,7 @@ class CSA2(nn.Module):
                 has = int((cand & (target[0] > 0)).any(-1).sum())
                 lc = ps.indexer_kl_loss(self.index_scores(xq[:, a], kc), target, cand)
                 total, count = total + lc * has, count + has
-            return total / max(count, 1) if count else xq.sum() * 0.0
+            return total / max(count, 1) if count else _zero_loss(self, xq)
         pos = q_offset + torch.arange(s, device=q.device)
         total, count = 0.0, 0
         for c0 in range(0, s, chunk):  # a query chunk at a time; checkpointed: the [c, Lc] scores are not kept
@@ -400,7 +412,7 @@ class CSA2(nn.Module):
                 lc = chunk_loss(xq[:, c0:c1], kc)
             total = total + lc * has
             count += has
-        return total / max(count, 1) if count else xq.sum() * 0.0
+        return total / max(count, 1) if count else _zero_loss(self, xq)
 
 
 # ----------------------------------------------------------------------------------------------- LSA
@@ -552,7 +564,7 @@ class LSA(nn.Module):
             _, mem, mem_ok, last = self.index(k)
         nb = mem.shape[0]
         if nb == 0 or self.proj_k is None:
-            return q.sum() * 0.0
+            return _zero_loss(self, q)
         tok = mem.clamp(max=L - 1)  # [nb, Mt]
         kn = F.normalize(ps._acc(self._pk(k.detach()))[0], dim=-1)  # [g, L, d]
         w = mem_ok.to(kn.dtype)
@@ -580,7 +592,7 @@ class LSA(nn.Module):
             has = int((cand & (target > 0)).any(-1).sum())
             lc = ps.indexer_kl_loss(sc * self.logit_scale.exp(), target, cand)
             total, count = total + lc * has, count + has
-        return total / max(count, 1) if count else q.sum() * 0.0
+        return total / max(count, 1) if count else _zero_loss(self, q)
 
     def _forward_flex(self, q, k, v, q_offset, scale, index):
         """Raw sinks + window, and the selected buckets over the keys permuted into bucket order (each bucket a
