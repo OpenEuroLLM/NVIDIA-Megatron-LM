@@ -23,6 +23,7 @@ a few MB instead of table-sized (torch's foreach Adam allocates several table-si
 
 import logging
 import math
+import os
 from dataclasses import replace
 from typing import List, Optional
 
@@ -283,7 +284,8 @@ class EngramTableOptimizer(MegatronOptimizer):
         self._report_rownorm_cap()
         return True
 
-    _REPORT_EVERY = 100
+    # MEGATRON_ENGRAM_ROWNORM_REPORT: report interval in steps (tests: 1)
+    _REPORT_EVERY = int(os.environ.get("MEGATRON_ENGRAM_ROWNORM_REPORT", "100"))
 
     def _report_rownorm_cap(self):
         """Every 100 steps with --engram-clip-rownorm: the rows rescaled since the last report and
