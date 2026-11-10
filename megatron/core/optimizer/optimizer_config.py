@@ -722,6 +722,11 @@ class OptimizerConfig:
     dense parameters are clipped with the norm of everything else (clip_grad) and the tables with
     their own norm against this threshold. The logged grad norm stays the total over everything."""
 
+    engram_table_optimizer: str = "adam"
+    """Update rule of the sharded Engram tables: "adam" (TableAdam) or "sinkhorn" (DeepSeek-V4.1's
+    Nesterov momentum + Sinkhorn row / column balancing, sinkhorn_momentum / _iters / _lr_ratio;
+    lr = base x engram_lr_mult, no weight decay)."""
+
     engram_clip_rownorm: Optional[float] = None
     """Cap on the L2 norm of every Engram table row: after each update, rows above it are rescaled
     to it (their Adam moments stay). None (default): off."""

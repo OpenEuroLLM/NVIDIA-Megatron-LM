@@ -2911,6 +2911,12 @@ def _add_regularization_args(parser):
                        'current overrides instead of raising.')
     group.add_argument('--clip-grad', type=float, default=1.0,
                        help='Gradient clipping based on global L2 norm.')
+    group.add_argument('--engram-table-optimizer', type=str, default='adam',
+                       choices=['adam', 'sinkhorn'],
+                       help='Update rule of the sharded Engram tables: adam (TableAdam) or '
+                            'sinkhorn (DeepSeek-V4.1: Nesterov momentum + Sinkhorn row / column '
+                            'balancing, --sinkhorn-momentum / --sinkhorn-iters / '
+                            '--sinkhorn-lr-ratio; lr = base x --engram-lr-mult).')
     group.add_argument('--engram-clip-rownorm', type=float, default=None,
                        help='Cap on the L2 norm of every Engram table row: after each update, '
                             'rows above it are rescaled to it (Adam moments unchanged). Default: '

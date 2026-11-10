@@ -60,3 +60,64 @@ def test_off_and_non_engram_tables_untouched():
     before_q = q.detach().clone()
     TableAdam([q], lr=1e-3, betas=(0.9, 0.95), eps=1e-8, rownorm_cap=2.0).step()
     assert torch.equal(q.detach(), before_q)  # the cap is for Engram tables only
+
+
+# --engram-table-optimizer sinkhorn: TableAdam's Sinkhorn mode == sinkhorn.SinkhornMomentum (unsharded)
+
+
+def _pair(rows=96, dim=16, seed=1):
+    torch.manual_seed(seed)
+    w0 = torch.randn(rows, dim) * 0.1
+    a = torch.nn.Parameter(w0.clone(), requires_grad=False)
+    b = torch.nn.Parameter(w0.clone(), requires_grad=False)
+    return a, b
+
+
+def test_sinkhorn_matches_reference(monkeypatch):
+    from megatron.core.optimizer import engram_optimizer
+    from megatron.core.optimizer.sinkhorn import SinkhornMomentum
+
+    monkeypatch.setattr(engram_optimizer, "_CHUNK_ELEMENTS", 16 * 7)  # 7 rows per chunk: many chunks
+    a, b = _pair()
+    ours = TableAdam([a], lr=1e-2, betas=(0.9, 0.95), eps=1e-8, update="sinkhorn",
+                     sinkhorn_momentum=0.95, sinkhorn_iters=11, sinkhorn_lr_ratio=0.18)
+    ref = SinkhornMomentum([b], lr=1e-2, momentum=0.95, nesterov=True, iters=11, tau=1e-3,
+                           eps=1e-20, lr_ratio=0.18)
+    g = torch.Generator().manual_seed(2)
+    for _ in range(4):
+        grad = torch.randn(a.shape, generator=g)
+        grad[::5] = 0.0  # rows absent from the batch (never touched: masked)
+        a.grad, b.grad = grad.clone(), grad.clone()
+        ours.step()
+        ref.step()
+        assert torch.allclose(a.detach(), b.detach(), atol=1e-6, rtol=1e-5)
+    torch.testing.assert_close(ours.state[a]['exp_avg'].float(), ref.state[b]['momentum_buffer'],
+                               atol=1e-6, rtol=1e-5)
+
+
+def test_sinkhorn_step_size_untouched_rows_and_cap():
+    grad = torch.randn(96, 16)
+    grad[:10] = 0.0
+    # no cap: touched rows move by lr x lr_ratio per element (unit row RMS), untouched rows not at all
+    a, _ = _pair()
+    w0 = a.detach().clone()
+    opt = TableAdam([a], lr=1e-2, betas=(0.9, 0.95), eps=1e-8, update="sinkhorn")
+    a.grad = grad.clone()
+    opt.step()
+    assert torch.equal(a.detach()[:10], w0[:10])
+    step_rms = (a.detach()[10:] - w0[10:]).pow(2).mean().sqrt().item()
+    assert abs(step_rms - 1e-2 * 0.18) < 1e-2 * 0.18 * 0.05
+    # with the cap (rows start at norm ~0.4): every row ends at or below it
+    b, _ = _pair()
+    opt = TableAdam([b], lr=1e-2, betas=(0.9, 0.95), eps=1e-8, update="sinkhorn", rownorm_cap=0.3)
+    b.grad = grad.clone()
+    opt.step()
+    assert torch.all(b.detach().norm(dim=-1) <= 0.3 + 1e-5)
+
+
+def test_bad_update_rejected():
+    import pytest
+
+    with pytest.raises(ValueError):
+        TableAdam([torch.nn.Parameter(torch.zeros(2, 2))], lr=0.0, betas=(0.9, 0.95), eps=1e-8,
+                  update="lion")

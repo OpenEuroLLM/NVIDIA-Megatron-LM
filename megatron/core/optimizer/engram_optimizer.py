@@ -69,10 +69,30 @@ class TableAdam(torch.optim.Optimizer):
 
     def __init__(self, params, lr, betas, eps, rowwise_v=False, momentum_dtype=torch.float32,
                  rownorm_cap=None, rownorm_cap_start=None, rownorm_cap_ramp_start=0,
-                 rownorm_cap_ramp_steps=0):
+                 rownorm_cap_ramp_steps=0, update="adam", sinkhorn_momentum=0.95,
+                 sinkhorn_iters=11, sinkhorn_lr_ratio=0.18, sinkhorn_tau=1e-3,
+                 sinkhorn_eps=1e-20, row_group_fn=None):
         super().__init__(params, dict(lr=lr, betas=betas, eps=eps))
         self.rowwise_v = rowwise_v
         self.momentum_dtype = momentum_dtype
+        # --engram-table-optimizer sinkhorn: DeepSeek-V4.1's update for the tables (report §2.5,
+        # Algorithm 1; sinkhorn.py for the embedding / head) instead of Adam -- Nesterov momentum
+        # (in exp_avg, so a switch from Adam starts from Adam's first moment), rows with norm
+        # <= tau x the mean row norm masked, K alternating row / column l2 normalizations (column
+        # norms and the mean all-reduced over the table's row-shard group), step
+        # lr x lr_ratio x sqrt(n) x U. exp_avg_sq is kept (unused) for checkpoint compatibility.
+        if update not in ("adam", "sinkhorn"):
+            raise ValueError(f"TableAdam update must be 'adam' or 'sinkhorn', got {update!r}")
+        if update == "sinkhorn" and (sinkhorn_iters < 1 or sinkhorn_iters % 2 == 0):
+            raise ValueError(f"Sinkhorn iters must be odd and positive, got {sinkhorn_iters}")
+        self.update = update
+        self.sinkhorn_momentum = sinkhorn_momentum
+        self.sinkhorn_iters = int(sinkhorn_iters)
+        self.sinkhorn_lr_ratio = sinkhorn_lr_ratio
+        self.sinkhorn_tau = sinkhorn_tau
+        self.sinkhorn_eps = sinkhorn_eps
+        self.row_group_fn = row_group_fn
+        self._sinkhorn_buf = None  # one fp32 [rows, n] buffer, reused across tables and steps
         # --engram-clip-rownorm: after each update, Engram table rows with an L2 norm above the
         # cap are rescaled to it (their Adam moments stay). The cap ramps geometrically from
         # rownorm_cap_start to rownorm_cap over rownorm_cap_ramp_steps table steps from
@@ -129,6 +149,9 @@ class TableAdam(torch.optim.Optimizer):
                 rows = max(1, _CHUNK_ELEMENTS // max(1, p.shape[-1]))
                 starts = list(range(0, p.shape[0], rows))
                 bounds = sparse.chunk_bounds(starts) if sparse is not None else None
+                if self.update == "sinkhorn":
+                    self._sinkhorn_step(p, group, state, sparse, starts, rows, bounds, cap)
+                    continue
                 for i, lo in enumerate(starts):
                     w = p.data[lo : lo + rows]
                     if sparse is not None:  # zeros where the step left the row untouched
@@ -143,13 +166,59 @@ class TableAdam(torch.optim.Optimizer):
                     v.mul_(beta2).add_(sq, alpha=1 - beta2)
                     w.addcdiv_(m32, v.sqrt().div_(bc2_sqrt).add_(group['eps']), value=-step_size)
                     m.copy_(m32)
-                    if cap is not None:
-                        n = w.float().norm(dim=-1, keepdim=True)
-                        over = n > cap
-                        w.mul_(torch.where(over, cap / n.clamp_min(1e-12), torch.ones_like(n)))
-                        self.capped_rows += over.sum()
-                        torch.maximum(self.max_row_norm, n.max(), out=self.max_row_norm)
+                    self._cap_rows(w, cap)
         return None
+
+    def _cap_rows(self, w, cap):
+        """--engram-clip-rownorm: rescale the rows of chunk w above the cap to it."""
+        if cap is None:
+            return
+        n = w.float().norm(dim=-1, keepdim=True)
+        over = n > cap
+        w.mul_(torch.where(over, cap / n.clamp_min(1e-12), torch.ones_like(n)))
+        self.capped_rows += over.sum()
+        torch.maximum(self.max_row_norm, n.max(), out=self.max_row_norm)
+
+    def _sinkhorn_step(self, p, group, state, sparse, starts, rows, bounds, cap):
+        """One Sinkhorn-balanced momentum step of table shard p (sinkhorn.SinkhornMomentum's
+        update, over the table's row shards, chunked for the gradient / momentum passes)."""
+        beta = self.sinkhorn_momentum
+        n_rows, n = p.shape[0], p.shape[-1]
+        if self._sinkhorn_buf is None or self._sinkhorn_buf.numel() < n_rows * n:
+            self._sinkhorn_buf = torch.empty(n_rows * n, dtype=torch.float32, device=p.device)
+        u = self._sinkhorn_buf[: n_rows * n].view(n_rows, n)
+        for i, lo in enumerate(starts):
+            hi = min(lo + rows, n_rows)
+            if sparse is not None:  # zeros where the step left the row untouched
+                g = sparse.dense_chunk(lo, hi, *bounds[i])
+            else:
+                g = p.grad[lo:hi].float()
+            m = state['exp_avg'][lo:hi]
+            m32 = m.float().mul_(beta).add_(g, alpha=1 - beta)  # == m itself when m is fp32
+            m.copy_(m32)
+            # Nesterov beta m + (1 - beta) g, built in u: m32 / g may alias the state / the grad
+            u[lo:hi].copy_(m32).mul_(beta).add_(g, alpha=1 - beta)
+        pg = self.row_group_fn(p) if self.row_group_fn is not None else None
+        rho = torch.linalg.vector_norm(u, dim=1)
+        stats = torch.stack([rho.sum(), torch.tensor(float(n_rows), device=u.device)])
+        if pg is not None:
+            torch.distributed.all_reduce(stats, group=pg)
+        mean = stats[0] / stats[1].clamp(min=1.0)
+        u.mul_((rho > self.sinkhorn_tau * mean).unsqueeze(1).to(u.dtype))
+        eps = self.sinkhorn_eps
+        for k in range(self.sinkhorn_iters):
+            if k % 2 == 0:  # rows
+                u.div_(torch.linalg.vector_norm(u, dim=1, keepdim=True).add_(eps))
+            else:  # columns, over every row shard
+                col_sq = torch.linalg.vector_norm(u, dim=0).square_()
+                if pg is not None:
+                    torch.distributed.all_reduce(col_sq, group=pg)
+                u.div_(col_sq.sqrt_().add_(eps).unsqueeze(0))
+        scale = group['lr'] * self.sinkhorn_lr_ratio * math.sqrt(n)
+        for lo in starts:
+            w = p.data[lo : lo + rows]
+            w.add_(u[lo : lo + w.shape[0]], alpha=-scale)
+            self._cap_rows(w, cap)
 
 
 def _sparse_grad(p):
@@ -209,7 +278,18 @@ class EngramTableOptimizer(MegatronOptimizer):
             rownorm_cap_start=getattr(config, "engram_clip_rownorm_start", None),
             rownorm_cap_ramp_start=getattr(config, "engram_clip_rownorm_ramp_start", 0),
             rownorm_cap_ramp_steps=getattr(config, "engram_clip_rownorm_ramp_steps", 0),
+            update=getattr(config, "engram_table_optimizer", "adam"),
+            sinkhorn_momentum=config.sinkhorn_momentum,
+            sinkhorn_iters=config.sinkhorn_iters,
+            sinkhorn_lr_ratio=config.sinkhorn_lr_ratio,
+            # the group a "dp" table's rows are sharded over (engram.py: table._engram_rows)
+            row_group_fn=lambda p: (getattr(p, "_engram_rows", None) or (None, None))[1],
         )
+        if optimizer.update == "sinkhorn" and torch.distributed.is_initialized() \
+                and torch.distributed.get_rank() == 0:
+            print(f"[engram-table-optimizer] sinkhorn: momentum {config.sinkhorn_momentum}, "
+                  f"K {config.sinkhorn_iters}, lr ratio {config.sinkhorn_lr_ratio}, "
+                  f"lr mult {config.engram_lr_mult}", flush=True)
         super().__init__(optimizer, config, init_state_fn=lambda opt, cfg=None: None)
         self.params = [p for g in optimizer.param_groups for p in g["params"]]
         self.is_stub_optimizer = False
