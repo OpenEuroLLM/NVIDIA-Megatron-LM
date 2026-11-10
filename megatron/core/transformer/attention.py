@@ -1732,6 +1732,20 @@ class Attention(MegatronModule, ABC):
         if self.length_scaling != "none":
             query = self._length_scale_query(query, packed_seq_params, inference_context)
 
+        if getattr(self.config, "ckda_branch", None) == "kvshare":
+            # ckda_branch kvshare (megatron/core/ssm/ckda_branch.py): a source layer publishes the
+            # keys / values its core attention gets; a kvshare branch attends over its source's
+            from megatron.core.ssm import ckda_branch as _ckda_branch
+
+            if getattr(self, "kv_src", None) is not None:
+                if inference_context is not None:
+                    raise NotImplementedError("ckda_branch kvshare: inference KV cache")
+                key, value = _ckda_branch.fetch_kv(self.kv_src)
+                if own_value is not None:  # XSA: the token's own value is the source's
+                    own_value = value
+            elif _ckda_branch.publishes_kv(self.config, self.layer_number):
+                _ckda_branch.publish_kv(self.layer_number, key, value)
+
         # ==================================
         # core attention computation
         # ==================================

@@ -353,7 +353,7 @@ class ComplexKDA(_MegatronSelfAttentionAdapter):
             packed_seq_params=packed_seq_params, sequence_len_offset=sequence_len_offset, **kwargs)
         if self.branch is None:
             return y, None
-        if self.config.ckda_branch == "attention":
+        if self.config.ckda_branch in ("attention", "kvshare"):
             b, bias = self.branch(
                 hidden_states, attention_mask=attention_mask, inference_context=inference_context,
                 rotary_pos_emb=rotary_pos_emb, rotary_pos_cos=rotary_pos_cos, rotary_pos_sin=rotary_pos_sin,

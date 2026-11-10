@@ -7,7 +7,9 @@ For the layers in ``config.ckda_branch_layers`` the complex_kda adapter (complex
 - ``branch``: Megatron's own softmax attention, built as the hybrid's ``*`` layers are (fused
   ``linear_qkv`` per query group [q | gate | k | v], output gate, qk norm, XSA, NoPE) but with
   ``ckda_branch_num_query_groups`` KV groups and a plain ``linear_qkv`` (the layer's input norm
-  is the complex_kda layer's); or the KronLSTM layer (``ckda_branch="kronlstm"``).
+  is the complex_kda layer's); or the KronLSTM layer (``ckda_branch="kronlstm"``); or
+  (``ckda_branch="kvshare"``) that attention with a query (+ output gate) projection only, over the
+  keys / values of an earlier attention layer (``ckda_branch_kv_source_layers``): no KV of its own.
 - ``gamma``: one learnable scale per layer, shape (1,) (Adam, no weight decay), 0 at insertion,
   so the model computes exactly what it computed before; the layer uses
   ``ckda_branch_gamma_scale * gamma`` (how fast Adam's ~lr steps move the branch's share).
@@ -81,7 +83,133 @@ def branch_config(config):
     return c
 
 
+# kvshare: the source attention layers' (key, value) of the current micro-batch, by 0-based layer index.
+# A source layer runs before its consumers in the forward and in every recompute (the consumer's
+# recompute segment comes earlier in the backward than the source's, so it reads the forward's entry;
+# a source in the same segment re-publishes the same values first). Detached: no gradient into the source.
+KV_STORE: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def kv_source(config, layer_number: int) -> int | None:
+    """The kvshare source layer (0-based) of the branch layer ``layer_number`` (1-based)."""
+    layers = list(config.ckda_branch_layers or [])
+    sources = list(getattr(config, "ckda_branch_kv_source_layers", None) or [])
+    if len(sources) != len(layers):
+        raise ValueError(
+            f"ckda_branch kvshare: ckda_branch_kv_source_layers {sources} needs one entry per "
+            f"ckda_branch_layers entry {layers}"
+        )
+    src = sources[layers.index(layer_number - 1)]
+    if src >= layer_number - 1:
+        raise ValueError(f"ckda_branch kvshare: source layer {src} is not before layer {layer_number - 1}")
+    return src
+
+
+def publishes_kv(config, layer_number: int) -> bool:
+    """Whether the attention layer ``layer_number`` (1-based) is a kvshare source."""
+    return getattr(config, "ckda_branch", None) == "kvshare" and (layer_number - 1) in set(
+        getattr(config, "ckda_branch_kv_source_layers", None) or []
+    )
+
+
+def publish_kv(layer_number: int, key: torch.Tensor, value: torch.Tensor) -> None:
+    KV_STORE[layer_number - 1] = (key.detach(), value.detach())
+
+
+def fetch_kv(src: int) -> tuple[torch.Tensor, torch.Tensor]:
+    if src not in KV_STORE:
+        raise RuntimeError(
+            f"ckda_branch kvshare: no keys / values of layer {src} (not an attention layer of this "
+            f"rank, or it did not run before the branch)"
+        )
+    return KV_STORE[src]
+
+
+def _kvshare_attention_class():
+    from megatron.core.transformer.attention import SelfAttention
+    from megatron.core.typed_torch import apply_module
+
+    class KVShareSelfAttention(SelfAttention):
+        """SelfAttention whose keys / values are an earlier attention layer's (``fetch_kv``):
+        ``linear_qkv`` produces per query group [q | gate] only (the stack's own layout minus k, v),
+        q norm, output gate and XSA as the source's kind; no k norm (the keys come normed)."""
+
+        def __init__(self, config, submodules, layer_number, kv_src: int, **kwargs):
+            super().__init__(config, submodules, layer_number, **kwargs)
+            self.kv_src = kv_src
+            if getattr(self, "canon_b", None) is not None:
+                raise NotImplementedError("ckda_branch kvshare: Canon B")
+            if self.config.num_query_groups < self.world_size:
+                raise NotImplementedError("ckda_branch kvshare: fewer KV groups than TP ranks")
+            gated = 2 if self.config.attention_output_gate else 1
+            self.linear_qkv_out_dim = self.query_projection_size * gated
+            self.linear_qkv = submodules.linear_qkv(
+                self.config.hidden_size,
+                self.linear_qkv_out_dim,
+                config=self.config,
+                init_method=self.config.init_method,
+                gather_output=False,
+                bias=self.config.add_bias_linear or self.config.add_qkv_bias,
+                skip_bias_add=False,
+                is_expert=False,
+                tp_comm_buffer_name="qkv",
+                tp_group=self.pg_collection.tp,
+            )
+            self.k_layernorm = None
+
+        def _fused_qk_norm_rope_applies(self, inference_context, packed_seq_params, rotary_pos_emb):
+            return False  # no fused k / v: the unfused path below
+
+        def get_query_key_value_tensors(self, hidden_states, key_value_states=None, output_gate=False,
+                                        split_qkv=True):
+            if not split_qkv:
+                raise ValueError("ckda_branch kvshare: split_qkv only")
+            mixed, _ = apply_module(self.linear_qkv)(hidden_states)
+            ng = self.num_query_groups_per_partition
+            per = self.num_attention_heads_per_partition // ng * self.hidden_size_per_attention_head
+            mixed = mixed.view(*mixed.shape[:-1], ng, -1)  # [s, b, ng, (1 | 2) * np/ng * hn]
+            if output_gate:
+                query, gate = torch.split(mixed, [per, per], dim=3)
+                gate = gate.reshape(*gate.shape[:2], -1, self.hidden_size_per_attention_head)
+            else:
+                query, gate = mixed, None
+            query = query.reshape(*query.shape[:2], -1, self.hidden_size_per_attention_head)
+            if self.q_layernorm is not None:
+                query = apply_module(self.q_layernorm)(query)
+            # key / value: placeholders of the KV shape (views, no memory), replaced by the source's
+            # right before the core attention (Attention.forward)
+            key = value = query[:, :, :ng]
+            return (query, key, value, gate) if output_gate else (query, key, value)
+
+    return KVShareSelfAttention
+
+
 def build_branch(config, layer_number: int, pg_collection=None) -> nn.Module:
+    if config.ckda_branch == "kvshare":
+        from megatron.core.extensions.transformer_engine import (
+            TEColumnParallelLinear,
+            TEDotProductAttention,
+            TERowParallelLinear,
+        )
+        from megatron.core.transformer.attention import SelfAttentionSubmodules
+        from megatron.core.transformer.enums import AttnMaskType
+
+        if config.context_parallel_size != 1:
+            raise NotImplementedError("ckda_branch kvshare: context parallelism")
+        attn = _kvshare_attention_class()(
+            config,  # the stack's own KV groups: the source's keys / values
+            SelfAttentionSubmodules(
+                linear_qkv=TEColumnParallelLinear,
+                core_attention=TEDotProductAttention,
+                linear_proj=TERowParallelLinear,
+            ),
+            layer_number,
+            kv_source(config, layer_number),
+            attn_mask_type=AttnMaskType.causal,
+            pg_collection=pg_collection,
+        )
+        attn.linear_qkv.weight.headwise_dim = config.kv_channels
+        return attn
     if config.ckda_branch == "attention":
         from megatron.core.extensions.transformer_engine import (
             TEColumnParallelLinear,
@@ -122,7 +250,7 @@ def build_branch(config, layer_number: int, pg_collection=None) -> nn.Module:
         # [q; k; v] split tag is for stand-alone layers)
         kron.layer.qkv_proj.weight.headwise_dim = config.linear_key_head_dim
         return kron
-    raise ValueError(f"ckda_branch {config.ckda_branch!r}: attention or kronlstm")
+    raise ValueError(f"ckda_branch {config.ckda_branch!r}: attention, kronlstm or kvshare")
 
 
 def has_branch(config, layer_number: int) -> bool:

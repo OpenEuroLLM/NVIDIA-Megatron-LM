@@ -251,3 +251,153 @@ def test_stand_alone_kronlstm_keeps_its_silu(model_parallel):
 
     kron = KronLSTM(_config(), layer_number=1)
     assert kron.layer.qkv_conv1d.activation == "silu"
+
+
+def test_kvshare_source_mapping():
+    c = SimpleNamespace(ckda_branch="kvshare", ckda_branch_layers=[9, 25], ckda_branch_kv_source_layers=[0, 17])
+    assert cb.kv_source(c, 10) == 0 and cb.kv_source(c, 26) == 17
+    assert cb.publishes_kv(c, 1) and cb.publishes_kv(c, 18) and not cb.publishes_kv(c, 10)
+    assert not cb.publishes_kv(SimpleNamespace(ckda_branch="attention", ckda_branch_kv_source_layers=[0]), 1)
+    with pytest.raises(ValueError):  # one source per branch layer
+        cb.kv_source(SimpleNamespace(ckda_branch_layers=[9, 25], ckda_branch_kv_source_layers=[0]), 10)
+    with pytest.raises(ValueError):  # the source must come first
+        cb.kv_source(SimpleNamespace(ckda_branch_layers=[9], ckda_branch_kv_source_layers=[12]), 10)
+
+
+def _source_attention(config):
+    """The hybrid's ``*`` attention as a kvshare source (layer index 0)."""
+    from megatron.core.extensions.transformer_engine import (
+        TEColumnParallelLinear,
+        TEDotProductAttention,
+        TERowParallelLinear,
+    )
+    from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
+    from megatron.core.transformer.enums import AttnMaskType
+
+    torch.manual_seed(2)
+    return SelfAttention(
+        config,
+        SelfAttentionSubmodules(linear_qkv=TEColumnParallelLinear, core_attention=TEDotProductAttention,
+                                linear_proj=TERowParallelLinear),
+        layer_number=1,
+        attn_mask_type=AttnMaskType.causal,
+    ).cuda().bfloat16()
+
+
+@gpu
+def test_kvshare_branch_is_attention_over_the_sources_keys_and_values(model_parallel):
+    kw = dict(ckda_branch="kvshare", ckda_branch_layers=[1], ckda_branch_kv_source_layers=[0])
+    from megatron.core.ssm.complex_kda import ComplexKDA
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+
+    torch.manual_seed(0)
+    model_parallel_cuda_manual_seed(0)
+    config = _config(**kw)
+    layer = ComplexKDA(config, layer_number=2).cuda().bfloat16()
+    src = _source_attention(config)
+    d, g = 2 * HEAD_DIM, 2
+    shapes = {n: tuple(p.shape) for n, p in layer.named_parameters() if n.startswith(("branch.", "branch_mix."))}
+    # what add_ckda_branch.py writes: per KV group [q heads | gate heads] x d rows; no k / v, no k norm
+    assert shapes == {
+        "branch.linear_qkv.weight": (2 * HEADS * d, HIDDEN),
+        "branch.linear_proj.weight": (HIDDEN, HEADS * d),
+        "branch.q_layernorm.weight": (d,),
+        "branch_mix.gamma": (1,),
+    }, shapes
+    assert layer.branch.kv_src == 0 and layer.branch.linear_qkv.weight.headwise_dim == d
+
+    # reference: one ordinary attention layer with the branch's q / gate rows, the source's k / v rows
+    # and k norm, the branch's q norm and output projection -- on the same input it is the same function
+    ref = _source_attention(config)
+    with torch.no_grad():
+        bq = layer.branch.linear_qkv.weight.view(g, 2 * HEADS // g * d, HIDDEN)
+        sk = src.linear_qkv.weight.view(g, (2 * HEADS // g + 2) * d, HIDDEN)[:, 2 * HEADS // g * d:]
+        ref.linear_qkv.weight.copy_(torch.cat([bq, sk], 1).reshape(-1, HIDDEN))
+        ref.q_layernorm.weight.copy_(layer.branch.q_layernorm.weight.add(0.25))
+        layer.branch.q_layernorm.weight.add_(0.25)  # a non-trivial q norm on both
+        ref.k_layernorm.weight.copy_(src.k_layernorm.weight)
+        ref.linear_proj.weight.copy_(layer.branch.linear_proj.weight)
+    cb.KV_STORE.clear()
+    x = _x()
+    with torch.no_grad():
+        src(x, attention_mask=None)  # publishes layer 0's keys / values
+        assert set(cb.KV_STORE) == {0}
+        got = layer.branch(x, attention_mask=None)[0]
+        want = ref(x, attention_mask=None)[0]
+    torch.testing.assert_close(got, want, atol=2e-2, rtol=0)  # bf16, two kernels' rounding
+    assert set(cb.KV_STORE) == {0}  # the branch does not publish
+
+    # gamma = 0: the model is unchanged; then gradients reach the branch, never the source (detached)
+    with torch.no_grad():
+        with_branch = layer(x)[0]
+        branch, layer.branch = layer.branch, None
+        without = layer(x)[0]
+        layer.branch = branch
+    assert torch.equal(with_branch, without)
+    with torch.no_grad():
+        layer.branch_mix.gamma.fill_(0.5)
+    src(x, attention_mask=None)[0].float().sum().mul(0).backward()  # graph-carrying source keys
+    for p in src.parameters():
+        p.grad = None
+    layer(x)[0].float().pow(2).mean().backward()
+    assert layer.branch.linear_qkv.weight.grad.abs().sum() > 0
+    assert layer.branch.linear_proj.weight.grad.abs().sum() > 0
+    assert all(p.grad is None for p in src.parameters())
+    cb.KV_STORE.clear()
+
+
+@gpu
+def test_kvshare_under_full_recompute_matches_no_recompute(model_parallel):
+    """Source and branch layer in separate recompute segments (as in the main run, 2 layers each): the
+    backward recomputes the branch's segment first, reading the forward's published keys / values."""
+    from megatron.core.ssm.complex_kda import ComplexKDA
+    from megatron.core.tensor_parallel.random import checkpoint, model_parallel_cuda_manual_seed
+
+    torch.manual_seed(0)
+    model_parallel_cuda_manual_seed(0)
+    # no dropout (as the main run): the two runs must draw the same function
+    config = _config(ckda_branch="kvshare", ckda_branch_layers=[1], ckda_branch_kv_source_layers=[0],
+                     attention_dropout=0.0, hidden_dropout=0.0)
+    layer = ComplexKDA(config, layer_number=2).cuda().bfloat16()
+    src = _source_attention(config)
+    with torch.no_grad():
+        layer.branch_mix.gamma.fill_(0.5)
+    x = _x()
+
+    def run(recompute):
+        cb.KV_STORE.clear()
+        for p in list(layer.parameters()) + list(src.parameters()):
+            p.grad = None
+        xs = x.clone().requires_grad_()
+        if recompute:
+            h = checkpoint(lambda t: src(t, attention_mask=None)[0], False, xs)
+            out = checkpoint(lambda t: layer(t)[0], False, xs + h)
+        else:
+            h = src(xs, attention_mask=None)[0]
+            out = layer(xs + h)[0]
+        out.float().pow(2).mean().backward()
+        grads = {n: p.grad.float().clone() for n, p in layer.named_parameters()
+                 if n.startswith("branch") and p.grad is not None}
+        grads.update({f"src.{n}": p.grad.float().clone() for n, p in src.named_parameters()})
+        return out.detach().float(), xs.grad.float(), grads
+
+    def rel(a, b):
+        return float((a - b).norm() / b.norm().clamp_min(1e-30))
+
+    # bf16 kernels may round differently between the no-autograd forward (checkpoint) and the autograd one;
+    # stale or missing keys / values would be O(1)
+    out0, gx0, g0 = run(False)
+    out1, gx1, g1 = run(True)
+    branch, layer.branch = layer.branch, None
+    base0, basegx0, _ = run(False)
+    base1, basegx1, _ = run(True)
+    layer.branch = branch
+    print(f"recompute vs not: out {rel(out1, out0):.2e} (no branch {rel(base1, base0):.2e}), "
+          f"input grad {rel(gx1, gx0):.2e} (no branch {rel(basegx1, basegx0):.2e}), "
+          + ", ".join(f"{n} {rel(g1[n], g0[n]):.2e}" for n in g0))
+    assert rel(out1, out0) < 1e-2 and rel(gx1, gx0) < 3e-2
+    assert g0.keys() == g1.keys()
+    for n in g0:
+        assert g0[n].abs().sum() > 0, n
+        assert rel(g1[n], g0[n]) < 3e-2, (n, rel(g1[n], g0[n]))
+    cb.KV_STORE.clear()

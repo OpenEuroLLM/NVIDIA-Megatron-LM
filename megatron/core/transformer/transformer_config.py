@@ -988,14 +988,17 @@ class TransformerConfig(ModelParallelConfig):
     therefore a term a signed-vs-unsigned comparison must set deliberately
     rather than inherit."""
 
-    ckda_branch: Optional[Literal["attention", "kronlstm"]] = None
+    ckda_branch: Optional[Literal["attention", "kronlstm", "kvshare"]] = None
     """A second mixer in parallel to the complex_kda mixer of the layers ``ckda_branch_layers``
     (megatron/core/ssm/ckda_branch.py): ``out = alpha(t) * ckda(x) + m(t) * gamma * branch(x)``.
     ``"attention"`` is Megatron's own softmax attention as the hybrid's ``*`` layers build it
     (kv_channels, output gate, qk norm, XSA, NoPE) with ``ckda_branch_num_query_groups`` KV
     groups; ``"kronlstm"`` is the KronLSTM layer (the ``linear_kronlstm_*`` / ``linear_fla_*``
-    settings). ``gamma`` (one per layer, 0 at insertion) makes the branch start as a no-op; the
-    branch's weights come from checkpoint surgery (scripts/korbi/production/add_ckda_branch.py)."""
+    settings); ``"kvshare"`` is that attention with its own query (and output gate) projection
+    only, reading the keys / values of an earlier attention layer (``ckda_branch_kv_source_layers``):
+    no KV cache of its own. ``gamma`` (one per layer, 0 at insertion) makes the branch start as a
+    no-op; the branch's weights come from checkpoint surgery
+    (scripts/korbi/production/add_ckda_branch.py)."""
 
     ckda_branch_layers: Optional[list[int]] = None
     """0-based indices (in the decoder's layer list, as the checkpoint keys
@@ -1003,6 +1006,12 @@ class TransformerConfig(ModelParallelConfig):
 
     ckda_branch_num_query_groups: int = 2
     """KV groups of the attention branch (its query heads: num_attention_heads)."""
+
+    ckda_branch_kv_source_layers: Optional[list[int]] = None
+    """``ckda_branch="kvshare"``: per entry of ``ckda_branch_layers``, the 0-based index of the
+    attention layer whose keys / values (after its k norm, as its own core attention gets them) the
+    branch attends over. They are detached: the source layer's projections get no gradient from the
+    branch (full-layer recompute runs the source's forward without autograd)."""
 
     ckda_branch_start_iteration: int = 0
     """The iteration the branch was inserted at; the schedules below count from it."""
