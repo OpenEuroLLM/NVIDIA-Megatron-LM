@@ -84,6 +84,65 @@ from .param_layout import (
 logger = getLogger(__name__)
 
 
+# The group keys that differ between a softmax-attention group (OptimizerConfig.attention_lr_mult)
+# and the group its parameters would be in without the multiplier.
+_ATTENTION_LR_GROUP_KEYS = ('lr', 'max_lr', 'min_lr', 'default_config', 'attention_lr_mult')
+
+
+def reconcile_attention_lr_group_meta(
+    param_to_group_meta: Dict[str, Any], param_groups: List[Dict[str, Any]], param_name: Callable
+) -> Tuple[Dict[str, Any], int]:
+    """A checkpoint's per-parameter group metadata, made consistent with the CURRENT groups where
+    ``attention_lr_mult`` changed between the checkpoint and the arguments.
+
+    The Megatron-FSDP load rebuilds the param groups from the CURRENT construction and fills each
+    with the checkpoint's metadata of its parameters, strictly (all parameters of a current group
+    must carry identical metadata), and ``torch.optim.Optimizer.load_state_dict`` then replaces every
+    group dict with that metadata. A changed multiplier changes the group structure:
+
+    - 1 -> m: the attention parameters form new groups (key ``attention_lr_mult``) whose
+      checkpoint metadata is their old groups' -- loadable, but the old (x1) lr bounds would win,
+      silently, without --override-opt-param-scheduler;
+    - m -> 1: the attention parameters fall back into the groups of everything else, whose
+      checkpoint metadata differs from theirs (x m bounds) -- the strict check fails the load.
+
+    For every parameter whose checkpoint ``attention_lr_mult`` (absent = 1) differs from its current
+    group's: the checkpoint metadata of a parameter of the same current group that does match (all
+    of the group then agrees), else its own checkpoint metadata with ``lr`` / ``max_lr`` /
+    ``min_lr`` / ``default_config`` / ``attention_lr_mult`` taken from the current group (the
+    multiplier as the arguments set it). Nothing changes when the multiplier did not change.
+
+    Returns ``(metadata, number of parameters whose metadata was replaced)``; the input is not
+    modified (its dicts are shared between the parameters of a saved group).
+    """
+    out = dict(param_to_group_meta)
+    changed = 0
+    for group in param_groups:
+        want = float(group.get('attention_lr_mult', 1.0))
+        names = [n for n in (param_name(p) for p in group['params']) if n in out]
+        if not names:
+            continue
+        native = next(
+            (out[n] for n in names if float(out[n].get('attention_lr_mult', 1.0)) == want), None
+        )
+        for n in names:
+            meta = out[n]
+            if float(meta.get('attention_lr_mult', 1.0)) == want:
+                continue
+            if native is None:
+                meta = dict(meta)
+                for key in _ATTENTION_LR_GROUP_KEYS:
+                    if key in group:
+                        meta[key] = group[key]
+                    else:
+                        meta.pop(key, None)
+            else:
+                meta = native
+            out[n] = meta
+            changed += 1
+    return out, changed
+
+
 class Range:
     """
     A range represents a start and end points for indexing a shard
@@ -931,8 +990,20 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             # When using Megatron-FSDP, directly load the optimizer state
             # into the wrapped optimizer.
             if "param_to_group_meta" in state_dict:
+                # a changed attention_lr_mult changes the group structure: the bounds of the
+                # affected parameters come from the arguments (reconcile_attention_lr_group_meta)
+                meta, n_changed = reconcile_attention_lr_group_meta(
+                    state_dict["param_to_group_meta"], self.optimizer.param_groups, self._param_name
+                )
+                if n_changed:
+                    log_single_rank(
+                        logger,
+                        logging.WARNING,
+                        f"attention_lr_mult differs from the checkpoint's: the param-group "
+                        f"metadata of {n_changed} parameters (this rank) follows the arguments",
+                    )
                 state_dict["param_groups"] = self._param2group_meta_to_param_groups(
-                    state_dict["param_to_group_meta"], self.optimizer.param_groups
+                    meta, self.optimizer.param_groups
                 )
                 del state_dict["param_to_group_meta"]
             self.optimizer.load_state_dict(state_dict)

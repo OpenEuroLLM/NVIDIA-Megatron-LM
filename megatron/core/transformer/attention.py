@@ -138,6 +138,14 @@ except ImportError:
 
 
 @jit_fuser
+def mark_softmax_attention_params(module: torch.nn.Module) -> None:
+    """Mark every parameter of ``module`` ``is_softmax_attention`` (the param-group key of
+    OptimizerConfig.attention_lr_mult). A plain attribute: Megatron-FSDP copies it onto its
+    sharded parameters, and nothing reads it unless attention_lr_mult != 1."""
+    for p in module.parameters():
+        p.is_softmax_attention = True
+
+
 def _sigmoid_output_gate(x: Tensor, gate: Tensor) -> Tensor:
     """x * sigmoid(gate) in fp32, one fused kernel each way (torch.compile)."""
     return (x * torch.sigmoid(gate.float())).to(x.dtype)
@@ -2044,6 +2052,10 @@ class SelfAttention(Attention):
             # true gradient is the sum over the TP group.
             for scaler in (self.ngpt_sq, self.ngpt_sk):
                 scaler.weight.sum_gradients_across_tp_domain = True
+
+        # every parameter of the softmax attention (linear_qkv incl. the output-gate rows and a
+        # TE-fused input norm, linear_proj, q / k norm, ...): its own lr (attention_lr_mult)
+        mark_softmax_attention_params(self)
 
     def run_realtime_tests(self):
         """Performs a consistency check.

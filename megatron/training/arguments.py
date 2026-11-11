@@ -2897,6 +2897,13 @@ def _add_regularization_args(parser):
     group.add_argument('--output-layer-lr-mult', type=float, default=1.0,
                        help='Learning-rate multiplier of the untied output layer (max and min lr). '
                        'No effect with tied embeddings. Conflicts with --decoupled-lr.')
+    group.add_argument('--attention-lr-mult', type=float, default=1.0,
+                       help='Learning-rate multiplier (max and min lr) of the softmax-attention '
+                       'parameters: every parameter of a SelfAttention module (linear_qkv incl. '
+                       'output-gate rows and a fused input norm, linear_proj, q / k norm) and of a '
+                       'ckda_branch attention / kvshare branch incl. its gamma. Own param group; '
+                       'a changed value on a Megatron-FSDP resume takes effect without '
+                       '--override-opt-param-scheduler.')
     group.add_argument('--moe-router-lr-warmup-iters', type=int, default=0,
                        help='Linear lr warmup of the MoE router weights over this many steps, on '
                        'top of the schedule (0: off).')

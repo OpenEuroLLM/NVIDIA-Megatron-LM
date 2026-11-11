@@ -206,6 +206,22 @@ def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, Par
             max_lr=config.lr * mixer_mult, min_lr=(config.min_lr or 0.0) * mixer_mult
         )
 
+    # Softmax attention (SelfAttention modules, ckda_branch attention branches + their gamma; marked
+    # is_softmax_attention): their own learning rate. The group carries `attention_lr_mult`, so a
+    # resume that changes the multiplier can tell the groups apart (see
+    # DistributedOptimizer._reconcile_attention_lr_groups); the key makes default_config False.
+    attn_mult = getattr(config, 'attention_lr_mult', 1.0)
+    if attn_mult != 1.0:
+        if config.lr is None:
+            raise ValueError("attention_lr_mult requires config.lr to be set")
+        if not 0.0 < attn_mult < float("inf"):
+            raise ValueError("attention_lr_mult must be positive")
+        config_overrides[ParamKey(attr="is_softmax_attention")] = ParamGroupOverride(
+            max_lr=config.lr * attn_mult,
+            min_lr=(config.min_lr or 0.0) * attn_mult,
+            attention_lr_mult=float(attn_mult),
+        )
+
     # Word embedding / untied output layer: their own learning rates (disjoint name predicates;
     # they combine with embedding_wd_mult's key, which sets wd_mult only).
     emb_mult = getattr(config, 'embedding_lr_mult', 1.0)

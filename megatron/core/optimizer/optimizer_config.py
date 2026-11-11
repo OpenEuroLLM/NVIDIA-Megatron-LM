@@ -233,6 +233,18 @@ class OptimizerConfig:
     each step, so recipes usually lower it. No effect with tied embeddings (the shared matrix is the
     word embedding). Conflicts with decoupled_lr."""
 
+    attention_lr_mult: float = 1.0
+    """Learning-rate multiplier of the softmax-attention parameters: every parameter of a
+    `SelfAttention` module (linear_qkv incl. its output-gate rows and a TE-fused input norm,
+    linear_proj, q / k layernorm, XSA has none of its own) and of a ckda_branch attention / kvshare
+    branch together with that branch's mix scale `branch_mix.gamma` (all marked
+    `is_softmax_attention`). Applies to max_lr and min_lr alike, through a param group of its own
+    (key `attention_lr_mult` in the group). Changing it on a resume is supported on the
+    Megatron-FSDP load path: the bounds of a parameter whose group's `attention_lr_mult` differs
+    from the checkpoint's come from the current arguments (DistributedOptimizer.
+    _reconcile_attention_lr_groups). Recall surgery 2026-11-11: new attention capacity has to move
+    within ~100 steps of the main run's batches."""
+
     moe_router_lr_warmup_iters: int = 0
     """Linear lr warmup of the MoE router weights (`*router.weight`) over this many steps, on top of
     the schedule; 0 = off. Without it the router's Adam moves every weight by ~lr from the first

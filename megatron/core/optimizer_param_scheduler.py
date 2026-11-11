@@ -35,6 +35,9 @@ class ParamGroupOverride(TypedDict, total=False):
     end_wd: float
     wd_mult: float
     optimizer: str
+    attention_lr_mult: float
+    """The softmax-attention lr multiplier (OptimizerConfig.attention_lr_mult) of an attention-only
+    group: marks the group, so a resume that changes the multiplier can tell its groups apart."""
     lr_warmup_steps: int
     """A linear warmup of this group's lr on top of the schedule (factor num_steps / lr_warmup_steps
     until it reaches 1; moe_router_lr_warmup_iters, adam_lr_warmup_iters)."""

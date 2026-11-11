@@ -126,7 +126,7 @@ def fetch_kv(src: int) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def _kvshare_attention_class():
-    from megatron.core.transformer.attention import SelfAttention
+    from megatron.core.transformer.attention import SelfAttention, mark_softmax_attention_params
     from megatron.core.typed_torch import apply_module
 
     class KVShareSelfAttention(SelfAttention):
@@ -156,6 +156,8 @@ def _kvshare_attention_class():
                 tp_group=self.pg_collection.tp,
             )
             self.k_layernorm = None
+            # the rebuilt linear_qkv: the softmax-attention lr group as the rest (attention_lr_mult)
+            mark_softmax_attention_params(self)
 
         def _fused_qk_norm_rope_applies(self, inference_context, packed_seq_params, rotary_pos_emb):
             return False  # no fused k / v: the unfused path below
@@ -265,6 +267,10 @@ class BranchMix(nn.Module):
         self.config = config
         self.layer_number = layer_number
         self.gamma = nn.Parameter(torch.zeros(1))
+        if getattr(config, "ckda_branch", None) in ("attention", "kvshare"):
+            # an attention branch's scale moves with its weights: the softmax-attention lr group
+            # (attention_lr_mult), as the branch's SelfAttention parameters
+            self.gamma.is_softmax_attention = True
         self._logged = None
         self._calibrated = False
         if getattr(config, "ckda_branch_calibrate", False):
