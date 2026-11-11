@@ -72,6 +72,29 @@ _AUX_SEED_OFFSET = 0xA0C5
 _PAD_ID = 0
 
 
+
+def engram_output_scale(config) -> float:
+    """The factor on the Engram layers' output (recall surgery, docs/recall_surgery_ambitious.md): 1 before
+    ``engram_output_scale_start``, then linear to ``engram_output_scale`` over ``engram_output_scale_ramp``
+    steps (0: at once). The iteration is the training loop's or, when later, the loaded checkpoint's
+    (ckda_branch.current_iteration), so an eval-only run of a checkpoint sees that checkpoint's scale."""
+    target = float(getattr(config, "engram_output_scale", 1.0))
+    if target == 1.0:
+        return 1.0
+    from megatron.core.ssm.ckda_branch import current_iteration
+
+    it = current_iteration()
+    start = int(getattr(config, "engram_output_scale_start", 0))
+    ramp = int(getattr(config, "engram_output_scale_ramp", 0))
+    if it is None:  # no training loop (tests, inference): the target
+        return target
+    t = it - start
+    if t <= 0:
+        return 1.0
+    if ramp <= 0 or t >= ramp:
+        return target
+    return 1.0 + (target - 1.0) * t / ramp
+
 def _is_prime(n: int) -> bool:
     if n < 2:
         return False
@@ -716,6 +739,9 @@ class EngramLayer(MegatronModule):
                 positions = self._document_positions(packed_seq_params)
             y = self._engram(h, input_ids, positions)
         y = scatter_replicated_output(y, self.config, self.tp_group)
+        scale = engram_output_scale(self.config)
+        if scale != 1.0:
+            y = y * scale
         if self.residual_scheme is not None:
             return self.residual_scheme.write(y, ctx, self._depth_state, self.layer_number)
         return hidden_states + y
