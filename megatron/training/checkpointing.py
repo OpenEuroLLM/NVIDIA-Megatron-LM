@@ -2586,10 +2586,10 @@ def _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model):
 
 
 def _optimizer_lr_bounds(optimizer):
-    """(group, max_lr, min_lr) of every optimizer param group that carries a per-group lr bound."""
+    """(max_lr, min_lr) of every optimizer param group, by position; None for a group without bounds."""
     if optimizer is None or not hasattr(optimizer, 'param_groups'):
         return []
-    return [(g, g['max_lr'], g.get('min_lr')) for g in optimizer.param_groups if 'max_lr' in g]
+    return [(g['max_lr'], g.get('min_lr')) if 'max_lr' in g else None for g in optimizer.param_groups]
 
 
 def load_checkpoint(
@@ -2604,12 +2604,25 @@ def load_checkpoint(
     --override-opt_param-scheduler also resets the per-group lr bounds (``max_lr`` / ``min_lr``) the
     optimizer state restores from the checkpoint's param groups: the scheduler takes its schedule from
     the arguments, but every group interpolates between its OWN bounds, so a constant-lr checkpoint
-    (min_lr = lr) would otherwise keep any new decay a no-op."""
+    (min_lr = lr) would otherwise keep any new decay a no-op.
+
+    The bounds are captured BY POSITION and written into the param groups the optimizer holds AFTER
+    the load: ``torch.optim.Optimizer.load_state_dict`` (reached from every Megatron optimizer's
+    ``load_state_dict``, Megatron-FSDP and DistributedOptimizer alike) replaces each group dict with
+    a new one, so references to the pre-load dicts are stale (c9c04235f wrote into those)."""
     bounds = _optimizer_lr_bounds(optimizer)
     out = _load_checkpoint_impl(ddp_model, optimizer, opt_param_scheduler, *args_, **kwargs)
-    if bounds and getattr(get_args(), 'override_opt_param_scheduler', False):
+    override = getattr(get_args(), 'override_opt_param_scheduler', False)
+    if override and any(b is not None for b in bounds):
+        groups = optimizer.param_groups
+        if len(groups) != len(bounds):
+            raise RuntimeError(f'override_opt_param_scheduler: the optimizer has {len(groups)} param '
+                               f'groups after the checkpoint load, {len(bounds)} before')
         changed = 0
-        for g, max_lr, min_lr in bounds:
+        for g, b in zip(groups, bounds):
+            if b is None:
+                continue
+            max_lr, min_lr = b
             changed += int(g.get('max_lr') != max_lr or g.get('min_lr') != min_lr)
             g['max_lr'] = max_lr
             if min_lr is None:
@@ -2618,8 +2631,9 @@ def load_checkpoint(
                 g['min_lr'] = min_lr
         if opt_param_scheduler is not None:
             opt_param_scheduler.step(0)
+        n = sum(b is not None for b in bounds)
         print_rank_0(f' > override_opt_param_scheduler: per-group lr bounds reset to the arguments '
-                     f'({changed} of {len(bounds)} groups differed in the checkpoint)')
+                     f'({changed} of {n} groups differed in the checkpoint)')
     return out
 
 

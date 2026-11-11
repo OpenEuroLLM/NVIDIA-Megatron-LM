@@ -22,9 +22,18 @@ def _setup(min_lr):
 
 
 def _fake_load(opt, sched, g):
-    """What a resume does: the optimizer state restores the checkpoint's group bounds (constant lr)."""
+    """What a resume does: the optimizer state restores the checkpoint's group bounds (constant lr).
+
+    A real ``torch.optim.Optimizer.load_state_dict`` (what every Megatron optimizer's load ends in)
+    REPLACES each param-group dict, so the reset must address the groups the optimizer holds after
+    the load, not the pre-load dicts (the c9c04235f version mutated those and was a no-op)."""
+    saved = opt.state_dict()
+    saved['param_groups'][0]['min_lr'] = 8.5e-4
+
     def impl(model, optimizer, scheduler, *a, **k):
-        optimizer.param_groups[0]['min_lr'] = 8.5e-4
+        before = optimizer.param_groups[0]
+        optimizer.load_state_dict(saved)
+        assert optimizer.param_groups[0] is not before
         scheduler.num_steps = 100 * g
         scheduler.step(0)
         return 100, 0
