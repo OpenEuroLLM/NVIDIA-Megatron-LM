@@ -2585,7 +2585,45 @@ def _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model):
     return layer_maps, load_optim
 
 
+def _optimizer_lr_bounds(optimizer):
+    """(group, max_lr, min_lr) of every optimizer param group that carries a per-group lr bound."""
+    if optimizer is None or not hasattr(optimizer, 'param_groups'):
+        return []
+    return [(g, g['max_lr'], g.get('min_lr')) for g in optimizer.param_groups if 'max_lr' in g]
+
+
 def load_checkpoint(
+    ddp_model,
+    optimizer,
+    opt_param_scheduler,
+    *args_,
+    **kwargs,
+):
+    """Load a model checkpoint and return the iteration (see _load_checkpoint_impl).
+
+    --override-opt_param-scheduler also resets the per-group lr bounds (``max_lr`` / ``min_lr``) the
+    optimizer state restores from the checkpoint's param groups: the scheduler takes its schedule from
+    the arguments, but every group interpolates between its OWN bounds, so a constant-lr checkpoint
+    (min_lr = lr) would otherwise keep any new decay a no-op."""
+    bounds = _optimizer_lr_bounds(optimizer)
+    out = _load_checkpoint_impl(ddp_model, optimizer, opt_param_scheduler, *args_, **kwargs)
+    if bounds and getattr(get_args(), 'override_opt_param_scheduler', False):
+        changed = 0
+        for g, max_lr, min_lr in bounds:
+            changed += int(g.get('max_lr') != max_lr or g.get('min_lr') != min_lr)
+            g['max_lr'] = max_lr
+            if min_lr is None:
+                g.pop('min_lr', None)
+            else:
+                g['min_lr'] = min_lr
+        if opt_param_scheduler is not None:
+            opt_param_scheduler.step(0)
+        print_rank_0(f' > override_opt_param_scheduler: per-group lr bounds reset to the arguments '
+                     f'({changed} of {len(bounds)} groups differed in the checkpoint)')
+    return out
+
+
+def _load_checkpoint_impl(
     ddp_model,
     optimizer,
     opt_param_scheduler,
