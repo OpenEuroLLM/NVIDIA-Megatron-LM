@@ -449,6 +449,12 @@ class TransformerConfig(ModelParallelConfig):
     """Rows of the fixed +-1 sign table of ``engram_sign_hash`` (each ``engram_embed_dim``
     wide; not trained, not checkpointed: a function of a fixed seed)."""
 
+    attention_logit_scale: float = 1.0
+    """Factor on the softmax scale of the softmax-attention layers (``softmax_scale`` becomes
+    ``attention_logit_scale / sqrt(kv_channels)``, or the factor times an explicit / MuP ``softmax_scale``):
+    a sharper (> 1) or flatter (< 1) attention distribution. Recall surgery: the ambitious v4 NoPE
+    attention at x1.25 (inference) reads spans better (CoQA F1 +3.1). 1 = unchanged."""
+
     engram_output_scale: float = 1.0
     """Factor on every Engram layer's output (recall surgery: damping the hashed n-gram path, which drives
     a closer-mention bias). 1 = unchanged; reached linearly over ``engram_output_scale_ramp`` steps from
@@ -3742,6 +3748,13 @@ class TransformerConfig(ModelParallelConfig):
                     + f" {verb} set. This may break MuP initialization assumptions.",
                     UserWarning,
                 )
+
+        # attention temperature (recall surgery): a factor on the softmax scale of every softmax-attention layer
+        if self.attention_logit_scale != 1.0:
+            if self.attention_logit_scale <= 0:
+                raise ValueError("attention_logit_scale must be positive")
+            base = self.softmax_scale if self.softmax_scale is not None else 1.0 / math.sqrt(self.kv_channels)
+            self.softmax_scale = base * self.attention_logit_scale
 
         # Set the embedding init method.
         # NOTE: This block must run AFTER the MuP block above but BEFORE the init_method
