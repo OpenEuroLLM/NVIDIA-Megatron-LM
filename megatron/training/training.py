@@ -5593,10 +5593,14 @@ def get_train_valid_test_num_samples():
     args = get_args()
 
     # Number of train/valid/test samples.
+    # --data-sampler-reference-global-batch-size: the training dataset is the reference run's (its index,
+    # cache entry and sample order), sized at the reference batch -- a smaller actual batch reads a slice
+    # of it (data_samplers.MegatronPretrainingReferenceLayoutSampler)
+    data_batch = getattr(args, 'data_sampler_reference_global_batch_size', None) or args.global_batch_size
     if args.train_samples:
         train_samples = args.train_samples
     else:
-        train_samples = args.train_iters * args.global_batch_size
+        train_samples = args.train_iters * data_batch
     if args.full_validation:
         eval_samples = None
     else:
@@ -5622,8 +5626,8 @@ def get_train_valid_test_num_samples():
     # Get train_samples in current phase.
     if args.phase_transition_iterations:
         # train_samples (not args.train_samples): None for iteration-based training (--train-iters)
-        phase_transition_samples = [0] + [t * args.global_batch_size for t in args.phase_transition_iterations] + [train_samples]
-        current_sample = args.iteration * args.global_batch_size
+        phase_transition_samples = [0] + [t * data_batch for t in args.phase_transition_iterations] + [train_samples]
+        current_sample = args.iteration * data_batch
         last_transition_sample = max(s for s in phase_transition_samples if s <= current_sample)
         next_transition_sample = min(s for s in phase_transition_samples if s > current_sample)
         train_samples_in_current_phase = next_transition_sample - last_transition_sample
@@ -5642,6 +5646,36 @@ def build_train_valid_test_datasets(build_train_valid_test_datasets_provider, tr
     print_rank_0('    validation: {}'.format(train_valid_test_num_samples[1]))
     print_rank_0('    test:       {}'.format(train_valid_test_num_samples[2]))
     return build_train_valid_test_datasets_provider(train_valid_test_num_samples)
+
+
+def consumed_train_samples_in_phase(args):
+    """The training data position (samples) inside the current phase (--phase-transition-iterations):
+    (iteration - phase start) x global batch size, or -- with --phase-start-consumed-samples -- the
+    checkpoint's consumed samples minus the phase's start, which stays right across a change of the
+    global batch size inside the phase (small-batch arms from a main-run checkpoint, and back)."""
+    if not args.phase_transition_iterations:
+        return args.consumed_train_samples
+    last_transition = max(
+        iteration for iteration in (0, *args.phase_transition_iterations) if iteration <= args.iteration
+    )
+    by_iteration = (args.iteration - last_transition) * args.global_batch_size
+    phase_start = getattr(args, 'phase_start_consumed_samples', None)
+    if phase_start is None:
+        return by_iteration
+    by_samples = args.consumed_train_samples - phase_start
+    print_rank_0(
+        f'> phase data position from consumed samples: {args.consumed_train_samples} - '
+        f'{phase_start} = {by_samples} (iteration-based: {by_iteration})'
+    )
+    assert by_samples >= 0, (
+        f'--phase-start-consumed-samples {phase_start} is above the consumed samples '
+        f'{args.consumed_train_samples}'
+    )
+    assert args.iteration <= last_transition or by_samples > 0, (
+        'the checkpoint is inside the phase but consumed no sample of it: wrong '
+        '--phase-start-consumed-samples?'
+    )
+    return by_samples
 
 
 def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider):
@@ -5692,11 +5726,7 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
         )
 
     # Get consumed train samples in this phase.
-    if args.phase_transition_iterations:
-        last_transition = max(iteration for iteration in (0, *args.phase_transition_iterations) if iteration <= args.iteration)
-        consumed_train_samples_in_current_phase = (args.iteration - last_transition) * args.global_batch_size
-    else:
-        consumed_train_samples_in_current_phase = args.consumed_train_samples
+    consumed_train_samples_in_current_phase = consumed_train_samples_in_phase(args)
 
     # Rely on distributed-aware core datasets, temporary
     is_distributed = getattr(build_train_valid_test_datasets_provider, "is_distributed", False)

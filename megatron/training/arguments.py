@@ -881,6 +881,22 @@ def validate_args(args, defaults={}):
         assert not args.use_checkpoint_opt_param_scheduler, \
             '--phase-transition-variable-batch takes the scheduler from the arguments, not the checkpoint'
         args.override_opt_param_scheduler = True
+    ref_gbs = getattr(args, 'data_sampler_reference_global_batch_size', None)
+    if ref_gbs is not None:
+        assert args.data_sampler_reference_dp_size, \
+            '--data-sampler-reference-global-batch-size needs --data-sampler-reference-dp-size'
+        assert (args.dataloader_type or 'single') == 'cyclic', \
+            '--data-sampler-reference-global-batch-size: the reference-layout sampler is the cyclic one'
+        assert args.rampup_batch_size is None and args.train_samples is None, \
+            '--data-sampler-reference-global-batch-size: iteration-based training, no batch-size rampup'
+        if args.phase_transition_iterations and ref_gbs != args.global_batch_size:
+            assert getattr(args, 'phase_start_consumed_samples', None) is not None, (
+                '--data-sampler-reference-global-batch-size other than --global-batch-size inside a phase '
+                'needs --phase-start-consumed-samples (the data position = consumed samples - it)'
+            )
+    if getattr(args, 'phase_start_consumed_samples', None) is not None:
+        assert args.phase_transition_variable_batch, \
+            '--phase-start-consumed-samples belongs to --phase-transition-variable-batch'
     if args.phase_transition_iterations:
         args.phase_transition_iterations = sorted(
             int(x.strip()) for x in args.phase_transition_iterations.split(",")
@@ -3839,6 +3855,14 @@ def _add_data_args(parser):
                        '(num_steps = iteration x the current global batch size, its other settings from '
                        'the arguments: implies --override-opt-param-scheduler). Requires '
                        '--phase-transition-iterations.')
+    group.add_argument('--phase-start-consumed-samples', type=int, default=None,
+                       help='--phase-transition-variable-batch: consumed_train_samples at the start of the '
+                       'current phase (e.g. 23691 x 8192 for a phase entered at iteration 23691 from a '
+                       'phase at global batch 8192). The data position inside the phase is then '
+                       'consumed_train_samples (from the checkpoint) minus this, instead of (iteration - '
+                       'phase start) x the current global batch size -- which is wrong once the global '
+                       'batch size changes inside a phase (it would replay or skip samples). Required '
+                       'with a --data-sampler-reference-global-batch-size other than --global-batch-size.')
     group.add_argument('--split', type=str, default=None,
                        help='Comma-separated list of proportions for training,'
                        ' validation, and test split. For example the split '
@@ -4093,6 +4117,13 @@ def _add_vision_args(parser):
     group.add_argument('--data-sampler-reference-micro-batch-size', type=int, default=None,
                        help='the reference layout\'s micro-batch size (default: the actual '
                        'one); see --data-sampler-reference-dp-size')
+    group.add_argument('--data-sampler-reference-global-batch-size', type=int, default=None,
+                       help='the reference run\'s global batch size (default: the actual one); see '
+                       '--data-sampler-reference-dp-size. Another (e.g. smaller) --global-batch-size then '
+                       'trains, step by step, on consecutive slices of the reference run\'s sample stream '
+                       '(k steps at 1/k of the batch = one reference step), and the training dataset (its '
+                       'index and cache entry) is sized as the reference run\'s (train iterations x this). '
+                       'With phases: also --phase-start-consumed-samples.')
     group.add_argument('--head-lr-mult', type=float, default=1.0,
                        help='learning rate multiplier for head during finetuning')
 

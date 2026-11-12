@@ -82,6 +82,9 @@ def build_pretraining_data_loader(dataset, consumed_samples):
                 if args.data_sampler_reference_micro_batch_size
                 else micro_batch_size
             ),
+            reference_global_batch_size=getattr(
+                args, 'data_sampler_reference_global_batch_size', None
+            ),
         )
     elif args.dataloader_type == 'cyclic':
         batch_sampler = MegatronPretrainingRandomSampler(
@@ -464,6 +467,16 @@ class MegatronPretrainingReferenceLayoutSampler:
     The global batch size must stay the same; consumed_samples (from the checkpoint) is a step
     boundary. Steps that straddle an epoch end take the next epoch's first micro-batches, as the
     reference run's re-created iterator does.
+
+    ``reference_global_batch_size`` (default: the actual global batch size): the reference run's
+    global batch size. The reference steps, each ordered as above (reference rank, reference
+    micro-batch, position) and concatenated, form one sample stream; an actual step of a SMALLER
+    (or any other) global batch size trains on the next ``global_batch_size`` samples of that stream
+    (``consumed_samples`` counts samples of it). So 8 steps at 1/8 of the reference batch train on
+    exactly the samples of one reference step, in its order, and a run that switches back to the
+    reference batch at a reference-step boundary continues the reference run's data exactly
+    (recall surgery: small-batch arms from a main-run checkpoint, docs/recall_surgery_ambitious.md
+    §10). At reference_global_batch_size == global_batch_size the batches are unchanged.
     """
 
     def __init__(
@@ -478,6 +491,7 @@ class MegatronPretrainingReferenceLayoutSampler:
         data_sharding,
         reference_dp_size,
         reference_micro_batch_size,
+        reference_global_batch_size=None,
     ):
         self.dataset = dataset
         self.total_samples = total_samples
@@ -490,14 +504,15 @@ class MegatronPretrainingReferenceLayoutSampler:
         self.ref_dp = reference_dp_size
         self.ref_mbs = reference_micro_batch_size
         self.ref_mb_dp = self.ref_mbs * self.ref_dp
+        self.ref_gbs = reference_global_batch_size or global_batch_size
         assert total_samples > 0, f'no sample to consume: {total_samples}'
         assert data_parallel_rank < data_parallel_size
-        assert global_batch_size % self.ref_mb_dp == 0, (
-            f'global batch {global_batch_size} is not a multiple of the reference layout '
+        assert self.ref_gbs % self.ref_mb_dp == 0, (
+            f'reference global batch {self.ref_gbs} is not a multiple of the reference layout '
             f'{self.ref_dp} x {self.ref_mbs}'
         )
         assert global_batch_size % (micro_batch_size * data_parallel_size) == 0
-        self.ref_microbatches = global_batch_size // self.ref_mb_dp  # per step
+        self.ref_microbatches = self.ref_gbs // self.ref_mb_dp  # per reference step
         self.per_rank = global_batch_size // data_parallel_size  # samples per rank per step
         # micro-batches per reference rank and epoch (the reference sampler's bucket length)
         self.mb_per_epoch = total_samples // self.ref_mb_dp
@@ -541,18 +556,21 @@ class MegatronPretrainingReferenceLayoutSampler:
         per_ref_rank = self.ref_microbatches * self.ref_mbs  # samples per reference rank and step
         lo = self.data_parallel_rank * self.per_rank
         while True:
-            step = self.consumed_samples // self.global_batch_size
-            first_mb = step * self.ref_microbatches
-            # this rank's slice [lo, lo + per_rank) of the step's samples, ordered by
-            # (reference rank, reference micro-batch, position)
+            # this rank's slice [lo, lo + per_rank) of the step's samples = the positions
+            # [consumed + lo, consumed + lo + per_rank) of the reference stream: reference step
+            # q // ref_gbs, inside it ordered by (reference rank, reference micro-batch, position)
             samples = []
-            pos = lo
-            while pos < lo + self.per_rank:
+            q = self.consumed_samples + lo
+            end = q + self.per_rank
+            while q < end:
+                ref_step, pos = divmod(q, self.ref_gbs)
                 ref_rank, rem = divmod(pos, per_ref_rank)
                 k, i0 = divmod(rem, self.ref_mbs)
-                n = min(self.ref_mbs - i0, lo + self.per_rank - pos)
-                samples += self._reference_samples(ref_rank, first_mb + k, range(i0, i0 + n))
-                pos += n
+                n = min(self.ref_mbs - i0, end - q)
+                samples += self._reference_samples(
+                    ref_rank, ref_step * self.ref_microbatches + k, range(i0, i0 + n)
+                )
+                q += n
             for b in range(0, self.per_rank, self.micro_batch_size):
                 self.consumed_samples += self.micro_batch_size * self.data_parallel_size
                 yield samples[b : b + self.micro_batch_size]

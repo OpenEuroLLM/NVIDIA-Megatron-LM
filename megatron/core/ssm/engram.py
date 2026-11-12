@@ -73,14 +73,22 @@ _PAD_ID = 0
 
 
 
-def engram_output_scale(config) -> float:
+def engram_output_scale(config, layer_number: Optional[int] = None) -> float:
     """The factor on the Engram layers' output (recall surgery, docs/recall_surgery_ambitious.md): 1 before
     ``engram_output_scale_start``, then linear to ``engram_output_scale`` over ``engram_output_scale_ramp``
     steps (0: at once). The iteration is the training loop's or, when later, the loaded checkpoint's
-    (ckda_branch.current_iteration), so an eval-only run of a checkpoint sees that checkpoint's scale."""
+    (ckda_branch.current_iteration), so an eval-only run of a checkpoint sees that checkpoint's scale.
+    ``engram_output_scale_layers`` (0-based decoder indices) restricts it to those layers: the Engram layer
+    ``layer_number`` (1-based, as the hybrid stack numbers its layers) outside the list keeps 1."""
     target = float(getattr(config, "engram_output_scale", 1.0))
     if target == 1.0:
         return 1.0
+    layers = getattr(config, "engram_output_scale_layers", None)
+    if layers is not None:
+        if layer_number is None:
+            raise ValueError("engram_output_scale_layers needs the Engram layer's layer_number")
+        if (int(layer_number) - 1) not in {int(i) for i in layers}:
+            return 1.0
     from megatron.core.ssm.ckda_branch import current_iteration
 
     it = current_iteration()
@@ -739,7 +747,7 @@ class EngramLayer(MegatronModule):
                 positions = self._document_positions(packed_seq_params)
             y = self._engram(h, input_ids, positions)
         y = scatter_replicated_output(y, self.config, self.tp_group)
-        scale = engram_output_scale(self.config)
+        scale = engram_output_scale(self.config, self.layer_number)
         if scale != 1.0:
             y = y * scale
         if self.residual_scheme is not None:

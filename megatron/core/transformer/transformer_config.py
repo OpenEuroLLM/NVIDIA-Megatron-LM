@@ -466,6 +466,13 @@ class TransformerConfig(ModelParallelConfig):
     engram_output_scale_ramp: int = 0
     """Steps of the linear ramp from 1 to ``engram_output_scale`` (0: at once)."""
 
+    engram_output_scale_layers: Optional[list[int]] = None
+    """The Engram layers ``engram_output_scale`` applies to, as 0-based indices in the decoder's layer list
+    (``hybrid_layer_pattern`` positions, as the checkpoint keys ``decoder.layers.<i>`` and
+    ``ckda_branch_layers``; the ambitious v4 Engram layers are 2 and 49). None = every Engram layer; the
+    others keep factor 1 (recall surgery: the deep Engram off, the early one -- which carries the
+    multilingual reading -- unchanged)."""
+
     engram_hash_per_layer: bool = False
     """Hash multipliers of their own for every Engram layer (the reference code seeds them
     per layer), so two Engram layers do not share their n-gram collisions. False: one set

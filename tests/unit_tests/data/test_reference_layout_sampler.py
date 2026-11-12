@@ -113,3 +113,75 @@ def test_rejects_non_step_boundary_and_bad_gbs():
     s = MegatronPretrainingReferenceLayoutSampler(None, 1000, 5, 1, 32, 0, 16, True, 8, 2)
     with pytest.raises(AssertionError):
         next(iter(s))
+
+
+# ---- reference_global_batch_size: a smaller actual global batch on the reference run's stream ----
+
+
+def _steps_small(total, gbs, dp, mbs, sharding, consumed, n_steps, ref_dp, ref_mbs, ref_gbs):
+    m_per_step = gbs // (mbs * dp)
+    its = [
+        iter(
+            MegatronPretrainingReferenceLayoutSampler(
+                None, total, consumed, mbs, gbs, r, dp, sharding, ref_dp, ref_mbs, ref_gbs
+            )
+        )
+        for r in range(dp)
+    ]
+    return [[[next(it) for _ in range(m_per_step)] for it in its] for _ in range(n_steps)]
+
+
+def _ordered(step):
+    """A step's samples in stream order: rank 0's micro-batches, then rank 1's, ..."""
+    return [x for rank in step for mb in rank for x in mb]
+
+
+SMALL_CASES = [
+    # (total, ref_gbs, ref_dp, ref_mbs, gbs, dp, mbs): the v4 main run's shape scaled down
+    # (reference 512 ranks x mbs 1, gbs 1024 -> arms 128 ranks x mbs 1, gbs 128) and others
+    (5000, 64, 32, 1, 8, 8, 1),
+    (5000, 64, 32, 1, 16, 8, 1),
+    (997, 48, 4, 4, 12, 3, 2),
+    (1000, 32, 8, 2, 8, 4, 2),
+    (1000, 32, 8, 2, 32, 16, 1),  # same gbs, other layout: the old behaviour
+]
+
+
+@pytest.mark.parametrize("sharding", [True, False])
+@pytest.mark.parametrize("total,ref_gbs,ref_dp,ref_mbs,gbs,dp,mbs", SMALL_CASES)
+def test_small_batch_follows_reference_stream(total, ref_gbs, ref_dp, ref_mbs, gbs, dp, mbs, sharding):
+    """k = ref_gbs / gbs small steps train on exactly the samples of one reference step, in the
+    reference step's order (rank slices of the reference layout concatenated); across epoch ends too."""
+    n_ref = 30
+    ref = _steps_new(total, ref_gbs, ref_dp, ref_mbs, sharding, 0, n_ref, ref_dp, ref_mbs)
+    k = ref_gbs // gbs
+    small = _steps_small(total, gbs, dp, mbs, sharding, 0, n_ref * k, ref_dp, ref_mbs, ref_gbs)
+    for s in range(n_ref):
+        got = [x for t in range(k) for x in _ordered(small[s * k + t])]
+        assert got == _ordered(ref[s]), (s,)
+        assert all(len(mb) == mbs for t in range(k) for rank in small[s * k + t] for mb in rank)
+
+
+def test_small_batch_resume_and_hand_back():
+    """Resume from the reference run's checkpoint (consumed = 5 reference steps) at 1/8 of the batch,
+    resume again from the small run's own checkpoint mid reference step, then switch back to the
+    reference batch at a reference-step boundary: the stream continues the reference run exactly."""
+    total, ref_gbs, ref_dp, ref_mbs = 5000, 64, 32, 1
+    gbs, dp, mbs = 8, 8, 1
+    ref = _steps_new(total, ref_gbs, ref_dp, ref_mbs, True, 0, 12, ref_dp, ref_mbs)
+    c0 = 5 * ref_gbs
+    a = _steps_small(total, gbs, dp, mbs, True, c0, 11, ref_dp, ref_mbs, ref_gbs)  # 11 small steps
+    b = _steps_small(total, gbs, dp, mbs, True, c0 + 11 * gbs, 5, ref_dp, ref_mbs, ref_gbs)  # resume
+    stream = [x for st in a + b for x in _ordered(st)]
+    assert stream == _ordered(ref[5]) + _ordered(ref[6])
+    # hand back: the reference layout and batch from consumed = 7 reference steps
+    back = _steps_new(total, ref_gbs, ref_dp, ref_mbs, True, c0 + 16 * gbs, 3, ref_dp, ref_mbs)
+    assert back == ref[7:10]
+
+
+def test_small_batch_rejects_bad_reference():
+    with pytest.raises(AssertionError):  # reference batch not a multiple of the reference layout
+        MegatronPretrainingReferenceLayoutSampler(None, 1000, 0, 1, 8, 0, 8, True, 32, 1, 48)
+    s = MegatronPretrainingReferenceLayoutSampler(None, 1000, 4, 1, 8, 0, 8, True, 32, 1, 64)
+    with pytest.raises(AssertionError):  # consumed not a step boundary of the actual batch
+        next(iter(s))
