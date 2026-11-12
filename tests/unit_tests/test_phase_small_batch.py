@@ -7,6 +7,11 @@ at the reference batch 1024, not 128 -> same index / cache entry / samples) and 
 data position in the phase -- the consumed samples minus the phase start, NOT (iteration - 23691) x 128,
 which would replay the phase's first eighth. Back at 1024 after k x 8 small steps it continues exactly.
 
+Phase 1 (8k, global batch 8192, iterations 0-23691): an arm at 1024 from 23300 counts 8 iterations per main-run
+step, so its own iteration reaches the phase boundary 23691 after 391 steps -- 49 main-run steps of data. With
+--phase-start-iteration the phase is located by the data position (reference iteration = 0 + consumed / 8192):
+no exit at 23691, the phase-1 dataset after a restart past it, the exit only at the phase's data end.
+
     python -m pytest tests/unit_tests/test_phase_small_batch.py
 """
 
@@ -20,8 +25,9 @@ P1_ITERS, P1_GBS, P2_GBS, TRAIN_ITERS = 23691, 8192, 1024, 236733
 P2_START = P1_ITERS * P1_GBS  # 194,076,672: consumed samples at the phase-2 start
 
 
-def _args(iteration, gbs, consumed, ref_gbs=None, phase_start=None):
+def _args(iteration, gbs, consumed, ref_gbs=None, phase_start=None, phase_start_it=None):
     return SimpleNamespace(
+        phase_start_iteration=phase_start_it,
         phase_transition_iterations=[P1_ITERS],
         phase_transition_variable_batch=True,
         iteration=iteration,
@@ -92,3 +98,84 @@ def test_dataset_sized_at_reference_batch(monkeypatch):
     assert sizes["main"] == (TRAIN_ITERS - P1_ITERS) * P2_GBS
     assert sizes["arm"] == sizes["main"]  # the main run's dataset (index, cache entry, samples)
     assert sizes["arm_unfixed"] == (TRAIN_ITERS - P1_ITERS) * 128  # another dataset
+
+
+# ---- phase 1: the arm's iteration counter passes the main run's phase boundary long before its data ----
+P1_ARM_GBS = 1024
+
+
+def _p1_arm(it, consumed, phase_start_it=0):
+    return _args(it, P1_ARM_GBS, consumed, ref_gbs=P1_GBS, phase_start=0, phase_start_it=phase_start_it)
+
+
+def test_phase1_arm_located_by_data(monkeypatch):
+    it0 = 23300
+    consumed0 = it0 * P1_GBS  # 190,873,600 as logged by the main run at 23300
+    assert consumed0 == 190873600
+
+    def size(a):
+        monkeypatch.setattr(tr, "get_args", lambda a=a: a)
+        return tr.get_train_valid_test_num_samples()[0]
+
+    main = _args(it0, P1_GBS, consumed0)
+    assert size(main) == P1_ITERS * P1_GBS
+    # the seed: the main run's dataset and position
+    a = _p1_arm(it0, consumed0)
+    assert tr.phase_location_iteration(a) == it0
+    assert size(a) == P1_ITERS * P1_GBS
+    assert tr.consumed_train_samples_in_phase(a) == consumed0
+    # a restart from the arm's own save at +800 (iteration 24100, past 23691): still phase 1
+    a = _p1_arm(it0 + 800, consumed0 + 800 * P1_ARM_GBS)
+    assert tr.phase_location_iteration(a) == it0 + 100
+    assert size(a) == P1_ITERS * P1_GBS
+    assert tr.consumed_train_samples_in_phase(a) == consumed0 + 800 * P1_ARM_GBS
+    # without --phase-start-iteration that restart is located in phase 2: another dataset
+    b = _args(it0 + 800, P1_ARM_GBS, consumed0 + 800 * P1_ARM_GBS, ref_gbs=P1_GBS, phase_start=0)
+    assert size(b) == (TRAIN_ITERS - P1_ITERS) * P1_GBS
+
+
+def test_phase1_arm_exit_at_the_data_boundary():
+    it0, consumed0 = 23300, 23300 * P1_GBS
+    steps_to_boundary = (P1_ITERS - it0) * (P1_GBS // P1_ARM_GBS)  # 3128
+    # the arm's iteration 23691 (391 steps): no phase transition with the flag, one without it
+    k = P1_ITERS - it0
+    a = _p1_arm(P1_ITERS, consumed0 + k * P1_ARM_GBS)
+    assert not tr.phase_transition_reached(a, P1_ITERS)
+    old = _args(P1_ITERS, P1_ARM_GBS, consumed0 + k * P1_ARM_GBS, ref_gbs=P1_GBS, phase_start=0)
+    assert tr.phase_transition_reached(old, P1_ITERS)
+    # mid reference step / one step before the data boundary: no transition
+    for n in (steps_to_boundary - 1, steps_to_boundary - 4):
+        a = _p1_arm(it0 + n, consumed0 + n * P1_ARM_GBS)
+        assert not tr.phase_transition_reached(a, it0 + n)
+    # the data boundary (the main run's 23691 x 8192): transition
+    n = steps_to_boundary
+    a = _p1_arm(it0 + n, consumed0 + n * P1_ARM_GBS)
+    assert a.consumed_train_samples == P2_START
+    assert tr.phase_transition_reached(a, it0 + n)
+    # past it the position is in the next phase: loud
+    a = _p1_arm(it0 + n + 8, consumed0 + (n + 8) * P1_ARM_GBS)
+    with pytest.raises(AssertionError):
+        tr.consumed_train_samples_in_phase(a)
+
+
+def test_phase_start_iteration_keeps_phase2_arms():
+    # the phase-2 arms (gbs 128 from 33200): the flag changes nothing there (their iterations stay in phase 2)
+    it0 = 33200
+    consumed0 = P2_START + (it0 - P1_ITERS) * P2_GBS
+    for n in (0, 800):
+        with_flag = _args(it0 + n, 128, consumed0 + n * 128, P2_GBS, P2_START, phase_start_it=P1_ITERS)
+        without = _args(it0 + n, 128, consumed0 + n * 128, P2_GBS, P2_START)
+        assert tr.consumed_train_samples_in_phase(with_flag) == tr.consumed_train_samples_in_phase(without)
+        assert tr._phase_iteration_bounds(with_flag) == tr._phase_iteration_bounds(without) == (P1_ITERS, TRAIN_ITERS)
+        assert not tr.phase_transition_reached(with_flag, it0 + n)
+        # the phase start itself (pos multiple of R, reference iteration = start) is not a transition
+    a = _args(P1_ITERS, P2_GBS, P2_START, P2_GBS, P2_START, phase_start_it=P1_ITERS)
+    assert not tr.phase_transition_reached(a, P1_ITERS)
+
+
+def test_main_run_exit_unchanged():
+    a = _args(P1_ITERS, P1_GBS, P2_START)
+    assert tr.phase_transition_reached(a, P1_ITERS)
+    assert not tr.phase_transition_reached(a, P1_ITERS - 1)
+    a.phase_transition_iterations = None
+    assert not tr.phase_transition_reached(a, P1_ITERS)

@@ -894,12 +894,27 @@ def validate_args(args, defaults={}):
                 '--data-sampler-reference-global-batch-size other than --global-batch-size inside a phase '
                 'needs --phase-start-consumed-samples (the data position = consumed samples - it)'
             )
+            # this run's iterations advance at another rate than the reference run's: the phase (its
+            # dataset, data position and end) must be located by the data position
+            assert getattr(args, 'phase_start_iteration', None) is not None, (
+                '--data-sampler-reference-global-batch-size other than --global-batch-size inside a phase '
+                'needs --phase-start-iteration (the reference run\'s iteration at the phase start)'
+            )
     if getattr(args, 'phase_start_consumed_samples', None) is not None:
         assert args.phase_transition_variable_batch, \
             '--phase-start-consumed-samples belongs to --phase-transition-variable-batch'
     if args.phase_transition_iterations:
         args.phase_transition_iterations = sorted(
             int(x.strip()) for x in args.phase_transition_iterations.split(",")
+        )
+    if getattr(args, 'phase_start_iteration', None) is not None:
+        assert getattr(args, 'phase_start_consumed_samples', None) is not None, \
+            '--phase-start-iteration needs --phase-start-consumed-samples'
+        assert args.phase_start_iteration == 0 or args.phase_start_iteration in (
+            args.phase_transition_iterations or []
+        ), (
+            f'--phase-start-iteration {args.phase_start_iteration} is not a phase start (0 or one of '
+            f'--phase-transition-iterations {args.phase_transition_iterations})'
         )
     # Batch size.
     assert args.micro_batch_size is not None
@@ -3863,6 +3878,17 @@ def _add_data_args(parser):
                        'phase start) x the current global batch size -- which is wrong once the global '
                        'batch size changes inside a phase (it would replay or skip samples). Required '
                        'with a --data-sampler-reference-global-batch-size other than --global-batch-size.')
+    group.add_argument('--phase-start-iteration', type=int, default=None,
+                       help='With --phase-start-consumed-samples: the REFERENCE run\'s iteration at which the '
+                       'current phase starts (0 or one of --phase-transition-iterations). The phase -- its '
+                       'training dataset (size), the data position in it and its end (the exit at the next '
+                       'phase transition) -- is then located from the data position, reference iteration = '
+                       'this + (consumed_train_samples - --phase-start-consumed-samples) / reference global '
+                       'batch size, instead of from this run\'s iteration counter, which advances faster at a '
+                       'smaller global batch size (an arm at 1/8 of the batch from iteration 23300 of a phase '
+                       'that ends at 23691 reaches iteration 23691 after 391 steps, the phase\'s data end only '
+                       'after 3128). Required with a --data-sampler-reference-global-batch-size other than '
+                       '--global-batch-size inside a phase.')
     group.add_argument('--split', type=str, default=None,
                        help='Comma-separated list of proportions for training,'
                        ' validation, and test split. For example the split '

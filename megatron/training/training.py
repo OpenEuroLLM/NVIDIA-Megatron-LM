@@ -4293,10 +4293,7 @@ def checkpoint_and_decide_exit(
     if (
         args.exit_interval
         and iteration % args.exit_interval == 0
-    ) or (
-        args.phase_transition_iterations
-        and iteration in args.phase_transition_iterations
-    ):
+    ) or phase_transition_reached(args, iteration):
         if args.save and not saved_checkpoint:
             save_checkpoint_and_time(
                 iteration,
@@ -5570,11 +5567,43 @@ def cyclic_iter(iterable):
             )
 
 
+def phase_location_iteration(args, consumed_samples=None):
+    """The iteration that locates the current phase (--phase-transition-iterations): this run's
+    iteration, or -- with --phase-start-iteration -- the REFERENCE run's iteration at this run's data
+    position, phase start + (consumed samples - --phase-start-consumed-samples) // reference global batch
+    size. A run at another global batch size than the reference run's (small-batch arms from a main-run
+    checkpoint) counts iterations at another rate, so its own iteration would cross the reference run's
+    next phase boundary (exit, the next phase's dataset) long before its data does."""
+    start = getattr(args, 'phase_start_iteration', None)
+    if start is None:
+        return args.iteration
+    consumed = args.consumed_train_samples if consumed_samples is None else consumed_samples
+    ref_gbs = getattr(args, 'data_sampler_reference_global_batch_size', None) or args.global_batch_size
+    return start + (consumed - args.phase_start_consumed_samples) // ref_gbs
+
+
+def phase_transition_reached(args, iteration):
+    """Whether the step that ended at ``iteration`` reached a phase transition (exit + save): this
+    run's iteration is one of --phase-transition-iterations, or -- with --phase-start-iteration -- the
+    data position reached the reference run's next phase boundary (a whole reference step)."""
+    if not args.phase_transition_iterations:
+        return False
+    start = getattr(args, 'phase_start_iteration', None)
+    if start is None:
+        return iteration in args.phase_transition_iterations
+    ref_gbs = getattr(args, 'data_sampler_reference_global_batch_size', None) or args.global_batch_size
+    pos = args.consumed_train_samples - args.phase_start_consumed_samples
+    ref_it = start + pos // ref_gbs
+    return pos % ref_gbs == 0 and ref_it > start and ref_it in args.phase_transition_iterations
+
+
 def _phase_iteration_bounds(args):
-    """(first, end) iteration of the phase args.iteration lies in (--phase-transition-iterations)."""
+    """(first, end) iteration of the phase the run lies in (--phase-transition-iterations; located by
+    phase_location_iteration)."""
+    it = phase_location_iteration(args)
     bounds = [0, *args.phase_transition_iterations, args.train_iters]
-    first = max(t for t in bounds[:-1] if t <= args.iteration)
-    end = min(t for t in bounds[1:] if t > args.iteration) if args.iteration < args.train_iters else args.train_iters
+    first = max(t for t in bounds[:-1] if t <= it)
+    end = min(t for t in bounds[1:] if t > it) if it < args.train_iters else args.train_iters
     return first, end
 
 
@@ -5627,7 +5656,8 @@ def get_train_valid_test_num_samples():
     if args.phase_transition_iterations:
         # train_samples (not args.train_samples): None for iteration-based training (--train-iters)
         phase_transition_samples = [0] + [t * data_batch for t in args.phase_transition_iterations] + [train_samples]
-        current_sample = args.iteration * data_batch
+        # the phase of the data position (--phase-start-iteration), not of this run's iteration counter
+        current_sample = phase_location_iteration(args) * data_batch
         last_transition_sample = max(s for s in phase_transition_samples if s <= current_sample)
         next_transition_sample = min(s for s in phase_transition_samples if s > current_sample)
         train_samples_in_current_phase = next_transition_sample - last_transition_sample
@@ -5655,11 +5685,17 @@ def consumed_train_samples_in_phase(args):
     global batch size inside the phase (small-batch arms from a main-run checkpoint, and back)."""
     if not args.phase_transition_iterations:
         return args.consumed_train_samples
+    phase_start = getattr(args, 'phase_start_consumed_samples', None)
+    if phase_start is not None:
+        assert args.consumed_train_samples >= phase_start, (
+            f'--phase-start-consumed-samples {phase_start} is above the consumed samples '
+            f'{args.consumed_train_samples}'
+        )
+    location = phase_location_iteration(args)
     last_transition = max(
-        iteration for iteration in (0, *args.phase_transition_iterations) if iteration <= args.iteration
+        iteration for iteration in (0, *args.phase_transition_iterations) if iteration <= location
     )
     by_iteration = (args.iteration - last_transition) * args.global_batch_size
-    phase_start = getattr(args, 'phase_start_consumed_samples', None)
     if phase_start is None:
         return by_iteration
     by_samples = args.consumed_train_samples - phase_start
@@ -5667,10 +5703,16 @@ def consumed_train_samples_in_phase(args):
         f'> phase data position from consumed samples: {args.consumed_train_samples} - '
         f'{phase_start} = {by_samples} (iteration-based: {by_iteration})'
     )
-    assert by_samples >= 0, (
-        f'--phase-start-consumed-samples {phase_start} is above the consumed samples '
-        f'{args.consumed_train_samples}'
-    )
+    start_it = getattr(args, 'phase_start_iteration', None)
+    if start_it is not None:
+        print_rank_0(
+            f'> phase located by the data position: reference iteration {location} '
+            f'(this run: {args.iteration}), phase start {start_it}'
+        )
+        assert last_transition == start_it, (
+            f'the data position (reference iteration {location}) is past the phase that starts at '
+            f'--phase-start-iteration {start_it}: a new phase needs its own --phase-start-* values'
+        )
     assert args.iteration <= last_transition or by_samples > 0, (
         'the checkpoint is inside the phase but consumed no sample of it: wrong '
         '--phase-start-consumed-samples?'

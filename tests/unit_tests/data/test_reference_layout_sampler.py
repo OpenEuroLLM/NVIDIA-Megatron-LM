@@ -144,6 +144,10 @@ SMALL_CASES = [
     (997, 48, 4, 4, 12, 3, 2),
     (1000, 32, 8, 2, 8, 4, 2),
     (1000, 32, 8, 2, 32, 16, 1),  # same gbs, other layout: the old behaviour
+    # phase 1 of the v4 main run scaled down: reference 512 ranks x mbs 8, gbs 8192 (2 reference
+    # micro-batches per rank and step) -> arms 256 ranks x mbs 4, gbs 1024 (one micro-batch, 1/8)
+    (3000, 64, 16, 2, 8, 8, 1),
+    (3000, 64, 16, 2, 8, 2, 4),
 ]
 
 
