@@ -3164,6 +3164,12 @@ def _load_checkpoint_impl(
                 optimizer.load_state_dict(state_dict['optimizer'])
                 _debug_optimizer_state(optimizer, "after load", model)
                 _load_phase("optimizer_load_state_dict")
+                # parameters that resume with an all-zero Adam second moment (JUPITER fsdp_dtensor
+                # checkpoints, docs/recall_surgery_ambitious.md §14.6): their updates ramp in
+                if ckpt_format == 'fsdp_dtensor':
+                    from megatron.core.optimizer.cold_adam_warmup import install_cold_adam_warmup
+
+                    install_cold_adam_warmup(optimizer)
 
             # Load distributed optimizer's custom parameter state.
             # For distributed checkpoint it's already loaded in load_state_dict above
