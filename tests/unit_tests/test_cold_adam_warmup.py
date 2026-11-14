@@ -139,3 +139,31 @@ def test_partially_cold_shard_is_ramped_elementwise():
     d, d_raw = w - before, raw_model[0].weight - before_raw
     torch.testing.assert_close(d[:3], d_raw[:3])  # warm rows: the plain update
     torch.testing.assert_close(d[3:], d_raw[3:] / steps)  # cold rows: 1/N of it
+
+
+def test_broken_layout_state_is_zeroed_and_wholly_cold():
+    # TE 2.10 FusedAdam under Megatron-FSDP: plain state of the parameter's global shape for a sharded parameter
+    from megatron.core.optimizer import cold_adam_warmup as caw
+
+    class P:
+        def __init__(self, local, global_shape):
+            self.data = local
+            self.shape = torch.Size(global_shape)
+
+    local = torch.randn(2, 8)
+    p = P(local, (8, 8))
+    state = {"exp_avg": torch.randn(8, 8), "exp_avg_sq": torch.rand(8, 8) + 0.1}
+
+    class Opt:
+        param_groups = [{"params": [p]}]
+
+    Opt.state = {p: state}
+    cold = caw.cold_parameters(Opt)
+    assert len(cold) == 1 and cold[0][0] is p and cold[0][1] == "reset"
+    assert not state["exp_avg"].any() and not state["exp_avg_sq"].any()
+    # a state shaped like the local shard is judged element-wise, and the Engram row-wise moment is skipped
+    state2 = {"exp_avg_sq": torch.rand(2, 8) + 0.1}
+    Opt.state = {p: state2}
+    assert caw.cold_parameters(Opt) == []
+    Opt.state = {p: {"exp_avg_sq": torch.zeros(8, 1)}}
+    assert caw.cold_parameters(Opt) == []
