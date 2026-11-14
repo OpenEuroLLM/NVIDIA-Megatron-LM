@@ -1,6 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 """megatron.core.optimizer.cold_adam_warmup: parameters resumed with an all-zero Adam second moment get their
-updates ramped in (k / N); parameters with intact moments step exactly as without it."""
+updates ramped in (k / N), element-wise for partially cold shards; parameters with intact moments step exactly as
+without it."""
 
 import copy
 
@@ -64,12 +65,12 @@ def test_cold_moments_are_detected_and_ramped():
     for p in norm.parameters():
         cold_opt.state[p]["exp_avg"].zero_()
         cold_opt.state[p]["exp_avg_sq"].zero_()
-    assert set(map(id, cold_parameters(cold_opt))) == set(map(id, norm.parameters()))
+    assert [(id(p), m) for p, m in cold_parameters(cold_opt)] == [(id(p), None) for p in norm.parameters()]
     # the same cold resume without the warmup: the reference update of the cold parameters
     raw_model, raw_opt = _resume_copy(cold_model, cold_opt)
     steps = 4
     summary = install_cold_adam_warmup(_Wrapper(cold_opt), steps=steps)
-    assert summary["params"] == 2 and summary["elements"] == 16
+    assert summary["params"] == 2 and summary["partial"] == 0 and summary["elements"] == 16
     for k in range(1, steps + 2):
         before = [p.detach().clone() for p in cold_model[1].parameters()]
         before_raw = [p.detach().clone() for p in raw_model[1].parameters()]
@@ -115,3 +116,26 @@ def test_multi_optimizer_chain_is_walked():
     other_model, other_opt = _trained(seed=1)
     summary = install_cold_adam_warmup(_Chained(other_opt, cold_opt), steps=4)
     assert summary["params"] == 2 and summary["elements"] == 16
+
+
+def test_partially_cold_shard_is_ramped_elementwise():
+    # the JUPITER checkpoints: a sharded state saved with only rank 0's slice filled (here: the first 3 of 8 rows)
+    model, opt = _trained()
+    cold_model, cold_opt = _resume_copy(model, opt)
+    w = cold_model[0].weight
+    cold_opt.state[w]["exp_avg"][3:].zero_()
+    cold_opt.state[w]["exp_avg_sq"][3:].zero_()
+    raw_model, raw_opt = _resume_copy(cold_model, cold_opt)
+    (p, mask), = cold_parameters(cold_opt)
+    assert p is w and mask is not None and int(mask.sum()) == 40
+    steps = 4
+    summary = install_cold_adam_warmup(_Wrapper(cold_opt), steps=steps)
+    assert summary["params"] == 1 and summary["partial"] == 1 and summary["elements"] == 40
+    before, before_raw = w.detach().clone(), raw_model[0].weight.detach().clone()
+    _grads(cold_model, 301)
+    cold_opt.step()
+    _grads(raw_model, 301)
+    raw_opt.step()
+    d, d_raw = w - before, raw_model[0].weight - before_raw
+    torch.testing.assert_close(d[:3], d_raw[:3])  # warm rows: the plain update
+    torch.testing.assert_close(d[3:], d_raw[3:] / steps)  # cold rows: 1/N of it
