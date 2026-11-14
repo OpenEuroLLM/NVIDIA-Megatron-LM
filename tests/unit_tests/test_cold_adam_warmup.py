@@ -93,3 +93,25 @@ def test_cold_moments_are_detected_and_ramped():
                 assert (p - pb).abs().max() <= r * 1e-2 + 1e-7
     # past the ramp the wrapper is gone: the plain step again
     assert "_wrap_step" not in getattr(cold_opt.step, "__qualname__", "")
+
+
+class _Chained:
+    """ChainedOptimizer-like: ``.optimizer`` asserts when more than one optimizer is chained (Muown + Adam)."""
+
+    def __init__(self, *opts):
+        self.chained_optimizers = [_Wrapper(o) for o in opts]
+
+    @property
+    def optimizer(self):
+        assert len(self.chained_optimizers) == 1, "more than one optimizer"
+        return self.chained_optimizers[0].optimizer
+
+
+def test_multi_optimizer_chain_is_walked():
+    model, opt = _trained()
+    cold_model, cold_opt = _resume_copy(model, opt)
+    for p in cold_model[1].parameters():
+        cold_opt.state[p]["exp_avg_sq"].zero_()
+    other_model, other_opt = _trained(seed=1)
+    summary = install_cold_adam_warmup(_Chained(other_opt, cold_opt), steps=4)
+    assert summary["params"] == 2 and summary["elements"] == 16

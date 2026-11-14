@@ -41,11 +41,19 @@ def _torch_optimizers(optimizer) -> list:
         if isinstance(o, torch.optim.Optimizer):
             out.append(o)
             continue
+        found_subs = False
         for name in ("chained_optimizers", "optimizers"):
             subs = getattr(o, name, None)
             if isinstance(subs, (list, tuple)):
                 todo.extend(subs)
-        inner = getattr(o, "optimizer", None)
+                found_subs = True
+        if found_subs:
+            # ChainedOptimizer.optimizer asserts when it holds more than one optimizer.
+            continue
+        try:
+            inner = getattr(o, "optimizer", None)
+        except (AssertionError, AttributeError):
+            inner = None
         if inner is not None:
             todo.append(inner)
     return out
