@@ -1595,6 +1595,9 @@ class Attention(MegatronModule, ABC):
             else:
                 query, key, value = qkv_output
             mixed_qkv = qkv_split_arg_list = None
+            temperature = getattr(self, "head_temperature", None)
+            if temperature is not None:  # [sq, b, np, hn] * [np, 1]: the logit scale of each head
+                query = query * temperature.to(query.dtype)[:, None]
             if getattr(self, "value_embedding", None) is not None:
                 if inference_context is not None:
                     raise NotImplementedError("value embeddings are not supported for inference")
@@ -1605,6 +1608,8 @@ class Attention(MegatronModule, ABC):
             assert (
                 not self.config.attention_output_gate
             ), "attention_output_gate is not supported for unsplit mixed_qkv tensor."
+            if getattr(self, "head_temperature", None) is not None:
+                raise NotImplementedError("attention_head_temperature needs split q / k / v")
             mixed_qkv, qkv_split_arg_list = qkv_output
         nvtx_range_pop(suffix="qkv")
 
@@ -2030,6 +2035,17 @@ class SelfAttention(Attention):
             if k_norm_cls is not None
             else None
         )
+
+        # attention_head_temperature: one learned logit scale per query head on the normalized query
+        self.head_temperature = None
+        if getattr(self.config, "attention_head_temperature", False):
+            self.head_temperature = torch.nn.Parameter(
+                torch.ones(self.num_attention_heads_per_partition, dtype=torch.float32)
+            )
+            if self.world_size > 1:  # heads are split over tensor-parallel ranks
+                setattr(self.head_temperature, "tensor_model_parallel", True)
+                setattr(self.head_temperature, "partition_dim", 0)
+                setattr(self.head_temperature, "partition_stride", 1)
 
         # nGPT per-channel scalers on Q/K (s_qk). Built here so they sit beside
         # the norms they compensate for.

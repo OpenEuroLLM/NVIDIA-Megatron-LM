@@ -1073,6 +1073,12 @@ class TransformerConfig(ModelParallelConfig):
     about lr per step whatever its gradient's size, so this sets how fast the branch's share of the
     layer can grow (1: lr per step, 8.5e-4 in the main run, ~0.2 over a 200-step hand-over)."""
 
+    attention_head_temperature: bool = False
+    """A learned temperature per query head on the softmax-attention layers: the normalized query of head h is
+    multiplied by ``head_temperature[h]`` (initialized to 1, so a checkpoint without it computes exactly what it
+    computed before; a 1-D parameter, trained by the scalar optimizer) -- the logit scale of each head becomes
+    learnable (small31 arm T, docs/recall_surgery_ambitious.md §14.8). Needs split q / k / v."""
+
     muon_scale_reference_ffn_hidden_size: Optional[int] = None
     """Muon-family optimizers scale a matrix's orthogonalized update by a factor of its shape (sqrt(max(m, n))
     for scale_mode spectral). With this set, the dense MLP's linear_fc1 / linear_fc2 weights get the update scale of
