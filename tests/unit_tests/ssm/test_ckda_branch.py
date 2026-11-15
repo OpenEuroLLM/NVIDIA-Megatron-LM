@@ -446,3 +446,62 @@ def test_rest_dropout_at_the_mhc_write_skips_the_branch_layers():
     assert (write(layer(True), "mlp") == 0).any()  # the branch layer's MLP: dropped
     assert torch.equal(write(layer(True), "attn"), out)  # the branch layer's mixer: its BranchMix drops ckda
     assert torch.equal(write(layer(False, training=False), "attn"), out)  # eval: unchanged
+
+
+@gpu
+@pytest.mark.parametrize("branch", ["attention", "kvshare"])
+def test_rest_dropout_under_full_recompute_matches_no_recompute(model_parallel, branch):
+    """ckda_branch_rest_dropout under --recompute-granularity full (the 84B main run's setting): the backward's
+    recompute must redraw the forward's dropout mask (Megatron's checkpoint restores the CUDA RNG state); a fresh
+    mask would make the gradients O(1) different. Also: the dropout is active (another seed, another output)."""
+    from megatron.core.ssm.complex_kda import ComplexKDA
+    from megatron.core.tensor_parallel.random import checkpoint, model_parallel_cuda_manual_seed
+
+    torch.manual_seed(0)
+    model_parallel_cuda_manual_seed(0)
+    kw = dict(ckda_branch=branch, ckda_branch_layers=[1], ckda_branch_rest_dropout=0.3,
+              attention_dropout=0.0, hidden_dropout=0.0)
+    if branch == "kvshare":
+        kw["ckda_branch_kv_source_layers"] = [0]
+    config = _config(**kw)
+    layer = ComplexKDA(config, layer_number=2).cuda().bfloat16()
+    src = _source_attention(config)
+    with torch.no_grad():
+        layer.branch_mix.gamma.fill_(0.5)
+    layer.train()
+    src.train()
+    x = _x()
+
+    def run(recompute, seed=7):
+        cb.KV_STORE.clear()
+        for p in list(layer.parameters()) + list(src.parameters()):
+            p.grad = None
+        torch.manual_seed(seed)
+        model_parallel_cuda_manual_seed(seed)
+        xs = x.clone().requires_grad_()
+        if recompute:
+            h = checkpoint(lambda t: src(t, attention_mask=None)[0], False, xs)
+            out = checkpoint(lambda t: layer(t)[0], False, xs + h)
+        else:
+            h = src(xs, attention_mask=None)[0]
+            out = layer(xs + h)[0]
+        out.float().pow(2).mean().backward()
+        grads = {n: p.grad.float().clone() for n, p in layer.named_parameters() if p.grad is not None}
+        return out.detach().float(), xs.grad.float(), grads
+
+    def rel(a, b):
+        return float((a - b).norm() / b.norm().clamp_min(1e-30))
+
+    out0, gx0, g0 = run(False)
+    out1, gx1, g1 = run(True)
+    other, _, _ = run(False, seed=8)
+    print(f"{branch}: recompute vs not: out {rel(out1, out0):.2e}, input grad {rel(gx1, gx0):.2e}, "
+          f"other seed out {rel(other, out0):.2e}")
+    assert rel(other, out0) > 5e-2  # the rest dropout is active in training
+    assert rel(out1, out0) < 1e-2 and rel(gx1, gx0) < 3e-2
+    assert g0.keys() == g1.keys()
+    for n in g0:
+        if n.startswith("branch"):
+            assert g0[n].abs().sum() > 0, n
+        assert rel(g1[n], g0[n]) < 3e-2, (n, rel(g1[n], g0[n]))
+    cb.KV_STORE.clear()
