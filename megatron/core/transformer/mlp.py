@@ -300,6 +300,19 @@ class MLP(MegatronModule):
             tp_group=tp_group,
             name=(name + ".linear_fc2") if name is not None else None,
         )
+        ref = getattr(self.config, "muon_scale_reference_ffn_hidden_size", None)
+        if ref and not is_expert and not use_latent_size:
+            # the Muon update scale of these matrices at the reference width (emerging_optimizers reads
+            # muon_scale_shapes = (reference, actual) global shapes and rescales the orthogonalized update)
+            ffn, hidden = int(self.config.ffn_hidden_size), int(self.config.hidden_size)
+            glu = 2 if self.config.gated_linear_unit else 1
+            for lin, shapes in (
+                (self.linear_fc1, ((glu * int(ref), hidden), (glu * ffn, hidden))),
+                (self.linear_fc2, ((hidden, int(ref)), (hidden, ffn))),
+            ):
+                weight = getattr(lin, "weight", None)
+                if weight is not None:
+                    weight.muon_scale_shapes = shapes
 
     def _suv_local(self) -> torch.Tensor:
         """This TP rank's slice of the nGPT s_uv scaler (effective values)."""

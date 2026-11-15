@@ -310,6 +310,16 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         shard_size = gathered_grad.shape[0] // gtp_remat_size
         return gathered_grad[gtp_rank * shard_size : (gtp_rank + 1) * shard_size].contiguous()
 
+    def _scale_correction(self, p: torch.Tensor) -> float:
+        """A parameter's update-scale correction: scale(reference shape) / scale(actual shape) when the model tagged
+        it with ``muon_scale_shapes`` (TransformerConfig.muon_scale_reference_ffn_hidden_size), else 1."""
+        shapes = getattr(p, "muon_scale_shapes", None)
+        if not shapes:
+            return 1.0
+        (r0, c0), (r1, c1) = shapes
+        mode = self._scale_mode
+        return float(get_muon_scale_factor(r0, c0, mode=mode) / get_muon_scale_factor(r1, c1, mode=mode))
+
     def orthogonalize(self, p: torch.Tensor, grad: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         """Orthogonalize the momentum.
 
@@ -370,7 +380,8 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             grad = torch.cat(qkv_grads, dim=1).view(grad_shape)
         else:
             grad = self.scaled_orthogonalize_fn_with_gtp_remat(p, grad, tp_group, partition_dim)
-        return grad
+        correction = self._scale_correction(p)
+        return grad if correction == 1.0 else grad * correction
 
     def _tp_row_reduce_group(self, p: torch.Tensor) -> Optional["torch.distributed.ProcessGroup"]:
         """Return the TP group used for per-row reductions, if any."""
@@ -416,12 +427,14 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
 
         reduce_group = self._tp_row_reduce_group(p)
         qkv_split_shapes = self._effective_qkv_split_shapes(p)
-        key = (tuple(p.shape), partition_dim, id(tp_group), id(reduce_group), qkv_split_shapes)
+        correction = self._scale_correction(p)
+        key = (tuple(p.shape), partition_dim, id(tp_group), id(reduce_group), qkv_split_shapes, correction)
         return key, {
             "tp_group": tp_group,
             "reduce_group": reduce_group,
             "partition_dim": partition_dim,
             "qkv_split_shapes": qkv_split_shapes,
+            "scale_correction": correction,
         }
 
     def _scaled_ns_batched(self, x: torch.Tensor, batch: dict) -> torch.Tensor:
@@ -440,7 +453,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             tp_mode="duplicated" if self.tp_mode == "blockwise" else self.tp_mode,
         )
         scale_factor = get_muon_scale_factor(size[0], size[1], mode=self._scale_mode)
-        return orth * (scale_factor * self._extra_scale_factor)
+        return orth * (scale_factor * self._extra_scale_factor * batch.get("scale_correction", 1.0))
 
     def _orthogonalize_batched(self, update: torch.Tensor, batch: dict) -> torch.Tensor:
         """Batched orthogonalization with v0.19 parameter-specific QKV layouts."""
