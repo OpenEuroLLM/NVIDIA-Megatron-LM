@@ -1073,6 +1073,13 @@ class TransformerConfig(ModelParallelConfig):
     about lr per step whatever its gradient's size, so this sets how fast the branch's share of the
     layer can grow (1: lr per step, 8.5e-4 in the main run, ~0.2 over a 200-step hand-over)."""
 
+    ckda_branch_rest_dropout: float = 0.0
+    """Dropout on everything but the ckda_branch branches ("the rest"), in training only: the complex_kda term of
+    the branch layers (inside the branch mix, before the branch is added) and the outputs of every other
+    attention, complex_kda and MLP sublayer (at the mHC write); the branches and the Engram layers are not
+    dropped. Forces the model to carry information through the new branches while the rest is unreliable
+    (small31 arm D, docs/recall_surgery_ambitious.md §14.8). Needs the mHC residual (mhc)."""
+
     ckda_branch_log_interval: int = 10
     """Every this many iterations, rank 0 prints per branch layer alpha, m, gamma and the RMS of
     both mixers' outputs (``[ckda_branch]`` lines; 0: never)."""

@@ -309,6 +309,9 @@ class BranchMix(nn.Module):
             gamma = 1.0 + gamma
         if self.calib is not None:
             gamma = gamma * self.calib.to(gamma.dtype)
+        p = float(getattr(self.config, "ckda_branch_rest_dropout", 0.0) or 0.0)
+        if p > 0 and self.training:  # rest dropout: the complex_kda term only, the branch is added after it
+            y = torch.nn.functional.dropout(y, p=p, training=True)
         out = y * alpha + b * (gamma.to(b.dtype) * m)
         every = getattr(self.config, "ckda_branch_log_interval", 0)
         if every and it is not None and it % every == 0 and self._logged != it and torch.is_grad_enabled():

@@ -554,6 +554,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
             self.attnres_attn = _make_attnres() if has_attn else None
             self.attnres_mlp = _make_attnres() if has_mlp else None
+        if (float(getattr(self.config, "ckda_branch_rest_dropout", 0.0) or 0.0) > 0 and (has_attn or has_mlp)
+                and self.mhc_attn_mixer is None and self.mhc_mlp_mixer is None):
+            raise NotImplementedError("ckda_branch_rest_dropout: applied at the mHC write, needs the mHC residual")
         # Linear Depth Memory: a read before and an RLS write after every sublayer, on the
         # matrix memory the HybridStack stashes on `_depth_state` (as Block AttnRes').
         self.ldm_attn = None
@@ -1118,9 +1121,17 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         h_post, h_res, *link = pending
         # the fused read's link (mhc_fused.py) only for the MHCMixer that made it
         extra = {"link": link[0]} if link else {}
+        output = self._sublayer_output(output_with_bias)
+        p = float(getattr(self.config, "ckda_branch_rest_dropout", 0.0) or 0.0)
+        # ckda_branch rest dropout: every sublayer but the branch layers, which drop their complex_kda term
+        # themselves (BranchMix) so the branch is added undropped; Engram layers are not TransformerLayers
+        if p > 0 and self.training and not (
+            kind == "attn" and getattr(self.self_attention, "branch_mix", None) is not None
+        ):
+            output = torch.nn.functional.dropout(output, p=p, training=True)
         return mixer.write(
             streams,
-            self._sublayer_output(output_with_bias),
+            output,
             h_post,
             h_res,
             lerp=self._depth_lerp(

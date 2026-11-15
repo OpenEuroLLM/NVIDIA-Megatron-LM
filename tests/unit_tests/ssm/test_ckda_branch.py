@@ -401,3 +401,48 @@ def test_kvshare_under_full_recompute_matches_no_recompute(model_parallel):
         assert g0[n].abs().sum() > 0, n
         assert rel(g1[n], g0[n]) < 3e-2, (n, rel(g1[n], g0[n]))
     cb.KV_STORE.clear()
+
+
+def test_rest_dropout_drops_the_ckda_term_only_and_only_in_training():
+    # ckda_branch_rest_dropout (small31 arm D): the branch is added after the complex_kda term is dropped
+    torch.manual_seed(0)
+    c = _sched(ckda_branch_alpha_hold=0, ckda_branch_alpha_ramp=0, ckda_branch_alpha_end=1.0,
+               ckda_branch_m_start=1.0, ckda_branch_m_ramp=0, ckda_branch_rest_dropout=0.5)
+    mix = cb.BranchMix(c, layer_number=10)
+    with torch.no_grad():
+        mix.gamma.fill_(1.0)
+    y, b = torch.ones(64, 2, 8), torch.full((64, 2, 8), 3.0)
+    mix.train()
+    out = mix(y, b)
+    dropped = out - b  # the complex_kda term after dropout: 0 or 1 / (1 - p) = 2
+    assert set(dropped.unique().tolist()) == {0.0, 2.0}
+    assert 0.3 < (dropped == 0).float().mean().item() < 0.7
+    mix.eval()
+    assert torch.equal(mix(y, b), y + b)  # no dropout outside training
+    assert torch.equal(cb.BranchMix(_sched(), layer_number=10).train()(y, b), y)  # default 0: unchanged
+
+
+def test_rest_dropout_at_the_mhc_write_skips_the_branch_layers():
+    from megatron.core.transformer.transformer_layer import TransformerLayer
+
+    class Mixer:
+        def write(self, streams, output, h_post, h_res, lerp=None, **kw):
+            return output
+
+    def layer(branch, training=True):
+        return SimpleNamespace(
+            config=SimpleNamespace(ckda_branch_rest_dropout=0.5, mhc_lerp=False),
+            training=training,
+            self_attention=SimpleNamespace(branch_mix=object() if branch else None),
+            _sublayer_output=lambda ob: TransformerLayer._sublayer_output(None, ob),
+            _depth_lerp=lambda kind, use: None,
+        )
+
+    torch.manual_seed(0)
+    out = torch.ones(64, 2, 8)
+    write = lambda lay, kind: TransformerLayer._mhc_write(lay, Mixer(), kind, None, (out, None), (None, None))
+    assert (write(layer(False), "attn") == 0).any()  # an attention / complex_kda sublayer: dropped
+    assert (write(layer(False), "mlp") == 0).any()  # an MLP sublayer: dropped
+    assert (write(layer(True), "mlp") == 0).any()  # the branch layer's MLP: dropped
+    assert torch.equal(write(layer(True), "attn"), out)  # the branch layer's mixer: its BranchMix drops ckda
+    assert torch.equal(write(layer(False, training=False), "attn"), out)  # eval: unchanged
