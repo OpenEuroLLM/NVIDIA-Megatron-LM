@@ -155,6 +155,12 @@ hybrid_stack_spec = ModuleSpec(
         kvshare_layer=ModuleSpec(
             module=TransformerLayer,
             submodules=TransformerLayerSubmodules(
+                # The V layer normalizes its input like every other mixer (the source attention
+                # layer's keys / values are already normed; q / gate read the layer's normalized
+                # input). Without this the layer would attend on the raw residual stream, and the
+                # trained checkpoint would carry no norm parameter at all
+                # (docs/recall_surgery_ambitious.md §22.18).
+                input_layernorm=TENorm,
                 self_attention=ModuleSpec(
                     module=KVShareSelfAttention,
                     params={"attn_mask_type": AttnMaskType.causal},

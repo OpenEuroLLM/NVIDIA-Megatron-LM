@@ -590,3 +590,22 @@ def test_rest_dropout_under_full_recompute_matches_no_recompute(model_parallel, 
             assert g0[n].abs().sum() > 0, n
         assert rel(g1[n], g0[n]) < 3e-2, (n, rel(g1[n], g0[n]))
     cb.KV_STORE.clear()
+
+
+def test_v_layer_spec_normalizes_its_input():
+    """A V layer normalizes its input like every other mixer.
+
+    ``TransformerLayerSubmodules`` defaults ``input_layernorm`` to ``IdentityOp``; the kvshare
+    layer spec must set ``TENorm`` explicitly, otherwise the layer attends on the raw residual
+    stream and its checkpoint carries no norm parameter at all
+    (docs/recall_surgery_ambitious.md §22.18).
+    """
+    from megatron.core.extensions.transformer_engine import TENorm
+    from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+
+    kvshare = hybrid_stack_spec.submodules.kvshare_layer.submodules
+    assert kvshare.input_layernorm is TENorm
+    # plain linear: the norm is the layer's own, not fused into linear_qkv
+    from megatron.core.extensions.transformer_engine import TEColumnParallelLinear
+
+    assert kvshare.self_attention.submodules.linear_qkv is TEColumnParallelLinear
