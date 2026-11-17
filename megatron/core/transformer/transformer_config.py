@@ -1045,6 +1045,22 @@ class TransformerConfig(ModelParallelConfig):
     v_block_gate_start_iteration: int = 0
     """Iteration the ``v_block_gate_ramp`` counts from: the step the V layers were inserted at."""
 
+    v_block_learnable_gate: bool = False
+    """Learnable gates on every inserted ``V`` layer instead of the ``v_block_gate_ramp`` schedule.
+
+    The layer writes ``(1 - rho) * streams + rho * (h_res @ streams) + h_post^T (g_v * out)``:
+    ``g_v`` (``v_gate.out_gate``) scales the attention write and ``rho`` (``v_gate.res_gate``) the
+    ``h_res`` stream mixing. Both are one-element parameters, 0 at insertion, so the layer is an
+    exact identity at step 0. Unlike a schedule, both gates get a gradient at step 0
+    (``dL/dg_v = <delta, h_post^T out>`` with a copy-initialized branch whose output is not zero,
+    ``dL/drho = <delta, h_res @ streams - streams>``), so they open themselves while the branch is
+    already a working attention: 300 steps adapt a working path instead of bootstrapping a random
+    one. A convex combination of two doubly stochastic mixers stays doubly stochastic, so the
+    residual stays norm-preserving for every ``rho``. The gates are checkpoint tensors (Adam
+    state); the export folds ``g_v`` into ``linear_proj`` and ``rho`` into the mixer's ``h_res``.
+    Mutually exclusive with a positive ``v_block_gate_ramp``. See docs/v4b_plan.md.
+    """
+
     ckda_branch_serial: bool = False
     """Run the ``ckda_branch`` after the complex_kda mixer instead of beside it.
 

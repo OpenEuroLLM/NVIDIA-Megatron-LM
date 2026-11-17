@@ -301,6 +301,69 @@ class BaseTransformerLayer(ABC):
         pass
 
 
+class VBlockGate(torch.nn.Module):
+    """The learnable gates of an inserted ``V`` hybrid layer (``v_block_learnable_gate``).
+
+    ``out_gate`` is ``g_v`` on the attention write and ``res_gate`` is ``rho`` on the ``h_res``
+    stream mixing, so the layer writes
+
+        streams' = (1 - rho) * streams + rho * (h_res @ streams) + h_post^T (g_v * out)
+
+    Both are zero at insertion: the layer is an exact identity, and both gates get a gradient at
+    step 0 (``dL/dg_v = <delta, h_post^T out>``, ``dL/drho = <delta, h_res @ streams - streams>``),
+    so they open themselves while the branch is already a working attention. One element each; the
+    scalar optimizer (Adam) owns them, so they move by ~lr per step whatever the gradient's size.
+    See docs/v4b_plan.md.
+    """
+
+    def __init__(self, n_streams: int) -> None:
+        super().__init__()
+        self.out_gate = torch.nn.Parameter(torch.zeros(1))
+        self.res_gate = torch.nn.Parameter(torch.zeros(1))
+        self.n_streams = int(n_streams)
+        # cached per (device, dtype): the write runs once per sublayer per step, the eye is 16 values
+        self._eye: Dict[tuple, Tensor] = {}
+
+    def eye(self, like: Tensor) -> Tensor:
+        """The ``[n, n]`` identity on ``like``'s device / dtype."""
+        key = (like.device, like.dtype)
+        eye = self._eye.get(key)
+        if eye is None:
+            eye = self._eye[key] = torch.eye(self.n_streams, device=like.device, dtype=like.dtype)
+        return eye
+
+    def mix_streams(self, h_res: Tensor) -> Tensor:
+        """``lerp(I, h_res, rho)``: the stream mixer pulled toward the identity by ``rho``.
+
+        A convex combination of two doubly stochastic matrices is doubly stochastic, so the
+        norm-preserving property holds for every ``rho`` in [0, 1]. ``rho`` is not clamped: it is
+        the layer's own degree of freedom, and a value outside that range is a training result to
+        look at, not a case to hide.
+        """
+        return torch.lerp(self.eye(h_res), h_res, self.res_gate.to(h_res.dtype))
+
+
+def _build_v_gate(config, layer_number: int) -> "VBlockGate | None":
+    """The learnable gate module of layer ``layer_number`` (1-based), or None.
+
+    Only the inserted ``V`` layers (``kv_share_layers``) get one, so no other layer's checkpoint
+    changes. The schedule ``v_block_gate_ramp`` is the other gate for the same layers: both at once
+    would multiply two gates into one layer, so that is an error rather than a silent choice.
+    """
+    if not bool(getattr(config, "v_block_learnable_gate", False)):
+        return None
+    if int(getattr(config, "v_block_gate_ramp", 0) or 0) > 0:
+        raise ValueError(
+            "v_block_learnable_gate and v_block_gate_ramp gate the same V layers: set "
+            "v_block_gate_ramp 0 (docs/v4b_plan.md)"
+        )
+    if not bool(getattr(config, "mhc", False)):
+        raise ValueError("v_block_learnable_gate: the V layer's write is the mHC mixer's (needs mhc)")
+    if (layer_number - 1) not in set(getattr(config, "kv_share_layers", None) or ()):
+        return None
+    return VBlockGate(int(config.mhc_expansion_rate))
+
+
 class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
     """A single transformer layer.
 
@@ -382,6 +445,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         # [Module 3: BiasDropoutFusion]
         self.self_attn_bda = build_module(submodules.self_attn_bda)
+
+        # [Module 3b: the inserted V layers' learnable gates] g_v on the attention write, rho on the
+        # h_res stream mixing (v_block_learnable_gate, docs/v4b_plan.md). Built only on V layers, so
+        # no other layer's checkpoint changes. Both are 0 at insertion: an exact identity.
+        self.v_gate = _build_v_gate(config, self.layer_number)
 
         # [Module 4: Post SelfAttention] Optional Layernorm after self-attn
         self.pre_cross_attn_layernorm = submodules.pre_cross_attn_layernorm(
@@ -1129,6 +1197,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             kind == "attn" and getattr(self.self_attention, "branch_mix", None) is not None
         ):
             output = torch.nn.functional.dropout(output, p=p, training=True)
+        vgate = self._v_learnable_gate(kind)
+        if vgate is not None:
+            # g_v on the attention write, rho on the h_res stream mixing (v_block_learnable_gate):
+            # streams' = (1 - rho) * streams + rho * (h_res @ streams) + h_post^T (g_v * out). Scaling
+            # the write's output and pulling the mixer toward the identity both stay inside the one
+            # existing write kernel (no extra pass over the streams), and both gates are 0 at
+            # insertion, so the layer is an exact identity at step 0 with a gradient on each gate.
+            output = vgate.out_gate.to(output.dtype) * output
+            h_res = vgate.mix_streams(h_res)
         written = mixer.write(
             streams,
             output,
@@ -1141,6 +1218,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
         gate = self._v_block_gate(kind)
         if gate is None:
+            if vgate is not None:
+                self._record_v_gate(vgate, streams, written)
             return written
         self._record_v_block_impact(streams, written, gate)
         # r = 0 is the incoming streams bit-exactly: neither the attention write nor h_res applies.
@@ -1164,6 +1243,33 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         move = (w - x).square().sum(-1).sqrt().mean()
         size = x.square().sum(-1).sqrt().mean().clamp(min=1e-12)
         arch_metrics.record_mean("vgate/delta", layer, n, move / size)
+
+    def _record_v_gate(self, vgate: VBlockGate, streams: Tensor, written: Tensor) -> None:
+        """Record an inserted V layer's learned gates and how far they move the residual streams.
+
+        ``vgate/out`` is ``g_v``, ``vgate/res`` is ``rho`` and ``vgate/delta`` the relative residual
+        move ``||write - streams|| / ||streams||`` of the gated write. Arch metrics: nothing is
+        computed unless the step reports them.
+        """
+        from megatron.core.transformer import arch_metrics
+
+        if not arch_metrics.active():
+            return
+        layer, n = self.layer_number, arch_metrics.num_layers_of(self.config)
+        arch_metrics.record_mean("vgate/out", layer, n, vgate.out_gate.detach())
+        arch_metrics.record_mean("vgate/res", layer, n, vgate.res_gate.detach())
+        x = arch_metrics.token_rows(streams, 2).float()
+        w = arch_metrics.token_rows(written, 2).float()
+        move = (w - x).square().sum(-1).sqrt().mean()
+        size = x.square().sum(-1).sqrt().mean().clamp(min=1e-12)
+        arch_metrics.record_mean("vgate/delta", layer, n, move / size)
+
+    def _v_learnable_gate(self, kind: str) -> VBlockGate | None:
+        """The learnable gate module of an inserted ``V`` layer, or None (not a V layer / not attn)."""
+        vgate = getattr(self, "v_gate", None)
+        if vgate is None or kind != "attn":
+            return None
+        return vgate
 
     def _v_block_gate(self, kind: str) -> float | None:
         """The residual-level gate of an inserted ``V`` layer, or None when it writes whole.
