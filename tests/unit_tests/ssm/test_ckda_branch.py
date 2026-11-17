@@ -609,3 +609,27 @@ def test_v_layer_spec_normalizes_its_input():
     from megatron.core.extensions.transformer_engine import TEColumnParallelLinear
 
     assert kvshare.self_attention.submodules.linear_qkv is TEColumnParallelLinear
+
+
+def test_v_param_row_norms_split_q_gate_and_o():
+    """The inserted V branch's row norms, split q / gate per query group and o over its rows.
+
+    These are the numbers that say whether the branch survives MuOwn's magnitude step: a matrix
+    whose radial gradient stays negative loses ``lr`` of row norm per step (v4a: 0.02 -> 5e-4).
+    """
+    from megatron.core.transformer.transformer_layer import _v_param_row_norms
+
+    groups, per, hidden = 2, 3, 4
+    qkv = torch.zeros(groups * 2 * per, hidden)
+    v = qkv.view(groups, 2, per, hidden)
+    v[:, 0] = 1.0  # q rows: norm sqrt(hidden)
+    v[:, 1] = 2.0  # gate rows: norm 2 sqrt(hidden)
+    out = _v_param_row_norms(qkv, groups, groups * 2 * per)
+    assert set(out) == {"q", "gate"}
+    assert torch.isclose(out["q"], torch.tensor(hidden ** 0.5))
+    assert torch.isclose(out["gate"], torch.tensor(2 * hidden ** 0.5))
+    # no group / out_dim information: one number for the whole matrix
+    assert set(_v_param_row_norms(qkv)) == {"qkv"}
+    # linear_proj: rows are the output dims
+    o = torch.full((5, 3), 0.5)
+    assert torch.isclose(_v_param_row_norms(o)["qkv"], torch.tensor(0.5 * 3 ** 0.5))

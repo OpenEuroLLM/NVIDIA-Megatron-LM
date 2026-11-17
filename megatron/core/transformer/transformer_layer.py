@@ -301,6 +301,27 @@ class BaseTransformerLayer(ABC):
         pass
 
 
+def _v_param_row_norms(weight: Tensor, groups: int | None = None,
+                       out_dim: int | None = None) -> Dict[str, Tensor]:
+    """Mean row norms of an inserted V layer's attention weights, by name.
+
+    The row norm is the quantity that decides whether the branch survives MuOwn's magnitude step:
+    a matrix whose radial gradient stays negative loses ``lr`` of row norm per step, so it collapses
+    to ~``lr`` within tens of steps (that is what happened to v4a's ``q`` / ``gate``: 0.02 -> 5e-4).
+    Holding near the copy-init values means the branch is alive.
+
+    ``linear_qkv`` rows are ``[groups, 2, per]`` ([q | gate] per query group, ckda_branch.py), so
+    with ``groups`` and ``out_dim`` the q and gate rows are reported apart; otherwise the whole
+    matrix is one number. ``linear_proj`` rows are the output dims.
+    """
+    w = weight.detach().float()
+    if groups and out_dim and out_dim % (2 * groups) == 0:
+        v = w.view(groups, 2, out_dim // (2 * groups), -1)
+        return {"q": v[:, 0].square().sum(-1).sqrt().mean(),
+                "gate": v[:, 1].square().sum(-1).sqrt().mean()}
+    return {"qkv": w.square().sum(-1).sqrt().mean()}
+
+
 class VBlockGate(torch.nn.Module):
     """The learnable gates of an inserted ``V`` hybrid layer (``v_block_learnable_gate``).
 
@@ -1248,8 +1269,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         """Record an inserted V layer's learned gates and how far they move the residual streams.
 
         ``vgate/out`` is ``g_v``, ``vgate/res`` is ``rho`` and ``vgate/delta`` the relative residual
-        move ``||write - streams|| / ||streams||`` of the gated write. Arch metrics: nothing is
-        computed unless the step reports them.
+        move ``||write - streams|| / ||streams||`` of the gated write. ``vnorm/q``, ``vnorm/gate``
+        and ``vnorm/o`` are the branch weights' mean row norms (see :func:`_v_param_row_norms`):
+        they say whether the branch is still alive after the gate opens, which the gate values alone
+        cannot. Arch metrics: nothing is computed unless the step reports them.
         """
         from megatron.core.transformer import arch_metrics
 
@@ -1263,6 +1286,19 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         move = (w - x).square().sum(-1).sqrt().mean()
         size = x.square().sum(-1).sqrt().mean().clamp(min=1e-12)
         arch_metrics.record_mean("vgate/delta", layer, n, move / size)
+        attn = getattr(self, "self_attention", None)
+        qkv = getattr(getattr(attn, "linear_qkv", None), "weight", None)
+        if qkv is not None:
+            for tag, value in _v_param_row_norms(
+                qkv,
+                getattr(attn, "num_query_groups_per_partition", None),
+                getattr(attn, "linear_qkv_out_dim", None),
+            ).items():
+                arch_metrics.record_mean(f"vnorm/{tag}", layer, n, value)
+        o = getattr(getattr(attn, "linear_proj", None), "weight", None)
+        if o is not None:
+            for tag, value in _v_param_row_norms(o).items():
+                arch_metrics.record_mean(f"vnorm/o", layer, n, value)
 
     def _v_learnable_gate(self, kind: str) -> VBlockGate | None:
         """The learnable gate module of an inserted ``V`` layer, or None (not a V layer / not attn)."""
