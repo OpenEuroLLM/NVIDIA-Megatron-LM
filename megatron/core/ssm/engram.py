@@ -167,6 +167,24 @@ def engram_hash_multipliers(
     return torch.from_numpy(mult | 1).to(torch.int64)
 
 
+def engram_hash_layer_number(
+    config: TransformerConfig, layer_number: Optional[int]
+) -> Optional[int]:
+    """The layer number the n-gram hash seeds use.
+
+    ``V`` layers (``kv_share_layers``) are insertions: they add depth without renumbering
+    the layers after them. An Engram layer behind inserted V layers keeps the hash
+    multipliers of its pre-insertion position, so the stitched model stays
+    function-preserving (docs/recall_surgery_ambitious.md §22: the second Engram layer
+    moves from layer_number 50 to 53, and its seeds must stay those of 50).
+    """
+    if layer_number is None:
+        return None
+    index = int(layer_number) - 1
+    inserted = {int(i) for i in (getattr(config, "kv_share_layers", None) or [])}
+    return index - sum(1 for i in inserted if i < index) + 1
+
+
 def engram_sign_table(config: TransformerConfig) -> torch.Tensor:
     """The fixed +-1 table of ``engram_sign_hash``: [engram_sign_table_size, embed_dim]."""
     rng = np.random.default_rng(_SIGN_TABLE_SEED)
@@ -256,6 +274,9 @@ class EngramLayer(MegatronModule):
         self.cp_group = pg_collection.cp if pg_collection.cp.size() > 1 else None
         self.config = config
         self.layer_number = layer_number
+        # The hash seeds, pinned across layer insertions (engram_hash_layer_number). The
+        # output scale and the metrics keep the layer's own stack position.
+        hash_layer_number = engram_hash_layer_number(config, layer_number)
         self.tp_group = pg_collection.tp
         tp_size, tp_rank = self.tp_group.size(), self.tp_group.rank()
 
@@ -271,12 +292,12 @@ class EngramLayer(MegatronModule):
             "row_offsets", torch.tensor(offsets, dtype=torch.int64), persistent=False
         )
         self.register_buffer(
-            "hash_mult", engram_hash_multipliers(config, layer_number), persistent=False
+            "hash_mult", engram_hash_multipliers(config, hash_layer_number), persistent=False
         )
         if config.engram_sign_hash:
             self.register_buffer(
                 "sign_mult",
-                engram_hash_multipliers(config, layer_number, seed=_SIGN_HASH_SEED),
+                engram_hash_multipliers(config, hash_layer_number, seed=_SIGN_HASH_SEED),
                 persistent=False,
             )
             self.register_buffer("sign_table", engram_sign_table(config), persistent=False)
@@ -286,13 +307,13 @@ class EngramLayer(MegatronModule):
         self.register_buffer("token_map", token_map, persistent=False)
         if self.aux_orders:
             self.register_buffer(
-                "aux_hash_mult", engram_hash_multipliers(config, layer_number, aux=True),
+                "aux_hash_mult", engram_hash_multipliers(config, hash_layer_number, aux=True),
                 persistent=False,
             )
             if config.engram_sign_hash:
                 self.register_buffer(
                     "aux_sign_mult",
-                    engram_hash_multipliers(config, layer_number, seed=_SIGN_HASH_SEED, aux=True),
+                    engram_hash_multipliers(config, hash_layer_number, seed=_SIGN_HASH_SEED, aux=True),
                     persistent=False,
                 )
             aux_map = None

@@ -13,6 +13,7 @@ from megatron.core.ssm.engram import (
     EngramLayer,
     document_positions,
     engram_hash,
+    engram_hash_layer_number,
     engram_hash_multipliers,
     engram_sign_table,
     engram_table_sizes,
@@ -78,6 +79,36 @@ def test_hash_per_layer():
     assert torch.equal(engram_hash_multipliers(shared, 1), engram_hash_multipliers(shared, 5))
     assert not torch.equal(engram_hash_multipliers(own, 1), engram_hash_multipliers(own, 5))
     assert bool((engram_hash_multipliers(own, 5) % 2 == 1).all())
+
+
+def test_v_insertions_keep_the_engram_hash_seeds():
+    """V layers are insertions: they do not renumber the Engram hash seeds.
+
+    The v4a surgery inserts six V layers after the CKDA layers 9 / 25 / 41 / 58 / 74 / 90
+    (docs/recall_surgery_ambitious.md §22), which moves the second Engram layer from index
+    49 (layer_number 50) to 52 (layer_number 53). With ``engram_hash_per_layer`` the hash
+    multipliers are seeded per layer_number, so the shifted layer must keep the seeds of 50
+    for the stitched model to be function-preserving.
+    """
+    base = _config(engram_hash_per_layer=True)
+    stitched = _config(engram_hash_per_layer=True, kv_share_layers=[10, 27, 44, 62, 79, 96])
+    # first Engram layer (index 2) is not moved by the insertions after it
+    assert engram_hash_layer_number(stitched, 3) == 3
+    # second Engram layer: index 52 -> layer_number 53, pinned to the pre-insertion 50
+    assert engram_hash_layer_number(stitched, 53) == 50
+    assert torch.equal(
+        engram_hash_multipliers(stitched, engram_hash_layer_number(stitched, 53)),
+        engram_hash_multipliers(base, 50),
+    )
+    assert not torch.equal(
+        engram_hash_multipliers(stitched, engram_hash_layer_number(stitched, 53)),
+        engram_hash_multipliers(stitched, 53),
+    )
+    # a V layer after a layer does not renumber it; one before it does
+    assert engram_hash_layer_number(stitched, 20) == 19  # index 19, one V below
+    # without insertions the layer's own position is the seed layer number
+    assert engram_hash_layer_number(base, 53) == 53
+    assert engram_hash_layer_number(base, None) is None
 
 
 class TestDocumentPositions:
