@@ -1142,8 +1142,28 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         gate = self._v_block_gate(kind)
         if gate is None:
             return written
+        self._record_v_block_impact(streams, written, gate)
         # r = 0 is the incoming streams bit-exactly: neither the attention write nor h_res applies.
         return torch.lerp(streams, written, gate)
+
+    def _record_v_block_impact(self, streams: Tensor, written: Tensor, gate: float) -> None:
+        """Record how far the inserted V layer moves the residual streams.
+
+        ``vgate/r`` is the gate itself and ``vgate/delta`` the relative residual move
+        ``||write - streams|| / ||streams||`` of the ungated write, so the layer's actual impact is
+        ``r * delta``. Both are arch metrics: nothing is computed unless the step reports them.
+        """
+        from megatron.core.transformer import arch_metrics
+
+        if not arch_metrics.active():
+            return
+        layer, n = self.layer_number, arch_metrics.num_layers_of(self.config)
+        arch_metrics.record_mean("vgate/r", layer, n, torch.as_tensor(gate, device=streams.device))
+        x = arch_metrics.token_rows(streams, 2).float()
+        w = arch_metrics.token_rows(written, 2).float()
+        move = (w - x).square().sum(-1).sqrt().mean()
+        size = x.square().sum(-1).sqrt().mean().clamp(min=1e-12)
+        arch_metrics.record_mean("vgate/delta", layer, n, move / size)
 
     def _v_block_gate(self, kind: str) -> float | None:
         """The residual-level gate of an inserted ``V`` layer, or None when it writes whole.
