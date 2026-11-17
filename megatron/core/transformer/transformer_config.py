@@ -1024,6 +1024,24 @@ class TransformerConfig(ModelParallelConfig):
     no-op; the branch's weights come from checkpoint surgery
     (scripts/korbi/production/add_ckda_branch.py)."""
 
+    kv_share_layers: Optional[list[int]] = None
+    """First-class ``V`` hybrid layers: 0-based layer indices, paired with ``kv_share_source_layers``."""
+    kv_share_source_layers: Optional[list[int]] = None
+    """For each ``kv_share_layers`` entry, the 0-based earlier attention layer whose keys / values
+    the V layer reads. A V layer is a shared-KV attention layer in the pattern, not a ckda_branch."""
+
+    ckda_branch_serial: bool = False
+    """Run the ``ckda_branch`` after the complex_kda mixer instead of beside it.
+
+    The branch then receives ``LayerNorm(ckda(x))`` and the layer computes
+    ``out = ckda(x) + m(t) * gamma * branch(LayerNorm(ckda(x)))``.  ``gamma`` is
+    still one learned scalar per layer and is 0 at insertion, so the layer is
+    function-preserving at zero.  This is a serial *branch* inside the existing
+    layer, not an extra depth layer: the layer count and the checkpoint layout
+    are unchanged.  It exists so the post-stitch v4a variant can be evaluated
+    without changing the model depth (docs/recall_surgery_ambitious.md §22).
+    """
+
     ckda_branch_layers: Optional[list[int]] = None
     """0-based indices (in the decoder's layer list, as the checkpoint keys
     ``decoder.layers.<i>``) of the complex_kda layers that get the branch."""

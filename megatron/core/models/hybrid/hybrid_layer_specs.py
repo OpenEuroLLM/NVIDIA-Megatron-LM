@@ -16,6 +16,7 @@ from megatron.core.models.gpt.moe_module_specs import (
 )
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
 from megatron.core.ssm.engram import EngramLayer
+from megatron.core.ssm.ckda_branch import KVShareSelfAttention
 from megatron.core.ssm.product_key_memory import ProductKeyMemoryLayer
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNetSubmodules
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
@@ -144,6 +145,21 @@ hybrid_stack_spec = ModuleSpec(
                     params={"attn_mask_type": AttnMaskType.causal},
                     submodules=SelfAttentionSubmodules(
                         linear_qkv=TELayerNormColumnParallelLinear,
+                        core_attention=TEDotProductAttention,
+                        linear_proj=TERowParallelLinear,
+                    ),
+                ),
+                self_attn_bda=get_bias_dropout_add,
+            ),
+        ),
+        kvshare_layer=ModuleSpec(
+            module=TransformerLayer,
+            submodules=TransformerLayerSubmodules(
+                self_attention=ModuleSpec(
+                    module=KVShareSelfAttention,
+                    params={"attn_mask_type": AttnMaskType.causal},
+                    submodules=SelfAttentionSubmodules(
+                        linear_qkv=TEColumnParallelLinear,
                         core_attention=TEDotProductAttention,
                         linear_proj=TERowParallelLinear,
                     ),

@@ -69,6 +69,21 @@ def schedule(config, iteration: int | None) -> tuple[float, float]:
     return alpha, m
 
 
+def branch_input(config, hidden_states, ckda_out):
+    """The tensor the branch sees.
+
+    Parallel (default): the layer input, so the branch is a second mixer beside CKDA.
+    Serial (``ckda_branch_serial``): the layer-normalized CKDA output, so the branch is an
+    attention step after CKDA.  The LayerNorm is parameter-free; gamma remains the only new
+    parameter and is zero at insertion, so the layer is function-preserving either way.
+    """
+    if not bool(getattr(config, "ckda_branch_serial", False)):
+        return hidden_states
+    return torch.nn.functional.layer_norm(
+        ckda_out, (ckda_out.shape[-1],), eps=float(config.layernorm_epsilon)
+    )
+
+
 def branch_config(config):
     """The branch's config: a shallow copy (no __post_init__ re-run) with the branch's KV groups."""
     c = copy.copy(config)
@@ -105,11 +120,27 @@ def kv_source(config, layer_number: int) -> int | None:
     return src
 
 
+def kvshare_source(config, layer_number: int) -> int:
+    """The source layer (0-based) of a first-class ``V`` layer ``layer_number`` (1-based)."""
+    layers = list(getattr(config, "kv_share_layers", None) or [])
+    sources = list(getattr(config, "kv_share_source_layers", None) or [])
+    if len(layers) != len(sources):
+        raise ValueError(
+            f"kv_share_layers {layers} needs one kv_share_source_layers entry per layer, got {sources}"
+        )
+    try:
+        return sources[layers.index(layer_number - 1)]
+    except ValueError:
+        raise ValueError(f"V layer {layer_number - 1}: not in kv_share_layers {layers}") from None
+
+
 def publishes_kv(config, layer_number: int) -> bool:
     """Whether the attention layer ``layer_number`` (1-based) is a kvshare source."""
-    return getattr(config, "ckda_branch", None) == "kvshare" and (layer_number - 1) in set(
+    if getattr(config, "ckda_branch", None) == "kvshare" and (layer_number - 1) in set(
         getattr(config, "ckda_branch_kv_source_layers", None) or []
-    )
+    ):
+        return True
+    return (layer_number - 1) in set(getattr(config, "kv_share_source_layers", None) or [])
 
 
 def publish_kv(layer_number: int, key: torch.Tensor, value: torch.Tensor) -> None:
@@ -134,9 +165,9 @@ def _kvshare_attention_class():
         ``linear_qkv`` produces per query group [q | gate] only (the stack's own layout minus k, v),
         q norm, output gate and XSA as the source's kind; no k norm (the keys come normed)."""
 
-        def __init__(self, config, submodules, layer_number, kv_src: int, **kwargs):
+        def __init__(self, config, submodules, layer_number, kv_src: int | None = None, **kwargs):
             super().__init__(config, submodules, layer_number, **kwargs)
-            self.kv_src = kv_src
+            self.kv_src = kv_src if kv_src is not None else kvshare_source(config, layer_number)
             if getattr(self, "canon_b", None) is not None:
                 raise NotImplementedError("ckda_branch kvshare: Canon B")
             if self.config.num_query_groups < self.world_size:
@@ -184,6 +215,10 @@ def _kvshare_attention_class():
             return (query, key, value, gate) if output_gate else (query, key, value)
 
     return KVShareSelfAttention
+
+
+# Public, importable class for a first-class `V` hybrid layer (hybrid_layer_specs.py).
+KVShareSelfAttention = _kvshare_attention_class()
 
 
 def build_branch(config, layer_number: int, pg_collection=None) -> nn.Module:

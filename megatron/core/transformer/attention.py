@@ -1745,8 +1745,11 @@ class Attention(MegatronModule, ABC):
         if self.length_scaling != "none":
             query = self._length_scale_query(query, packed_seq_params, inference_context)
 
-        if getattr(self.config, "ckda_branch", None) == "kvshare":
-            # ckda_branch kvshare (megatron/core/ssm/ckda_branch.py): a source layer publishes the
+        if getattr(self.config, "ckda_branch", None) == "kvshare" or getattr(
+            self.config, "kv_share_layers", None
+        ):
+            # ckda_branch kvshare / first-class V layers (megatron/core/ssm/ckda_branch.py):
+            # a source layer publishes the
             # keys / values its core attention gets; a kvshare branch attends over its source's
             from megatron.core.ssm import ckda_branch as _ckda_branch
 

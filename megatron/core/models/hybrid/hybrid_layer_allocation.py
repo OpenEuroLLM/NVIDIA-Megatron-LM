@@ -37,6 +37,7 @@ class Symbols:
     SWA_ATTENTION = "W"
     DS_ATTENTION = "D"
     MLA = "+"
+    KVSHARE = 'V'
     MLP = "-"
     MOE = 'E'
     PIPE = '|'
@@ -53,6 +54,7 @@ class Symbols:
         SWA_ATTENTION,
         DS_ATTENTION,
         MLA,
+        KVSHARE,
         MLP,
         MOE,
     }

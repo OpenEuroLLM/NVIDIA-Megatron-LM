@@ -188,6 +188,91 @@ def _x(seq=64, batch=2):
     return torch.randn(seq, batch, HIDDEN, device="cuda", dtype=torch.bfloat16)
 
 
+class _RecordingBranch(torch.nn.Module):
+    """A branch that records its input and returns zeros or ones."""
+
+    def __init__(self, ones: bool = False):
+        super().__init__()
+        self.ones = ones
+        self.input = None
+
+    def forward(self, hidden_states, **kwargs):
+        self.input = hidden_states.detach().clone()
+        return torch.ones_like(hidden_states) if self.ones else torch.zeros_like(hidden_states), None
+
+
+def test_branch_input_parallel_vs_serial():
+    x = torch.randn(5, 2, 8)
+    y = torch.randn(5, 2, 8)
+    parallel = SimpleNamespace(ckda_branch_serial=False, layernorm_epsilon=1e-5)
+    serial = SimpleNamespace(ckda_branch_serial=True, layernorm_epsilon=1e-5)
+    assert torch.equal(cb.branch_input(parallel, x, y), x)
+    want = torch.nn.functional.layer_norm(y, (8,), eps=1e-5)
+    assert torch.allclose(cb.branch_input(serial, x, y), want)
+
+
+@gpu
+def test_serial_branch_uses_normalized_ckda_output_at_2layer_scale(model_parallel):
+    layer = _layer(ckda_branch="attention", ckda_branch_serial=True)
+    layer.eval()
+    x = _x()
+    branch, layer.branch = layer.branch, None
+    with torch.no_grad():
+        ckda_out = layer(x)[0]
+    rec = _RecordingBranch()
+    layer.branch = rec
+    with torch.no_grad():
+        layer(x)
+    want = torch.nn.functional.layer_norm(
+        ckda_out, (HIDDEN,), eps=float(layer.config.layernorm_epsilon)
+    )
+    assert torch.allclose(rec.input, want, atol=2e-2, rtol=2e-2)
+    assert not torch.allclose(rec.input, x, atol=2e-2, rtol=2e-2)
+
+
+@gpu
+def test_serial_branch_adds_after_ckda_at_2layer_scale(model_parallel, monkeypatch):
+    layer = _layer(ckda_branch="attention", ckda_branch_serial=True)
+    layer.eval()
+    x = _x()
+    branch, layer.branch = layer.branch, None
+    with torch.no_grad():
+        ckda_out = layer(x)[0]
+    layer.branch = _RecordingBranch(ones=True)
+    with torch.no_grad():
+        layer.branch_mix.gamma.fill_(0.1)
+    monkeypatch.setattr(cb, "current_iteration", lambda: None)  # insertion schedule: alpha 1, m = m_start
+    with torch.no_grad():
+        out = layer(x)[0]
+    want = ckda_out + 0.1 * float(layer.config.ckda_branch_m_start)
+    assert torch.allclose(out, want, atol=2e-2, rtol=2e-2)
+
+
+@gpu
+def test_serial_branch_exact_start_and_grad_at_2layer_scale(model_parallel):
+    layer = _layer(ckda_branch="attention", ckda_branch_serial=True)
+    x = _x()
+    with torch.no_grad():
+        with_branch = layer(x)[0]
+        branch, layer.branch = layer.branch, None
+        without = layer(x)[0]
+        layer.branch = branch
+    assert torch.equal(with_branch, without)  # gamma = 0: identity, as the parallel arm
+    with torch.no_grad():
+        layer.branch_mix.gamma.fill_(0.5)
+    out = layer(x)[0]
+    assert not torch.equal(out.detach(), without)
+    out.float().pow(2).mean().backward()
+    assert layer.branch.linear_qkv.weight.grad.abs().sum() > 0
+    assert layer.branch_mix.gamma.grad.abs().sum() > 0
+
+
+@gpu
+def test_serial_branch_rejects_crossfade(model_parallel):
+    with pytest.raises(ValueError, match="serial"):
+        _layer(ckda_branch="attention", ckda_branch_serial=True, ckda_branch_crossfade=True)
+
+
 @gpu
 @pytest.mark.parametrize("groups", [2, 4])
 def test_attention_branch_names_shapes_and_exact_start(model_parallel, groups):

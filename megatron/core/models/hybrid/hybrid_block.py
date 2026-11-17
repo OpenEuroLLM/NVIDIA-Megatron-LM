@@ -60,6 +60,7 @@ class HybridStackSubmodules:
     engram_layer: Union[ModuleSpec, type] = IdentityOp
     pkm_layer: Union[ModuleSpec, type] = IdentityOp
     attention_layer: Union[ModuleSpec, type] = IdentityOp
+    kvshare_layer: Union[ModuleSpec, type] = IdentityOp
     dsa_layer: Union[ModuleSpec, type] = IdentityOp
     mla_layer: Union[ModuleSpec, type] = IdentityOp
     mlp_layer: Union[ModuleSpec, type] = IdentityOp
@@ -175,6 +176,17 @@ class HybridStack(MegatronModule):
                 elif layer_type == LayerSymbols.DS_ATTENTION:
                     layer = build_module(
                         submodules.dsa_layer,
+                        config=self.config,
+                        layer_number=layer_number,
+                        pg_collection=pg_collection,
+                        is_mtp_layer=is_mtp_layer,
+                        add_layer_offset=False,
+                        pp_layer_offset=pp_layer_offset,
+                        name=(name + f".layers.{i}") if name is not None else None,
+                    )
+                elif layer_type == LayerSymbols.KVSHARE:
+                    layer = build_module(
+                        submodules.kvshare_layer,
                         config=self.config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,

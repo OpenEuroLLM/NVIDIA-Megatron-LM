@@ -329,6 +329,10 @@ class ComplexKDA(_MegatronSelfAttentionAdapter):
         if _cb.has_branch(config, layer_number):
             if self.cp_group is not None:
                 raise NotImplementedError("ckda_branch: context parallelism is not wired")
+            if bool(getattr(config, "ckda_branch_serial", False)) and bool(
+                getattr(config, "ckda_branch_crossfade", False)
+            ):
+                raise ValueError("ckda_branch_serial: crossfade is not supported (serial is additive only)")
             self.branch = _cb.build_branch(config, layer_number, kwargs.get("pg_collection"))
             self.branch_mix = _cb.BranchMix(config, layer_number)
 
@@ -353,13 +357,20 @@ class ComplexKDA(_MegatronSelfAttentionAdapter):
             packed_seq_params=packed_seq_params, sequence_len_offset=sequence_len_offset, **kwargs)
         if self.branch is None:
             return y, None
+        # Serial v4a: the branch sees LayerNorm(CKDA output) instead of the
+        # CKDA input.  The layer stays one mixer deep; gamma is still zero at
+        # insertion, so this is function-preserving.  A true extra depth layer
+        # would need surgery and is deliberately not represented by this flag.
+        from megatron.core.ssm import ckda_branch as _cb
+
+        branch_input = _cb.branch_input(self.config, hidden_states, y)
         if self.config.ckda_branch in ("attention", "kvshare"):
             b, bias = self.branch(
-                hidden_states, attention_mask=attention_mask, inference_context=inference_context,
+                branch_input, attention_mask=attention_mask, inference_context=inference_context,
                 rotary_pos_emb=rotary_pos_emb, rotary_pos_cos=rotary_pos_cos, rotary_pos_sin=rotary_pos_sin,
                 packed_seq_params=packed_seq_params, sequence_len_offset=sequence_len_offset)
         else:
-            b, bias = self.branch(hidden_states, attention_mask=attention_mask,
+            b, bias = self.branch(branch_input, attention_mask=attention_mask,
                                   inference_context=inference_context, packed_seq_params=packed_seq_params,
                                   sequence_len_offset=sequence_len_offset)
         if bias is not None:
