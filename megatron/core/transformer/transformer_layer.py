@@ -1129,7 +1129,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             kind == "attn" and getattr(self.self_attention, "branch_mix", None) is not None
         ):
             output = torch.nn.functional.dropout(output, p=p, training=True)
-        return mixer.write(
+        written = mixer.write(
             streams,
             output,
             h_post,
@@ -1139,6 +1139,36 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             ),
             **extra,
         )
+        gate = self._v_block_gate(kind)
+        if gate is None:
+            return written
+        # r = 0 is the incoming streams bit-exactly: neither the attention write nor h_res applies.
+        return torch.lerp(streams, written, gate)
+
+    def _v_block_gate(self, kind: str) -> float | None:
+        """The residual-level gate of an inserted ``V`` layer, or None when it writes whole.
+
+        ``v_block_gate_ramp`` (0 = off) scales the layer's whole mHC delta, so the attention
+        write and the ``h_res`` stream mixing both ramp in over the first ``ramp`` iterations
+        after ``v_block_gate_start_iteration``. Only the attention write of a
+        ``kv_share_layers`` layer is gated, and the gate is dropped once the ramp completes.
+        """
+        ramp = int(getattr(self.config, "v_block_gate_ramp", 0) or 0)
+        if ramp <= 0 or kind != "attn":
+            return None
+        if (self.layer_number - 1) not in (self.config.kv_share_layers or ()):
+            return None
+        # imported here: ckda_branch owns the iteration accessor and transformer_layer loads early
+        from megatron.core.ssm.ckda_branch import current_iteration
+
+        iteration = current_iteration()
+        if iteration is None:
+            # no training loop (evaluation, unit tests): a trained layer writes whole
+            return None
+        t = iteration - int(getattr(self.config, "v_block_gate_start_iteration", 0) or 0)
+        if t >= ramp:
+            return None
+        return max(0.0, t / ramp)
 
     # -------------------------------------------------------------- AttnRes
     def _depth_read(self, kind: str) -> Tensor:

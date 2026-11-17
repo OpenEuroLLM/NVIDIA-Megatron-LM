@@ -1030,6 +1030,21 @@ class TransformerConfig(ModelParallelConfig):
     """For each ``kv_share_layers`` entry, the 0-based earlier attention layer whose keys / values
     the V layer reads. A V layer is a shared-KV attention layer in the pattern, not a ckda_branch."""
 
+    v_block_gate_ramp: int = 0
+    """Ramp length, in iterations, of the residual-level gate on every inserted ``V`` layer.
+
+    0 (the default) gates nothing: the layer writes its whole mHC delta from step 0, which is
+    what v4a does. A positive value writes ``streams + r(t) * (write - streams)`` with
+    ``r(t) = clamp((t - v_block_gate_start_iteration) / ramp, 0, 1)``, so at ``r = 0`` the
+    inserted layer is an exact identity -- no attention write and no ``h_res`` stream mixing --
+    and both ramp in together. The gate is a schedule, not a parameter: nothing is added to the
+    checkpoint, and the lerp is skipped once ``r`` reaches 1, so an export past the ramp carries
+    no gate. See docs/v4b_plan.md.
+    """
+
+    v_block_gate_start_iteration: int = 0
+    """Iteration the ``v_block_gate_ramp`` counts from: the step the V layers were inserted at."""
+
     ckda_branch_serial: bool = False
     """Run the ``ckda_branch`` after the complex_kda mixer instead of beside it.
 
