@@ -301,6 +301,39 @@ class BaseTransformerLayer(ABC):
         pass
 
 
+# Set once if recording the V-gate metrics raised: a diagnostic must never take an arm down.
+_VGATE_METRIC_ERROR: str | None = None
+
+
+def _plain_gate(param: Tensor) -> Tensor:
+    """A one-element gate parameter as a plain contiguous tensor.
+
+    Under FSDP2 every parameter is a ``DTensor``, and a one-element parameter is sharded across
+    the data-parallel ranks: its local shard is *empty* on all but one rank. ``arch_metrics``
+    keeps plain CUDA buffers, adds the recorded values into them and all-reduces those, so a
+    ``DTensor`` there is wrong; ``full_tensor`` all-gathers the one element (a collective, so
+    every rank must call it in the same order -- they do, the recording runs on every rank) and
+    returns an aligned plain tensor. A shard view into the flat parameter buffer is also what
+    faults the vectorized kernels with ``CUDA error: misaligned address`` (v4b, iteration 36000).
+    """
+    value = param.detach().float()
+    full = getattr(value, "full_tensor", None)
+    return (full() if full is not None else value).contiguous()
+
+
+def _plain_weight(weight: Tensor) -> Tensor:
+    """A weight as a contiguous *local* plain tensor: the rows this rank owns.
+
+    A ``DTensor`` weight is sharded along dim 0, so ``to_local`` keeps this rank's rows; the
+    mean row norm over them is the quantity the metric reports (the all-reduce over ranks in
+    ``arch_metrics.collect`` averages the per-rank means). Gathering the full weight instead
+    would copy it on every metrics step.
+    """
+    value = weight.detach().float()
+    local = getattr(value, "to_local", None)
+    return (local() if local is not None else value).contiguous()
+
+
 def _v_param_row_norms(weight: Tensor, groups: int | None = None,
                        out_dim: int | None = None) -> Dict[str, Tensor]:
     """Mean row norms of an inserted V layer's attention weights, by name.
@@ -314,7 +347,7 @@ def _v_param_row_norms(weight: Tensor, groups: int | None = None,
     with ``groups`` and ``out_dim`` the q and gate rows are reported apart; otherwise the whole
     matrix is one number. ``linear_proj`` rows are the output dims.
     """
-    w = weight.detach().float()
+    w = _plain_weight(weight)
     if groups and out_dim and out_dim % (2 * groups) == 0:
         v = w.view(groups, 2, out_dim // (2 * groups), -1)
         return {"q": v[:, 0].square().sum(-1).sqrt().mean(),
@@ -1276,29 +1309,39 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         """
         from megatron.core.transformer import arch_metrics
 
-        if not arch_metrics.active():
+        global _VGATE_METRIC_ERROR
+
+        if not arch_metrics.active() or _VGATE_METRIC_ERROR is not None:
             return
         layer, n = self.layer_number, arch_metrics.num_layers_of(self.config)
-        arch_metrics.record_mean("vgate/out", layer, n, vgate.out_gate.detach())
-        arch_metrics.record_mean("vgate/res", layer, n, vgate.res_gate.detach())
-        x = arch_metrics.token_rows(streams, 2).float()
-        w = arch_metrics.token_rows(written, 2).float()
-        move = (w - x).square().sum(-1).sqrt().mean()
-        size = x.square().sum(-1).sqrt().mean().clamp(min=1e-12)
-        arch_metrics.record_mean("vgate/delta", layer, n, move / size)
-        attn = getattr(self, "self_attention", None)
-        qkv = getattr(getattr(attn, "linear_qkv", None), "weight", None)
-        if qkv is not None:
-            for tag, value in _v_param_row_norms(
-                qkv,
-                getattr(attn, "num_query_groups_per_partition", None),
-                getattr(attn, "linear_qkv_out_dim", None),
-            ).items():
-                arch_metrics.record_mean(f"vnorm/{tag}", layer, n, value)
-        o = getattr(getattr(attn, "linear_proj", None), "weight", None)
-        if o is not None:
-            for tag, value in _v_param_row_norms(o).items():
-                arch_metrics.record_mean(f"vnorm/o", layer, n, value)
+        try:
+            arch_metrics.record_mean("vgate/out", layer, n, _plain_gate(vgate.out_gate))
+            arch_metrics.record_mean("vgate/res", layer, n, _plain_gate(vgate.res_gate))
+            x = arch_metrics.token_rows(streams, 2).float()
+            w = arch_metrics.token_rows(written, 2).float()
+            move = (w - x).square().sum(-1).sqrt().mean()
+            size = x.square().sum(-1).sqrt().mean().clamp(min=1e-12)
+            arch_metrics.record_mean("vgate/delta", layer, n, move / size)
+            attn = getattr(self, "self_attention", None)
+            qkv = getattr(getattr(attn, "linear_qkv", None), "weight", None)
+            if qkv is not None:
+                for tag, value in _v_param_row_norms(
+                    qkv,
+                    getattr(attn, "num_query_groups_per_partition", None),
+                    getattr(attn, "linear_qkv_out_dim", None),
+                ).items():
+                    arch_metrics.record_mean(f"vnorm/{tag}", layer, n, value)
+            o = getattr(getattr(attn, "linear_proj", None), "weight", None)
+            if o is not None:
+                for tag, value in _v_param_row_norms(o).items():
+                    arch_metrics.record_mean(f"vnorm/o", layer, n, value)
+        except Exception as exc:  # a diagnostic metric must never take the arm down
+            _VGATE_METRIC_ERROR = f"{type(exc).__name__}: {exc}"
+            logger.warning(
+                "arch metrics: vgate/vnorm recording failed once at layer %s and is now off: %s",
+                layer,
+                _VGATE_METRIC_ERROR,
+            )
 
     def _v_learnable_gate(self, kind: str) -> VBlockGate | None:
         """The learnable gate module of an inserted ``V`` layer, or None (not a V layer / not attn)."""
