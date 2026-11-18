@@ -272,7 +272,8 @@ class DepthMemoryMixer(nn.Module):
         self._x_only = hasattr(workspace, "read")
 
     # -- mHC mixer API (TransformerLayer._mhc_read / _mhc_write, ResidualSchemeAdapter) --------
-    def forward(self, streams: torch.Tensor):
+    def forward(self, streams: torch.Tensor, eager: bool = False):
+        del eager  # the mHC eager-coefficient switch (_mhc_read): no compiled path here
         return None, None, None
 
     def read(self, streams: torch.Tensor, h_pre=None) -> torch.Tensor:
@@ -363,7 +364,8 @@ class DepthMemoryPassThrough(nn.Module):
     read r carried to the next site unchanged (that site reads x + r, its query taken at the
     previous site's write). No parameters, no step."""
 
-    def forward(self, streams: torch.Tensor):
+    def forward(self, streams: torch.Tensor, eager: bool = False):
+        del eager  # the mHC eager-coefficient switch (_mhc_read): no compiled path here
         return None, None, None
 
     def read(self, streams: torch.Tensor, h_pre=None) -> torch.Tensor:

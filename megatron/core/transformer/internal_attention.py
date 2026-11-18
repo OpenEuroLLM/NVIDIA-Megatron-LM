@@ -163,7 +163,8 @@ class IATStreamMixer(nn.Module):
         if self.mhc is not None and tag is not None:
             self.mhc._arch_metrics_tag = tag
 
-    def forward(self, streams: torch.Tensor):
+    def forward(self, streams: torch.Tensor, eager: bool = False):
+        del eager  # the mHC eager-coefficient switch (_mhc_read): no compiled path here
         if self.mhc is not None:
             return self.mhc(streams)
         return None, None, None

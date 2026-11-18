@@ -172,8 +172,9 @@ class RoutedStreamMixer(nn.Module):
             self.local_picks_per_stream.data = self.local_picks_per_stream.data.float()
         return self
 
-    def forward(self, streams: torch.Tensor):
+    def forward(self, streams: torch.Tensor, eager: bool = False):
         """``streams`` ``[s, b, n, C]`` -> ``(pre, post, None)`` routing state."""
+        del eager  # the mHC eager-coefficient switch (_mhc_read): no compiled path here
         stash = GradStash()
         params = (self.phi, self.w_key, self.key_gain) if self.key_dim else (self.phi,)
         # the fused router's backward reads stream 0 from the read's saved rows: it needs

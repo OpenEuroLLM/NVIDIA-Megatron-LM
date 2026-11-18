@@ -424,7 +424,8 @@ class AttnResStreamMixer(nn.Module):
         goes to, and whether the block starts here (``seed``: no partial sum yet)."""
         self.live, self.slot, self.seed = live, slot, seed
 
-    def forward(self, streams: torch.Tensor):
+    def forward(self, streams: torch.Tensor, eager: bool = False):
+        del eager  # the mHC eager-coefficient switch (_mhc_read): no compiled path here
         return None, None, None
 
     def read(self, streams: torch.Tensor, h_pre=None) -> torch.Tensor:
