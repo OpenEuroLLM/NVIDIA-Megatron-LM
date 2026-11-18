@@ -294,3 +294,74 @@ def test_selector_adam_tags_only_the_selector(single, name):
     params = list(on.parameters())
     assert params and all(getattr(p, "use_adam_with_emerging_optimizers", False) for p in params)
     assert not any(getattr(p, "use_adam_with_emerging_optimizers", False) for p in off.parameters())
+
+
+FLEX_CP_ARMS = {  # the t16 arms on the flex backend (the training path), small pages / budgets
+    "page_mean_pg": dict(page_sparse_selector="page_mean", page_sparse_per_group=True, page_sparse_packed_flex=True),
+    "page_maxpool_pg": dict(page_sparse_selector="page_maxpool", page_sparse_per_group=True,
+                            page_sparse_packed_flex=True),
+    "nsa": dict(page_sparse_selector="nsa", **VARIANTS["nsa"]),
+    "csa2_fix": dict(page_sparse_selector="csa2", page_sparse_csa2_entry_bias=1.3862944,
+                     page_sparse_csa2_entry_rms=True, **VARIANTS["csa2"]),
+    "lsa_fix": dict(page_sparse_selector="lsa", page_sparse_lsa_visibility="block", **VARIANTS["lsa"]),
+}
+# every CP chunk (length / (2 cp)) a multiple of select_block 32 up to 4 ranks: a select block that straddles a
+# chunk boundary takes its selection from the chunk's first query under CP (its block's first query is on another
+# rank), not from the block's first query as on one rank -- causal, but not the same selection
+CP_LENGTHS = (256, 512, 768)
+
+
+@pytest.mark.skipif(Utils.world_size < 2, reason="needs 2 GPUs")
+@pytest.mark.parametrize("name", list(FLEX_CP_ARMS))
+def test_flex_cp_matches_single_rank(name):
+    """CP = world size (2 or 4; intra-node 4 is the 256k layout) vs one rank, both on the flex backend: outputs,
+    q / k / v gradients and the CP-summed parameter gradients (fp32; the flex kernels have no float64)."""
+    cp_size = Utils.world_size
+    Utils.initialize_model_parallel(1, 1, context_parallel_size=cp_size)
+    try:
+        tp = parallel_state.get_tensor_model_parallel_group()
+        cp_group = parallel_state.get_context_parallel_group()
+        solo = [torch.distributed.new_group([r]) for r in range(torch.distributed.get_world_size())]
+        kw = dict(page_sparse_page=32, page_sparse_topk=2, page_sparse_window=32, page_sparse_select_block=32,
+                  page_sparse_flex_q_block=32, page_sparse_backend="flex", context_parallel_size=cp_size,
+                  **FLEX_CP_ARMS[name])
+        torch.manual_seed(7)
+        att = PageSparseCoreAttention(_config(**kw), 1, pg_collection=ProcessGroupCollection(tp=tp, cp=cp_group))
+        ref = PageSparseCoreAttention(_config(**kw), 1, pg_collection=ProcessGroupCollection(
+            tp=tp, cp=solo[torch.distributed.get_rank()]))
+        for p in att.parameters():
+            torch.nn.init.normal_(p, std=0.3)
+        ref.load_state_dict(att.state_dict())
+        att, ref = att.cuda(), ref.cuda()
+        params = _packed(CP_LENGTHS)
+        st = fla_cp.thd_stream(params.cu_seqlens_q_padded, cp_group)
+        g = torch.Generator().manual_seed(11)
+        t = sum(CP_LENGTHS)
+        q, k, v = (torch.randn(t, n, D, generator=g).cuda() for n in (HQ, G, G))
+        x = torch.randn(t, 1, H, generator=g).cuda()
+        dout = torch.randn(t, HQ * D, generator=g).cuda()
+        loc = [y[st.local_idx].clone().requires_grad_(True) for y in (q, k, v)]
+        att.set_hidden(x[st.local_idx])
+        out = att(*loc, packed_seq_params=params)
+        (out * dout[st.local_idx]).sum().backward()
+        full = [y.clone().requires_grad_(True) for y in (q, k, v)]
+        ref.set_hidden(x)
+        out_ref = ref(*full, packed_seq_params=params)
+        (out_ref * dout).sum().backward()
+
+        def close(a, b, what):
+            err = float((a - b).abs().max() / b.abs().max().clamp_min(1e-12))
+            assert err < 2e-3, f"{name} cp{cp_size} {what}: rel err {err:.2e}"
+
+        close(out, out_ref[st.local_idx], "output")
+        for i, w in enumerate("qkv"):
+            close(loc[i].grad, full[i].grad[st.local_idx], f"d{w}")
+        for (n, p), pr in zip(att.named_parameters(), ref.parameters()):
+            if pr.grad is None:
+                assert p.grad is None, n
+                continue
+            gp = p.grad.clone()
+            torch.distributed.all_reduce(gp, group=cp_group)
+            close(gp, pr.grad, n)
+    finally:
+        Utils.destroy_model_parallel()
