@@ -1223,7 +1223,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             if out is not None:
                 layer_input, _, h_post, h_res = out
                 return layer_input, (h_post, h_res)
-        h_pre, h_post, h_res = mixer(streams)
+        h_pre, h_post, h_res = mixer(streams, eager=arch_metrics.active())
 
         if arch_metrics.active():
             mixer.record_metrics(streams, (h_pre, h_post, h_res))

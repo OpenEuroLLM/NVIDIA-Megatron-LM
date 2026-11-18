@@ -561,24 +561,45 @@ class MHCMixer(nn.Module):
             else:
                 self.b_res.zero_()
 
-    def forward(self, streams: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, streams: torch.Tensor, eager: bool = False) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compute the three connection maps for the current stream state.
 
         Args:
             streams: Stream tensor of shape ``[s, b, n, C]``.
+            eager: Skip the ``torch.compile``d coefficients kernel and run the plain PyTorch math.
+                Inductor-generated kernels assume aligned pointers; under activation recompute the
+                buffers are freed and reallocated, so a recomputed forward can hand the kernel an
+                unaligned address -- the CUDA ``misaligned address`` that killed v4b at its first
+                arch-metrics step (iteration 36000), where the unfused coefficients are needed.
+                The arch-metrics path therefore asks for the eager math; the training path keeps
+                the compiled kernel.
 
         Returns:
             ``(h_pre, h_post, h_res)`` with shapes ``[s, b, n]``, ``[s, b, n]`` and
             ``[s, b, n, n]``, all in fp32.
         """
         global _mhc_coeffs_compiled
+        s, b, n, c = streams.shape
+        flat = _canonical(streams.reshape(s, b, n * c))
+        if eager:
+            return _mhc_coeffs(
+                flat,
+                self.phi,
+                self.b_pre,
+                self.b_post,
+                self.b_res,
+                self.alpha_pre,
+                self.alpha_post,
+                self.alpha_res,
+                n,
+                self.eps,
+                self.num_sinkhorn_iters,
+            )
         if _mhc_coeffs_compiled is None:
             try:
                 _mhc_coeffs_compiled = torch.compile(_mhc_coeffs, dynamic=False)
             except Exception:  # pragma: no cover
                 _mhc_coeffs_compiled = _mhc_coeffs
-        s, b, n, c = streams.shape
-        flat = _canonical(streams.reshape(s, b, n * c))
         try:
             return _mhc_coeffs_compiled(
                 flat,
