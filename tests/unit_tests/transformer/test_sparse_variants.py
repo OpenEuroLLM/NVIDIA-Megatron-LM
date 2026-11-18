@@ -476,3 +476,47 @@ def test_full_budget_is_dense_blockwise(name):
         mod.cfg = dataclasses.replace(mod.cfg, select_block=16)
         out = _run("lsa" if name == "dlsa" else name, mod, q, k, v, x)
     torch.testing.assert_close(out, dense(q, k, v), atol=1e-8, rtol=1e-8)
+
+
+def test_csa2_entry_bias_log_m_restores_redundant_tokens():
+    """An entry stands for m tokens: with m identical tokens per entry and a full budget, CSA2 equals dense
+    attention exactly once its entry logits get + log m, and not without (the under-weighting the audit found)."""
+    import math
+
+    m = 4
+    q, k, v, x = qkvx()
+    L = k.shape[2]
+    k = k[:, :, ::m].repeat_interleave(m, 2)[:, :, :L]
+    v = v[:, :, ::m].repeat_interleave(m, 2)[:, :, :L]
+    mod = _csa2(m=m)
+    plain = _run("csa2", mod, q, k, v, x)
+    mod.cfg = dataclasses.replace(mod.cfg, entry_bias=math.log(m))
+    biased = _run("csa2", mod, q, k, v, x)
+    torch.testing.assert_close(biased, dense(q, k, v), atol=1e-8, rtol=1e-8)
+    assert (plain - dense(q, k, v)).abs().max() > 1e-3
+
+
+def test_csa2_entry_rms_matches_member_rms():
+    q, k, v, x = qkvx()
+    mod = _csa2(m=4)
+    mod.cfg = dataclasses.replace(mod.cfg, entry_rms=True)
+    kc, _ = mod.compress(k, v, mod.token_features(x))
+    members = k.view(1, G, -1, 4, D).pow(2).mean(-1).sqrt().mean(-1)
+    torch.testing.assert_close(kc.pow(2).mean(-1).sqrt(), members, atol=1e-10, rtol=1e-10)
+
+
+def test_lsa_block_visibility_full_budget_is_dense():
+    """With a cluster span larger than the window, the original visibility leaves the tokens between the last
+    complete block and the window unreachable (not dense at a full budget); visibility='block' (the reference's
+    rule: blocks closed before the query's own block, members in the window skipped) reaches every token."""
+    q, k, v, _ = qkvx(L=256)
+    cfg = sv.LSAConfig(pool=2, block=32, buckets=4, iters=3, topk=10_000, window=16, page=16, sink_pages=1)
+    old = sv.LSA(cfg)(q, k, v, 0, D**-0.5)
+    assert (old - dense(q, k, v)).abs().max() > 1e-3
+    new = sv.LSA(dataclasses.replace(cfg, visibility="block"))(q, k, v, 0, D**-0.5)
+    span = cfg.pool * cfg.block
+    # every query whose window covers the tokens since its own block start: dense; the rest can only be dense
+    # once the open block's earlier tokens are reachable, which needs the window to cover them
+    pos = torch.arange(256, device=q.device)
+    covered = (pos // cfg.page - cfg.window // cfg.page) * cfg.page <= (pos // span) * span
+    torch.testing.assert_close(new[:, :, covered], dense(q, k, v)[:, :, covered], atol=1e-8, rtol=1e-8)

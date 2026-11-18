@@ -232,6 +232,11 @@ class CSA2Config:
     index_dim: int = 64
     select_block: int = 1  # > 1: one entry selection per block of queries (its first query's); the flex path
     kv_block: int = 64  # flex: entries per block-mask block (smaller: sparser unions; bf16 bwd needs H100 smem)
+    # An entry stands for m tokens, but its logit is the weighted MEAN of theirs: without + log m (and with keys
+    # of about half the members' RMS after averaging) the softmax under-weights the compressed context (audit
+    # 2026-11-18: ~32 % of the dense mass on its region). A NoPE retrofit has no parameter that can fix this.
+    entry_bias: float = 0.0  # added to the entry logits (log m restores the m tokens' share for redundant ones)
+    entry_rms: bool = False  # rescale each entry key to its members' mean RMS
 
 
 class CSA2(nn.Module):
@@ -258,7 +263,12 @@ class CSA2(nn.Module):
         g, L, d = k.shape[1], k.shape[2], k.shape[3]
         Lc = L // m
         w = torch.softmax(ps._acc(z[:, : Lc * m]).view(1, Lc, m, g), dim=2).permute(0, 3, 1, 2)  # [1, g, Lc, m]
-        kc = (ps._acc(k[:, :, : Lc * m]).view(1, g, Lc, m, d) * w[..., None]).sum(3).to(k.dtype)
+        kg = ps._acc(k[:, :, : Lc * m]).view(1, g, Lc, m, d)
+        kc = (kg * w[..., None]).sum(3)
+        if self.cfg.entry_rms:  # each entry key back to its members' mean RMS
+            target = kg.pow(2).mean(-1).sqrt().mean(-1, keepdim=True)
+            kc = kc * target / kc.pow(2).mean(-1, keepdim=True).sqrt().clamp(min=1e-12)
+        kc = kc.to(k.dtype)
         vc = (ps._acc(v[:, :, : Lc * m]).view(1, g, Lc, m, d) * w[..., None]).sum(3).to(v.dtype)
         return kc, vc
 
@@ -297,6 +307,8 @@ class CSA2(nn.Module):
         kc, vc = self.compress(k, v, z)
         Lc = kc.shape[2]
         if self.flex and q.is_cuda and cfg.select_block > 1:
+            if cfg.entry_bias:
+                raise NotImplementedError("CSA2 entry_bias: the reference path only (the flex path has no bias yet)")
             return self._forward_flex(q, k, v, xq, kc, vc, q_offset, scale)
         raw_cfg = ps.PageSparseConfig(selector="window", page=cfg.page, window=cfg.window,
                                       sink_pages=cfg.sink_pages)
@@ -322,7 +334,11 @@ class CSA2(nn.Module):
         kk, vv = torch.cat([k, kc], 2), torch.cat([v, vc], 2)
         idx = torch.cat([tok, L + sel.clamp(min=0)], -1)
         ok = torch.cat([tok_ok, torch.isfinite(val)], -1)
-        return ps.attend_gathered(q, kk, vv, idx, ok, scale, None)
+        bias = None
+        if cfg.entry_bias:
+            bias = torch.cat([torch.zeros(tok.shape, device=q.device),
+                              torch.full(sel.shape, float(cfg.entry_bias), device=q.device)], -1)
+        return ps.attend_gathered(q, kk, vv, idx, ok, scale, bias)
 
     def _forward_flex(self, q, k, v, xq, kc, vc, q_offset, scale):
         """Raw sinks + window and the selected entries as two FlexAttention calls, merged by their LSEs. The
@@ -438,6 +454,11 @@ class LSAConfig:
     select_block: int = 1  # > 1: one bucket selection per block of queries (its first query's); the flex path
     kv_block: int = 64  # flex: bucket-ordered keys per block-mask block
     latent: bool = False  # D-LSA: cluster / score in a learned latent space (per-KV-group key and query maps)
+    # which buckets a query may select: "window" = buckets whose whole cluster block ends before the query's
+    # window (the original rule: the up-to pool * block tokens before the window are unreachable, ~1000 per query
+    # at 64k -- audit 2026-11-18); "block" = buckets whose cluster block closed before the query's own block (the
+    # reference's rule), their members inside the window / sinks skipped (attended raw already)
+    visibility: str = "window"
 
 
 class LSA(nn.Module):
@@ -534,6 +555,8 @@ class LSA(nn.Module):
         if nb == 0:
             return ps.attend_gathered(q, k, v, tok, tok_ok, scale, None)
         if self.flex and q.is_cuda and cfg.select_block > 1:
+            if cfg.visibility != "window":
+                raise NotImplementedError("LSA visibility='block': the reference path only (flex not yet)")
             return self._forward_flex(q, k, v, q_offset, scale, (cent, mem, mem_ok, last))
         pos = q_offset + torch.arange(s, device=q.device)
         with torch.no_grad():
@@ -548,6 +571,9 @@ class LSA(nn.Module):
             stok = mem[sel].view(s, -1)  # [s, kb * M * pool]
             sok = (mem_ok[sel] & torch.isfinite(val)[..., None]).view(s, -1)
             sok = sok & (stok >= cfg.sink_pages * cfg.page)  # the sinks are attended already
+            if cfg.visibility == "block":  # members inside the raw window are attended already
+                first_window = (pos // cfg.page - cfg.window // cfg.page) * cfg.page
+                sok = sok & (stok < first_window[:, None])
         idx = torch.cat([tok, stok[None]], -1)
         ok = torch.cat([tok_ok, sok[None]], -1)
         return ps.attend_gathered(q, k, v, idx, ok, scale, None)
@@ -561,8 +587,13 @@ class LSA(nn.Module):
         _, hq, n, d = q.shape
         qn = F.normalize(ps._acc(q[0]).view(g, hq // g, n, d), dim=-1)
         sc = torch.einsum("grsd,ngd->grsn", qn, cent.to(qn.dtype)).amax(1).sum(0)
-        first_window = (pos // cfg.page - cfg.window // cfg.page) * cfg.page
-        return sc.masked_fill(~(last[None, :] < first_window[:, None]), float("-inf"))
+        if cfg.visibility == "block":
+            span = cfg.pool * cfg.block
+            visible = last[None, :] < ((pos // span) * span)[:, None]
+        else:
+            first_window = (pos // cfg.page - cfg.window // cfg.page) * cfg.page
+            visible = last[None, :] < first_window[:, None]
+        return sc.masked_fill(~visible, float("-inf"))
 
     def indexer_loss(self, q, k, q_offset: int, scale: float, chunk: int = 256):
         """D-LSA distillation: KL(dense attention mass per bucket || softmax(exp(logit_scale) x bucket scores)) for
