@@ -100,6 +100,7 @@ class NSA(nn.Module):
             raise ValueError("NSA: block <= page and a multiple of stride")
         self.cfg, self.hq, self.d = cfg, num_heads, kv_channels
         self.flex = False  # FlexAttention for the three branches (CUDA); the exact reference otherwise
+        self.diag = None  # diagnostics (reference path): diag.scores(kind, scores, ...) may record / replace scores
         d, b = kv_channels, cfg.block
         self.pos = nn.Parameter(torch.zeros(b, d))  # intra-block position embedding
         # the compressors: [block * d] -> d, initialised to the block mean
@@ -168,6 +169,8 @@ class NSA(nn.Module):
             o_win = ps.flex_page_sparse_attention(q, k, v, win_cfg, q_offset, scale, None, 64)
         else:
             o_cmp, imp = _attend_entries(q, kc, vc, ok, scale, reduce=importance)
+            if self.diag is not None:  # page importances [s, P] of the selection branch
+                imp = self.diag.scores("nsa", imp[0], q, k, pos, scale, cfg, ("page", cfg.page), cfg.topk)[None]
             o_slc = ps.page_sparse_attention(q, k, v, sel_cfg, q_offset, scale, indexer_scores=imp)
             o_win = ps.page_sparse_attention(q, k, v, win_cfg, q_offset, scale)
         gt = torch.sigmoid(ps._acc(self.gate(xq))).view(1, s, hq, 3).permute(0, 2, 1, 3)  # [1, hq, s, 3]
@@ -243,6 +246,7 @@ class CSA2(nn.Module):
         self.idx_w = nn.Linear(hidden, cfg.index_heads, bias=False)
         self.idx_k = nn.Linear(kv_channels, cfg.index_dim, bias=False)
         self.flex = False  # FlexAttention (CUDA, select_block > 1); the exact reference otherwise
+        self.diag = None  # diagnostics (reference path): diag.scores(kind, scores, ...) may record / replace scores
 
     def token_features(self, x):
         """Per-token features of the KEY side, gathered with the keys under context parallelism: [t, g]."""
@@ -304,6 +308,10 @@ class CSA2(nn.Module):
                 c1 = min(s, c0 + chunk)
                 cand = self._candidates(c1 - c0, Lc, q_offset + c0, q.device)
                 sc = self.index_scores(xq[:, c0:c1], kc).masked_fill(~cand[None], float("-inf"))
+                if self.diag is not None:  # entry scores [c, Lc]
+                    rows = q_offset + c0 + torch.arange(c1 - c0, device=q.device)
+                    sc = self.diag.scores("csa2", sc[0], q[:, :, c0:c1], k, rows, scale, cfg,
+                                          ("entry", cfg.compress), n)[None]
                 val, sel = sc.topk(n, dim=-1)
                 vals.append(val)
                 sels.append(sel)
@@ -443,6 +451,7 @@ class LSA(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.flex = False  # FlexAttention over the keys in bucket order (CUDA, select_block > 1)
+        self.diag = None  # diagnostics (reference path): diag.scores(kind, scores, ...) may record / replace scores
         self.proj_k = self.proj_q = self.logit_scale = None
         if cfg.latent:
             g, d = num_query_groups, kv_channels
@@ -529,6 +538,8 @@ class LSA(nn.Module):
         pos = q_offset + torch.arange(s, device=q.device)
         with torch.no_grad():
             sc = self._bucket_scores(q, cent, last, pos)
+            if self.diag is not None:  # bucket scores [s, nb]
+                sc = self.diag.scores("lsa", sc, q, k, pos, scale, cfg, ("members", mem, mem_ok), min(cfg.topk, nb))
             if cfg.select_block > 1:  # every query uses its anchor's selection
                 anchor = ((pos // cfg.select_block) * cfg.select_block - q_offset).clamp(min=0)
                 sc = sc[anchor]

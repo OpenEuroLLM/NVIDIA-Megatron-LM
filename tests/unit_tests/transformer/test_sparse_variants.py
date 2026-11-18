@@ -6,6 +6,7 @@ for chunked queries, and trains its parameters. Pure torch, CPU or GPU, float64 
     pytest --noconftest tests/unit_tests/transformer/test_sparse_variants.py
 """
 
+import dataclasses
 import importlib.util
 import sys
 from pathlib import Path
@@ -453,3 +454,25 @@ def test_selector_losses_reach_all_params_without_candidates():
     loss = csa.indexer_loss(q, k, x, csa.token_features(x), 0, D**-0.5)
     loss.backward()
     assert all(p.grad is not None for p in csa.parameters())
+
+
+@pytest.mark.parametrize("name", ["csa2", "lsa", "dlsa", "nsa", "page_mean", "quest", "page_mean_pg"])
+def test_full_budget_is_dense_blockwise(name):
+    """Every selector as trained (block-wise selection, one selection per 16 queries; per KV group for
+    page_mean_pg; D-LSA's latent maps) attends every earlier token when the budget covers the context:
+    exactly dense attention."""
+    q, k, v, x = qkvx()
+    if name in ("page_mean", "quest", "page_mean_pg"):
+        cfg = ps.PageSparseConfig(selector="page_mean" if name != "quest" else "quest", page=16, topk=10_000,
+                                  window=16, sink_pages=1, select_block=16, per_group=name == "page_mean_pg")
+        out = ps.page_sparse_attention(q, k, v, cfg, 0, D**-0.5)
+    else:
+        if name == "csa2":
+            mod = _csa2()
+        elif name == "nsa":
+            mod = _nsa()
+        else:
+            mod = _dlsa(topk=10_000) if name == "dlsa" else _lsa()
+        mod.cfg = dataclasses.replace(mod.cfg, select_block=16)
+        out = _run("lsa" if name == "dlsa" else name, mod, q, k, v, x)
+    torch.testing.assert_close(out, dense(q, k, v), atol=1e-8, rtol=1e-8)
