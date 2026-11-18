@@ -151,7 +151,7 @@ def test_csa2_query_chunks():
     torch.testing.assert_close(a, b, atol=1e-6, rtol=1e-6)  # indexer_kl_loss is fp32
 
 
-@pytest.mark.parametrize("selector", ["page_mean", "quest", "oracle"])
+@pytest.mark.parametrize("selector", ["page_mean", "quest", "oracle", "page_maxpool"])
 def test_block_selection(selector):
     """select_block: every query of a block attends the anchor's selection (+ its own sinks / window), causal,
     chunk-invariant at block-aligned cuts, and block 1 is the per-query selection."""
@@ -301,7 +301,7 @@ def test_block_selection_prev_max(selector):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="FlexAttention needs a GPU")
-@pytest.mark.parametrize("selector", ["page_mean", "quest", "oracle"])
+@pytest.mark.parametrize("selector", ["page_mean", "quest", "oracle", "page_maxpool"])
 @pytest.mark.parametrize("off", [0, 144])
 def test_block_selection_flex(selector, off):
     """Block-wise selection through flex (full blocks without mask_mod: every query of the block attends the
@@ -318,7 +318,7 @@ def test_block_selection_flex(selector, off):
         assert float((x - y).abs().max() / y.abs().max()) < 2e-2
 
 
-@pytest.mark.parametrize("selector", ["page_mean", "quest", "oracle"])
+@pytest.mark.parametrize("selector", ["page_mean", "quest", "oracle", "page_maxpool"])
 def test_per_group_selection(selector):
     """per_group: each KV group's heads attend the pages that group's own queries / keys select -- the shared
     selection run on that group alone; selections can differ between the groups."""
@@ -383,7 +383,7 @@ def test_flex_many_lengths_stay_compiled():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="FlexAttention needs a GPU")
 @pytest.mark.parametrize("per_group", [False, True])
-@pytest.mark.parametrize("selector", ["page_mean", "quest", "window"])
+@pytest.mark.parametrize("selector", ["page_mean", "quest", "window", "page_maxpool"])
 def test_packed_flex_equals_per_span(selector, per_group):
     """One flex call for a whole packed batch equals one call per span (documents of different lengths, CP-style
     chunks with offsets), forward and backward; its selections, reused, give the same output again."""
@@ -580,3 +580,23 @@ def test_dlsa_block_visibility_distillation_trains():
     loss = lat.indexer_loss(q, k, 0, D**-0.5)
     loss.backward()
     assert float(loss) > 0 and all(p.grad is not None for p in lat.parameters())
+
+
+
+def test_page_maxpool_scores_match_bruteforce():
+    """InfLLM-v2 page scores: q . mean(keys of [j p/4, j p/4 + p/2)) summed over the heads, a page's score the
+    max over the windows overlapping it (j = 4p-1 .. 4p+3, zero-padded past the end)."""
+    q, k, _, _ = qkvx(L=200)
+    page = 16
+    cfg = ps.PageSparseConfig(selector="page_maxpool", page=page, topk=4, window=16, sink_pages=1)
+    got = ps.page_scores(q, k, cfg, 0, D**-0.5)
+    L, P, st, sub = k.shape[2], -(-200 // page), page // 4, page // 2
+    kp = torch.nn.functional.pad(k, (0, 0, 0, 4 * P * st + sub))
+    rep = HQ // G
+    ref = torch.full((1, q.shape[2], P), float("-inf"), dtype=torch.float64, device=q.device)
+    for p_ in range(P):
+        for j in range(max(4 * p_ - 1, 0), 4 * p_ + 4):
+            win = kp[:, :, j * st: j * st + sub].mean(2)  # [1, g, d]
+            sc = torch.einsum("bgrsd,bgd->bs", q.view(1, G, rep, -1, D), win) * D**-0.5
+            ref[..., p_] = torch.maximum(ref[..., p_], sc)
+    torch.testing.assert_close(got, ref, atol=1e-10, rtol=1e-10)

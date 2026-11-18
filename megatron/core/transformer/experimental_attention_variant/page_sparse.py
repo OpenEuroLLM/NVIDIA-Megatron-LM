@@ -49,7 +49,8 @@ def _acc(x: torch.Tensor) -> torch.Tensor:
     return x if x.dtype == torch.float64 else x.float()
 
 
-SELECTORS = ("dense", "window", "page_mean", "quest", "oracle", "token_topk", "compress_mean", "indexer")
+SELECTORS = ("dense", "window", "page_mean", "quest", "oracle", "token_topk", "compress_mean", "indexer",
+             "page_maxpool")
 VARIANT_SELECTORS = ("nsa", "csa2", "lsa")  # trained modules of sparse_variants.py (PageSparseCoreAttention)
 
 
@@ -151,6 +152,20 @@ def page_scores(q, k, cfg: PageSparseConfig, q_offset: int, scale: float, indexe
     if cfg.selector == "page_mean":
         kp = page_pool(k, cfg.page, "mean")
         return torch.einsum("bgrsd,bgpd->bsp", qg, kp) * scale
+    if cfg.selector == "page_maxpool":
+        # InfLLM-v2: keys mean-pooled over half-page windows at a quarter-page stride, a page scored by the max
+        # over the 5 windows overlapping it (a match straddling a page boundary is not diluted by its page)
+        if cfg.page % 4:
+            raise ValueError("page_maxpool: page must be a multiple of 4")
+        st, sub = cfg.page // 4, cfg.page // 2
+        J = 4 * P + 1  # windows [j st, j st + sub), j = 0 .. 4P
+        need = (J - 1) * st + sub
+        cs = F.pad(F.pad(_acc(k), (0, 0, 0, max(0, need - L))).cumsum(2), (0, 0, 1, 0))
+        starts = torch.arange(J, device=k.device) * st
+        win = (cs[:, :, starts + sub] - cs[:, :, starts]) / sub  # [b, g, J, d]
+        sc = torch.einsum("bgrsd,bgjd->bsj", qg, win) * scale
+        pooled = F.max_pool1d(sc.reshape(b * s, 1, J), kernel_size=5, stride=4, padding=1)  # page p: 4p-1 .. 4p+3
+        return pooled.view(b, s, -1)[..., :P]
     if cfg.selector == "quest":
         hi, lo = page_pool(k, cfg.page, "minmax")
         hi, lo = hi.nan_to_num(0.0), lo.nan_to_num(0.0)
@@ -469,7 +484,7 @@ def indexer_kl_loss(scores: torch.Tensor, target_mass: torch.Tensor, cand: torch
 
 
 # --------------------------------------------------------------------------- fast backend: FlexAttention
-PAGE_SELECTORS = ("window", "page_mean", "quest", "oracle", "indexer")
+PAGE_SELECTORS = ("window", "page_mean", "quest", "oracle", "indexer", "page_maxpool")
 _FLEX = {}
 
 

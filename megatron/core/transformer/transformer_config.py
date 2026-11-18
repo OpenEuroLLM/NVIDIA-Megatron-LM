@@ -2548,7 +2548,7 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.page_sparse_selector is not None:
             selectors = ("dense", "window", "page_mean", "quest", "oracle", "token_topk", "compress_mean",
-                         "indexer", "nsa", "csa2", "lsa")
+                         "indexer", "page_maxpool", "nsa", "csa2", "lsa")
             if self.page_sparse_selector not in selectors:
                 raise ValueError(f"page_sparse_selector must be one of {selectors}")
             if self.page_sparse_window % self.page_sparse_page:
@@ -2560,12 +2560,13 @@ class TransformerConfig(ModelParallelConfig):
                                                            and self.page_sparse_lsa_latent)):
                 raise ValueError("page_sparse_dense_forward is the indexer warm-up (indexer, csa2, latent lsa)")
             if self.page_sparse_share_source:
-                if self.page_sparse_selector not in ("window", "page_mean", "quest", "oracle", "indexer"):
+                if self.page_sparse_selector not in ("window", "page_mean", "quest", "oracle", "indexer",
+                                                     "page_maxpool"):
                     raise ValueError("page_sparse_share_source: page selectors only")
                 if self.pipeline_model_parallel_size > 1:
                     raise ValueError("page_sparse_share_source needs pipeline_model_parallel_size 1")
             if self.page_sparse_hier_group and self.page_sparse_selector not in (
-                    "page_mean", "quest", "oracle", "indexer"):
+                    "page_mean", "quest", "oracle", "indexer", "page_maxpool"):
                 raise ValueError("page_sparse_hier_group: page selectors only (page_mean, quest, oracle, indexer)")
 
         if self.moe_expert_post_act_norm or self.mlp_post_act_norm:
