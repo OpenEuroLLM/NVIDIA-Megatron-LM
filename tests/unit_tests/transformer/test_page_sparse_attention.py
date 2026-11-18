@@ -281,3 +281,16 @@ def test_cp_matches_single_rank(selector):
             torch.testing.assert_close(loc[i].grad, full[i].grad[st.local_idx], atol=1e-4, rtol=1e-4)
     finally:
         Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("name", ["nsa", "csa2", "lsa_latent", "indexer"])
+def test_selector_adam_tags_only_the_selector(single, name):
+    """page_sparse_selector_adam: every selector parameter is tagged for Adam (not the matrix optimizer); off by
+    default."""
+    kw = (dict(page_sparse_selector="lsa", page_sparse_lsa_latent=True) if name == "lsa_latent"
+          else dict(page_sparse_selector="indexer") if name == "indexer" else _variant_kw(name))
+    off = PageSparseCoreAttention(_config(**kw), 1, pg_collection=single)
+    on = PageSparseCoreAttention(_config(**kw, page_sparse_selector_adam=True), 1, pg_collection=single)
+    params = list(on.parameters())
+    assert params and all(getattr(p, "use_adam_with_emerging_optimizers", False) for p in params)
+    assert not any(getattr(p, "use_adam_with_emerging_optimizers", False) for p in off.parameters())

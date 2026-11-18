@@ -737,6 +737,26 @@ class TransformerConfig(ModelParallelConfig):
     trained by KL to the dense attention mass per bucket (page_sparse_indexer_loss_coeff; with
     page_sparse_dense_forward as its warm-up)."""
 
+    page_sparse_lsa_visibility: str = "window"
+    """lsa: which buckets a query may select. "window": buckets whose whole cluster block ends before the query's
+    window (up to page_sparse_lsa_pool x page_sparse_lsa_block tokens before the window are unreachable);
+    "block": the reference's rule -- buckets of cluster blocks closed before the query's own block, their
+    members inside the raw window skipped (audit 2026-11-18). Use a cluster span equal to the window."""
+
+    page_sparse_csa2_entry_bias: float = 0.0
+    """csa2: added to every compressed entry's logit. An entry's logit is the mean of its m tokens' logits, so the
+    softmax under-weights compressed context; log(page_sparse_compress) restores the m tokens' share for
+    redundant ones (audit 2026-11-18)."""
+
+    page_sparse_csa2_entry_rms: bool = False
+    """csa2: rescale each compressed entry key to its members' mean RMS (averaging roughly halves it)."""
+
+    page_sparse_selector_adam: bool = False
+    """The sparse-attention selector's own parameters (NSA compressors / gates, CSA2 compression weights and
+    indexer, D-LSA maps, the page indexer) on Adam instead of the matrix optimizer (Muon / MuOwn): orthogonalised
+    updates move zero-initialised matrices to a fixed norm after one step whatever the gradient (audit
+    2026-11-18: NSA's gate rows)."""
+
     linear_kronlstm_forget_offset: float = 0.0
     """KronLSTM: a fixed extra decay per step on every forget channel (log|f| - offset); 0.012 is
     the polar forget gate's init cap without its angle."""
@@ -2555,6 +2575,8 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError("page_sparse_window must be a multiple of page_sparse_page")
             if self.page_sparse_backend not in ("flex", "gathered"):
                 raise ValueError("page_sparse_backend must be flex or gathered")
+            if self.page_sparse_lsa_visibility not in ("window", "block"):
+                raise ValueError("page_sparse_lsa_visibility must be window or block")
             if self.page_sparse_dense_forward and not (self.page_sparse_selector in ("indexer", "csa2")
                                                        or (self.page_sparse_selector == "lsa"
                                                            and self.page_sparse_lsa_latent)):

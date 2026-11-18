@@ -108,7 +108,9 @@ class PageSparseCoreAttention(MegatronModule):
                                                  sink_pages=self.cfg.sink_pages,
                                                  index_heads=config.page_sparse_indexer_heads,
                                                  index_dim=config.page_sparse_indexer_dim,
-                                                 select_block=config.page_sparse_select_block))
+                                                 select_block=config.page_sparse_select_block,
+                                                 entry_bias=config.page_sparse_csa2_entry_bias,
+                                                 entry_rms=config.page_sparse_csa2_entry_rms))
             self.variant.flex = config.page_sparse_backend == "flex"
         elif self.cfg.selector == "lsa":
             self.variant = sv.LSA(sv.LSAConfig(pool=config.page_sparse_lsa_pool, block=config.page_sparse_lsa_block,
@@ -116,9 +118,14 @@ class PageSparseCoreAttention(MegatronModule):
                                                window=self.cfg.window, page=self.cfg.page,
                                                sink_pages=self.cfg.sink_pages,
                                                select_block=config.page_sparse_select_block,
-                                               latent=config.page_sparse_lsa_latent),
+                                               latent=config.page_sparse_lsa_latent,
+                                               visibility=config.page_sparse_lsa_visibility),
                                   config.num_query_groups or config.num_attention_heads, config.kv_channels)
             self.variant.flex = config.page_sparse_backend == "flex"
+        if config.page_sparse_selector_adam:  # the selector's parameters on Adam, not the matrix optimizer
+            for mod in (self.indexer, self.variant):
+                for param in (mod.parameters() if mod is not None else ()):
+                    param.use_adam_with_emerging_optimizers = True
         self.flex = config.page_sparse_backend == "flex" and self.cfg.selector in ps.PAGE_SELECTORS
         self.q_block = config.page_sparse_flex_q_block
         self.packed_flex = config.page_sparse_packed_flex  # one flex call for every document of a packed batch
