@@ -307,8 +307,6 @@ class CSA2(nn.Module):
         kc, vc = self.compress(k, v, z)
         Lc = kc.shape[2]
         if self.flex and q.is_cuda and cfg.select_block > 1:
-            if cfg.entry_bias:
-                raise NotImplementedError("CSA2 entry_bias: the reference path only (the flex path has no bias yet)")
             return self._forward_flex(q, k, v, xq, kc, vc, q_offset, scale)
         raw_cfg = ps.PageSparseConfig(selector="window", page=cfg.page, window=cfg.window,
                                       sink_pages=cfg.sink_pages)
@@ -389,10 +387,14 @@ class CSA2(nn.Module):
         o_ent, l_ent = ps._flex()(q, kc.to(q.dtype), vc.to(q.dtype), block_mask=bm, scale=scale,
                                   enable_gqa=hq != g, return_lse=True,
                                   kernel_options=ps.flex_kernel_options(q, B, kv_block))
+        if cfg.entry_bias:  # a constant on every entry logit = the entry part's LSE shifted by it
+            l_ent = l_ent + float(cfg.entry_bias)
         return ps.merge_attention([(o_raw, l_raw), (o_ent, l_ent)])
 
     def indexer_loss(self, q, k, xq, z, q_offset: int, scale: float, chunk: int = 256):
-        """KL(dense attention mass per compressed entry || softmax(index scores)) over the candidates."""
+        """KL(dense attention mass per compressed entry || softmax(index scores)) over the candidates. The indexer
+        input is detached (as DSA and Megatron's dsa.py): the KL trains the indexer, not the residual stream."""
+        xq = xq.detach()
         cfg = self.cfg
         _, hq, s, d = q.shape
         L = k.shape[2]
@@ -555,8 +557,6 @@ class LSA(nn.Module):
         if nb == 0:
             return ps.attend_gathered(q, k, v, tok, tok_ok, scale, None)
         if self.flex and q.is_cuda and cfg.select_block > 1:
-            if cfg.visibility != "window":
-                raise NotImplementedError("LSA visibility='block': the reference path only (flex not yet)")
             return self._forward_flex(q, k, v, q_offset, scale, (cent, mem, mem_ok, last))
         pos = q_offset + torch.arange(s, device=q.device)
         with torch.no_grad():
@@ -623,12 +623,19 @@ class LSA(nn.Module):
             a = a_all[c0:c0 + chunk]
             pos = q_offset + a
             first_window = (pos // cfg.page - cfg.window // cfg.page) * cfg.page
-            cand = last[None, :] < first_window[:, None]  # [n, nb]
+            if cfg.visibility == "block":
+                span = cfg.pool * cfg.block
+                cand = last[None, :] < ((pos // span) * span)[:, None]  # [n, nb]
+            else:
+                cand = last[None, :] < first_window[:, None]  # [n, nb]
             if not bool(cand.any()):
                 continue
             with torch.no_grad():
                 pr = ps._causal_probs(q[:, :, a].detach(), k.detach(), pos, scale).mean(1)[0]  # [n, L]
-                target = (pr[:, tok] * w.to(pr.dtype)).sum(-1)  # [n, nb]
+                wr = w.to(pr.dtype)[None]
+                if cfg.visibility == "block":  # the members inside the raw window are not the bucket's to win
+                    wr = wr * (tok[None] < first_window[:, None, None]).to(pr.dtype)
+                target = (pr[:, tok] * wr).sum(-1)  # [n, nb]
             qn = F.normalize(ps._acc(self._pq(q[:, :, a].detach(), g)[0]).view(g, hq // g, len(a), -1), dim=-1)
             sc = torch.einsum("grnd,bgd->grnb", qn, cent).amax(1).sum(0)  # [n, nb]
             has = int((cand & (target > 0)).any(-1).sum())
@@ -677,9 +684,14 @@ class LSA(nn.Module):
             kv_idx = torch.argsort((~rows).to(torch.int8), dim=-1, stable=True).to(torch.int32)
             sel_i8 = selected.to(torch.int8)
             bucket_i = bucket_of.to(torch.int32)
+            # visibility "block": a selected bucket's members inside the query's raw window are attended raw
+            fw = ((qpos // cfg.page - cfg.window // cfg.page) * cfg.page).to(torch.int32)
+            if cfg.visibility != "block":
+                fw = torch.full_like(fw, torch.iinfo(torch.int32).max)
+            perm_i = perm.to(torch.int32)
 
         def mask_mod(bi, hi, qi, ki):
-            return sel_i8[qsel[qi], bucket_i[ki]] > 0
+            return (sel_i8[qsel[qi], bucket_i[ki]] > 0) & (perm_i[ki] < fw[qi])
 
         bm = BlockMask.from_kv_blocks(kv_num[None, None], kv_idx[None, None], BLOCK_SIZE=(B, kv_block),
                                       mask_mod=mask_mod, seq_lengths=(s, Lp))

@@ -520,3 +520,63 @@ def test_lsa_block_visibility_full_budget_is_dense():
     pos = torch.arange(256, device=q.device)
     covered = (pos // cfg.page - cfg.window // cfg.page) * cfg.page <= (pos // span) * span
     torch.testing.assert_close(new[:, :, covered], dense(q, k, v)[:, :, covered], atol=1e-8, rtol=1e-8)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="FlexAttention needs a GPU")
+@pytest.mark.parametrize("off", [0, 144])
+def test_csa2_flex_entry_fixes_match_reference(off):
+    """The flex path with the audit fixes (entry logits + log m as an LSE shift, entry keys at their members'
+    RMS) equals the reference path, forward and backward (fp32)."""
+    import math
+
+    q, k, v, x = (t.float().clone().requires_grad_() for t in qkvx(L=512))
+    cfg = sv.CSA2Config(compress=2, topk_entries=6, window=32, page=16, sink_pages=1, index_heads=2, index_dim=8,
+                        select_block=32, kv_block=16, entry_bias=math.log(2), entry_rms=True)
+    csa = sv.CSA2(H, G, D, cfg).to(DEV)
+    torch.nn.init.normal_(csa.z.weight, std=0.3)
+
+    def run():
+        return csa(q[:, :, off:], k, v, x[:, off:], csa.token_features(x), off, D**-0.5)
+
+    ref = run()
+    csa.flex = True
+    out = run()
+    assert float((out - ref).abs().max() / ref.abs().max()) < 1e-2
+    g = torch.randn_like(ref)
+    gf = torch.autograd.grad((out * g).sum(), (q, k, v, csa.z.weight))
+    csa.flex = False
+    gr = torch.autograd.grad((run() * g).sum(), (q, k, v, csa.z.weight))
+    for a, b in zip(gf, gr):
+        assert float((a - b).abs().max() / b.abs().max()) < 2e-2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="FlexAttention needs a GPU")
+@pytest.mark.parametrize("off", [0, 128, 144])
+def test_lsa_flex_block_visibility_matches_reference(off):
+    """LSA with visibility='block' (cluster span 64 > window 32): flex equals the reference, fwd and bwd."""
+    q, k, v, _ = (t.float().clone().requires_grad_() for t in qkvx(L=512))
+    lsa = sv.LSA(sv.LSAConfig(pool=2, block=32, buckets=4, iters=3, topk=2, window=32, page=16, sink_pages=1,
+                              select_block=32, kv_block=16, visibility="block"))
+
+    def run():
+        return lsa(q[:, :, off:], k, v, off, D**-0.5)
+
+    ref = run()
+    lsa.flex = True
+    out = run()
+    assert float((out - ref).abs().max() / ref.abs().max()) < 1e-2
+    g = torch.randn_like(ref)
+    gf = torch.autograd.grad((out * g).sum(), (q, k, v))
+    lsa.flex = False
+    gr = torch.autograd.grad((run() * g).sum(), (q, k, v))
+    for x, y in zip(gf, gr):
+        assert float((x - y).abs().max() / y.abs().max()) < 2e-2
+
+
+def test_dlsa_block_visibility_distillation_trains():
+    q, k, _, _ = qkvx(L=256)
+    lat = sv.LSA(sv.LSAConfig(pool=2, block=32, buckets=4, iters=3, topk=3, window=16, page=16, sink_pages=1,
+                              select_block=16, latent=True, visibility="block"), G, D).to(DEV, torch.float64)
+    loss = lat.indexer_loss(q, k, 0, D**-0.5)
+    loss.backward()
+    assert float(loss) > 0 and all(p.grad is not None for p in lat.parameters())
