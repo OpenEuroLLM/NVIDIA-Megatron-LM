@@ -306,19 +306,22 @@ _VGATE_METRIC_ERROR: str | None = None
 
 
 def _plain_gate(param: Tensor) -> Tensor:
-    """A one-element gate parameter as a plain contiguous tensor.
+    """A one-element gate parameter as this rank's plain local shard (may be empty).
 
     Under FSDP2 every parameter is a ``DTensor``, and a one-element parameter is sharded across
-    the data-parallel ranks: its local shard is *empty* on all but one rank. ``arch_metrics``
-    keeps plain CUDA buffers, adds the recorded values into them and all-reduces those, so a
-    ``DTensor`` there is wrong; ``full_tensor`` all-gathers the one element (a collective, so
-    every rank must call it in the same order -- they do, the recording runs on every rank) and
-    returns an aligned plain tensor. A shard view into the flat parameter buffer is also what
-    faults the vectorized kernels with ``CUDA error: misaligned address`` (v4b, iteration 36000).
+    the data-parallel ranks: its local shard holds the value on one rank and is empty on all
+    others. ``arch_metrics`` keeps plain CUDA buffers, adds each recorded value into them and
+    all-reduces those, so an empty local shard is *correct* here: the sum over ranks in
+    ``collect`` reconstructs the value and the matching count sums to one.
+
+    Do not gather instead. ``full_tensor`` (or any redistribute) is a collective over the FSDP
+    mesh issued from inside the forward, where the parameter all-gather is already in flight, and
+    with an empty local shard on nearly every rank it faults (v4b: CUDA ``misaligned address`` at
+    iteration 36000, on the first forward of the arch-metrics step).
     """
     value = param.detach().float()
-    full = getattr(value, "full_tensor", None)
-    return (full() if full is not None else value).contiguous()
+    local = getattr(value, "to_local", None)
+    return (local() if local is not None else value).contiguous()
 
 
 def _plain_weight(weight: Tensor) -> Tensor:
