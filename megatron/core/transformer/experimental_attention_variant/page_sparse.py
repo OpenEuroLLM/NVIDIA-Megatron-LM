@@ -69,7 +69,8 @@ class PageSparseConfig:
     # selection granularity: 1 = every query selects its own pages; B > 1 = one selection per block of B queries
     # (absolute positions), made by the block's first query and reused by the rest (V4.1's "Reuse"; decode
     # selects at every B-th token). A page union per block of B: block-sparse kernels attend just the budget.
-    # Chunk-invariant when chunks start at multiples of B (a chunk starting mid-block anchors at its first query).
+    # Chunk-invariant when chunks start at multiples of B (a chunk starting mid-block anchors at its first query;
+    # PageSparseCoreAttention prepends the block's earlier queries under CP, so its chunks always start aligned).
     select_block: int = 1
     # how a block's selection is scored: "first" = its first query's scores; "prev_max" = the max over the first
     # query and every query of the previous block (causal: all precede the block; decode knows them)

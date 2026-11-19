@@ -305,17 +305,19 @@ FLEX_CP_ARMS = {  # the t16 arms on the flex backend (the training path), small 
                      page_sparse_csa2_entry_rms=True, **VARIANTS["csa2"]),
     "lsa_fix": dict(page_sparse_selector="lsa", page_sparse_lsa_visibility="block", **VARIANTS["lsa"]),
 }
-# every CP chunk (length / (2 cp)) a multiple of select_block 32 up to 4 ranks: a select block that straddles a
-# chunk boundary takes its selection from the chunk's first query under CP (its block's first query is on another
-# rank), not from the block's first query as on one rank -- causal, but not the same selection
-CP_LENGTHS = (256, 512, 768)
+# "aligned": every CP chunk (length / (2 cp)) a multiple of select_block 32 up to 4 ranks; "straddling": chunks
+# start inside select blocks (and at CP 4 are shorter than one), so blocks need their first queries from other
+# ranks (PageSparseCoreAttention._cp_block_heads)
+CP_LENGTHS = {"aligned": (256, 512, 768), "straddling": (120, 264, 136)}
 
 
 @pytest.mark.skipif(Utils.world_size < 2, reason="needs 2 GPUs")
+@pytest.mark.parametrize("lengths", list(CP_LENGTHS))
 @pytest.mark.parametrize("name", list(FLEX_CP_ARMS))
-def test_flex_cp_matches_single_rank(name):
+def test_flex_cp_matches_single_rank(name, lengths):
     """CP = world size (2 or 4; intra-node 4 is the 256k layout) vs one rank, both on the flex backend: outputs,
-    q / k / v gradients and the CP-summed parameter gradients (fp32; the flex kernels have no float64)."""
+    q / k / v gradients and the CP-summed parameter gradients (fp32; the flex kernels have no float64), also
+    when select blocks straddle the CP chunk boundaries."""
     cp_size = Utils.world_size
     Utils.initialize_model_parallel(1, 1, context_parallel_size=cp_size)
     try:
@@ -333,10 +335,10 @@ def test_flex_cp_matches_single_rank(name):
             torch.nn.init.normal_(p, std=0.3)
         ref.load_state_dict(att.state_dict())
         att, ref = att.cuda(), ref.cuda()
-        params = _packed(CP_LENGTHS)
+        params = _packed(CP_LENGTHS[lengths])
         st = fla_cp.thd_stream(params.cu_seqlens_q_padded, cp_group)
         g = torch.Generator().manual_seed(11)
-        t = sum(CP_LENGTHS)
+        t = sum(CP_LENGTHS[lengths])
         q, k, v = (torch.randn(t, n, D, generator=g).cuda() for n in (HQ, G, G))
         x = torch.randn(t, 1, H, generator=g).cuda()
         dout = torch.randn(t, HQ * D, generator=g).cuda()
@@ -351,7 +353,7 @@ def test_flex_cp_matches_single_rank(name):
 
         def close(a, b, what):
             err = float((a - b).abs().max() / b.abs().max().clamp_min(1e-12))
-            assert err < 2e-3, f"{name} cp{cp_size} {what}: rel err {err:.2e}"
+            assert err < 2e-3, f"{name} {lengths} cp{cp_size} {what}: rel err {err:.2e}"
 
         close(out, out_ref[st.local_idx], "output")
         for i, w in enumerate("qkv"):

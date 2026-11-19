@@ -151,9 +151,10 @@ class PageSparseCoreAttention(MegatronModule):
                                "layer must run before this one on the same micro-batch")
         return fn(*args, selection=_SHARED_SELECTION[key], **kwargs)
 
-    def _indexer_scores(self, q, k, q_offset, xq, kpages):
+    def _indexer_scores(self, q, k, q_offset, xq, kpages, drop: int = 0):
         """The indexer's page scores (detached: no gradient through the selection) and its KL warm-up loss
-        (summed over the queries), or (None, None) for the other page selectors."""
+        (summed over the queries after the ``drop`` prepended ones), or (None, None) for the other page
+        selectors."""
         if self.indexer is None:
             return None, None
         scores = self.indexer(xq, kpages)
@@ -161,10 +162,11 @@ class PageSparseCoreAttention(MegatronModule):
         if self.training and self.loss_coeff > 0:
             oracle = ps.PageSparseConfig(selector="oracle", page=self.cfg.page, window=self.cfg.window,
                                          sink_pages=self.cfg.sink_pages)
+            qo = q[:, :, drop:]
             with torch.no_grad():
-                target = ps.page_scores(q.detach(), k.detach(), oracle, q_offset, self.scale)
-            cand = ps.candidate_mask(q.shape[2], scores.shape[-1], q_offset, self.cfg, q.device)
-            loss = ps.indexer_kl_loss(scores, target, cand) * q.shape[2]
+                target = ps.page_scores(qo.detach(), k.detach(), oracle, q_offset + drop, self.scale)
+            cand = ps.candidate_mask(qo.shape[2], scores.shape[-1], q_offset + drop, self.cfg, q.device)
+            loss = ps.indexer_kl_loss(scores[:, drop:], target, cand) * qo.shape[2]
         return scores.detach(), loss
 
     def _packed_flex(self, spans, keys):
@@ -184,29 +186,32 @@ class PageSparseCoreAttention(MegatronModule):
                 _SHARED_SELECTION[k] = sel
         return outs
 
-    def _attend(self, q, k, v, q_offset, xq, kpages, kfeat=None, key=(0, 0)):
+    def _attend(self, q, k, v, q_offset, xq, kpages, kfeat=None, key=(0, 0), drop: int = 0):
         """q [1, hq, sq, d] at positions q_offset.., k / v [1, g, L, d]; xq [1, sq, h] and kpages [1, P, dim]
         for the indexer; kfeat [1, L, F] the key side's per-token features (csa2: the compression weights).
+        The first ``drop`` queries are prepended block heads (CP, :meth:`_cp_block_heads`): they select, but the
+        caller drops their outputs and the losses leave them out.
         Returns (out [1, hq, sq, d], indexer loss or None)."""
         if self.cfg.selector == "dense":
             return ps.dense_attention(q, k, v, q_offset, self.scale), None
         if self.cfg.selector == "nsa":
             return self.variant(q, k, v, xq, q_offset, self.scale), None
+        qo, xo = q[:, :, drop:], (None if xq is None else xq[:, drop:])  # the loss rows
         if self.cfg.selector == "lsa":
             loss = None
             if self.training and self.loss_coeff > 0 and self.variant.proj_k is not None:  # D-LSA distillation
-                loss = self.variant.indexer_loss(q, k, q_offset, self.scale) * q.shape[2]
+                loss = self.variant.indexer_loss(qo, k, q_offset + drop, self.scale) * qo.shape[2]
             if self.dense_forward:
                 return ps.dense_attention(q, k, v, q_offset, self.scale), loss
             return self.variant(q, k, v, q_offset, self.scale), loss
         if self.cfg.selector == "csa2":
             loss = None
             if self.training and self.loss_coeff > 0:
-                loss = self.variant.indexer_loss(q, k, xq, kfeat, q_offset, self.scale) * q.shape[2]
+                loss = self.variant.indexer_loss(qo, k, xo, kfeat, q_offset + drop, self.scale) * qo.shape[2]
             if self.dense_forward:
                 return ps.dense_attention(q, k, v, q_offset, self.scale), loss
             return self.variant(q, k, v, xq, kfeat, q_offset, self.scale), loss
-        sel_scores, loss = self._indexer_scores(q, k, q_offset, xq, kpages)
+        sel_scores, loss = self._indexer_scores(q, k, q_offset, xq, kpages, drop)
         if self.dense_forward:
             return ps.dense_attention(q, k, v, q_offset, self.scale), loss
         if self.flex and q.is_cuda:
@@ -259,6 +264,51 @@ class PageSparseCoreAttention(MegatronModule):
                 losses.append((loss, s))
         return torch.stack(outs, 1), losses
 
+    def _cp_block_heads(self, query, x, bounds, cp, rank):
+        """Under CP, the queries a chunk needs from other ranks. A select block (``select_block`` B queries share
+        one selection, made by the block's first query) that straddles a chunk boundary has its first query on
+        another rank; the chunk then gets the block's earlier queries prepended, so it starts at a multiple of B
+        and every selector makes the one-rank selection. Every rank builds the same request list (the zigzag
+        layout is known everywhere), fills the rows it holds, and one all-reduce shares them.
+        -> {(document start, chunk offset): (q rows [h, hq, d], x rows [h, H] or None)}, detached: their outputs
+        are dropped, they only select (and selection carries no gradient)."""
+        B = self.cfg.select_block
+        if cp == 1 or B <= 1 or self.cfg.selector == "dense":
+            return {}
+        reqs, buf_rows, loc_rows, n_rows, loc0 = [], [], [], 0, 0
+        for a, b in zip(bounds[:-1], bounds[1:]):
+            L = b - a
+            if L == 0:
+                continue
+            c = L // (2 * cp)
+            for r in range(cp):
+                for off in (r * c, (2 * cp - 1 - r) * c):
+                    h = off % B
+                    if h == 0:
+                        continue
+                    if r == rank:
+                        reqs.append((a, off, n_rows, h))
+                    for i, p in enumerate(range(off - h, off)):  # the block's queries before the chunk
+                        j = p // c
+                        if (j if j < cp else 2 * cp - 1 - j) == rank:
+                            buf_rows.append(n_rows + i)
+                            loc_rows.append(loc0 + (p - j * c) + (0 if j < cp else c))
+                    n_rows += h
+            loc0 += L // cp
+        if n_rows == 0:
+            return {}
+        bi = torch.tensor(buf_rows, dtype=torch.long, device=query.device)
+        li = torch.tensor(loc_rows, dtype=torch.long, device=query.device)
+        qb = query.new_zeros(n_rows, *query.shape[1:])
+        qb[bi] = query.detach()[li]
+        torch.distributed.all_reduce(qb, group=self.cp_group)  # each row is non-zero on its owner only
+        xb = None
+        if x is not None:
+            xb = x.new_zeros(n_rows, x.shape[-1])
+            xb[bi] = x.detach()[li]
+            torch.distributed.all_reduce(xb, group=self.cp_group)
+        return {(a, off): (qb[s0:s0 + h], None if xb is None else xb[s0:s0 + h]) for a, off, s0, h in reqs}
+
     def _forward_thd(self, query, key, value, packed_seq_params):
         """query [t, hq, d], key / value [t, g, d] (this rank's THD tokens) -> [t, hq * d]."""
         cu = packed_seq_params.cu_seqlens_q_padded
@@ -288,6 +338,7 @@ class PageSparseCoreAttention(MegatronModule):
                   and not self.dense_forward and self.cfg.selector in ps.PAGE_SELECTORS)
         flex_spans, flex_keys, flex_rows = [], [], []
         pieces, losses, local = [], [], 0
+        heads = self._cp_block_heads(query, x, bounds, cp, rank)
         for a, b in zip(bounds[:-1], bounds[1:]):
             L = b - a
             if L == 0:
@@ -306,23 +357,30 @@ class PageSparseCoreAttention(MegatronModule):
                 q = query[lo:lo + n].permute(1, 0, 2).unsqueeze(0)  # [1, hq, n, d]
                 end = off + n  # the chunk's queries see the document's keys up to its end
                 xq = None if x is None else x[lo:lo + n].unsqueeze(0)
+                h = 0  # prepended block heads (a chunk starting inside a select block, CP)
+                if (a, off) in heads:
+                    qh, xh = heads[(a, off)]
+                    h = qh.shape[0]
+                    q = torch.cat([qh.permute(1, 0, 2).unsqueeze(0), q], 2)
+                    xq = None if xq is None else torch.cat([xh.unsqueeze(0), xq], 1)
                 kpc = None if kp is None else kp[:, : -(-end // self.cfg.page)]
                 kfc = None if kf is None else kf[:, :end]
                 if packed:
-                    sel_scores, loss = self._indexer_scores(q, kd[:, :, :end], off, xq, kpc)
-                    flex_spans.append((q, kd[:, :, :end], vd[:, :, :end], off, sel_scores))
+                    sel_scores, loss = self._indexer_scores(q, kd[:, :, :end], off - h, xq, kpc, h)
+                    flex_spans.append((q, kd[:, :, :end], vd[:, :, :end], off - h, sel_scores))
                     flex_keys.append((a, off))
-                    flex_rows.append((len(pieces), n))
+                    flex_rows.append((len(pieces), n, h))
                     pieces.append(None)  # filled after the one flex call
                 else:
-                    o, loss = self._attend(q, kd[:, :, :end], vd[:, :, :end], off, xq, kpc, kfc, key=(a, off))
-                    pieces.append(o[0].permute(1, 0, 2).reshape(n, hq * d))
+                    o, loss = self._attend(q, kd[:, :, :end], vd[:, :, :end], off - h, xq, kpc, kfc, key=(a, off),
+                                           drop=h)
+                    pieces.append(o[0, :, h:].permute(1, 0, 2).reshape(n, hq * d))
                 if loss is not None:
                     losses.append((loss, n))
             local += L // cp
         if flex_spans:
-            for (i, n), o in zip(flex_rows, self._packed_flex(flex_spans, flex_keys)):
-                pieces[i] = o[0].permute(1, 0, 2).reshape(n, hq * d)
+            for (i, n, h), o in zip(flex_rows, self._packed_flex(flex_spans, flex_keys)):
+                pieces[i] = o[0, :, h:].permute(1, 0, 2).reshape(n, hq * d)
         if local < t:  # padding after the last document
             pieces.append(query.new_zeros(t - local, hq * d))
         return torch.cat(pieces, 0), losses
