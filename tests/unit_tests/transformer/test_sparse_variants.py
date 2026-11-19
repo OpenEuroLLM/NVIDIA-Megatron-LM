@@ -621,3 +621,25 @@ def test_csa2_selection_independent_of_the_sequence_length():
     for n in (54, 55, 56):
         part = csa(q[:, :, :n], k[:, :, :n], v[:, :, :n], x[:, :n], z[:, :n], 0, d**-0.5)
         torch.testing.assert_close(part, full[:, :, :n], atol=1e-10, rtol=1e-10)
+
+
+def test_page_maxpool_ties_break_by_page_index():
+    """Two pages sharing the max of their common boundary window score exactly the same under page_maxpool; the
+    selection must keep the lower page for any number of later keys (torch.topk broke the tie by the row length, so
+    decode / chunked prefill selected another page than one shot). Pins the rule: CPU topk happens to agree on this
+    input; the HF decode test (tests/unit/test_hf_sparse_attention.py, token select mode) diverged without it."""
+    page, p = 8, 2  # window 4p+3 covers positions 8p+6 .. 8p+9: the end of page p and the start of page p+1
+    L0 = 72
+    q = torch.zeros(1, 1, L0, 4, dtype=torch.float64)
+    q[..., 0] = 1.0
+    k = torch.zeros(1, 1, L0, 4, dtype=torch.float64)
+    k[:, :, 8 * p + 6: 8 * p + 10, 0] = 5.0  # only the shared window sees them in full
+    cfg = ps.PageSparseConfig(selector="page_maxpool", page=page, topk=1, window=8, sink_pages=0, select_block=1)
+    sc = ps.selection_scores(q[:, :, 50:51], k, cfg, 50, 1.0)
+    assert sc[0, 0, p] == sc[0, 0, p + 1]  # the tie
+    picks = set()
+    for L in (51, 56, 64, 72):
+        tok, ok = ps.select_tokens(q[:, :, 50:51], k[:, :, :L], cfg, 50, 1.0)
+        sel = sorted({int(t) // page for t in tok[ok].tolist()} - {50 // page, 50 // page - 1})
+        picks.add(tuple(sel))
+    assert picks == {(p,)}

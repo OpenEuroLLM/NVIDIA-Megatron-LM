@@ -243,7 +243,7 @@ def hierarchical_restrict(sc, q, k, cfg: PageSparseConfig, q_offset: int, scale:
         coarse = coarse[..., :ng].masked_fill(~has, float("-inf"))
     else:
         coarse = F.pad(sc, (0, ng * G - P), value=float("-inf")).view(b, s, ng, G).amax(-1)
-    val, top = coarse.topk(min(cfg.hier_topk, ng), dim=-1)
+    val, top = topk_stable(coarse, min(cfg.hier_topk, ng))
     keep = torch.zeros(b, s, ng, dtype=torch.bool, device=sc.device).scatter_(-1, top, torch.isfinite(val))
     keep = keep.repeat_interleave(G, -1)[..., :P]
     return sc.masked_fill(~keep, float("-inf"))
@@ -272,7 +272,7 @@ def select_tokens(q, k, cfg: PageSparseConfig, q_offset: int = 0, scale: float |
         sel_tok, sel_tok_ok = _token_topk(q, k, cfg, pos, scale)
     elif cfg.selector != "window" and cfg.topk > 0:
         sc = selection_scores(q, k, cfg, q_offset, scale, indexer_scores)
-        val, sel = sc.topk(min(cfg.topk, P), dim=-1)
+        val, sel = topk_stable(sc, min(cfg.topk, P))  # ties (page_maxpool's shared boundary window) by page index
         sel, _ = torch.sort(torch.where(torch.isfinite(val), sel, P + 1), dim=-1)  # page order: contiguous fetches
         pages.append(sel)
         # a block's selection may reach into a later query's window (attended there already: no duplicates)
@@ -403,7 +403,8 @@ def _per_group(fn, q, k, v, selection, return_selection, **kw):
 def topk_stable(scores: torch.Tensor, n: int):
     """The n largest of ``scores`` along the last dim, ties to the lower index -- independent of how many trailing
     (unselectable) columns the tensor has. ``torch.topk`` orders tied values arbitrarily, so a score with exact ties
-    (CSA2's indexer: a sum of relus, often exactly 0) selected differently for different sequence lengths."""
+    (CSA2's indexer: a sum of relus, often exactly 0; page_maxpool: two pages sharing their boundary window's max)
+    selected differently for different sequence lengths."""
     vals, idx = torch.sort(scores, dim=-1, descending=True, stable=True)
     return vals[..., :n], idx[..., :n]
 
@@ -545,7 +546,7 @@ def select_pages(q, k, cfg: PageSparseConfig, q_offset: int = 0, scale: float | 
     allowed = allowed[None].expand(b, s, P).clone()
     if cfg.selector != "window" and cfg.topk > 0:
         sc = selection_scores(q, k, cfg, q_offset, scale, indexer_scores)
-        val, sel = sc.topk(min(cfg.topk, P), dim=-1)
+        val, sel = topk_stable(sc, min(cfg.topk, P))
         allowed.scatter_(-1, sel, torch.isfinite(val) | allowed.gather(-1, sel))
     return allowed
 
