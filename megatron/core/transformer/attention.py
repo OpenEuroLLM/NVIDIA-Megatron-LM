@@ -434,7 +434,11 @@ class Attention(MegatronModule, ABC):
             softmax_scale=self.config.softmax_scale,
             pg_collection=self.pg_collection,
         )
-        if getattr(self.config, "page_sparse_selector", None) and self.attention_type == "self":
+        if (
+            getattr(self.config, "page_sparse_selector", None)
+            and self.attention_type == "self"
+            and self.layer_number - 1 not in (getattr(self.config, "page_sparse_dense_layers", None) or ())
+        ):
             # page-sparse attention instead of the configured core attention (same call, same output)
             from megatron.core.transformer.experimental_attention_variant.page_sparse_attention import (
                 PageSparseCoreAttention,

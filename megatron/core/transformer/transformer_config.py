@@ -757,6 +757,10 @@ class TransformerConfig(ModelParallelConfig):
     updates move zero-initialised matrices to a fixed norm after one step whatever the gradient (audit
     2026-11-18: NSA's gate rows)."""
 
+    page_sparse_dense_layers: Optional[list[int]] = None
+    """0-based decoder layer indices (like ``kv_share_layers``) whose self-attention stays dense (the configured core
+    attention) under ``page_sparse_selector``; e.g. the first attention layer of an attention-first hybrid."""
+
     linear_kronlstm_forget_offset: float = 0.0
     """KronLSTM: a fixed extra decay per step on every forget channel (log|f| - offset); 0.012 is
     the polar forget gate's init cap without its angle."""

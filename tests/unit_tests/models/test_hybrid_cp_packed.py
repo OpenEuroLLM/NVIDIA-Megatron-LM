@@ -152,3 +152,25 @@ def test_cp_matches_single_rank(attention, max_err, mean_max):
     finally:
         Utils.destroy_model_parallel()
         faulthandler.cancel_dump_traceback_later()
+
+
+def test_page_sparse_dense_layers():
+    """page_sparse_dense_layers keeps the listed (0-based) layers' self-attention dense: layer 0 ('*') gets the
+    configured core attention, without the option the page-sparse one."""
+    from megatron.core.transformer.experimental_attention_variant.page_sparse_attention import (
+        PageSparseCoreAttention,
+    )
+
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        sparse = dict(page_sparse_selector="page_maxpool", page_sparse_page=16, page_sparse_topk=2,
+                      page_sparse_window=16)
+
+        def n_sparse(m):  # PATTERN's only attention layer is layer 0
+            return sum(isinstance(x, PageSparseCoreAttention) for x in m.modules())
+
+        assert n_sparse(_model(1, **sparse)) == 1
+        assert n_sparse(_model(1, **sparse, page_sparse_dense_layers=[0])) == 0
+    finally:
+        Utils.destroy_model_parallel()
