@@ -710,17 +710,25 @@ class LSA(nn.Module):
             kv_idx = torch.argsort((~partial).to(torch.int8), dim=-1, stable=True).to(torch.int32)
             full_num = full.sum(-1).to(torch.int32)
             full_idx = torch.argsort((~full).to(torch.int8), dim=-1, stable=True).to(torch.int32)
-            sel_i8 = selected.to(torch.int8)
-            bucket_i = bucket_of.to(torch.int32)
-            valid_i8 = valid.to(torch.int8)
-            # visibility "block": a selected bucket's members inside the query's raw window are attended raw
+            # visibility "block": a selected bucket's members inside the query's raw window are attended raw;
+            # padding gets the largest position, so one comparison masks both
+            big = torch.iinfo(torch.int32).max
             fw = ((qpos // cfg.page - cfg.window // cfg.page) * cfg.page).to(torch.int32)
             if cfg.visibility != "block":
-                fw = torch.full_like(fw, torch.iinfo(torch.int32).max)
-            perm_i = perm.to(torch.int32)
+                fw = torch.full_like(fw, big - 1)
+            perm_i = torch.where(valid, perm, big).to(torch.int32)
+            straddle = bool((rows & ~(sel_a & sel_b)).any())
 
-        def mask_mod(bi, hi, qi, ki):
-            return (valid_i8[ki] > 0) & (sel_i8[qsel[qi], bucket_i[ki]] > 0) & (perm_i[ki] < fw[qi])
+        if straddle:  # some flex row spans two selection blocks: the selection is checked per query
+            sel_i8 = selected.to(torch.int8)
+            bucket_i = bucket_of.to(torch.int32)
+
+            def mask_mod(bi, hi, qi, ki):
+                return (sel_i8[qsel[qi], bucket_i[ki]] > 0) & (perm_i[ki] < fw[qi])
+        else:  # a listed block's bucket is selected for every query of its row
+
+            def mask_mod(bi, hi, qi, ki):
+                return perm_i[ki] < fw[qi]
 
         bm = BlockMask.from_kv_blocks(kv_num[None, None], kv_idx[None, None], full_num[None, None],
                                       full_idx[None, None], BLOCK_SIZE=(B, kv_block), mask_mod=mask_mod,
