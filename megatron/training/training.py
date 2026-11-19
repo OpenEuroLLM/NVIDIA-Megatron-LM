@@ -2769,6 +2769,21 @@ def setup_model_and_optimizer(
         print_rank_0(f'Upcycled checkpoint saved to {args.save}')
 
     if (
+        getattr(args, "branch_resume_from_save", False)
+        and args.save
+        and args.load != args.save
+        and checkpoint_exists(args.save)
+    ):
+        # a branch arm (--load another run's checkpoint, pinned by --ckpt-step and the data position) that
+        # already saved: resume its own run -- the pins belong to the branch point only
+        print_rank_0(
+            f"> branch resume: {args.save} has a checkpoint; loading it instead of {args.load} "
+            f"(ckpt_step {args.ckpt_step} and diag_consumed_train_samples "
+            f"{getattr(args, 'diag_consumed_train_samples', None)} dropped)"
+        )
+        args.load, args.ckpt_step, args.diag_consumed_train_samples = args.save, None, None
+
+    if (
         args.load is not None or args.pretrained_checkpoint is not None
     ) and not args.moe_use_upcycling:
         one_logger and one_logger.log_metrics(

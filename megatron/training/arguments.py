@@ -2865,6 +2865,11 @@ def _add_diagnostics_args(parser):
                             'the checkpoint\'s own, so a probe can run the weights of '
                             'iteration X on the batches of iteration Y '
                             '(Y * global batch size). Never use for real training.')
+    group.add_argument('--branch-resume-from-save', action='store_true', default=False,
+                       help='A branch run (--load another run\'s checkpoint, pinned by --ckpt-step '
+                            'and --diag-consumed-train-samples): once --save holds a checkpoint, '
+                            'load that instead and drop both pins, so restarts (time limits, node '
+                            'failures) resume the branch, not the branch point.')
 
     return parser
 
