@@ -352,8 +352,10 @@ def test_flex_cp_matches_single_rank(name, lengths):
         (out_ref * dout).sum().backward()
 
         def close(a, b, what):
+            # 5e-3: the NGC container forces TF32 for fp32 GEMMs and CP sums in another order (lsa_fix straddling
+            # dq 2.6e-3 on H100 at CP 4); a selection that differs from one rank's gives 1e-2 .. 1
             err = float((a - b).abs().max() / b.abs().max().clamp_min(1e-12))
-            assert err < 2e-3, f"{name} {lengths} cp{cp_size} {what}: rel err {err:.2e}"
+            assert err < 5e-3, f"{name} {lengths} cp{cp_size} {what}: rel err {err:.2e}"
 
         close(out, out_ref[st.local_idx], "output")
         for i, w in enumerate("qkv"):
