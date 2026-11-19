@@ -709,7 +709,10 @@ def flex_kernel_options(q, q_block: int, kv_block: int) -> dict:
     tile for a short chunk); smaller ones on consumer GPUs (~100 KB of shared memory)."""
     smem = torch.cuda.get_device_properties(q.device).shared_memory_per_block_optin
     tile = 32 if smem < 160 * 1024 and q.shape[-1] >= 128 else 64
-    opts = {"BLOCK_M": min(tile, q_block), "BLOCK_N": min(tile, kv_block)}
+    # FORCE_USE_FLEX_ATTENTION: inductor picks its decoding kernel for < 128 queries (short documents / CP chunks),
+    # which fails to lower the symbolic tiles of the dynamic compile -- and the eager fallback is wrong for masks
+    # that rely on the block lists (LSA's bucket part)
+    opts = {"BLOCK_M": min(tile, q_block), "BLOCK_N": min(tile, kv_block), "FORCE_USE_FLEX_ATTENTION": True}
     if tile == 32:
         opts["num_stages"] = 1
     return opts

@@ -550,14 +550,14 @@ class LSA(nn.Module):
         g, L = k.shape[1], k.shape[2]
         rep = hq // g
         cent, mem, mem_ok, last = index if index is not None else self.index(k)
+        if self.flex and q.is_cuda and cfg.select_block > 1:
+            return self._forward_flex(q, k, v, q_offset, scale, (cent, mem, mem_ok, last))
         raw_cfg = ps.PageSparseConfig(selector="window", page=cfg.page, window=cfg.window,
                                       sink_pages=cfg.sink_pages)
         tok, tok_ok = ps.select_tokens(q, k, raw_cfg, q_offset, scale)
         nb = cent.shape[0]
         if nb == 0:
             return ps.attend_gathered(q, k, v, tok, tok_ok, scale, None)
-        if self.flex and q.is_cuda and cfg.select_block > 1:
-            return self._forward_flex(q, k, v, q_offset, scale, (cent, mem, mem_ok, last))
         pos = q_offset + torch.arange(s, device=q.device)
         with torch.no_grad():
             sc = self._bucket_scores(q, cent, last, pos)
@@ -644,95 +644,112 @@ class LSA(nn.Module):
         return total / max(count, 1) if count else _zero_loss(self, q)
 
     def _forward_flex(self, q, k, v, q_offset, scale, index):
-        """Raw sinks + window, and the selected buckets over the keys permuted into bucket order (each bucket a
-        contiguous span), as two FlexAttention calls merged by their LSEs."""
+        """ONE FlexAttention call over [the keys in position order (raw sinks + window) | the keys permuted into
+        bucket order (each bucket a contiguous span, padded to whole kv blocks)] -- no second call, no LSE merge
+        (two calls merged in fp32 cost ~2x the memory and a third of the time, 2026-11-19)."""
         from torch.nn.attention.flex_attention import BlockMask
 
         cfg = self.cfg
         _, hq, s, d = q.shape
-        g = k.shape[1]
+        g, L = k.shape[1], k.shape[2]
         B, kv_block = cfg.select_block, cfg.kv_block
         cent, mem, mem_ok, last = index
-        raw_cfg = ps.PageSparseConfig(selector="window", page=cfg.page, window=cfg.window,
-                                      sink_pages=cfg.sink_pages)
-        o_raw, l_raw = ps.flex_page_sparse_attention(q, k, v, raw_cfg, q_offset, scale, None, B, return_lse=True)
+        big = torch.iinfo(torch.int32).max
         with torch.no_grad():
             dev = q.device
             nb = cent.shape[0]
-            ok = mem_ok & (mem >= cfg.sink_pages * cfg.page)  # the sinks are attended already
+            sink_end = cfg.sink_pages * cfg.page
+            qpos = q_offset + torch.arange(s, device=dev)
+            fq = -(-s // B)
+            r = torch.arange(fq, device=dev)
+            r_first, r_last = r * B, ((r + 1) * B).clamp(max=s) - 1  # each flex row's first / last query
+            qa, qb = q_offset + r_first, q_offset + r_last
+            fw = ((qpos // cfg.page - cfg.window // cfg.page) * cfg.page).to(torch.int32)  # first window position
+            # raw part: keys 0 .. L-1 in position order, padded to whole kv blocks; a query sees the sinks and
+            # its window (causal)
+            nrb = -(-L // kv_block)
+            Lr = nrb * kv_block
+            lo = torch.arange(nrb, device=dev) * kv_block
+            hi = lo + kv_block - 1
+            fwa, fwb = fw[r_first].long(), fw[r_last].long()
+            raw_any = (lo[None] <= qb[:, None]) & ((lo[None] < sink_end) | (hi[None] >= fwa[:, None]))
+            raw_full = (hi[None] <= qa[:, None]) & ((hi[None] < sink_end) | (lo[None] >= fwb[:, None]))
+            raw_part = raw_any & ~raw_full
+            ok = mem_ok & (mem >= sink_end)  # the sinks are attended raw
             cnt = ok.sum(-1)  # [nb] members per bucket
-            if int(cnt.sum()) == 0:
-                return o_raw
-            # keys in bucket order, each bucket padded to whole kv blocks: a block belongs to one bucket, so a block
-            # of a selected bucket is FULL (no mask evaluation) unless it holds padding or members that may lie in
-            # the query's raw window -- packed back to back nearly every block straddled two buckets and the
-            # kernel evaluated the mask per element (83 % of LSA's training time, 2026-11-19)
+            if nb == 0 or int(cnt.sum()) == 0:
+                nb, cnt = 0, cnt[:0]
+            # bucket part: a block belongs to one bucket, so a block of a selected bucket is FULL (no mask
+            # evaluation) unless it holds padding or members that may lie in the query's raw window -- packed back
+            # to back nearly every block straddled two buckets and the kernel evaluated the mask per element
             nblk_b = (cnt + kv_block - 1) // kv_block  # [nb]
             pad = nblk_b * kv_block
             boff = torch.cumsum(pad, 0) - pad  # each bucket's first padded position
             Lp = int(pad.sum())
-            rank = torch.cumsum(ok.to(torch.long), -1) - 1
-            dest = (boff[:, None] + rank)[ok]
-            perm = torch.zeros(Lp, dtype=torch.long, device=dev)
-            perm[dest] = mem[ok]
-            valid = torch.zeros(Lp, dtype=torch.bool, device=dev)
-            valid[dest] = True
             nkb = Lp // kv_block
-            block_bucket = torch.repeat_interleave(torch.arange(nb, device=dev), nblk_b)  # [nkb]
-            bucket_of = block_bucket.repeat_interleave(kv_block)  # [Lp]
-            blk_in_bucket = torch.arange(nkb, device=dev) - (torch.cumsum(nblk_b, 0) - nblk_b)[block_bucket]
-            block_dense = (blk_in_bucket + 1) * kv_block <= cnt[block_bucket]  # no padding in the block
-            span = cfg.pool * cfg.block
-            block_cluster = (last // span)[block_bucket]  # the cluster block each kv block's bucket comes from
-            # one selection per block of B queries (the block's first query, or the chunk's first)
-            first = (q_offset // B) * B
-            anchors = (first + torch.arange(-(-s // B) + 1, device=dev) * B - q_offset).clamp(min=0)
-            anchors = anchors[anchors < s]
-            sc = self._bucket_scores(q[:, :, anchors], cent, last, q_offset + anchors)
-            val, top = sc.topk(min(cfg.topk, nb), dim=-1)
-            selected = torch.zeros(len(anchors), nb, dtype=torch.bool, device=dev)
-            selected.scatter_(-1, top, torch.isfinite(val))
-            qpos = q_offset + torch.arange(s, device=dev)
-            qsel = (qpos // B - q_offset // B).to(torch.int32)
-            fq = -(-s // B)
-            r = torch.arange(fq, device=dev)
-            r_first, r_last = r * B, ((r + 1) * B).clamp(max=s) - 1  # each flex row's first / last query
-            sel_a = selected[qsel[r_first].long()][:, block_bucket]  # [fq, nkb]
-            sel_b = selected[qsel[r_last].long()][:, block_bucket]
-            rows = sel_a | sel_b
-            partial = rows & ~(sel_a & sel_b)  # a row straddling two selection blocks: per query
-            partial |= rows & ~block_dense[None]
-            if cfg.visibility == "block":  # members of the previous cluster block may lie in the raw window
-                q_cluster = (q_offset + r_first) // span
-                partial |= rows & (block_cluster[None] >= q_cluster[:, None] - 1)
-            full = rows & ~partial
-            kv_num = partial.sum(-1).to(torch.int32)
-            kv_idx = torch.argsort((~partial).to(torch.int8), dim=-1, stable=True).to(torch.int32)
-            full_num = full.sum(-1).to(torch.int32)
-            full_idx = torch.argsort((~full).to(torch.int8), dim=-1, stable=True).to(torch.int32)
-            # visibility "block": a selected bucket's members inside the query's raw window are attended raw;
-            # padding gets the largest position, so one comparison masks both
-            big = torch.iinfo(torch.int32).max
-            fw = ((qpos // cfg.page - cfg.window // cfg.page) * cfg.page).to(torch.int32)
-            if cfg.visibility != "block":
-                fw = torch.full_like(fw, big - 1)
-            perm_i = torch.where(valid, perm, big).to(torch.int32)
-            straddle = bool((rows & ~(sel_a & sel_b)).any())
-
-        if straddle:  # some flex row spans two selection blocks: the selection is checked per query
+            perm = torch.zeros(Lp, dtype=torch.long, device=dev)
+            # each key's position, a bucket key's as -1 - position (the sign tells the parts apart without a
+            # length in the mask -- a captured int recompiles per document length); padding: big / -big
+            kpos = torch.full((Lr + Lp,), big, dtype=torch.int32, device=dev)
+            kpos[:L] = torch.arange(L, device=dev, dtype=torch.int32)
+            kpos[Lr:] = -big
+            selected = torch.zeros(1, 1, dtype=torch.bool, device=dev)
+            qsel = torch.zeros(s, dtype=torch.int32, device=dev)
+            bucket_of = torch.zeros(Lp, dtype=torch.long, device=dev)
+            if nb:
+                rank = torch.cumsum(ok.to(torch.long), -1) - 1
+                dest = (boff[:, None] + rank)[ok]
+                perm[dest] = mem[ok]
+                kpos[Lr + dest] = (-1 - mem[ok]).to(torch.int32)
+                block_bucket = torch.repeat_interleave(torch.arange(nb, device=dev), nblk_b)  # [nkb]
+                bucket_of = block_bucket.repeat_interleave(kv_block)  # [Lp]
+                blk_in_bucket = torch.arange(nkb, device=dev) - (torch.cumsum(nblk_b, 0) - nblk_b)[block_bucket]
+                block_dense = (blk_in_bucket + 1) * kv_block <= cnt[block_bucket]  # no padding in the block
+                span = cfg.pool * cfg.block
+                block_cluster = (last // span)[block_bucket]  # the cluster block each kv block's bucket is from
+                # one selection per block of B queries (the block's first query, or the chunk's first)
+                first = (q_offset // B) * B
+                anchors = (first + torch.arange(-(-s // B) + 1, device=dev) * B - q_offset).clamp(min=0)
+                anchors = anchors[anchors < s]
+                sc = self._bucket_scores(q[:, :, anchors], cent, last, q_offset + anchors)
+                val, top = sc.topk(min(cfg.topk, nb), dim=-1)
+                selected = torch.zeros(len(anchors), nb, dtype=torch.bool, device=dev)
+                selected.scatter_(-1, top, torch.isfinite(val))
+                qsel = (qpos // B - q_offset // B).to(torch.int32)
+                sel_a = selected[qsel[r_first].long()][:, block_bucket]  # [fq, nkb]
+                sel_b = selected[qsel[r_last].long()][:, block_bucket]
+                rows = sel_a | sel_b
+                part = rows & ~(sel_a & sel_b)  # a row straddling two selection blocks: per query
+                part |= rows & ~block_dense[None]
+                if cfg.visibility == "block":  # members of the previous cluster block may lie in the raw window
+                    q_cluster = qa // span
+                    part |= rows & (block_cluster[None] >= q_cluster[:, None] - 1)
+                full = rows & ~part
+                raw_part, raw_full = torch.cat([raw_part, part], -1), torch.cat([raw_full, full], -1)
+            kv_num = raw_part.sum(-1).to(torch.int32)
+            kv_idx = torch.argsort((~raw_part).to(torch.int8), dim=-1, stable=True).to(torch.int32)
+            full_num = raw_full.sum(-1).to(torch.int32)
+            full_idx = torch.argsort((~raw_full).to(torch.int8), dim=-1, stable=True).to(torch.int32)
+            # bucket keys: visibility "block" skips a selected bucket's members inside the query's raw window
+            fwk = fw if cfg.visibility == "block" else torch.full_like(fw, big - 1)
+            qpos_i = qpos.to(torch.int32)
             sel_i8 = selected.to(torch.int8)
-            bucket_i = bucket_of.to(torch.int32)
+            bucket_i = F.pad(bucket_of.to(torch.int32), (Lr, 0))  # [Lr + Lp]
 
-            def mask_mod(bi, hi, qi, ki):
-                return (sel_i8[qsel[qi], bucket_i[ki]] > 0) & (perm_i[ki] < fw[qi])
-        else:  # a listed block's bucket is selected for every query of its row
+        # raw key (p >= 0): causal, sink or window; bucket key (p < 0): a member (not padding) before fwk, of a
+        # bucket the query's selection block chose -- checked per element (not left to the block lists) so the
+        # mask is exact on its own: flex's eager fallback evaluates the mask alone, and one mask_mod (one closure
+        # layout) for every call -- two variants alternating crashed dynamo's recompile check into that fallback
+        def mask_mod(bi, hi, qi, ki):
+            p = kpos[ki]
+            raw = (p >= 0) & (p <= qpos_i[qi]) & ((p < sink_end) | (p >= fw[qi]))
+            return raw | ((p < 0) & (p > -1 - fwk[qi]) & (sel_i8[qsel[qi], bucket_i[ki]] > 0))
 
-            def mask_mod(bi, hi, qi, ki):
-                return perm_i[ki] < fw[qi]
-
-        bm = BlockMask.from_kv_blocks(kv_num[None, None], kv_idx[None, None], full_num[None, None],
-                                      full_idx[None, None], BLOCK_SIZE=(B, kv_block), mask_mod=mask_mod,
-                                      seq_lengths=(s, Lp))
-        o_sel, l_sel = ps._flex()(q, k[:, :, perm], v[:, :, perm], block_mask=bm, scale=scale, enable_gqa=hq != g,
-                                  return_lse=True, kernel_options=ps.flex_kernel_options(q, B, kv_block))
-        return ps.merge_attention([(o_raw, l_raw), (o_sel, l_sel)])
+        n = nrb + nkb
+        bm = BlockMask.from_kv_blocks(kv_num.view(1, 1, fq), kv_idx.view(1, 1, fq, n), full_num.view(1, 1, fq),
+                                      full_idx.view(1, 1, fq, n), BLOCK_SIZE=(B, kv_block), mask_mod=mask_mod,
+                                      seq_lengths=(s, Lr + Lp))
+        kc = torch.cat([F.pad(k, (0, 0, 0, Lr - L)), k[:, :, perm]], 2)
+        vc = torch.cat([F.pad(v, (0, 0, 0, Lr - L)), v[:, :, perm]], 2)
+        return ps._flex()(q, kc, vc, block_mask=bm, scale=scale, enable_gqa=hq != g,
+                          kernel_options=ps.flex_kernel_options(q, B, kv_block))

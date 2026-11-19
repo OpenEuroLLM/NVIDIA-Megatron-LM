@@ -249,13 +249,14 @@ def test_csa2_flex_matches_reference(off):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="FlexAttention needs a GPU")
+@pytest.mark.parametrize("visibility", ["window", "block"])
 @pytest.mark.parametrize("off", [0, 128, 144])
-def test_lsa_flex_matches_reference(off):
-    """LSA's flex path (keys in bucket order, LSE-merged with the raw part) equals the block-selection
+def test_lsa_flex_matches_reference(off, visibility):
+    """LSA's flex path (one call over the raw keys and the keys in bucket order) equals the block-selection
     reference, forward and backward (fp32); the reference is causal and chunk-invariant at aligned cuts."""
     q, k, v, _ = (t.float().clone().requires_grad_() for t in qkvx(L=512))
     lsa = sv.LSA(sv.LSAConfig(pool=2, block=16, buckets=4, iters=3, topk=2, window=32, page=16, sink_pages=1,
-                              select_block=32, kv_block=16))
+                              select_block=32, kv_block=16, visibility=visibility))
 
     def run():
         return lsa(q[:, :, off:], k, v, off, D**-0.5)
@@ -276,6 +277,25 @@ def test_lsa_flex_matches_reference(off):
     gr = torch.autograd.grad((run() * g).sum(), (q, k, v))
     for x, y in zip(gf, gr):
         assert float((x - y).abs().max() / y.abs().max()) < 2e-2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="FlexAttention needs a GPU")
+def test_lsa_flex_many_lengths():
+    """LSA's flex path at lengths off the kv blocks, documents without a complete cluster block (raw part only)
+    and straddling offsets equals the reference, with few compiled graphs."""
+    from torch._dynamo.utils import counters
+
+    counters.clear()
+    lsa = sv.LSA(sv.LSAConfig(pool=2, block=16, buckets=4, iters=3, topk=2, window=32, page=16, sink_pages=1,
+                              select_block=32, kv_block=16, visibility="block"))
+    for L, off in [(20, 0), (31, 0), (130, 0), (257, 16), (300, 44), (333, 100), (190, 0), (450, 64)]:
+        q, k, v, _ = (t.float() for t in qkvx(L=L, seed=L))
+        ref = lsa(q[:, :, off:], k, v, off, D**-0.5)
+        lsa.flex = True
+        out = lsa(q[:, :, off:], k, v, off, D**-0.5)
+        lsa.flex = False
+        assert float((out - ref).abs().max() / ref.abs().max()) < 1e-2, (L, off)
+    assert counters["stats"]["unique_graphs"] <= 4, dict(counters["stats"])
 
 
 @pytest.mark.parametrize("selector", ["page_mean", "quest"])
