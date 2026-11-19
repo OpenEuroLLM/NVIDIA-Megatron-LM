@@ -657,33 +657,62 @@ class LSA(nn.Module):
                                       sink_pages=cfg.sink_pages)
         o_raw, l_raw = ps.flex_page_sparse_attention(q, k, v, raw_cfg, q_offset, scale, None, B, return_lse=True)
         with torch.no_grad():
+            dev = q.device
             nb = cent.shape[0]
             ok = mem_ok & (mem >= cfg.sink_pages * cfg.page)  # the sinks are attended already
-            perm = mem[ok]  # member tokens, bucket by bucket
-            bucket_of = torch.arange(nb, device=q.device).repeat_interleave(ok.sum(-1))
-            Lp = perm.numel()
-            if Lp == 0:
+            cnt = ok.sum(-1)  # [nb] members per bucket
+            if int(cnt.sum()) == 0:
                 return o_raw
+            # keys in bucket order, each bucket padded to whole kv blocks: a block belongs to one bucket, so a block
+            # of a selected bucket is FULL (no mask evaluation) unless it holds padding or members that may lie in
+            # the query's raw window -- packed back to back nearly every block straddled two buckets and the
+            # kernel evaluated the mask per element (83 % of LSA's training time, 2026-11-19)
+            nblk_b = (cnt + kv_block - 1) // kv_block  # [nb]
+            pad = nblk_b * kv_block
+            boff = torch.cumsum(pad, 0) - pad  # each bucket's first padded position
+            Lp = int(pad.sum())
+            rank = torch.cumsum(ok.to(torch.long), -1) - 1
+            dest = (boff[:, None] + rank)[ok]
+            perm = torch.zeros(Lp, dtype=torch.long, device=dev)
+            perm[dest] = mem[ok]
+            valid = torch.zeros(Lp, dtype=torch.bool, device=dev)
+            valid[dest] = True
+            nkb = Lp // kv_block
+            block_bucket = torch.repeat_interleave(torch.arange(nb, device=dev), nblk_b)  # [nkb]
+            bucket_of = block_bucket.repeat_interleave(kv_block)  # [Lp]
+            blk_in_bucket = torch.arange(nkb, device=dev) - (torch.cumsum(nblk_b, 0) - nblk_b)[block_bucket]
+            block_dense = (blk_in_bucket + 1) * kv_block <= cnt[block_bucket]  # no padding in the block
+            span = cfg.pool * cfg.block
+            block_cluster = (last // span)[block_bucket]  # the cluster block each kv block's bucket comes from
             # one selection per block of B queries (the block's first query, or the chunk's first)
             first = (q_offset // B) * B
-            anchors = (first + torch.arange(-(-s // B) + 1, device=q.device) * B - q_offset).clamp(min=0)
+            anchors = (first + torch.arange(-(-s // B) + 1, device=dev) * B - q_offset).clamp(min=0)
             anchors = anchors[anchors < s]
             sc = self._bucket_scores(q[:, :, anchors], cent, last, q_offset + anchors)
             val, top = sc.topk(min(cfg.topk, nb), dim=-1)
-            selected = torch.zeros(len(anchors), nb, dtype=torch.bool, device=q.device)
+            selected = torch.zeros(len(anchors), nb, dtype=torch.bool, device=dev)
             selected.scatter_(-1, top, torch.isfinite(val))
-            qpos = q_offset + torch.arange(s, device=q.device)
+            qpos = q_offset + torch.arange(s, device=dev)
             qsel = (qpos // B - q_offset // B).to(torch.int32)
-            nkb = -(-Lp // kv_block)
-            per_key = F.pad(selected[:, bucket_of], (0, nkb * kv_block - Lp))  # [rows, Lp]
-            sel_blocks = per_key.view(len(anchors), nkb, kv_block).any(-1)
             fq = -(-s // B)
-            r = torch.arange(fq, device=q.device)
-            rows = sel_blocks[qsel[r * B].long()] | sel_blocks[qsel[((r + 1) * B).clamp(max=s) - 1].long()]
-            kv_num = rows.sum(-1).to(torch.int32)
-            kv_idx = torch.argsort((~rows).to(torch.int8), dim=-1, stable=True).to(torch.int32)
+            r = torch.arange(fq, device=dev)
+            r_first, r_last = r * B, ((r + 1) * B).clamp(max=s) - 1  # each flex row's first / last query
+            sel_a = selected[qsel[r_first].long()][:, block_bucket]  # [fq, nkb]
+            sel_b = selected[qsel[r_last].long()][:, block_bucket]
+            rows = sel_a | sel_b
+            partial = rows & ~(sel_a & sel_b)  # a row straddling two selection blocks: per query
+            partial |= rows & ~block_dense[None]
+            if cfg.visibility == "block":  # members of the previous cluster block may lie in the raw window
+                q_cluster = (q_offset + r_first) // span
+                partial |= rows & (block_cluster[None] >= q_cluster[:, None] - 1)
+            full = rows & ~partial
+            kv_num = partial.sum(-1).to(torch.int32)
+            kv_idx = torch.argsort((~partial).to(torch.int8), dim=-1, stable=True).to(torch.int32)
+            full_num = full.sum(-1).to(torch.int32)
+            full_idx = torch.argsort((~full).to(torch.int8), dim=-1, stable=True).to(torch.int32)
             sel_i8 = selected.to(torch.int8)
             bucket_i = bucket_of.to(torch.int32)
+            valid_i8 = valid.to(torch.int8)
             # visibility "block": a selected bucket's members inside the query's raw window are attended raw
             fw = ((qpos // cfg.page - cfg.window // cfg.page) * cfg.page).to(torch.int32)
             if cfg.visibility != "block":
@@ -691,10 +720,11 @@ class LSA(nn.Module):
             perm_i = perm.to(torch.int32)
 
         def mask_mod(bi, hi, qi, ki):
-            return (sel_i8[qsel[qi], bucket_i[ki]] > 0) & (perm_i[ki] < fw[qi])
+            return (valid_i8[ki] > 0) & (sel_i8[qsel[qi], bucket_i[ki]] > 0) & (perm_i[ki] < fw[qi])
 
-        bm = BlockMask.from_kv_blocks(kv_num[None, None], kv_idx[None, None], BLOCK_SIZE=(B, kv_block),
-                                      mask_mod=mask_mod, seq_lengths=(s, Lp))
+        bm = BlockMask.from_kv_blocks(kv_num[None, None], kv_idx[None, None], full_num[None, None],
+                                      full_idx[None, None], BLOCK_SIZE=(B, kv_block), mask_mod=mask_mod,
+                                      seq_lengths=(s, Lp))
         o_sel, l_sel = ps._flex()(q, k[:, :, perm], v[:, :, perm], block_mask=bm, scale=scale, enable_gqa=hq != g,
                                   return_lse=True, kernel_options=ps.flex_kernel_options(q, B, kv_block))
         return ps.merge_attention([(o_raw, l_raw), (o_sel, l_sel)])
