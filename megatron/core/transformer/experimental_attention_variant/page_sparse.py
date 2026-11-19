@@ -400,6 +400,14 @@ def _per_group(fn, q, k, v, selection, return_selection, **kw):
     return (out, sels) if return_selection else out
 
 
+def topk_stable(scores: torch.Tensor, n: int):
+    """The n largest of ``scores`` along the last dim, ties to the lower index -- independent of how many trailing
+    (unselectable) columns the tensor has. ``torch.topk`` orders tied values arbitrarily, so a score with exact ties
+    (CSA2's indexer: a sum of relus, often exactly 0) selected differently for different sequence lengths."""
+    vals, idx = torch.sort(scores, dim=-1, descending=True, stable=True)
+    return vals[..., :n], idx[..., :n]
+
+
 def page_sparse_attention(q, k, v, cfg: PageSparseConfig, q_offset: int = 0, scale: float | None = None,
                           indexer_scores=None, selection=None, return_selection: bool = False):
     """Sparse causal attention of queries q [b, hq, s, d] at absolute positions q_offset .. q_offset + s - 1 over

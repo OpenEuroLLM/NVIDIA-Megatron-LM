@@ -322,7 +322,7 @@ class CSA2(nn.Module):
                     rows = q_offset + c0 + torch.arange(c1 - c0, device=q.device)
                     sc = self.diag.scores("csa2", sc[0], q[:, :, c0:c1], k, rows, scale, cfg,
                                           ("entry", cfg.compress), n)[None]
-                val, sel = sc.topk(n, dim=-1)
+                val, sel = ps.topk_stable(sc, n)  # ties (relu scores of 0) to the lower entry
                 vals.append(val)
                 sels.append(sel)
         val, sel = torch.cat(vals, 1), torch.cat(sels, 1)
@@ -361,7 +361,7 @@ class CSA2(nn.Module):
             blk_anchor = blk_anchor[blk_anchor < s]
             cand = self._candidates(len(blk_anchor), Lc, 0, q.device, pos=q_offset + blk_anchor)
             sc = self.index_scores(xq[:, blk_anchor], kc).masked_fill(~cand[None], float("-inf"))[0]
-            val, top = sc.topk(n, dim=-1)
+            val, top = ps.topk_stable(sc, n)
             selected = torch.zeros(len(blk_anchor), Lc, dtype=torch.bool, device=q.device)
             selected.scatter_(-1, top, torch.isfinite(val))
             # the flex query blocks are aligned to the chunk start: map each to its selection block

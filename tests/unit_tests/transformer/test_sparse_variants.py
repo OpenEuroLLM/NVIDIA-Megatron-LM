@@ -600,3 +600,24 @@ def test_page_maxpool_scores_match_bruteforce():
             sc = torch.einsum("bgrsd,bgd->bs", q.view(1, G, rep, -1, D), win) * D**-0.5
             ref[..., p_] = torch.maximum(ref[..., p_], sc)
     torch.testing.assert_close(got, ref, atol=1e-10, rtol=1e-10)
+
+
+def test_csa2_selection_independent_of_the_sequence_length():
+    """A query's entries do not depend on how many keys follow it. The indexer scores are sums of relus and tie
+    exactly (often at 0), so the top entries must break ties by index (page_sparse.topk_stable), not by however
+    torch.topk orders the longer score row of a longer sequence (decode / chunked prefill vs one shot). The case
+    below (random parameters, 2 groups x 8 dims, 70 tokens) selected differently at 54 / 55 / 56 keys with topk."""
+    hid, g, hq, d, L = 32, 2, 4, 8, 70
+    torch.manual_seed(0)
+    csa = sv.CSA2(hid, g, d, sv.CSA2Config(compress=2, topk_entries=8, window=8, page=8, sink_pages=1,
+                                           index_heads=2, index_dim=8)).double()
+    for p in csa.parameters():
+        torch.nn.init.normal_(p, std=0.3)
+    gen = torch.Generator().manual_seed(1)
+    q, k, v = (torch.randn(1, n, L, d, generator=gen, dtype=torch.float64) for n in (hq, g, g))
+    x = torch.randn(1, L, hid, generator=gen, dtype=torch.float64)
+    z = csa.token_features(x)
+    full = csa(q, k, v, x, z, 0, d**-0.5)
+    for n in (54, 55, 56):
+        part = csa(q[:, :, :n], k[:, :, :n], v[:, :, :n], x[:, :n], z[:, :n], 0, d**-0.5)
+        torch.testing.assert_close(part, full[:, :, :n], atol=1e-10, rtol=1e-10)
