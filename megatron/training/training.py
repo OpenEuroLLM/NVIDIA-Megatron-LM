@@ -1542,7 +1542,7 @@ def pretrain(
         }
         for name, delta in startup_timers.items():
             timers(name, log_level=0).set_elapsed(delta)
-        timers.log(list(startup_timers.keys()), barrier=True)
+        _print_timers(timers, list(startup_timers.keys()), barrier=True)
 
         # Print rank 0's absolute timestamps
         startup_timestamps = {
@@ -1753,7 +1753,9 @@ def pretrain(
 
     # Print setup timing.
     print_rank_0('done with setup ...')
-    timers.log(['model-and-optimizer-setup', 'train/valid/test-data-iterators-setup'], barrier=True)
+    _print_timers(
+        timers, ['model-and-optimizer-setup', 'train/valid/test-data-iterators-setup'], barrier=True
+    )
 
     one_logger = get_one_logger()
     one_logger and one_logger.log_metrics(app_metrics)
@@ -5838,6 +5840,15 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
     args.do_valid = getattr(args, "do_valid", False) or flags[1].item()
     args.do_test = getattr(args, "do_test", False) or flags[2].item()
     return train_dataloader, valid_dataloaders, test_dataloader
+
+
+def _print_timers(timers, names, barrier=False):
+    """timers.log on stdout: it reports through logger.info, which the runs do not show, so the
+    startup and setup phases (min / max across ranks) were invisible. Same collective as
+    timers.log (every rank calls it); rank 0 prints."""
+    string = timers.get_all_timers_string(names, barrier=barrier)
+    if string is not None:
+        print_rank_0(string)
 
 
 def _malloc_trim(tag):

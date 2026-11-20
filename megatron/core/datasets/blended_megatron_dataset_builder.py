@@ -2,6 +2,7 @@
 
 import logging
 import math
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Iterable, List, Optional, Type, Union
 
@@ -404,6 +405,8 @@ class BlendedMegatronDatasetBuilder(object):
             isinstance(self.config, GPTDatasetConfig) and self.config.fast_cache_load
         ):
             rank = torch.distributed.get_rank()
+            last = rank == torch.distributed.get_world_size() - 1
+            t0 = time.time()
             # First, build on rank 0
             if rank == 0:
                 num_workers = num_dataset_builder_threads
@@ -416,8 +419,10 @@ class BlendedMegatronDatasetBuilder(object):
                 _threading_helper(
                     megatron_datasets, num_workers, prefixes, split, sizes_per_dataset
                 )
+                _print_timing(f"rank 0 alone, {len(prefixes)} datasets", t0)
 
             torch.distributed.barrier()
+            t1 = time.time()
 
             # Then, build on other ranks; guaranteed to be data_cache hit
             if rank != 0:
@@ -428,6 +433,8 @@ class BlendedMegatronDatasetBuilder(object):
                     split,
                     sizes_per_dataset,
                 )
+                if last:  # one of the ranks that wait for rank 0, then all load at once
+                    _print_timing(f"rank {rank}: waited for rank 0 {t1 - t0:.1f} s, own pass", t1)
         else:
             _threading_helper(
                 megatron_datasets, num_dataset_builder_threads, prefixes, split, sizes_per_dataset
@@ -640,3 +647,8 @@ def _get_size_per_split_per_dataset(
     ]
 
     return sizes_per_dataset
+
+
+def _print_timing(what: str, t_start: float) -> None:
+    """[dataset-timing] line on stdout (log_single_rank INFO is not shown in the runs)."""
+    print(f"[dataset-timing] {what}: {time.time() - t_start:.1f} s", flush=True)
