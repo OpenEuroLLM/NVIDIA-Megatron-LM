@@ -251,6 +251,16 @@ class _RMSNorm(nn.Module):
         return (xf * self.weight.float()).to(x.dtype)
 
 
+class _GateTerms(nn.Module):
+    """The optional scalars of the Engram gates, one per gate: ``query_mix`` (lambda of
+    ``engram_branch_query="learned"``, from 0) and ``scale`` (``engram_gate_scale``, from 1)."""
+
+    def __init__(self, n_gates: int, query_mix: bool, scale: bool, device):
+        super().__init__()
+        self.query_mix = nn.Parameter(torch.zeros(n_gates, device=device)) if query_mix else None
+        self.scale = nn.Parameter(torch.ones(n_gates, device=device)) if scale else None
+
+
 class EngramLayer(MegatronModule):
     """One Engram memory layer: ``h + Engram(h, token_ids)``.
 
@@ -382,6 +392,30 @@ class EngramLayer(MegatronModule):
         )
         self.hidden_norm = _RMSNorm(h, config.layernorm_epsilon).to(device)
         self.key_norm = _RMSNorm(h, config.layernorm_epsilon).to(device)
+        # engram_branch_gates: the key projections and norms of mHC streams 1 .. n - 1 (stream 0 has
+        # the ones above, so a checkpoint without per-stream gates loads after copying them in).
+        self.branch_gates = bool(getattr(config, "engram_branch_gates", False))
+        self.n_gates = config.mhc_expansion_rate if self.branch_gates else 1
+        self.branch_query = getattr(config, "engram_branch_query", "read")
+        if self.branch_query not in ("read", "stream", "learned"):
+            raise ValueError(f"engram_branch_query: read, stream or learned, got {self.branch_query!r}")
+        extra = range(self.n_gates - 1)
+        self.key_proj_extra = nn.ModuleList(
+            nn.Linear(mem_dim, h, bias=False, device=device, dtype=config.params_dtype)
+            for _ in extra
+        )
+        self.hidden_norm_extra = nn.ModuleList(
+            _RMSNorm(h, config.layernorm_epsilon).to(device) for _ in extra
+        )
+        self.key_norm_extra = nn.ModuleList(
+            _RMSNorm(h, config.layernorm_epsilon).to(device) for _ in extra
+        )
+        self.gate_terms = _GateTerms(
+            self.n_gates,
+            query_mix=self.branch_gates and self.branch_query == "learned",
+            scale=bool(getattr(config, "engram_gate_scale", False)),
+            device=device,
+        )
         self.conv_norm = (
             _RMSNorm(h, config.layernorm_epsilon).to(device) if config.engram_conv_prenorm else None
         )
@@ -404,6 +438,10 @@ class EngramLayer(MegatronModule):
             self.value_proj,
             self.hidden_norm,
             self.key_norm,
+            self.key_proj_extra,
+            self.hidden_norm_extra,
+            self.key_norm_extra,
+            self.gate_terms,
             self.conv1d,
             *([self.conv_norm] if self.conv_norm is not None else []),
         ):
@@ -421,6 +459,14 @@ class EngramLayer(MegatronModule):
             ResidualSchemeAdapter(config, layer_number) if residual_scheme_active(config) else None
         )
         self._depth_state = None
+        if self.branch_gates:
+            from megatron.core.transformer.mhc import MHCMixer
+
+            mixer = getattr(self.residual_scheme, "mhc_mixer", None)
+            if not isinstance(mixer, MHCMixer) or config.mhc_lerp:
+                raise ValueError("engram_branch_gates needs dense mHC without mhc_lerp")
+            if self.cp_group is not None:
+                raise NotImplementedError("engram_branch_gates with context parallelism")
 
     def _apply(self, fn, recurse=True):
         """Keep an fp32 table (``engram_table_fp32``) through the model's bf16/fp16 cast.
@@ -456,6 +502,8 @@ class EngramLayer(MegatronModule):
             with get_cuda_rng_tracker().fork():  # different rows on every TP rank
                 nn.init.normal_(self.table, mean=0.0, std=self.config.init_method_std)
         self.config.init_method(self.key_proj.weight)
+        for proj in self.key_proj_extra:
+            self.config.init_method(proj.weight)
         self.config.output_layer_init_method(self.value_proj.weight)
         nn.init.zeros_(self.conv1d.weight)  # starts as Y = v~
 
@@ -751,6 +799,8 @@ class EngramLayer(MegatronModule):
         if self.residual_scheme is not None:
             hidden_states, ctx = self.residual_scheme.read(hidden_states, self._depth_state)
         h = gather_replicated_input(hidden_states, self.config, self.tp_group)  # [s, b, h]
+        if self.branch_gates:  # one query per mHC stream: [s, b, n, h]
+            h = self._branch_queries(h, gather_replicated_input(ctx[0], self.config, self.tp_group))
         input_ids = self._input_ids
         if self.cp_group is not None and packed_seq_params is not None:
             y = self._forward_cp_packed(h, input_ids, packed_seq_params)
@@ -771,13 +821,60 @@ class EngramLayer(MegatronModule):
         scale = engram_output_scale(self.config, self.layer_number)
         if scale != 1.0:
             y = y * scale
+        if self.branch_gates:
+            return self.residual_scheme.write_streams(y, ctx)
         if self.residual_scheme is not None:
             return self.residual_scheme.write(y, ctx, self._depth_state, self.layer_number)
         return hidden_states + y
 
+    def _branch_queries(self, read: torch.Tensor, streams: torch.Tensor) -> torch.Tensor:
+        """The gate queries of the ``n`` mHC streams (``engram_branch_query``), ``[s, b, n, h]``, from the mHC
+        read ``[s, b, h]`` and the streams ``[s, b, n, h]``."""
+        read = read.unsqueeze(-2)
+        if self.branch_query == "read":
+            return read.expand(-1, -1, self.n_gates, -1)
+        streams = streams.to(read.dtype)
+        if self.branch_query == "stream":
+            return streams
+        lam = self.gate_terms.query_mix.to(read.dtype).view(-1, 1)
+        return read + lam * (streams - read)
+
+    def _branch_gate_logits(self, q: torch.Tensor, e: torch.Tensor) -> torch.Tensor:
+        """``<RMSNorm_m(q_m), RMSNorm_m(k_m)>`` of every stream m, [s, b, n, 1], for the queries ``q``
+        [s, b, n, h] and the memory ``e``, as ``q_m . (w_q w_k)_m . k_m / (rms(q_m) rms(k_m))``: no fp32
+        copies of the n normalized queries and keys (64k tokens x 4 streams x 2048 are 2 GiB each)."""
+        weight = torch.cat([self.key_proj.weight] + [p.weight for p in self.key_proj_extra])
+        k = F.linear(e, weight).unflatten(-1, (self.n_gates, -1))  # [s, b, n, h]
+        w = torch.stack(
+            [
+                hn.weight.float() * kn.weight.float()
+                for hn, kn in zip(
+                    [self.hidden_norm, *self.hidden_norm_extra], [self.key_norm, *self.key_norm_extra]
+                )
+            ]
+        )  # [n, h]
+        dot = ((q * w.to(q.dtype)) * k).sum(-1, keepdim=True, dtype=torch.float32)
+        dim, eps = q.shape[-1], self.hidden_norm.eps
+
+        def inv_rms(x):
+            ms = torch.linalg.vector_norm(x, dim=-1, keepdim=True, dtype=torch.float32).square() / dim
+            return torch.rsqrt(ms + eps)
+
+        return dot * inv_rms(q) * inv_rms(k)
+
+    def _norm_gated(self, v: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
+        """``conv_norm(alpha_m * v)`` for ``v`` [s, b, 1, h] and the gates ``alpha`` [s, b, n, 1], from one
+        normalization of ``v``: ``RMSNorm(a v) = w v a / sqrt(a^2 ms(v) + eps)``."""
+        ms = v.float().pow(2).mean(-1, keepdim=True)
+        a = alpha.float()
+        beta = a * torch.rsqrt(a.square() * ms + self.conv_norm.eps)
+        return (v * self.conv_norm.weight.to(v.dtype)) * beta.to(v.dtype)
+
     def _engram(self, h: torch.Tensor, input_ids: torch.Tensor, positions) -> torch.Tensor:
         """The layer's output ``Y`` for hidden states ``h`` [s, b, h] and token ids [b, s]; ``positions`` [s]
-        (batch 1): every token's position within its document (packed batches), else None."""
+        (batch 1): every token's position within its document (packed batches), else None. With
+        ``engram_branch_gates`` ``h`` holds one gate query per mHC stream, [s, b, n, h], and ``Y`` one
+        output per stream, [s, b, n, h]."""
         e = self._memory(
             input_ids, None if positions is None else positions.unsqueeze(0)
         ).to(h.dtype)
@@ -785,12 +882,17 @@ class EngramLayer(MegatronModule):
             e = e * self._signs(
                 input_ids, None if positions is None else positions.unsqueeze(0)
             ).to(e.dtype)
-        k = self.key_proj(e)
+        if self.branch_gates:
+            gate = self._branch_gate_logits(h, e)
+        else:
+            k = self.key_proj(e)
+            gate = (self.hidden_norm(h).float() * self.key_norm(k).float()).sum(-1, keepdim=True)
         v = self.value_proj(e)
-        gate = (self.hidden_norm(h).float() * self.key_norm(k).float()).sum(-1, keepdim=True)
         gate = gate / math.sqrt(h.shape[-1])
         if self.config.engram_gate_signed_sqrt:
             gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
+        if self.gate_terms.scale is not None:
+            gate = gate * self.gate_terms.scale.float().view(-1, 1)
         alpha = torch.sigmoid(gate).to(h.dtype)
         from megatron.core.transformer import arch_metrics
 
@@ -799,13 +901,27 @@ class EngramLayer(MegatronModule):
             arch_metrics.record_mean("engram/gate", self.layer_number, n, alpha)
             arch_metrics.record_mean("engram/gate_closed", self.layer_number, n, alpha < 0.05)
             arch_metrics.record_mean("engram/gate_open", self.layer_number, n, alpha > 0.95)
-        v = alpha * v
-        conv_in = v if self.conv_norm is None else self.conv_norm(v)
+            if self.branch_gates:
+                for m in range(self.n_gates):
+                    arch_metrics.record_mean(f"engram/gate_s{m}", self.layer_number, n, alpha[..., m, :])
+                arch_metrics.record_mean(
+                    "engram/gate_stream_spread", self.layer_number, n, alpha.float().std(dim=-2)
+                )
+        if self.branch_gates:
+            v = v.unsqueeze(-2)  # [s, b, 1, h], gated per stream
+            conv_in = alpha * v if self.conv_norm is None else self._norm_gated(v, alpha)
+            v = alpha * v
+            conv_in = conv_in.flatten(1, 2)  # the streams as batch entries of the conv
+        else:
+            v = alpha * v
+            conv_in = v if self.conv_norm is None else self.conv_norm(v)
         if positions is None:
             pad = (self.kernel_size - 1) * self.dilation
             conv = self.conv1d(F.pad(conv_in.permute(1, 2, 0), (pad, 0))).permute(2, 0, 1)
         else:
             conv = self._document_conv(conv_in, positions)
+        if self.branch_gates:
+            conv = conv.unflatten(1, (-1, self.n_gates))
         return F.silu(conv) + v
 
     def _forward_cp_packed(self, h, input_ids, packed_seq_params) -> torch.Tensor:

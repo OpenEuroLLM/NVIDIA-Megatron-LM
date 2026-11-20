@@ -164,6 +164,13 @@ def _mhc_write(streams, sublayer_out, h_post, h_res):
     return mixed + h_post.unsqueeze(-1) * sublayer_out.unsqueeze(-2)
 
 
+def _mhc_write_streams(streams, outs, h_post, h_res):
+    """:func:`_mhc_write` with an output of its own per stream (``outs`` ``[s, b, n, C]``):
+    ``H_res @ x + H_post * f_m(x)``."""
+    mixed = (h_res.unsqueeze(-1) * streams.unsqueeze(-3)).sum(dim=-2)
+    return mixed + h_post.unsqueeze(-1) * outs
+
+
 _mhc_write_compiled = None
 
 
@@ -763,6 +770,18 @@ class MHCMixer(nn.Module):
             # torch.compile defers compilation to the first call, so a broken
             # toolchain surfaces here rather than where the wrapper was built.
             return _mhc_write_lerp(streams, sublayer_out, post, res, self.eps, lerp)
+
+    def write_streams(
+        self, streams: torch.Tensor, outs: torch.Tensor, h_post: torch.Tensor, h_res: torch.Tensor
+    ) -> torch.Tensor:
+        """:meth:`write` for a sublayer with one output per stream (``outs`` ``[s, b, n, C]``, Engram's
+        per-stream gates): stream ``m`` takes ``H_post_m * outs[..., m, :]``. Equals :meth:`write` when all
+        ``n`` outputs are the same."""
+        args = (streams, outs.to(streams.dtype), h_post.to(streams.dtype), h_res.to(streams.dtype))
+        try:
+            return _compiled(_mhc_write_streams)(*args)
+        except Exception:  # pragma: no cover - Inductor unusable at runtime
+            return _mhc_write_streams(*args)
 
 
 def _inv_sigmoid(p: float) -> float:
