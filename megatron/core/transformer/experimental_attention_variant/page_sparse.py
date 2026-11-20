@@ -184,10 +184,13 @@ def page_scores(q, k, cfg: PageSparseConfig, q_offset: int, scale: float, indexe
     raise ValueError(f"page_scores: selector {cfg.selector!r} does not score pages")
 
 
-def selection_scores(q, k, cfg: PageSparseConfig, q_offset: int, scale: float, indexer_scores=None):
+def selection_scores(q, k, cfg: PageSparseConfig, q_offset: int, scale: float, indexer_scores=None,
+                     per_anchor: bool = False):
     """The selector's page scores [b, s, P] with everything a query may not select at -inf: pages outside its
     candidates, outside its best groups (``hier_group``), and -- with ``select_block`` -- the scores of its
-    block's anchor (the block's first query, or the chunk's first if the block started in an earlier chunk)."""
+    block's anchor (the block's first query, or the chunk's first if the block started in an earlier chunk).
+    ``per_anchor`` (select_block > 1, select_score "first"): (the anchors' scores [b, n_anchor, P], each query's
+    anchor row [s]) instead -- what the selection needs, select_block x fewer rows."""
     s, L = q.shape[2], k.shape[2]
     P = -(-L // cfg.page)
     if cfg.select_block > 1 and cfg.select_score == "first":  # score the anchors only (select_block x cheaper)
@@ -202,7 +205,7 @@ def selection_scores(q, k, cfg: PageSparseConfig, q_offset: int, scale: float, i
                                                                                          float("-inf"))
         if cfg.hier_group > 0:
             sc = hierarchical_restrict(sc, q[:, :, uniq], k, cfg, q_offset, scale, pos=apos)
-        return sc[:, inv]
+        return (sc, inv) if per_anchor else sc[:, inv]
     cand = candidate_mask(s, P, q_offset, cfg, q.device)
     sc = page_scores(q, k, cfg, q_offset, scale, indexer_scores).masked_fill(~cand[None], float("-inf"))
     if cfg.hier_group > 0:
@@ -544,8 +547,15 @@ def select_pages(q, k, cfg: PageSparseConfig, q_offset: int = 0, scale: float | 
     allowed = allowed & (p[None, :] <= cur[:, None])
     allowed = allowed[None].expand(b, s, P).clone()
     if cfg.selector != "window" and cfg.topk > 0:
-        sc = selection_scores(q, k, cfg, q_offset, scale, indexer_scores)
-        val, sel = topk_stable(sc, min(cfg.topk, P))
+        if cfg.select_block > 1 and cfg.select_score == "first":
+            # top-k of the anchors' rows, then each query takes its anchor's (the expanded [s, P] sort was most of
+            # the selection's time: s / select_block distinct rows)
+            sc, inv = selection_scores(q, k, cfg, q_offset, scale, indexer_scores, per_anchor=True)
+            val, sel = topk_stable(sc, min(cfg.topk, P))
+            val, sel = val[:, inv], sel[:, inv]
+        else:
+            sc = selection_scores(q, k, cfg, q_offset, scale, indexer_scores)
+            val, sel = topk_stable(sc, min(cfg.topk, P))
         allowed.scatter_(-1, sel, torch.isfinite(val) | allowed.gather(-1, sel))
     return allowed
 
@@ -659,12 +669,13 @@ def flex_packed_page_attention(spans, cfg: PageSparseConfig, scale: float, q_blo
         first_q = q_abs.view(nq, q_block)[:, 0].to(torch.int64)  # spans start at block boundaries
         full = (rows | pad_row).all(2) & (kend[None, None, :] <= first_q[None, :, None]) & blk
         part = blk & ~full
-        if per_group:  # one block mask row per query head
-            part, full = part.repeat_interleave(rep, 0), full.repeat_interleave(rep, 0)
         kv_num = part.sum(-1).to(torch.int32)
         kv_idx = torch.argsort((~part).to(torch.int8), dim=-1, stable=True).to(torch.int32)
         full_num = full.sum(-1).to(torch.int32)
         full_idx = torch.argsort((~full).to(torch.int8), dim=-1, stable=True).to(torch.int32)
+        if per_group:  # one block mask row per query head: its group's (sorted once per group, not per head)
+            kv_num, kv_idx, full_num, full_idx = (t.repeat_interleave(rep, 0)
+                                                  for t in (kv_num, kv_idx, full_num, full_idx))
         allowed_i = allowed.to(torch.int8)
 
     def pad_rows(t, to):  # [1, h, n, d] -> [1, h, to, d]
