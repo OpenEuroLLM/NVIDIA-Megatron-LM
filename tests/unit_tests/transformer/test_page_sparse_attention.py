@@ -369,3 +369,22 @@ def test_flex_cp_matches_single_rank(name, lengths):
             close(gp, pr.grad, n)
     finally:
         Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("L", [256, 300, 61])
+def test_page_maxpool_scores_match_cumsum_reference(L):
+    """page_maxpool's window means (quarter-page sums, 2026-11-20) equal the original cumsum formulation: half-page
+    windows at quarter-page stride, a page scored by the max over the 5 windows overlapping it (float64)."""
+    import torch.nn.functional as F
+
+    torch.manual_seed(0)
+    q, k = torch.randn(1, 4, 37, 16, dtype=torch.float64), torch.randn(1, 2, L, 16, dtype=torch.float64)
+    cfg = ps.PageSparseConfig(selector="page_maxpool", page=16, topk=2, window=16)
+    P = -(-L // 16)
+    st, sub, J = 4, 8, 4 * P + 1
+    cs = F.pad(F.pad(k, (0, 0, 0, max(0, (J - 1) * st + sub - L))).cumsum(2), (0, 0, 1, 0))
+    starts = torch.arange(J) * st
+    win = (cs[:, :, starts + sub] - cs[:, :, starts]) / sub
+    sc = torch.einsum("bgrsd,bgjd->bsj", q.view(1, 2, 2, 37, 16), win) * 0.25
+    ref = F.max_pool1d(sc.reshape(37, 1, J), kernel_size=5, stride=4, padding=1).view(1, 37, -1)[..., :P]
+    torch.testing.assert_close(ps.page_scores(q, k, cfg, 0, 0.25), ref, atol=1e-12, rtol=1e-12)

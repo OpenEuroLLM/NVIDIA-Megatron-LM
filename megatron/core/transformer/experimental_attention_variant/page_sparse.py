@@ -159,13 +159,12 @@ def page_scores(q, k, cfg: PageSparseConfig, q_offset: int, scale: float, indexe
         if cfg.page % 4:
             raise ValueError("page_maxpool: page must be a multiple of 4")
         st, sub = cfg.page // 4, cfg.page // 2
-        J = 4 * P + 1  # windows [j st, j st + sub), j = 0 .. 4P
-        need = (J - 1) * st + sub
-        cs = F.pad(F.pad(_acc(k), (0, 0, 0, max(0, need - L))).cumsum(2), (0, 0, 1, 0))
-        starts = torch.arange(J, device=k.device) * st
-        win = (cs[:, :, starts + sub] - cs[:, :, starts]) / sub  # [b, g, J, d]
+        # windows [j st, j st + sub), j = 0 .. 4P: each the sum of two adjacent quarter-page sums (a cumsum over the
+        # keys was 72 % of the selection: torch's outer-dim scan, 17.6 ms per KV group at 64k, 2026-11-20)
+        qs = F.pad(_acc(k), (0, 0, 0, (4 * P + 2) * st - L)).view(b, g, 4 * P + 2, st, d).sum(3)
+        win = (qs[:, :, :-1] + qs[:, :, 1:]) / sub  # [b, g, 4P + 1, d]
         sc = torch.einsum("bgrsd,bgjd->bsj", qg, win) * scale
-        pooled = F.max_pool1d(sc.reshape(b * s, 1, J), kernel_size=5, stride=4, padding=1)  # page p: 4p-1 .. 4p+3
+        pooled = F.max_pool1d(sc.reshape(b * s, 1, 4 * P + 1), kernel_size=5, stride=4, padding=1)  # page p: 4p-1 .. 4p+3
         return pooled.view(b, s, -1)[..., :P]
     if cfg.selector == "quest":
         hi, lo = page_pool(k, cfg.page, "minmax")
