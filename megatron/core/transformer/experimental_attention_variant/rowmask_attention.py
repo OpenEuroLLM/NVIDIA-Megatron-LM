@@ -23,7 +23,10 @@ import triton.language as tl
 
 BM = 64  # queries per tile (= bits per mask word)
 
+_CONFIGS = [triton.Config({}, num_warps=w, num_stages=st) for w in (4, 8) for st in (1, 2, 3)]
 
+
+@triton.autotune(configs=_CONFIGS, key=['D', 'REP', 'PER_GROUP'])
 @triton.jit
 def _fwd_kernel(Q, K, V, O, LSE, IDX, BITS, CNT, QPOS, KPOS, scale,
                 Sq, Sk, NQ, NB,
@@ -52,24 +55,25 @@ def _fwd_kernel(Q, K, V, O, LSE, IDX, BITS, CNT, QPOS, KPOS, scale,
         kb = tl.load(K + hk * skh + cols[:, None] * sks + dd[None, :], mask=cmask[:, None], other=0.0)
         vb = tl.load(V + hk * skh + cols[:, None] * sks + dd[None, :], mask=cmask[:, None], other=0.0)
         kpos = tl.load(KPOS + cols, mask=cmask, other=2147483647)
-        s = tl.dot(q, tl.trans(kb)) * scale
+        s = tl.dot(q, tl.trans(kb)) * (scale * 1.4426950408889634)  # log2 units: exp2
         rowbit = ((b >> shift) & 1) != 0
         ok = rowbit[:, None] & (kpos[None, :] <= qpos[:, None])
         s = tl.where(ok, s, float("-inf"))
         m_new = tl.maximum(m_i, tl.max(s, 1))
         m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
-        alpha = tl.exp(m_i - m_safe)
-        pij = tl.exp(s - m_safe[:, None])
+        alpha = tl.exp2(m_i - m_safe)
+        pij = tl.exp2(s - m_safe[:, None])
         l_i = l_i * alpha + tl.sum(pij, 1)
         acc = acc * alpha[:, None] + tl.dot(pij.to(vb.dtype), vb)
         m_i = m_new
     has = l_i > 0
     o = acc / tl.where(has, l_i, 1.0)[:, None]
-    lse = tl.where(has, m_i + tl.log(tl.where(has, l_i, 1.0)), float("-inf"))
+    lse = tl.where(has, (m_i + tl.log2(tl.where(has, l_i, 1.0))) * 0.6931471805599453, float("-inf"))
     tl.store(O + h * soh + rows[:, None] * sos + dd[None, :], o.to(O.dtype.element_ty), mask=rmask[:, None])
     tl.store(LSE + h * Sq + rows, lse, mask=rmask)
 
 
+@triton.autotune(configs=_CONFIGS, key=['D', 'REP', 'PER_GROUP'])
 @triton.jit
 def _dq_kernel(Q, K, V, DO, LSE, DELTA, DQ, IDX, BITS, CNT, QPOS, KPOS, scale,
                Sq, Sk, NQ, NB,
@@ -86,6 +90,7 @@ def _dq_kernel(Q, K, V, DO, LSE, DELTA, DQ, IDX, BITS, CNT, QPOS, KPOS, scale,
     do = tl.load(DO + h * soh + rows[:, None] * sos + dd[None, :], mask=rmask[:, None], other=0.0)
     lse = tl.load(LSE + h * Sq + rows, mask=rmask, other=float("-inf"))
     lse = tl.where(lse == float("-inf"), float("inf"), lse)  # rows without keys: p = 0
+    lse2 = lse * 1.4426950408889634
     delta = tl.load(DELTA + h * Sq + rows, mask=rmask, other=0.0)
     qpos = tl.load(QPOS + rows, mask=rmask, other=-1)
     n = tl.load(CNT + sg * NQ + r)
@@ -100,10 +105,10 @@ def _dq_kernel(Q, K, V, DO, LSE, DELTA, DQ, IDX, BITS, CNT, QPOS, KPOS, scale,
         kb = tl.load(K + hk * skh + cols[:, None] * sks + dd[None, :], mask=cmask[:, None], other=0.0)
         vb = tl.load(V + hk * skh + cols[:, None] * sks + dd[None, :], mask=cmask[:, None], other=0.0)
         kpos = tl.load(KPOS + cols, mask=cmask, other=2147483647)
-        s = tl.dot(q, tl.trans(kb)) * scale
+        s = tl.dot(q, tl.trans(kb)) * (scale * 1.4426950408889634)
         rowbit = ((b >> shift) & 1) != 0
         ok = rowbit[:, None] & (kpos[None, :] <= qpos[:, None])
-        pij = tl.where(ok, tl.exp(s - lse[:, None]), 0.0)
+        pij = tl.where(ok, tl.exp2(s - lse2[:, None]), 0.0)
         dp = tl.dot(do, tl.trans(vb))
         ds = pij * (dp - delta[:, None])
         dq += tl.dot(ds.to(kb.dtype), kb)
@@ -111,6 +116,7 @@ def _dq_kernel(Q, K, V, DO, LSE, DELTA, DQ, IDX, BITS, CNT, QPOS, KPOS, scale,
              mask=rmask[:, None])
 
 
+@triton.autotune(configs=_CONFIGS, key=['D', 'REP', 'PER_GROUP'])
 @triton.jit
 def _dkv_kernel(Q, K, V, DO, LSE, DELTA, DK, DV, CSR_OFF, CSR_R, CSR_B, QPOS, KPOS, scale,
                 Sq, Sk, NKB,
@@ -143,10 +149,10 @@ def _dkv_kernel(Q, K, V, DO, LSE, DELTA, DK, DV, CSR_OFF, CSR_R, CSR_B, QPOS, KP
             q = tl.load(Q + h * sqh + rows[:, None] * sqs + dd[None, :], mask=rmask[:, None], other=0.0)
             do = tl.load(DO + h * soh + rows[:, None] * sos + dd[None, :], mask=rmask[:, None], other=0.0)
             lse = tl.load(LSE + h * Sq + rows, mask=rmask, other=float("-inf"))
-            lse = tl.where(lse == float("-inf"), float("inf"), lse)
+            lse2 = tl.where(lse == float("-inf"), float("inf"), lse) * 1.4426950408889634
             delta = tl.load(DELTA + h * Sq + rows, mask=rmask, other=0.0)
-            s = tl.dot(q, tl.trans(kb)) * scale
-            pij = tl.where(ok, tl.exp(s - lse[:, None]), 0.0)  # [64 q, BN k]
+            s = tl.dot(q, tl.trans(kb)) * (scale * 1.4426950408889634)
+            pij = tl.where(ok, tl.exp2(s - lse2[:, None]), 0.0)  # [64 q, BN k]
             dv += tl.dot(tl.trans(pij.to(do.dtype)), do)
             dp = tl.dot(do, tl.trans(vb))
             ds = pij * (dp - delta[:, None])
@@ -172,10 +178,6 @@ def _csr(idx, bits, cnt, nkb):
     return off.to(torch.int32).contiguous(), r_of[valid][order].to(torch.int32), bits[valid][order].contiguous()
 
 
-def _cfg(D):
-    return dict(num_warps=8 if D >= 128 else 4, num_stages=2)
-
-
 class _RowMaskAttention(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, idx, bits, cnt, q_pos, k_pos, scale, per_group, bn):
@@ -188,7 +190,7 @@ class _RowMaskAttention(torch.autograd.Function):
         lse = torch.empty(Hq, Sq, device=q.device, dtype=torch.float32)
         _fwd_kernel[(nq, Hq)](q, k, v, o, lse, idx, bits, cnt, q_pos, k_pos, scale, Sq, Sk, nq, NB,
                               q.stride(0), q.stride(1), k.stride(0), k.stride(1), o.stride(0), o.stride(1),
-                              REP=Hq // Hk, PER_GROUP=per_group, D=D, BN=bn, **_cfg(D))
+                              REP=Hq // Hk, PER_GROUP=per_group, D=D, BN=bn)
         ctx.save_for_backward(q, k, v, o, lse, idx, bits, cnt, q_pos, k_pos)
         ctx.scale, ctx.per_group, ctx.bn = scale, per_group, bn
         return o
@@ -205,13 +207,13 @@ class _RowMaskAttention(torch.autograd.Function):
         dq = torch.empty_like(q)
         _dq_kernel[(nq, Hq)](q, k, v, do, lse, delta, dq, idx, bits, cnt, q_pos, k_pos, ctx.scale, Sq, Sk, nq, NB,
                              q.stride(0), q.stride(1), k.stride(0), k.stride(1), do.stride(0), do.stride(1),
-                             REP=rep, PER_GROUP=ctx.per_group, D=D, BN=ctx.bn, **_cfg(D))
+                             REP=rep, PER_GROUP=ctx.per_group, D=D, BN=ctx.bn)
         nkb = -(-Sk // ctx.bn)
         off, rr, bb = _csr(idx, bits, cnt, nkb)
         dk, dv = torch.empty_like(k), torch.empty_like(v)
         _dkv_kernel[(nkb, Hk)](q, k, v, do, lse, delta, dk, dv, off, rr, bb, q_pos, k_pos, ctx.scale, Sq, Sk, nkb,
                                q.stride(0), q.stride(1), k.stride(0), k.stride(1), do.stride(0), do.stride(1),
-                               REP=rep, PER_GROUP=ctx.per_group, D=D, BN=ctx.bn, **_cfg(D))
+                               REP=rep, PER_GROUP=ctx.per_group, D=D, BN=ctx.bn)
         return dq, dk, dv, None, None, None, None, None, None, None, None
 
 
