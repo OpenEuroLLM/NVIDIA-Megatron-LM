@@ -680,7 +680,9 @@ class TransformerConfig(ModelParallelConfig):
     """page selectors' kernel: "flex" (FlexAttention, fused Triton forward / backward, a block mask of each
     query block's page union), "gathered" (the exact torch reference) or "token" (per-token selection,
     select_block 1: every query token its own pages, NSA's selection kernel over the packed documents --
-    token_sparse.py; page_mean / page_maxpool / quest, CP 1); token_topk / compress_mean are always gathered."""
+    token_sparse.py; page_mean / page_maxpool / quest, CP 1) or "rowmask" (the packed flex path's selection with a
+    Triton kernel taking one bit word per (64-query tile, page): per-token choices inside block candidates at near
+    block-wise cost -- rowmask_attention.py; page 64, flex_q_block 64); token_topk / compress_mean are always gathered."""
 
     page_sparse_flex_q_block: int = 64
     """flex: queries per block-mask row (smaller: tighter page unions, more blocks)."""
@@ -2584,8 +2586,11 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(f"page_sparse_selector must be one of {selectors}")
             if self.page_sparse_window % self.page_sparse_page:
                 raise ValueError("page_sparse_window must be a multiple of page_sparse_page")
-            if self.page_sparse_backend not in ("flex", "gathered", "token"):
-                raise ValueError("page_sparse_backend must be flex, gathered or token")
+            if self.page_sparse_backend not in ("flex", "gathered", "token", "rowmask"):
+                raise ValueError("page_sparse_backend must be flex, gathered, token or rowmask")
+            if self.page_sparse_backend == "rowmask" and (self.page_sparse_page != 64
+                                                          or self.page_sparse_flex_q_block != 64):
+                raise ValueError("page_sparse_backend rowmask: page 64 and page_sparse_flex_q_block 64")
             if self.page_sparse_backend == "token" and (
                 self.page_sparse_selector not in ("page_mean", "page_maxpool", "quest")
                 or self.page_sparse_select_block != 1

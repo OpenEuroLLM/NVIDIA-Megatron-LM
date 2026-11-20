@@ -127,7 +127,10 @@ class PageSparseCoreAttention(MegatronModule):
             for mod in (self.indexer, self.variant):
                 for param in (mod.parameters() if mod is not None else ()):
                     param.use_adam_with_emerging_optimizers = True
-        self.flex = config.page_sparse_backend == "flex" and self.cfg.selector in ps.PAGE_SELECTORS
+        # rowmask: the packed path's kernel with a bit word per (query tile, page) (rowmask_attention.py) -- per-token
+        # choices inside block candidates without flex's per-element masks
+        self.flex = config.page_sparse_backend in ("flex", "rowmask") and self.cfg.selector in ps.PAGE_SELECTORS
+        self.packed_kernel = "rowmask" if config.page_sparse_backend == "rowmask" else "flex"
         self.token = config.page_sparse_backend == "token"  # per-token selection, NSA kernel (token_sparse.py)
         self.q_block = config.page_sparse_flex_q_block
         self.packed_flex = config.page_sparse_packed_flex  # one flex call for every document of a packed batch
@@ -182,7 +185,7 @@ class PageSparseCoreAttention(MegatronModule):
                                    "-- the source layer must run before this one on the same micro-batch")
             selections = [_SHARED_SELECTION[k] for k in keys]
         outs, sels = ps.flex_packed_page_attention(spans, self.cfg, self.scale, self.q_block, selections,
-                                                   return_selection=True)
+                                                   return_selection=True, kernel=self.packed_kernel)
         if self.share_source and self.layer_number == self.share_source:
             for k, sel in zip(keys, sels):
                 _SHARED_SELECTION[k] = sel

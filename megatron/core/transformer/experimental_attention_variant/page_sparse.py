@@ -655,7 +655,7 @@ def flex_page_sparse_attention(q, k, v, cfg: PageSparseConfig, q_offset: int = 0
 
 
 def flex_packed_page_attention(spans, cfg: PageSparseConfig, scale: float, q_block: int = 64, selections=None,
-                               return_selection: bool = False):
+                               return_selection: bool = False, kernel: str = "flex"):
     """:func:`flex_page_sparse_attention` for many sequences at once -- ONE FlexAttention call (forward and
     backward) for every document of a packed batch instead of one per document.
 
@@ -728,6 +728,18 @@ def flex_packed_page_attention(spans, cfg: PageSparseConfig, scale: float, q_blo
     qp = torch.cat([pad_rows(sp[0], qoff[i + 1] - qoff[i]) for i, sp in enumerate(spans)], 2)
     kp = torch.cat([pad_rows(sp[1], koff[i + 1] - koff[i]) for i, sp in enumerate(spans)], 2)
     vp = torch.cat([pad_rows(sp[2], koff[i + 1] - koff[i]) for i, sp in enumerate(spans)], 2)
+
+    if kernel == "rowmask":  # one bit word per (query tile, page) instead of flex's per-element mask_mod
+        from .rowmask_attention import BM, lists_from_allowed, rowmask_block_attention
+
+        if q_block != BM:
+            raise ValueError(f"rowmask kernel: q_block must be {BM}")
+        idx, bits, cnt = lists_from_allowed(allowed)
+        out = rowmask_block_attention(qp[0], kp[0], vp[0], idx, bits, cnt, q_abs, k_abs, scale, per_group,
+                                      page)[None]
+        segs = out.split([qoff[i + 1] - qoff[i] for i in range(len(spans))], dim=2)
+        outs = [seg[:, :, :sp[0].shape[2]] for seg, sp in zip(segs, spans)]
+        return (outs, sels) if return_selection else outs
 
     if per_group:
         def mask_mod(bi, hi, qi, ki):
