@@ -671,6 +671,42 @@ def flex_packed_page_attention(spans, cfg: PageSparseConfig, scale: float, q_blo
     page = cfg.page
     if q_block % page and page % q_block:
         raise ValueError("flex_packed_page_attention: q_block and page must divide one another")
+    if selections is None and not return_selection:
+        # documents short enough to attend every page (the sparse result is dense causal attention within them): all
+        # in ONE call packed without padding -- per-span selection, padding and lists made the many-document
+        # sequences (984 documents: 2.1 s vs 0.11 s for one 64k document, 2026-11-20) the step's stragglers
+        wp = cfg.window // page
+
+        def everything(sp):
+            P = -(-sp[1].shape[2] // page)
+            return P <= cfg.sink_pages + wp + 1 or (cfg.selector != "window" and cfg.topk > 0
+                                                    and _selects_everything(P, cfg))
+
+        short = [i for i, sp in enumerate(spans) if everything(sp)]
+        if short:
+            from .rowmask_attention import dense_docs_attention
+
+            outs = [None] * len(spans)
+            ss = [spans[i] for i in short]
+            qcat = torch.cat([sp[0] for sp in ss], 2)
+            kcat = torch.cat([sp[1] for sp in ss], 2)
+            vcat = torch.cat([sp[2] for sp in ss], 2)
+            dev = qcat.device
+            qpos, qlo, ko = [], [], 0
+            for sp in ss:
+                n, L, off = sp[0].shape[2], sp[1].shape[2], sp[3]
+                qpos.append(ko + off + torch.arange(n, device=dev, dtype=torch.int32))
+                qlo.append(torch.full((n,), ko, device=dev, dtype=torch.int32))
+                ko += L
+            o = dense_docs_attention(qcat[0], kcat[0], vcat[0], torch.cat(qpos), torch.cat(qlo), scale)[None]
+            for i, part in zip(short, o.split([sp[0].shape[2] for sp in ss], 2)):
+                outs[i] = part
+            rest = [i for i in range(len(spans)) if outs[i] is None]
+            if rest:
+                for i, part in zip(rest, flex_packed_page_attention([spans[i] for i in rest], cfg, scale, q_block,
+                                                                    kernel=kernel)):
+                    outs[i] = part
+            return outs
     q0, k0 = spans[0][0], spans[0][1]
     hq, d, g = q0.shape[1], q0.shape[3], k0.shape[1]
     rep = hq // g

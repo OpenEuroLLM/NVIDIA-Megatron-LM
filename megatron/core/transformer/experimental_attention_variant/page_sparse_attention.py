@@ -184,9 +184,14 @@ class PageSparseCoreAttention(MegatronModule):
                 raise RuntimeError(f"page_sparse_share_source {self.share_source}: no selection for {missing[0]} "
                                    "-- the source layer must run before this one on the same micro-batch")
             selections = [_SHARED_SELECTION[k] for k in keys]
-        outs, sels = ps.flex_packed_page_attention(spans, self.cfg, self.scale, self.q_block, selections,
-                                                   return_selection=True, kernel=self.packed_kernel)
-        if self.share_source and self.layer_number == self.share_source:
+        source = bool(self.share_source) and self.layer_number == self.share_source
+        if source:  # the selections are returned only for the layers that reuse them
+            outs, sels = ps.flex_packed_page_attention(spans, self.cfg, self.scale, self.q_block, selections,
+                                                       return_selection=True, kernel=self.packed_kernel)
+        else:
+            outs = ps.flex_packed_page_attention(spans, self.cfg, self.scale, self.q_block, selections,
+                                                 kernel=self.packed_kernel)
+        if source:
             for k, sel in zip(keys, sels):
                 _SHARED_SELECTION[k] = sel
         return outs

@@ -28,7 +28,7 @@ _CONFIGS = [triton.Config({}, num_warps=w, num_stages=st) for w in (4, 8) for st
 
 @triton.autotune(configs=_CONFIGS, key=['D', 'REP', 'PER_GROUP'])
 @triton.jit
-def _fwd_kernel(Q, K, V, O, LSE, IDX, BITS, CNT, QPOS, KPOS, scale,
+def _fwd_kernel(Q, K, V, O, LSE, IDX, BITS, CNT, QPOS, KPOS, QLO, scale,
                 Sq, Sk, NQ, NB,
                 sqh, sqs, skh, sks, soh, sos,
                 REP: tl.constexpr, PER_GROUP: tl.constexpr, D: tl.constexpr, BN: tl.constexpr):
@@ -41,6 +41,7 @@ def _fwd_kernel(Q, K, V, O, LSE, IDX, BITS, CNT, QPOS, KPOS, scale,
     dd = tl.arange(0, D)
     q = tl.load(Q + h * sqh + rows[:, None] * sqs + dd[None, :], mask=rmask[:, None], other=0.0)
     qpos = tl.load(QPOS + rows, mask=rmask, other=-1)
+    qlo = tl.load(QLO + rows, mask=rmask, other=0)
     n = tl.load(CNT + sg * NQ + r)
     m_i = tl.full([64], float("-inf"), tl.float32)
     l_i = tl.zeros([64], tl.float32)
@@ -57,7 +58,7 @@ def _fwd_kernel(Q, K, V, O, LSE, IDX, BITS, CNT, QPOS, KPOS, scale,
         kpos = tl.load(KPOS + cols, mask=cmask, other=2147483647)
         s = tl.dot(q, tl.trans(kb)) * (scale * 1.4426950408889634)  # log2 units: exp2
         rowbit = ((b >> shift) & 1) != 0
-        ok = rowbit[:, None] & (kpos[None, :] <= qpos[:, None])
+        ok = rowbit[:, None] & (kpos[None, :] <= qpos[:, None]) & (kpos[None, :] >= qlo[:, None])
         s = tl.where(ok, s, float("-inf"))
         m_new = tl.maximum(m_i, tl.max(s, 1))
         m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
@@ -75,7 +76,7 @@ def _fwd_kernel(Q, K, V, O, LSE, IDX, BITS, CNT, QPOS, KPOS, scale,
 
 @triton.autotune(configs=_CONFIGS, key=['D', 'REP', 'PER_GROUP'])
 @triton.jit
-def _dq_kernel(Q, K, V, DO, LSE, DELTA, DQ, IDX, BITS, CNT, QPOS, KPOS, scale,
+def _dq_kernel(Q, K, V, DO, LSE, DELTA, DQ, IDX, BITS, CNT, QPOS, KPOS, QLO, scale,
                Sq, Sk, NQ, NB,
                sqh, sqs, skh, sks, soh, sos,
                REP: tl.constexpr, PER_GROUP: tl.constexpr, D: tl.constexpr, BN: tl.constexpr):
@@ -93,6 +94,7 @@ def _dq_kernel(Q, K, V, DO, LSE, DELTA, DQ, IDX, BITS, CNT, QPOS, KPOS, scale,
     lse2 = lse * 1.4426950408889634
     delta = tl.load(DELTA + h * Sq + rows, mask=rmask, other=0.0)
     qpos = tl.load(QPOS + rows, mask=rmask, other=-1)
+    qlo = tl.load(QLO + rows, mask=rmask, other=0)
     n = tl.load(CNT + sg * NQ + r)
     dq = tl.zeros([64, D], tl.float32)
     shift = tl.arange(0, 64).to(tl.int64)
@@ -107,7 +109,7 @@ def _dq_kernel(Q, K, V, DO, LSE, DELTA, DQ, IDX, BITS, CNT, QPOS, KPOS, scale,
         kpos = tl.load(KPOS + cols, mask=cmask, other=2147483647)
         s = tl.dot(q, tl.trans(kb)) * (scale * 1.4426950408889634)
         rowbit = ((b >> shift) & 1) != 0
-        ok = rowbit[:, None] & (kpos[None, :] <= qpos[:, None])
+        ok = rowbit[:, None] & (kpos[None, :] <= qpos[:, None]) & (kpos[None, :] >= qlo[:, None])
         pij = tl.where(ok, tl.exp2(s - lse2[:, None]), 0.0)
         dp = tl.dot(do, tl.trans(vb))
         ds = pij * (dp - delta[:, None])
@@ -118,7 +120,7 @@ def _dq_kernel(Q, K, V, DO, LSE, DELTA, DQ, IDX, BITS, CNT, QPOS, KPOS, scale,
 
 @triton.autotune(configs=_CONFIGS, key=['D', 'REP', 'PER_GROUP'])
 @triton.jit
-def _dkv_kernel(Q, K, V, DO, LSE, DELTA, DK, DV, CSR_OFF, CSR_R, CSR_B, QPOS, KPOS, scale,
+def _dkv_kernel(Q, K, V, DO, LSE, DELTA, DK, DV, CSR_OFF, CSR_R, CSR_B, QPOS, KPOS, QLO, scale,
                 Sq, Sk, NKB,
                 sqh, sqs, skh, sks, soh, sos,
                 REP: tl.constexpr, PER_GROUP: tl.constexpr, D: tl.constexpr, BN: tl.constexpr):
@@ -142,8 +144,9 @@ def _dkv_kernel(Q, K, V, DO, LSE, DELTA, DK, DV, CSR_OFF, CSR_R, CSR_B, QPOS, KP
         rows = r * 64 + tl.arange(0, 64)
         rmask = rows < Sq
         qpos = tl.load(QPOS + rows, mask=rmask, other=-1)
+        qlo = tl.load(QLO + rows, mask=rmask, other=0)
         rowbit = ((b >> shift) & 1) != 0
-        ok = rowbit[:, None] & (kpos[None, :] <= qpos[:, None])
+        ok = rowbit[:, None] & (kpos[None, :] <= qpos[:, None]) & (kpos[None, :] >= qlo[:, None])
         for hh in range(REP):
             h = hk * REP + hh
             q = tl.load(Q + h * sqh + rows[:, None] * sqs + dd[None, :], mask=rmask[:, None], other=0.0)
@@ -180,7 +183,7 @@ def _csr(idx, bits, cnt, nkb):
 
 class _RowMaskAttention(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, v, idx, bits, cnt, q_pos, k_pos, scale, per_group, bn):
+    def forward(ctx, q, k, v, idx, bits, cnt, q_pos, k_pos, q_lo, scale, per_group, bn):
         Hq, Sq, D = q.shape
         Hk, Sk, _ = k.shape
         q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
@@ -188,16 +191,16 @@ class _RowMaskAttention(torch.autograd.Function):
         NB = idx.shape[2]
         o = torch.empty_like(q)
         lse = torch.empty(Hq, Sq, device=q.device, dtype=torch.float32)
-        _fwd_kernel[(nq, Hq)](q, k, v, o, lse, idx, bits, cnt, q_pos, k_pos, scale, Sq, Sk, nq, NB,
+        _fwd_kernel[(nq, Hq)](q, k, v, o, lse, idx, bits, cnt, q_pos, k_pos, q_lo, scale, Sq, Sk, nq, NB,
                               q.stride(0), q.stride(1), k.stride(0), k.stride(1), o.stride(0), o.stride(1),
                               REP=Hq // Hk, PER_GROUP=per_group, D=D, BN=bn)
-        ctx.save_for_backward(q, k, v, o, lse, idx, bits, cnt, q_pos, k_pos)
+        ctx.save_for_backward(q, k, v, o, lse, idx, bits, cnt, q_pos, k_pos, q_lo)
         ctx.scale, ctx.per_group, ctx.bn = scale, per_group, bn
         return o
 
     @staticmethod
     def backward(ctx, do):
-        q, k, v, o, lse, idx, bits, cnt, q_pos, k_pos = ctx.saved_tensors
+        q, k, v, o, lse, idx, bits, cnt, q_pos, k_pos, q_lo = ctx.saved_tensors
         Hq, Sq, D = q.shape
         Hk, Sk, _ = k.shape
         do = do.contiguous()
@@ -205,21 +208,48 @@ class _RowMaskAttention(torch.autograd.Function):
         nq, NB = -(-Sq // BM), idx.shape[2]
         rep = Hq // Hk
         dq = torch.empty_like(q)
-        _dq_kernel[(nq, Hq)](q, k, v, do, lse, delta, dq, idx, bits, cnt, q_pos, k_pos, ctx.scale, Sq, Sk, nq, NB,
+        _dq_kernel[(nq, Hq)](q, k, v, do, lse, delta, dq, idx, bits, cnt, q_pos, k_pos, q_lo, ctx.scale, Sq, Sk, nq, NB,
                              q.stride(0), q.stride(1), k.stride(0), k.stride(1), do.stride(0), do.stride(1),
                              REP=rep, PER_GROUP=ctx.per_group, D=D, BN=ctx.bn)
         nkb = -(-Sk // ctx.bn)
         off, rr, bb = _csr(idx, bits, cnt, nkb)
         dk, dv = torch.empty_like(k), torch.empty_like(v)
-        _dkv_kernel[(nkb, Hk)](q, k, v, do, lse, delta, dk, dv, off, rr, bb, q_pos, k_pos, ctx.scale, Sq, Sk, nkb,
+        _dkv_kernel[(nkb, Hk)](q, k, v, do, lse, delta, dk, dv, off, rr, bb, q_pos, k_pos, q_lo, ctx.scale, Sq, Sk, nkb,
                                q.stride(0), q.stride(1), k.stride(0), k.stride(1), do.stride(0), do.stride(1),
                                REP=rep, PER_GROUP=ctx.per_group, D=D, BN=ctx.bn)
-        return dq, dk, dv, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None
 
 
-def rowmask_block_attention(q, k, v, idx, bits, cnt, q_pos, k_pos, scale: float, per_group: bool, bn: int = 64):
-    """See the module docstring. idx / bits / cnt: from :func:`lists_from_allowed`."""
-    return _RowMaskAttention.apply(q, k, v, idx, bits, cnt, q_pos, k_pos, scale, per_group, bn)
+def rowmask_block_attention(q, k, v, idx, bits, cnt, q_pos, k_pos, scale: float, per_group: bool, bn: int = 64,
+                            q_lo=None):
+    """See the module docstring. idx / bits / cnt: from :func:`lists_from_allowed`. ``q_lo`` [Sq] int32: each
+    query's lowest key position (its document's start, for documents packed without padding); default 0."""
+    if q_lo is None:
+        q_lo = torch.zeros_like(q_pos)
+    return _RowMaskAttention.apply(q, k, v, idx, bits, cnt, q_pos, k_pos, q_lo, scale, per_group, bn)
+
+
+def dense_docs_attention(q, k, v, q_pos, q_lo, scale: float):
+    """Causal attention within documents packed WITHOUT padding: q [Hq, Sq, D] (query i at key position q_pos[i],
+    its document from key q_lo[i]; rows ascending in both), k / v [Hk, Sk, D] -> [Hq, Sq, D]. Every tile attends the
+    contiguous key blocks its rows' documents cover (all bits set; the per-element bound q_lo <= k <= q_pos masks the
+    rest) -- one call for any number of short documents."""
+    Sq, Sk = q.shape[1], k.shape[1]
+    nq = -(-Sq // BM)
+    pad = nq * BM - Sq
+    first = q_lo[::BM].to(torch.long) // 64  # a tile's first row has the lowest bound
+    last_pos = F_pad(q_pos, pad).view(nq, BM).amax(1).clamp(min=0).to(torch.long)
+    cnt = (last_pos // 64 - first + 1).clamp(min=0)
+    NB = max(1, int(cnt.max()))
+    idx = (first[:, None] + torch.arange(NB, device=q.device)[None]).clamp(max=-(-Sk // 64) - 1)
+    bits = torch.full((1, nq, NB), -1, dtype=torch.int64, device=q.device)
+    k_pos = torch.arange(Sk, device=q.device, dtype=torch.int32)
+    return rowmask_block_attention(q, k, v, idx[None].to(torch.int32).contiguous(), bits,
+                                   cnt[None].to(torch.int32).contiguous(), q_pos, k_pos, scale, False, 64, q_lo=q_lo)
+
+
+def F_pad(x, pad):
+    return torch.nn.functional.pad(x, (0, pad), value=-1)
 
 
 def lists_from_allowed(allowed: torch.Tensor, chunk: int = 64):

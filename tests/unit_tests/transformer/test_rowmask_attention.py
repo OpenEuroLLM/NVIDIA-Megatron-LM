@@ -129,3 +129,77 @@ def test_lists_from_allowed_chunking_and_bits():
         got = (idx[..., :1].clone(), cnt.clone())
         ref = ref or got
         torch.testing.assert_close(got[1], ref[1])
+
+
+def test_dense_docs_attention_matches_per_document_causal():
+    """Documents packed without padding (incl. CP-like chunks: queries from an offset, keys up to the chunk end) equal
+    causal attention per document, forward and gradients."""
+    from megatron.core.transformer.experimental_attention_variant import rowmask_attention as ra
+
+    torch.manual_seed(4)
+    Hq, Hk, D = 4, 2, 64
+    docs = [(37, 0, 37), (200, 0, 200), (150, 60, 120), (5, 0, 5), (90, 30, 60)]  # (keys, q offset, q end)
+    Sk = sum(d[0] for d in docs)
+    k = torch.randn(Hk, Sk, D, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    v = torch.randn(Hk, Sk, D, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    qs, qpos, qlo, refs, ko = [], [], [], [], 0
+    qd_all = []
+    for L, off, end in docs:
+        n = end - off
+        q = torch.randn(Hq, n, D, device="cuda", dtype=torch.bfloat16)
+        qs.append(q)
+        qpos.append(ko + off + torch.arange(n))
+        qlo.append(torch.full((n,), ko))
+        qd_all.append((q, ko, L, off))
+        ko += L
+    q = torch.cat(qs, 1).requires_grad_()
+    out = ra.dense_docs_attention(q, k, v, torch.cat(qpos).int().cuda(), torch.cat(qlo).int().cuda(), D**-0.5)
+    qd = q.detach().double().requires_grad_()
+    kd, vd = k.detach().double().requires_grad_(), v.detach().double().requires_grad_()
+    a = 0
+    for (qq, k0, L, off) in qd_all:
+        n = qq.shape[1]
+        qq = qd[:, a:a + n]
+        kk = kd[:, k0:k0 + L].repeat_interleave(Hq // Hk, 0)
+        vv = vd[:, k0:k0 + L].repeat_interleave(Hq // Hk, 0)
+        s = qq @ kk.transpose(1, 2) * D**-0.5
+        m = torch.arange(L, device="cuda")[None, :] <= (off + torch.arange(n, device="cuda"))[:, None]
+        refs.append(torch.softmax(s.masked_fill(~m, float("-inf")), -1) @ vv)
+        a += n
+    ref = torch.cat(refs, 1)
+    assert float((out.double() - ref).abs().max() / ref.abs().max()) < 2e-2
+    go = torch.randn_like(out)
+    g = torch.autograd.grad((out.float() * go.float()).sum(), (q, k, v))
+    gr = torch.autograd.grad((ref * go.double()).sum(), (qd, kd, vd))
+    for x, y in zip(g, gr):
+        assert float((x.double() - y).abs().max() / y.abs().max()) < 3e-2
+
+
+@pytest.mark.parametrize("kernel", ["flex", "rowmask"])
+def test_packed_short_documents_fast_path(kernel):
+    """Short documents (every page selected) take one unpadded dense call, long ones the sparse path: the outputs and
+    gradients equal one call per span (flex_page_sparse_attention), also for a CP-like chunk with an offset."""
+    from megatron.core.transformer.experimental_attention_variant import page_sparse as ps
+
+    torch.manual_seed(2)
+    hq, g, d = 4, 2, 64
+    cfg = ps.PageSparseConfig(selector="page_maxpool", page=64, topk=3, window=128, sink_pages=1, per_group=True,
+                              select_block=64)
+    layout = [(40, 0), (1000, 0), (100, 0), (300, 0), (7, 0), (900, 512), (200, 64)]  # (keys, query offset)
+    spans = []
+    for L, off in layout:
+        spans.append((torch.randn(1, hq, L - off, d, device="cuda", dtype=torch.bfloat16),
+                      torch.randn(1, g, L, d, device="cuda", dtype=torch.bfloat16),
+                      torch.randn(1, g, L, d, device="cuda", dtype=torch.bfloat16), off, None))
+
+    def run(fn):
+        leaves = [[t.clone().requires_grad_() for t in sp[:3]] for sp in spans]
+        outs = fn([(*lv, sp[3], None) for lv, sp in zip(leaves, spans)])
+        gen = torch.Generator(device="cuda").manual_seed(7)
+        sum((o.float() * torch.randn(o.shape, device="cuda", generator=gen)).sum() for o in outs).backward()
+        return [o.detach().float() for o in outs] + [t.grad.float() for lv in leaves for t in lv]
+
+    got = run(lambda sp: ps.flex_packed_page_attention(sp, cfg, d**-0.5, 64, kernel=kernel))
+    ref = run(lambda sp: [ps.flex_page_sparse_attention(q, k, v, cfg, off, d**-0.5, None, 64) for q, k, v, off, _ in sp])
+    for x, y in zip(got, ref):
+        assert float((x - y).abs().max() / y.abs().max().clamp(min=1e-6)) < 2e-2
