@@ -102,7 +102,7 @@ WEIGHT_FAMILY_PATTERNS = (
     ("mixer_qkv", r"\.layer\.[qkv]_proj\.weight$"),
     ("mixer_out", r"\.layer\.o_proj\.weight$"),
     ("mixer_gates", r"\.layer\.[fgb]_proj\.(\d+\.)?weight$"),
-    ("engram", r"(key_proj\.weight|value_proj\.weight|\.table)$"),
+    ("engram", r"(key_proj(_extra\.\d+)?\.weight|value_proj\.weight|\.table)$"),
 )
 WEIGHT_FAMILIES = tuple(f for f, _ in WEIGHT_FAMILY_PATTERNS) + ("all",)
 _WEIGHT_FAMILY_RE = tuple((f, re.compile(r)) for f, r in WEIGHT_FAMILY_PATTERNS)

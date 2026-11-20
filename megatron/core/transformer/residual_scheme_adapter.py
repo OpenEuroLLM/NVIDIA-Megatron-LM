@@ -150,3 +150,15 @@ class ResidualSchemeAdapter(nn.Module):
         if self.ngpt_residual is None:  # post_sublayer_norm alone: the plain residual
             return residual + out
         return self.ngpt_residual(out, residual)
+
+    def write_streams(self, outs: Tensor, ctx: tuple) -> Tensor:
+        """:meth:`write` of one output per mHC stream, ``outs`` ``[s, b, n, h]`` (dense mHC without the
+        LERP only); the streams themselves are ``ctx[0]``."""
+        if self.mhc_mixer is None or not hasattr(self.mhc_mixer, "write_streams"):
+            raise ValueError("per-stream sublayer outputs need dense mHC (mhc_routed_topk = 0)")
+        if self.config.mhc_lerp or getattr(self.config, "depth_memory_lerp", False):
+            raise ValueError("per-stream sublayer outputs do not support mhc_lerp")
+        if self.post_norm is not None:
+            outs = self.post_norm(outs)
+        streams, h_post, h_res = ctx
+        return self.mhc_mixer.write_streams(streams, outs, h_post, h_res)
