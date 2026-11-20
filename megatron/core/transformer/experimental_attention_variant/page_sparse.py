@@ -692,13 +692,15 @@ def flex_packed_page_attention(spans, cfg: PageSparseConfig, scale: float, q_blo
             kcat = torch.cat([sp[1] for sp in ss], 2)
             vcat = torch.cat([sp[2] for sp in ss], 2)
             dev = qcat.device
-            qpos, qlo, ko = [], [], 0
-            for sp in ss:
-                n, L, off = sp[0].shape[2], sp[1].shape[2], sp[3]
-                qpos.append(ko + off + torch.arange(n, device=dev, dtype=torch.int32))
-                qlo.append(torch.full((n,), ko, device=dev, dtype=torch.int32))
-                ko += L
-            o = dense_docs_attention(qcat[0], kcat[0], vcat[0], torch.cat(qpos), torch.cat(qlo), scale)[None]
+            n_ = torch.tensor([sp[0].shape[2] for sp in ss], device=dev)
+            L_ = torch.tensor([sp[1].shape[2] for sp in ss], device=dev)
+            off_ = torch.tensor([sp[3] for sp in ss], device=dev)
+            ko_ = torch.cumsum(L_, 0) - L_  # each document's first key in kcat
+            qlo = torch.repeat_interleave(ko_, n_)
+            first_q = torch.cumsum(n_, 0) - n_
+            local = torch.arange(int(n_.sum()), device=dev) - torch.repeat_interleave(first_q, n_)
+            qpos = qlo + torch.repeat_interleave(off_, n_) + local
+            o = dense_docs_attention(qcat[0], kcat[0], vcat[0], qpos.to(torch.int32), qlo.to(torch.int32), scale)[None]
             for i, part in zip(short, o.split([sp[0].shape[2] for sp in ss], 2)):
                 outs[i] = part
             rest = [i for i in range(len(spans)) if outs[i] is None]
