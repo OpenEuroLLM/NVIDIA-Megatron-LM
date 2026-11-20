@@ -77,6 +77,12 @@ class PageSparseConfig:
     select_score: str = "first"
     # one selection per KV group (from that group's query heads and keys) instead of one for all heads
     per_group: bool = False
+    # per-token selection (select_block 1) within block candidates: each block of ``candidate_block`` queries first
+    # keeps the ``block_candidates`` pages most often in its queries' own top-k, then every query selects its top-k
+    # among those -- a bounded page union per block (block-sparse kernels stay near the block-wise cost) with
+    # per-token choices; 0: plain per-token selection
+    block_candidates: int = 0
+    candidate_block: int = 64
 
     def __post_init__(self):
         if self.selector not in SELECTORS + VARIANT_SELECTORS:
@@ -566,9 +572,36 @@ def select_pages(q, k, cfg: PageSparseConfig, q_offset: int = 0, scale: float | 
             val, sel = val[:, inv], sel[:, inv]
         else:
             sc = selection_scores(q, k, cfg, q_offset, scale, indexer_scores)
+            if cfg.block_candidates > 0 and cfg.select_block <= 1:
+                sc = restrict_to_block_candidates(sc, cfg, q_offset)
             val, sel = topk_stable(sc, min(cfg.topk, P))
         allowed.scatter_(-1, sel, torch.isfinite(val) | allowed.gather(-1, sel))
     return allowed
+
+
+def restrict_to_block_candidates(sc, cfg: PageSparseConfig, q_offset: int = 0):
+    """Per-query page scores sc [b, s, P] (unselectable at -inf) -> the same with every page outside the query's block
+    candidates masked: blocks of ``candidate_block`` queries by absolute position (q_offset + i: the same under any
+    chunking / CP split on block boundaries, = the flex rows) keep the ``block_candidates`` pages chosen most often by their queries' own top-k (ties: the higher best score,
+    then the lower page). A query whose own top-k lies inside its block's candidates selects exactly as without."""
+    b, s, P = sc.shape
+    B, U = cfg.candidate_block, cfg.block_candidates
+    if U >= P:
+        return sc
+    lead = q_offset % B  # queries before the first block boundary belong to a partial first block
+    nb = -(-(s + lead) // B)
+    val, top = topk_stable(sc, min(cfg.topk, P))
+    hit = torch.isfinite(val).to(sc.dtype)
+    qblk = (torch.arange(s, device=sc.device) + lead) // B  # [s]
+    blk = qblk[None, :, None].expand_as(top)
+    count = sc.new_zeros(b, nb * P).scatter_add_(1, (blk * P + top).reshape(b, -1), hit.reshape(b, -1)).view(b, nb, P)
+    best = F.pad(sc, (0, 0, lead, nb * B - s - lead), value=float("-inf")).view(b, nb, B, P).amax(2)
+    # rank: count first; the best score in (0, 1) breaks ties (pages no query can select stay out)
+    tie = torch.sigmoid(best.nan_to_num(neginf=-1e30)).clamp(max=0.999)
+    rank = torch.where(torch.isfinite(best), count + tie, torch.full_like(count, float("-inf")))
+    rv, cand = topk_stable(rank, U)
+    keep = torch.zeros(b, nb, P, dtype=torch.bool, device=sc.device).scatter_(-1, cand, torch.isfinite(rv))
+    return sc.masked_fill(~keep[:, qblk], float("-inf"))
 
 
 def flex_page_sparse_attention(q, k, v, cfg: PageSparseConfig, q_offset: int = 0, scale: float | None = None,

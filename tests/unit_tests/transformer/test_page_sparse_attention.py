@@ -424,3 +424,37 @@ def test_token_backend_thd_matches_gathered(single, selector):
     (out_b * dout.double()).sum().backward()
     for a, b in zip(leaves_a, leaves_b):
         assert float((a.grad.double() - b.grad).abs().max() / b.grad.abs().max()) < 3e-2
+
+
+@pytest.mark.parametrize("selector", ["page_mean", "page_maxpool"])
+@pytest.mark.parametrize("off", [0, 40])
+def test_block_candidates_per_token_selection(selector, off):
+    """Per-token selection inside block candidates: with candidates >= pages it is plain per-token selection; with U
+    candidates every block's selected pages (beyond sinks / windows) are at most U, each query's choice inside them,
+    and a query whose own top-k lies inside the candidates keeps it; invariant to chunks that start on block
+    boundaries (absolute blocks)."""
+    torch.manual_seed(off)
+    L = 640
+    q, k = torch.randn(1, 4, L - off, 16), torch.randn(1, 2, L, 16)
+    base = dict(selector=selector, page=16, topk=4, window=16, sink_pages=1, select_block=1)
+    plain = ps.select_pages(q, k, ps.PageSparseConfig(**base), off, 0.25)[0]
+    wide = ps.select_pages(q, k, ps.PageSparseConfig(**base, block_candidates=64, candidate_block=32), off, 0.25)[0]
+    torch.testing.assert_close(wide, plain)
+    cfg = ps.PageSparseConfig(**base, block_candidates=6, candidate_block=32)
+    got = ps.select_pages(q, k, cfg, off, 0.25)[0]  # [s, P]
+    pos = off + torch.arange(L - off)
+    cur = pos // 16
+    p = torch.arange(40)
+    fixed = (p[None] < 1) | ((p[None] >= cur[:, None] - 1) & (p[None] <= cur[:, None]))
+    sel = got & ~fixed
+    blk = pos // 32
+    for bi in blk.unique():
+        rows = sel[blk == bi]
+        assert int(rows.any(0).sum()) <= 6
+        same = (plain[blk == bi] & ~fixed[blk == bi])
+        inside = (same & ~rows.any(0)[None]).sum(1) == 0  # own top-k inside the candidates -> unchanged
+        torch.testing.assert_close(rows[inside], same[inside])
+    # chunked on a block boundary (as CP chunks): the second part alone selects as in the whole call
+    h = 320 - off
+    part = ps.select_pages(q[:, :, h:], k, cfg, off + h, 0.25)[0]
+    torch.testing.assert_close(part, got[h:])

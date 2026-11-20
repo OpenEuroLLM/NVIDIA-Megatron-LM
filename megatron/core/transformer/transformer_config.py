@@ -758,6 +758,12 @@ class TransformerConfig(ModelParallelConfig):
     updates move zero-initialised matrices to a fixed norm after one step whatever the gradient (audit
     2026-11-18: NSA's gate rows)."""
 
+    page_sparse_block_candidates: int = 0
+    """Per-token selection (page_sparse_select_block 1) inside block candidates: each block of
+    page_sparse_flex_q_block queries keeps the pages most often in its queries' own top-k (this many), every query
+    picks its top-k among them -- the flex kernel's page union per block stays bounded (~ block-wise cost) while the
+    choices are per token. 0: plain per-token selection (unbounded union)."""
+
     page_sparse_dense_layers: Optional[list[int]] = None
     """0-based decoder layer indices (like ``kv_share_layers``) whose self-attention stays dense (the configured core
     attention) under ``page_sparse_selector``; e.g. the first attention layer of an attention-first hybrid."""

@@ -83,6 +83,7 @@ class PageSparseCoreAttention(MegatronModule):
             compress=config.page_sparse_compress, hier_group=config.page_sparse_hier_group,
             hier_topk=config.page_sparse_hier_topk, select_block=config.page_sparse_select_block,
             select_score=config.page_sparse_select_score, per_group=config.page_sparse_per_group,
+            block_candidates=config.page_sparse_block_candidates, candidate_block=config.page_sparse_flex_q_block,
         )
         self.share_source = config.page_sparse_share_source  # 0: every layer selects for itself
         cp = pg_collection.cp if pg_collection is not None else None
