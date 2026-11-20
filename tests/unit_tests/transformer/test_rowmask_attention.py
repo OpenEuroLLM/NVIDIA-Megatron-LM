@@ -103,3 +103,29 @@ def test_packed_path_rowmask_equals_flex(mode, selector):
     ob, gb = run("rowmask")
     for x, y in zip(oa + ga, ob + gb):
         assert float((x - y).abs().max() / y.abs().max().clamp(min=1e-6)) < 2e-2
+
+
+def test_lists_from_allowed_chunking_and_bits():
+    """The chunked byte packing equals the bit definition (bit i of a tile's word = row i allows the block), for any
+    chunk size, rows past Sq absent."""
+    from megatron.core.transformer.experimental_attention_variant import rowmask_attention as ra
+
+    torch.manual_seed(3)
+    allowed = torch.rand(2, 300, 9, device="cuda") < 0.3
+    ref = None
+    for chunk in (1, 2, 128):
+        idx, bits, cnt = ra.lists_from_allowed(allowed, chunk=chunk)
+        nq = idx.shape[1]
+        dense = torch.zeros(2, nq * 64, 9, dtype=torch.bool, device="cuda")
+        for g in range(2):
+            for t in range(nq):
+                for j in range(int(cnt[g, t])):
+                    w = int(bits[g, t, j])
+                    for i in range(64):
+                        if (w >> i) & 1:
+                            dense[g, t * 64 + i, int(idx[g, t, j])] = True
+        torch.testing.assert_close(dense[:, :300], allowed)
+        assert not dense[:, 300:].any()
+        got = (idx[..., :1].clone(), cnt.clone())
+        ref = ref or got
+        torch.testing.assert_close(got[1], ref[1])

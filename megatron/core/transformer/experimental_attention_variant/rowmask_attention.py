@@ -222,18 +222,30 @@ def rowmask_block_attention(q, k, v, idx, bits, cnt, q_pos, k_pos, scale: float,
     return _RowMaskAttention.apply(q, k, v, idx, bits, cnt, q_pos, k_pos, scale, per_group, bn)
 
 
-def lists_from_allowed(allowed: torch.Tensor):
+def lists_from_allowed(allowed: torch.Tensor, chunk: int = 64):
     """allowed [Gs, Sq, P] bool (query row -> key block) -> (idx [Gs, nq, NB] int32, bits [Gs, nq, NB] int64,
-    cnt [Gs, nq] int32): each tile's blocks some row allows, ascending, with the rows' bit word."""
+    cnt [Gs, nq] int32): each tile's blocks some row allows, ascending, with the rows' bit word (bit i = row i).
+    In chunks of ``chunk`` tiles, bytes packed directly (8 rows -> one byte, 8 bytes -> the word): an int64 word per
+    (tile, page) of the whole batch at once took 8x the mask's memory (OOM at 256k under CP 4, 2026-11-20)."""
     Gs, Sq, P = allowed.shape
     nq = -(-Sq // BM)
-    rows = torch.nn.functional.pad(allowed, (0, 0, 0, nq * BM - Sq)).view(Gs, nq, BM, P)
-    words = torch.zeros(Gs, nq, P, dtype=torch.int64, device=allowed.device)
-    for i in range(BM):  # one int64 word per (tile, block): bit i = row i
-        words |= rows[:, :, i, :].to(torch.int64) << i
-    blk = words != 0
-    cnt = blk.sum(-1)
-    NB = max(1, int(cnt.max()))
-    idx = torch.argsort((~blk).to(torch.int8), dim=-1, stable=True)[..., :NB]
-    bits = torch.gather(words, -1, idx)
+    dev = allowed.device
+    weights = (2 ** torch.arange(8, device=dev, dtype=torch.int16))  # row j of a byte -> bit j
+    parts = []
+    for t0 in range(0, nq, chunk):
+        t1 = min(nq, t0 + chunk)
+        rows = allowed[:, t0 * BM:min(Sq, t1 * BM)]
+        rows = torch.nn.functional.pad(rows, (0, 0, 0, (t1 - t0) * BM - rows.shape[1]))
+        rows = rows.view(Gs, t1 - t0, BM // 8, 8, P).permute(0, 1, 4, 2, 3)  # [Gs, c, P, 8 bytes, 8 rows]
+        byte = (rows.to(torch.int16) * weights).sum(-1).to(torch.uint8)  # [Gs, c, P, 8]
+        words = byte.contiguous().view(torch.int64)[..., 0]  # little-endian: byte j holds rows 8j .. 8j + 7
+        blk = words != 0
+        cnt = blk.sum(-1)
+        nb = max(1, int(cnt.max()))
+        idx = torch.argsort((~blk).to(torch.int8), dim=-1, stable=True)[..., :nb]
+        parts.append((idx, torch.gather(words, -1, idx), cnt))
+    NB = max(p[0].shape[-1] for p in parts)
+    idx = torch.cat([torch.nn.functional.pad(p[0], (0, NB - p[0].shape[-1])) for p in parts], 1)
+    bits = torch.cat([torch.nn.functional.pad(p[1], (0, NB - p[1].shape[-1])) for p in parts], 1)
+    cnt = torch.cat([p[2] for p in parts], 1)
     return idx.to(torch.int32).contiguous(), bits.contiguous(), cnt.to(torch.int32).contiguous()
