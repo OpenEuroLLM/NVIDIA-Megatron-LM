@@ -749,7 +749,9 @@ class LSA(nn.Module):
         bm = BlockMask.from_kv_blocks(kv_num.view(1, 1, fq), kv_idx.view(1, 1, fq, n), full_num.view(1, 1, fq),
                                       full_idx.view(1, 1, fq, n), BLOCK_SIZE=(B, kv_block), mask_mod=mask_mod,
                                       seq_lengths=(s, Lr + Lp))
-        kc = torch.cat([F.pad(k, (0, 0, 0, Lr - L)), k[:, :, perm]], 2)
-        vc = torch.cat([F.pad(v, (0, 0, 0, Lr - L)), v[:, :, perm]], 2)
+        # index_select: its backward is an index_add (k[:, :, perm] backpropagates through a sort-based index_put,
+        # 13 % of the 256k step on H100, 2026-11-19)
+        kc = torch.cat([F.pad(k, (0, 0, 0, Lr - L)), k.index_select(2, perm)], 2)
+        vc = torch.cat([F.pad(v, (0, 0, 0, Lr - L)), v.index_select(2, perm)], 2)
         return ps._flex()(q, kc, vc, block_mask=bm, scale=scale, enable_gqa=hq != g,
                           kernel_options=ps.flex_kernel_options(q, B, kv_block))
