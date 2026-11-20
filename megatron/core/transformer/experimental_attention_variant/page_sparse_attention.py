@@ -339,24 +339,42 @@ class PageSparseCoreAttention(MegatronModule):
         flex_spans, flex_keys, flex_rows = [], [], []
         pieces, losses, local = [], [], 0
         heads = self._cp_block_heads(query, x, bounds, cp, rank)
+        # every document's keys and this rank's query chunks as ONE split each (in order): a slice per document
+        # backpropagates a zero tensor of the whole input per document (O(documents x tokens), 2026-11-20), split's
+        # backward is one cat
+        docs, q_sizes, at = [], [], 0
         for a, b in zip(bounds[:-1], bounds[1:]):
             L = b - a
-            if L == 0:
-                continue
-            kd = kfull[a:b].permute(1, 0, 2).unsqueeze(0)  # [1, g, L, d]
-            vd = vfull[a:b].permute(1, 0, 2).unsqueeze(0)
-            kp = kf = None
-            if self.indexer is not None:
-                kp = ps.page_pool(ffull[a:b].unsqueeze(0).unsqueeze(0), self.cfg.page, "mean")[:, 0]
-            elif ffull is not None:
-                kf = ffull[a:b].unsqueeze(0)  # [1, L, F]
             c = L // (2 * cp)
             # this rank's query chunks of the document: (global offset, local start, length)
-            spans = [(0, local, L)] if cp == 1 else [(rank * c, local, c), ((2 * cp - 1 - rank) * c, local + c, c)]
+            spans = [(0, at, L)] if cp == 1 else [(rank * c, at, c), ((2 * cp - 1 - rank) * c, at + c, c)]
+            docs.append((a, b, spans))
+            q_sizes += [n for _, _, n in spans]
+            at += L // cp
+        q_sizes.append(t - at)  # padding after the last document
+        k_sizes = [b - a for a, b in zip(bounds[:-1], bounds[1:])] + [kfull.shape[0] - bounds[-1]]
+        q_parts = iter(query.split(q_sizes, 0))
+        x_parts = iter(x.split(q_sizes, 0)) if x is not None else None
+        k_parts, v_parts = kfull.split(k_sizes, 0), vfull.split(k_sizes, 0)
+        f_parts = ffull.split(k_sizes, 0) if ffull is not None else None
+        for di, (a, b, spans) in enumerate(docs):
+            L = b - a
+            if L == 0:
+                for _ in spans:
+                    next(q_parts)
+                    x_parts is not None and next(x_parts)
+                continue
+            kd = k_parts[di].permute(1, 0, 2).unsqueeze(0)  # [1, g, L, d]
+            vd = v_parts[di].permute(1, 0, 2).unsqueeze(0)
+            kp = kf = None
+            if self.indexer is not None:
+                kp = ps.page_pool(f_parts[di].unsqueeze(0).unsqueeze(0), self.cfg.page, "mean")[:, 0]
+            elif f_parts is not None:
+                kf = f_parts[di].unsqueeze(0)  # [1, L, F]
             for off, lo, n in spans:
-                q = query[lo:lo + n].permute(1, 0, 2).unsqueeze(0)  # [1, hq, n, d]
+                q = next(q_parts).permute(1, 0, 2).unsqueeze(0)  # [1, hq, n, d]
                 end = off + n  # the chunk's queries see the document's keys up to its end
-                xq = None if x is None else x[lo:lo + n].unsqueeze(0)
+                xq = None if x_parts is None else next(x_parts).unsqueeze(0)
                 h = 0  # prepended block heads (a chunk starting inside a select block, CP)
                 if (a, off) in heads:
                     qh, xh = heads[(a, off)]
