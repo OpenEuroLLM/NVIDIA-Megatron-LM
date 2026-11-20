@@ -739,4 +739,9 @@ def flex_kernel_options(q, q_block: int, kv_block: int) -> dict:
     opts = {"BLOCK_M": min(tile, q_block), "BLOCK_N": min(tile, kv_block), "FORCE_USE_FLEX_ATTENTION": True}
     if tile == 32:
         opts["num_stages"] = 1
+    elif q.shape[-1] >= 192:
+        # H100, head dim 256 (v4b): 8 warps, 2 stages -- the packed page path's fwd + bwd 1.6x faster than inductor's
+        # pick (64k: 176 -> 111 ms, 4 x 16k: 133 -> 83 ms), bit-identical outputs / gradients (flex_tune_bench.py,
+        # 2026-11-20); head dim 128 not measured yet
+        opts.update(num_warps=8, num_stages=2)
     return opts
