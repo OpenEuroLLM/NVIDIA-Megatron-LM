@@ -388,3 +388,17 @@ def test_page_maxpool_scores_match_cumsum_reference(L):
     sc = torch.einsum("bgrsd,bgjd->bsj", q.view(1, 2, 2, 37, 16), win) * 0.25
     ref = F.max_pool1d(sc.reshape(37, 1, J), kernel_size=5, stride=4, padding=1).view(1, 37, -1)[..., :P]
     torch.testing.assert_close(ps.page_scores(q, k, cfg, 0, 0.25), ref, atol=1e-12, rtol=1e-12)
+
+
+@pytest.mark.parametrize("selector", ["page_mean", "page_maxpool", "quest"])
+@pytest.mark.parametrize("block", [8, 16, 32])
+@pytest.mark.parametrize("L,off", [(64, 0), (100, 0), (128, 40), (144, 0), (160, 16), (300, 0)])
+def test_short_sequence_shortcut_equals_scored_selection(selector, block, L, off, monkeypatch):
+    """select_pages' shortcut for sequences with at most topk selectable pages equals the scored selection (page 16,
+    window 16, 1 sink, top 6); with select_block 32 > page it must not apply (anchors' windows differ)."""
+    torch.manual_seed(L)
+    q, k = torch.randn(1, 4, L - off, 16), torch.randn(1, 2, L, 16)
+    cfg = ps.PageSparseConfig(selector=selector, page=16, topk=6, window=16, sink_pages=1, select_block=block)
+    got = ps.select_pages(q, k, cfg, off, 0.25)
+    monkeypatch.setattr(ps, "_selects_everything", lambda P, cfg: False)
+    torch.testing.assert_close(got, ps.select_pages(q, k, cfg, off, 0.25))

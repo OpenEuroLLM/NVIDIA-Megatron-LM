@@ -530,6 +530,14 @@ def _raise_recompile_limit(limit: int = 64) -> None:
             setattr(cfg, name, limit)
 
 
+def _selects_everything(P: int, cfg: PageSparseConfig) -> bool:
+    """A sequence of P pages with at most topk pages outside the sinks and a query's window selects all of them anyway
+    (short packed documents: their scoring was CPU-bound overhead, 2026-11-20). Exact only while a select block never
+    straddles a page (page a multiple of select_block): a query must have its anchor's window."""
+    blocks_in_pages = cfg.select_block <= 1 or cfg.page % cfg.select_block == 0
+    return blocks_in_pages and cfg.hier_group <= 0 and P - cfg.sink_pages - (cfg.window // cfg.page + 1) <= cfg.topk
+
+
 def select_pages(q, k, cfg: PageSparseConfig, q_offset: int = 0, scale: float | None = None,
                  indexer_scores=None):
     """Every query's pages as a [b, s, P] bool (sinks, selection, window), the page selectors only."""
@@ -546,6 +554,9 @@ def select_pages(q, k, cfg: PageSparseConfig, q_offset: int = 0, scale: float | 
     allowed = ((p[None, :] < cfg.sink_pages) | ((p[None, :] >= cur[:, None] - wp) & (p[None, :] <= cur[:, None])))
     allowed = allowed & (p[None, :] <= cur[:, None])
     allowed = allowed[None].expand(b, s, P).clone()
+    if _selects_everything(P, cfg) and cfg.selector != "window" and cfg.topk > 0:
+        p_ok = p[None, :] <= cur[:, None]
+        return p_ok[None].expand(b, s, P).clone()
     if cfg.selector != "window" and cfg.topk > 0:
         if cfg.select_block > 1 and cfg.select_score == "first":
             # top-k of the anchors' rows, then each query takes its anchor's (the expanded [s, P] sort was most of
@@ -700,7 +711,10 @@ def flex_packed_page_attention(spans, cfg: PageSparseConfig, scale: float, q_blo
                                   seq_lengths=(Sq, Sk))
     out = _flex()(qp, kp, vp, block_mask=bm, scale=scale, enable_gqa=hq != g,
                   kernel_options=flex_kernel_options(qp, q_block, page))
-    outs = [out[:, :, qoff[i]:qoff[i] + sp[0].shape[2]] for i, sp in enumerate(spans)]
+    # split, then trim each span's padding: a slice per span backpropagates a zero tensor of the whole packed output
+    # per span (64 x 1k documents: 3/4 of the step was those adds / fills, 2026-11-20), split's backward is one cat
+    segs = out.split([qoff[i + 1] - qoff[i] for i in range(len(spans))], dim=2)
+    outs = [seg[:, :, :sp[0].shape[2]] for seg, sp in zip(segs, spans)]
     return (outs, sels) if return_selection else outs
 
 
