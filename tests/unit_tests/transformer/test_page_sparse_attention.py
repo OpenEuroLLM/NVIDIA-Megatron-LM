@@ -402,3 +402,25 @@ def test_short_sequence_shortcut_equals_scored_selection(selector, block, L, off
     got = ps.select_pages(q, k, cfg, off, 0.25)
     monkeypatch.setattr(ps, "_selects_everything", lambda P, cfg: False)
     torch.testing.assert_close(got, ps.select_pages(q, k, cfg, off, 0.25))
+
+
+@pytest.mark.parametrize("selector", ["page_mean", "page_maxpool"])
+def test_token_backend_thd_matches_gathered(single, selector):
+    """page_sparse_backend token (per-token selection, NSA kernel over the packed documents) equals the gathered
+    reference with select_block 1 on a packed batch, forward and backward."""
+    pytest.importorskip("fla.ops.nsa.parallel")
+    kw = dict(page_sparse_selector=selector, page_sparse_page=32, page_sparse_topk=2, page_sparse_window=32,
+              page_sparse_select_block=1, page_sparse_per_group=True)
+    tok = PageSparseCoreAttention(_config(**kw, page_sparse_backend="token"), 1, pg_collection=single)
+    ref = PageSparseCoreAttention(_config(**kw, page_sparse_backend="gathered"), 1, pg_collection=single)
+    q, k, v, _ = _inputs(8, torch.bfloat16)
+    dout = torch.randn(sum(LENGTHS), HQ * D, generator=torch.Generator().manual_seed(9)).cuda()
+    leaves_a = [x.clone().requires_grad_() for x in (q, k, v)]
+    leaves_b = [x.clone().double().requires_grad_() for x in (q, k, v)]
+    out_a = tok(*leaves_a, packed_seq_params=_packed(LENGTHS))
+    out_b = ref(*leaves_b, packed_seq_params=_packed(LENGTHS))
+    assert float((out_a.double() - out_b).abs().max() / out_b.abs().max()) < 2e-2
+    (out_a.float() * dout).sum().backward()
+    (out_b * dout.double()).sum().backward()
+    for a, b in zip(leaves_a, leaves_b):
+        assert float((a.grad.double() - b.grad).abs().max() / b.grad.abs().max()) < 3e-2

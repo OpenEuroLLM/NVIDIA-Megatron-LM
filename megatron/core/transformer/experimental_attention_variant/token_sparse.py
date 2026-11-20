@@ -61,10 +61,13 @@ def token_page_attention_thd(q, k, v, cu_seqlens, cfg: ps.PageSparseConfig, scal
     its own keys, causal) -> [t, hq, d]. One kernel call for every document."""
     from fla.ops.nsa.parallel import parallel_nsa
 
-    t, hq, d = q.shape
+    t_all, hq, d = q.shape
     g = k.shape[1]
     bounds = cu_seqlens.tolist()
-    idx = torch.full((t, g, 1), -1, dtype=torch.long, device=q.device)
+    t = bounds[-1]
+    if t < t_all:  # padding after the last document: the varlen kernel never writes its rows -> zeros
+        out = token_page_attention_thd(q[:t], k[:t], v[:t], cu_seqlens, cfg, scale)
+        return F.pad(out, (0, 0, 0, 0, 0, t_all - t))
     pieces = []
     for a, b in zip(bounds[:-1], bounds[1:]):
         if b == a:
@@ -79,7 +82,7 @@ def token_page_attention_thd(q, k, v, cu_seqlens, cfg: ps.PageSparseConfig, scal
         idx[a:b, :, : sel.shape[2]] = sel
     G = hq // g
     GP = max(16, _pow2(G))
-    qp = q.view(t, g, G, d)
+    qp = q.reshape(t, g, G, d)
     if GP != G:  # zero heads up to the kernel's minimum group size
         qp = F.pad(qp, (0, 0, 0, GP - G))
     o = parallel_nsa(qp.reshape(1, t, g * GP, d), k[None], v[None],

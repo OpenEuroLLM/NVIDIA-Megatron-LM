@@ -678,8 +678,9 @@ class TransformerConfig(ModelParallelConfig):
 
     page_sparse_backend: str = "flex"
     """page selectors' kernel: "flex" (FlexAttention, fused Triton forward / backward, a block mask of each
-    query block's page union) or "gathered" (the exact torch reference); token_topk / compress_mean are
-    always gathered."""
+    query block's page union), "gathered" (the exact torch reference) or "token" (per-token selection,
+    select_block 1: every query token its own pages, NSA's selection kernel over the packed documents --
+    token_sparse.py; page_mean / page_maxpool / quest, CP 1); token_topk / compress_mean are always gathered."""
 
     page_sparse_flex_q_block: int = 64
     """flex: queries per block-mask row (smaller: tighter page unions, more blocks)."""
@@ -2577,8 +2578,14 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(f"page_sparse_selector must be one of {selectors}")
             if self.page_sparse_window % self.page_sparse_page:
                 raise ValueError("page_sparse_window must be a multiple of page_sparse_page")
-            if self.page_sparse_backend not in ("flex", "gathered"):
-                raise ValueError("page_sparse_backend must be flex or gathered")
+            if self.page_sparse_backend not in ("flex", "gathered", "token"):
+                raise ValueError("page_sparse_backend must be flex, gathered or token")
+            if self.page_sparse_backend == "token" and (
+                self.page_sparse_selector not in ("page_mean", "page_maxpool", "quest")
+                or self.page_sparse_select_block != 1
+            ):
+                raise ValueError("page_sparse_backend token: per-token selection (page_sparse_select_block 1) of "
+                                 "page_mean / page_maxpool / quest")
             if self.page_sparse_lsa_visibility not in ("window", "block"):
                 raise ValueError("page_sparse_lsa_visibility must be window or block")
             if self.page_sparse_dense_forward and not (self.page_sparse_selector in ("indexer", "csa2")

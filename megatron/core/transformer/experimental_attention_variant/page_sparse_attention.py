@@ -127,6 +127,7 @@ class PageSparseCoreAttention(MegatronModule):
                 for param in (mod.parameters() if mod is not None else ()):
                     param.use_adam_with_emerging_optimizers = True
         self.flex = config.page_sparse_backend == "flex" and self.cfg.selector in ps.PAGE_SELECTORS
+        self.token = config.page_sparse_backend == "token"  # per-token selection, NSA kernel (token_sparse.py)
         self.q_block = config.page_sparse_flex_q_block
         self.packed_flex = config.page_sparse_packed_flex  # one flex call for every document of a packed batch
         self.loss_coeff = float(config.page_sparse_indexer_loss_coeff or 0.0)
@@ -315,6 +316,13 @@ class PageSparseCoreAttention(MegatronModule):
         if cu is None:
             cu = packed_seq_params.cu_seqlens_q
         t, hq, d = query.shape
+        if self.token:  # every query token selects its own pages: one NSA-kernel call for all documents
+            if self.cp_group is not None:
+                raise NotImplementedError("page_sparse_backend token: context parallelism")
+            from megatron.core.transformer.experimental_attention_variant import token_sparse
+
+            out = token_sparse.token_page_attention_thd(query, key, value, cu, self.cfg, self.scale)
+            return out.reshape(t, hq * out.shape[-1]), []
         x = self._hidden[:, 0] if self._needs_hidden() else None  # [t, h]
         # the key side's per-token features: the indexer's index keys, CSA2's compression weights
         feat = None
