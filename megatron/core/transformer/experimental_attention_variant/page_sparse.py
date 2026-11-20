@@ -582,25 +582,19 @@ def select_pages(q, k, cfg: PageSparseConfig, q_offset: int = 0, scale: float | 
 def restrict_to_block_candidates(sc, cfg: PageSparseConfig, q_offset: int = 0):
     """Per-query page scores sc [b, s, P] (unselectable at -inf) -> the same with every page outside the query's block
     candidates masked: blocks of ``candidate_block`` queries by absolute position (q_offset + i: the same under any
-    chunking / CP split on block boundaries, = the flex rows) keep the ``block_candidates`` pages chosen most often by their queries' own top-k (ties: the higher best score,
-    then the lower page). A query whose own top-k lies inside its block's candidates selects exactly as without."""
+    chunking / CP split on block boundaries, = the flex rows) keep the ``block_candidates`` pages its FIRST query
+    scores highest (that query precedes every query of the block: causal), then every query selects its own top-k
+    among them. (Candidates voted by all of a block's queries let later queries decide which pages earlier ones see:
+    a causality leak -- those arms trained BELOW dense, 2026-11-20.)"""
     b, s, P = sc.shape
     B, U = cfg.candidate_block, cfg.block_candidates
     if U >= P:
         return sc
-    lead = q_offset % B  # queries before the first block boundary belong to a partial first block
-    nb = -(-(s + lead) // B)
-    val, top = topk_stable(sc, min(cfg.topk, P))
-    hit = torch.isfinite(val).to(sc.dtype)
-    qblk = (torch.arange(s, device=sc.device) + lead) // B  # [s]
-    blk = qblk[None, :, None].expand_as(top)
-    count = sc.new_zeros(b, nb * P).scatter_add_(1, (blk * P + top).reshape(b, -1), hit.reshape(b, -1)).view(b, nb, P)
-    best = F.pad(sc, (0, 0, lead, nb * B - s - lead), value=float("-inf")).view(b, nb, B, P).amax(2)
-    # rank: count first; the best score in (0, 1) breaks ties (pages no query can select stay out)
-    tie = torch.sigmoid(best.nan_to_num(neginf=-1e30)).clamp(max=0.999)
-    rank = torch.where(torch.isfinite(best), count + tie, torch.full_like(count, float("-inf")))
-    rv, cand = topk_stable(rank, U)
-    keep = torch.zeros(b, nb, P, dtype=torch.bool, device=sc.device).scatter_(-1, cand, torch.isfinite(rv))
+    lead = q_offset % B
+    qblk = (torch.arange(s, device=sc.device) + lead) // B  # [s] block of each query (0: the call's first)
+    first = torch.searchsorted(qblk, torch.arange(int(qblk[-1]) + 1, device=sc.device))  # each block's first row
+    rv, cand = topk_stable(sc[:, first], min(U, P))  # [b, nb, U]
+    keep = torch.zeros(b, len(first), P, dtype=torch.bool, device=sc.device).scatter_(-1, cand, torch.isfinite(rv))
     return sc.masked_fill(~keep[:, qblk], float("-inf"))
 
 
