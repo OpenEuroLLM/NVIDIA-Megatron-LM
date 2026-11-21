@@ -525,6 +525,40 @@ def test_csa2_entry_rms_matches_member_rms():
     torch.testing.assert_close(kc.pow(2).mean(-1).sqrt(), members, atol=1e-10, rtol=1e-10)
 
 
+def test_csa2_entry_rms_zero_keys_finite_gradients():
+    """Exactly-zero keys (a whole entry of them): entry_rms's square roots at 0 must not turn the gradients of the
+    keys and the compression weights into NaN (sqrt'(0) = inf times a zero upstream gradient)."""
+    q, k, v, x = qkvx()
+    k = k.clone()
+    k[:, :, 64:72] = 0
+    k.requires_grad_()
+    mod = _csa2(m=4)
+    mod.cfg = dataclasses.replace(mod.cfg, entry_rms=True)
+    kc, vc = mod.compress(k, v, mod.token_features(x))
+    (kc.sum() + vc.sum()).backward()
+    assert torch.isfinite(kc).all()
+    assert torch.isfinite(k.grad).all() and torch.isfinite(mod.z.weight.grad).all()
+
+
+def test_nan_debug_reports_part_and_gradient(monkeypatch, capsys):
+    """PAGE_SPARSE_NAN_DEBUG: a non-finite input is reported with the layer label and part, and so is its
+    non-finite gradient (through the hook); off by default (no output)."""
+    q, k, v, x = qkvx()
+    mod = _csa2(m=4)
+    mod.tag = "L7 csa2"
+    v = v.clone()
+    v[:, :, 100] = float("nan")
+    v.requires_grad_()
+    _run("csa2", mod, q, k, v, x)
+    assert "[nan_debug]" not in capsys.readouterr().out
+    monkeypatch.setattr(sv, "NAN_DEBUG", True)
+    monkeypatch.setattr(sv, "_NAN_HITS", [0])
+    out = _run("csa2", mod, q, k, v, x)
+    out.sum().backward()
+    log = capsys.readouterr().out
+    assert "L7 csa2 v:" in log and "L7 csa2 vc:" in log and "grad(" in log
+
+
 def test_lsa_block_visibility_full_budget_is_dense():
     """With a cluster span larger than the window, the original visibility leaves the tokens between the last
     complete block and the window unreachable (not dense at a full budget); visibility='block' (the reference's

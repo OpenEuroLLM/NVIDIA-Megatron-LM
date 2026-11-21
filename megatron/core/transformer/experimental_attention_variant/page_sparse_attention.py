@@ -113,6 +113,7 @@ class PageSparseCoreAttention(MegatronModule):
                                                  entry_bias=config.page_sparse_csa2_entry_bias,
                                                  entry_rms=config.page_sparse_csa2_entry_rms))
             self.variant.flex = config.page_sparse_backend == "flex"
+            self.variant.tag = f"L{layer_number} csa2"
         elif self.cfg.selector == "lsa":
             self.variant = sv.LSA(sv.LSAConfig(pool=config.page_sparse_lsa_pool, block=config.page_sparse_lsa_block,
                                                buckets=config.page_sparse_lsa_buckets, topk=self.cfg.topk,
@@ -237,7 +238,14 @@ class PageSparseCoreAttention(MegatronModule):
             _SHARED_SELECTION.clear()  # a new micro-batch (or its recompute): the source refills
         if attention_bias is not None:
             raise NotImplementedError("page_sparse_selector: attention_bias")
+        if sv.NAN_DEBUG:
+            for name, t in (("query", query), ("key", key), ("value", value), ("hidden", self._hidden)):
+                sv.nan_check(f"L{self.layer_number}", name, t)
         out, losses = (self._forward_thd if thd else self._forward_sbhd)(query, key, value, packed_seq_params)
+        if sv.NAN_DEBUG:
+            sv.nan_check(f"L{self.layer_number}", "attention out", out)
+            for i, (lv, _) in enumerate(losses):
+                sv.nan_check(f"L{self.layer_number}", f"indexer loss {i}", lv)
         if losses:
             from megatron.core.transformer.moe.moe_utils import MoEAuxLossAutoScaler
 

@@ -29,6 +29,7 @@ Hierarchical selection: ``PageSparseConfig.hier_group`` / ``hier_topk`` in page_
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 
 import torch
@@ -208,6 +209,30 @@ class NSA(nn.Module):
         return out.masked_fill((pos < blk - 1)[None, None, :, None], 0.0)
 
 
+# ----------------------------------------------------------------------------------------------- NaN debug
+# PAGE_SPARSE_NAN_DEBUG=1: every checked tensor (CSA2's parts, the attention layer's inputs / output) and its
+# gradient is tested for non-finite values; the first PAGE_SPARSE_NAN_DEBUG_MAX (default 40) hits per process are
+# printed with the layer, the part and the rank (a CPU sync per check: diagnosis runs only).
+NAN_DEBUG = os.environ.get("PAGE_SPARSE_NAN_DEBUG", "0") not in ("", "0")
+_NAN_HITS = [0]
+
+
+def nan_check(tag: str, name: str, t, grad: bool = True):
+    """Report ``t`` when it holds a non-finite value (and its gradient, through a hook, when ``grad``)."""
+    if not NAN_DEBUG or t is None or not torch.is_tensor(t) or not t.is_floating_point():
+        return
+    bad = ~torch.isfinite(t.detach())
+    if bool(bad.any()) and _NAN_HITS[0] < int(os.environ.get("PAGE_SPARSE_NAN_DEBUG_MAX", "40")):
+        _NAN_HITS[0] += 1
+        fin = t.detach()[~bad]
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        print(f"[nan_debug] rank {rank} {tag} {name}: shape {tuple(t.shape)} non-finite {int(bad.sum())} "
+              f"(nan {int(torch.isnan(t.detach()).sum())}) finite absmax "
+              f"{float(fin.abs().max()) if fin.numel() else float('nan'):.4g}", flush=True)
+    if grad and t.requires_grad:
+        t.register_hook(lambda g, tag=tag, name=name: nan_check(tag, f"grad({name})", g, grad=False))
+
+
 # ----------------------------------------------------------------------------------------------- CSA2
 def _zero_loss(module: nn.Module, like: torch.Tensor) -> torch.Tensor:
     """A zero loss that still reaches every trainable parameter of ``module`` (zero gradients): a rank whose
@@ -252,6 +277,7 @@ class CSA2(nn.Module):
         self.idx_k = nn.Linear(kv_channels, cfg.index_dim, bias=False)
         self.flex = False  # FlexAttention (CUDA, select_block > 1); the exact reference otherwise
         self.diag = None  # diagnostics (reference path): diag.scores(kind, scores, ...) may record / replace scores
+        self.tag = "csa2"  # nan_check's layer label (PageSparseCoreAttention sets the layer number)
 
     def token_features(self, x):
         """Per-token features of the KEY side, gathered with the keys under context parallelism: [t, g]."""
@@ -266,10 +292,23 @@ class CSA2(nn.Module):
         kg = ps._acc(k[:, :, : Lc * m]).view(1, g, Lc, m, d)
         kc = (kg * w[..., None]).sum(3)
         if self.cfg.entry_rms:  # each entry key back to its members' mean RMS
-            target = kg.pow(2).mean(-1).sqrt().mean(-1, keepdim=True)
-            kc = kc * target / kc.pow(2).mean(-1, keepdim=True).sqrt().clamp(min=1e-12)
+            # the clamps go INSIDE the square roots: sqrt's gradient at 0 is inf, and an all-zero key (or entry)
+            # then turns its gradient into 0 * inf = NaN for every parameter upstream
+            target = kg.pow(2).mean(-1).clamp(min=1e-24).sqrt().mean(-1, keepdim=True)
+            den = kc.pow(2).mean(-1, keepdim=True).clamp(min=1e-24).sqrt()
+            if NAN_DEBUG:
+                nan_check(self.tag, "entry_rms target", target)
+                nan_check(self.tag, "entry_rms den", den)
+                small = int((den < 1e-6).sum())
+                if small:
+                    print(f"[nan_debug] {self.tag} entry_rms: {small} entries with RMS < 1e-6 "
+                          f"(min {float(den.min()):.3g}, target min {float(target.min()):.3g})", flush=True)
+            kc = kc * target / den
         kc = kc.to(k.dtype)
         vc = (ps._acc(v[:, :, : Lc * m]).view(1, g, Lc, m, d) * w[..., None]).sum(3).to(v.dtype)
+        nan_check(self.tag, "compress weights", w)
+        nan_check(self.tag, "kc", kc)
+        nan_check(self.tag, "vc", vc)
         return kc, vc
 
     def _candidates(self, s, Lc, q_offset, device, pos=None):
@@ -306,8 +345,13 @@ class CSA2(nn.Module):
         L = k.shape[2]
         kc, vc = self.compress(k, v, z)
         Lc = kc.shape[2]
+        if NAN_DEBUG:
+            for name, t in (("q", q), ("k", k), ("v", v), ("xq", xq), ("z", z)):
+                nan_check(self.tag, name, t)
         if self.flex and q.is_cuda and cfg.select_block > 1:
-            return self._forward_flex(q, k, v, xq, kc, vc, q_offset, scale)
+            out = self._forward_flex(q, k, v, xq, kc, vc, q_offset, scale)
+            nan_check(self.tag, "out", out)
+            return out
         raw_cfg = ps.PageSparseConfig(selector="window", page=cfg.page, window=cfg.window,
                                       sink_pages=cfg.sink_pages)
         tok, tok_ok = ps.select_tokens(q, k, raw_cfg, q_offset, scale)
@@ -350,6 +394,9 @@ class CSA2(nn.Module):
         raw_cfg = ps.PageSparseConfig(selector="window", page=cfg.page, window=cfg.window,
                                       sink_pages=cfg.sink_pages)
         o_raw, l_raw = ps.flex_page_sparse_attention(q, k, v, raw_cfg, q_offset, scale, None, B, return_lse=True)
+        if NAN_DEBUG:
+            nan_check(self.tag, "o_raw", o_raw)
+            nan_check(self.tag, "l_raw (nan only)", torch.where(torch.isinf(l_raw), 0.0, l_raw))
         n = min(cfg.topk_entries, Lc)
         if n == 0:
             return o_raw
@@ -389,6 +436,12 @@ class CSA2(nn.Module):
                                   kernel_options=ps.flex_kernel_options(q, B, kv_block))
         if cfg.entry_bias:  # a constant on every entry logit = the entry part's LSE shifted by it
             l_ent = l_ent + float(cfg.entry_bias)
+        if NAN_DEBUG:
+            nan_check(self.tag, "o_ent", o_ent)
+            nan_check(self.tag, "l_ent (nan only)", torch.where(torch.isinf(l_ent), 0.0, l_ent))
+            if bool(torch.isposinf(l_raw).any() | torch.isposinf(l_ent).any()):
+                print(f"[nan_debug] {self.tag} +inf LSE (raw {int(torch.isposinf(l_raw).sum())}, entries "
+                      f"{int(torch.isposinf(l_ent).sum())})", flush=True)
         return ps.merge_attention([(o_raw, l_raw), (o_ent, l_ent)])
 
     def indexer_loss(self, q, k, xq, z, q_offset: int, scale: float, chunk: int = 256):
