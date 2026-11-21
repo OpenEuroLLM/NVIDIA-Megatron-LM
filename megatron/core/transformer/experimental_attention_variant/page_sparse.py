@@ -704,6 +704,14 @@ def flex_packed_page_attention(spans, cfg: PageSparseConfig, scale: float, q_blo
     page = cfg.page
     if q_block % page and page % q_block:
         raise ValueError("flex_packed_page_attention: q_block and page must divide one another")
+    q0, k0 = spans[0][0], spans[0][1]
+    if q0.is_cuda:  # the short-document kernels autotuned on every rank now, not mid-run on the rank that needs them
+        try:
+            rm = _rowmask()
+        except ImportError:  # a standalone copy of this file (HF export) has no Triton training kernels
+            rm = None
+        if rm is not None:
+            rm.warm_dense_docs(q0.shape[1], k0.shape[1], q0.shape[3], q0.device, q0.dtype)
     if selections is None and not return_selection:
         # documents short enough to attend every page (the sparse result is dense causal attention within them): all
         # in ONE call packed without padding -- per-span selection, padding and lists made the many-document

@@ -455,6 +455,29 @@ def dense_docs_blocks(q_pos, q_lo) -> int:
     return max(1, int(_dense_docs_tiles(q_pos, q_lo)[1].max()))
 
 
+_WARMED: set = set()
+
+
+def warm_dense_docs(hq: int, hk: int, d: int, device, dtype) -> None:
+    """Autotune :func:`dense_docs_attention`'s kernels (forward, dq, dk / dv) once per process and head shape. Triton
+    autotunes at the first call, and the short-document path runs only when a rank first meets a short document --
+    mid-run, one rank benchmarked 6 configs x 3 kernels (~1.4 s) while every other rank waited at the next collective,
+    a new rank on almost every step on long-document data (t19i all-rank profile, 2026-11-21). Call it on every rank
+    at the first sparse call. No RNG (a recompute must replay the forward's random stream)."""
+    key = (str(device), dtype, hq, hk, d)
+    if key in _WARMED:
+        return
+    _WARMED.add(key)
+    S = 2 * 1024  # two short documents
+    with torch.enable_grad():
+        q = torch.zeros(hq, S, d, device=device, dtype=dtype, requires_grad=True)
+        k = torch.zeros(hk, S, d, device=device, dtype=dtype, requires_grad=True)
+        v = torch.zeros(hk, S, d, device=device, dtype=dtype, requires_grad=True)
+        q_pos = torch.arange(S, device=device, dtype=torch.int32)
+        q_lo = (q_pos // 1024) * 1024
+        dense_docs_attention(q, k, v, q_pos, q_lo, d**-0.5, nb=17).float().sum().backward()
+
+
 def dense_docs_attention(q, k, v, q_pos, q_lo, scale: float, nb: int | None = None):
     """Causal attention within documents packed WITHOUT padding: q [Hq, Sq, D] (query i at key position q_pos[i],
     its document from key q_lo[i]; rows ascending in both), k / v [Hk, Sk, D] -> [Hq, Sq, D]. Every tile attends the
