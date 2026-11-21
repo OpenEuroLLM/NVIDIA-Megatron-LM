@@ -7,6 +7,8 @@ the indexer gets gradients from its KL warm-up loss, and the warm-up keeps the d
     python -m torch.distributed.run --nproc-per-node 2 -m pytest -q tests/unit_tests/transformer/test_page_sparse_attention.py
 """
 
+import os
+
 import pytest
 import torch
 
@@ -26,6 +28,18 @@ HQ, G, D, H = 4, 2, 16, 64
 LENGTHS = (120, 260, 132)  # multiples of 4 (2 cp); the middle document spans the stream pieces
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPUs")
+
+# NGC containers force TF32 for every fp32 cuBLAS GEMM (TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1): fp32 page scores then differ
+# from a float64 reference beyond near-ties, so the per-token selection tests turn the Triton scoring's TF32 off (it
+# reads the variable per call) and compare with float64 references; paths scored by cuBLAS fp32 GEMMs are skipped there.
+TF32_FORCED = os.environ.get("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE") == "1"
+
+
+@pytest.fixture
+def exact_scores(monkeypatch):
+    monkeypatch.setenv("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE", "0")
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+
 
 
 def _config(**kw):
@@ -476,11 +490,13 @@ def test_selection_is_causal(mode, selector):
 
 @pytest.mark.parametrize("hq", [16, 10, 4])
 @pytest.mark.parametrize("selector", ["page_mean", "page_maxpool"])
-def test_rowmask_pure_token_packed_matches_gathered(hq, selector):
+def test_rowmask_pure_token_packed_matches_gathered(hq, selector, exact_scores):
     """Pure per-token selection (select_block 1, no block candidates, per KV group) through the rowmask backend's
     head-packed tiles (8 queries x 8 heads at 16 / 2; padded heads at 10 / 2; 32 queries x 2 heads at 4 / 2) equals
     the gathered reference per span on packed documents and an offset (CP-like) chunk, outputs and q / k / v
     gradients; and it is causal: outputs up to t do not change when every later query / key / value does."""
+    if selector == "page_mean" and TF32_FORCED:
+        pytest.skip("page_mean scores through cuBLAS fp32 GEMMs, forced to TF32 here")
     torch.manual_seed(2)
     g, d = 2, 32
     cfg = ps.PageSparseConfig(selector=selector, page=64, topk=3, window=128, sink_pages=1, select_block=1,
@@ -516,9 +532,11 @@ def test_rowmask_pure_token_packed_matches_gathered(hq, selector):
 
 
 @pytest.mark.parametrize("selector", ["page_mean", "page_maxpool"])
-def test_rowmask_pure_token_backend_thd_matches_gathered(single, selector):
+def test_rowmask_pure_token_backend_thd_matches_gathered(single, selector, exact_scores):
     """PageSparseCoreAttention with page_sparse_backend rowmask and per-token selection (select_block 1, per group)
     equals the gathered backend on a packed batch of long and short documents, forward and backward."""
+    if selector == "page_mean" and TF32_FORCED:
+        pytest.skip("page_mean scores through cuBLAS fp32 GEMMs, forced to TF32 here")
     lengths = (1300, 260, 120, 900)
     kw = dict(page_sparse_selector=selector, page_sparse_page=64, page_sparse_topk=3, page_sparse_window=128,
               page_sparse_select_block=1, page_sparse_per_group=True, page_sparse_flex_q_block=64,
@@ -555,9 +573,11 @@ def test_topk_mask_equals_stable_topk():
 
 @pytest.mark.parametrize("selector", ["page_mean", "page_maxpool"])
 @pytest.mark.parametrize("off", [0, 192])
-def test_token_allowed_equals_select_pages(selector, off):
+def test_token_allowed_equals_select_pages(selector, off, exact_scores):
     """token_allowed (the per-token training path's selection: span-wide key statistics, the top-k mask) selects the
     same pages as select_pages with select_block 1, also with quantized keys (exact score ties between pages)."""
+    if selector == "page_mean" and TF32_FORCED:
+        pytest.skip("page_mean scores through cuBLAS fp32 GEMMs, forced to TF32 here")
     torch.manual_seed(off)
     L = 2000
     q = torch.randn(1, 8, L - off, 32, device="cuda")
@@ -565,12 +585,12 @@ def test_token_allowed_equals_select_pages(selector, off):
         cfg = ps.PageSparseConfig(selector=selector, page=64, topk=5, window=128, sink_pages=1, select_block=1)
         kst = ps.maxpool_windows(k, 64) if selector == "page_maxpool" else ps.page_pool(k, 64, "mean")
         got = ps.token_allowed(q, k, cfg, off, 0.2, kst)
-        torch.testing.assert_close(got, ps.select_pages(q, k, cfg, off, 0.2)[0])
+        torch.testing.assert_close(got, ps.select_pages(q.double(), k.double(), cfg, off, 0.2)[0])
 
 
 @pytest.mark.parametrize("tq", [8, 16])
 @pytest.mark.parametrize("off", [0, 320])
-def test_token_span_lists_fused_equals_select_pages(tq, off):
+def test_token_span_lists_fused_equals_select_pages(tq, off, exact_scores):
     """token_span_lists' fused path (Triton scores + top-k / sinks / window -> lists) lists exactly the pages
     select_pages chooses per query (per KV group, ties to the lower page incl. quantized keys), over several selection
     chunks and a CP-like offset."""
@@ -583,7 +603,7 @@ def test_token_span_lists_fused_equals_select_pages(tq, off):
     for k in (torch.randn(1, g, L, 32, device="cuda", dtype=torch.bfloat16),
               torch.randint(-1, 2, (1, g, L, 32), device="cuda").to(torch.bfloat16)):
         idx, bits, cnt = ps.token_span_lists(q, k, cfg, off, 0.2, None, tq, chunk=1024)
-        ref = torch.stack([ps.select_pages(q[:, gi * rep:(gi + 1) * rep].float(), k[:, gi:gi + 1].float(), cfg, off,
+        ref = torch.stack([ps.select_pages(q[:, gi * rep:(gi + 1) * rep].double(), k[:, gi:gi + 1].double(), cfg, off,
                                            0.2)[0] for gi in range(g)])
         r_idx, r_bits, r_cnt = ra.lists_from_allowed(ref, tq=tq)
         torch.testing.assert_close(cnt, r_cnt)

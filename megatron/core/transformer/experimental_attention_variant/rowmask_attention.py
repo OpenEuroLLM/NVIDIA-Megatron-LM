@@ -324,9 +324,11 @@ def _dkv_hp_kernel(Q, K, V, DO, LSE, DELTA, DK, DV, CSR_OFF, CSR_R, CSR_B, QPOS,
 # per-token run OOMed at step 5, t19g / t19j 2026-11-21), and a rank first meeting a kernel mid-run stalls every
 # other rank while it benchmarks. ROWMASK_HP_CONFIG="fwd=8,2;dq=8,1;dkv=8,1,64" overrides (benchmarks).
 _HP_CONFIG = {
-    "fwd": {"default": (8, 2)},
-    "dq": {"default": (8, 1)},
-    "dkv": {"default": (8, 1, 64)},
+    "fwd": {"default": (8, 2)},  # H100, d 256, 128 rows: 254 regs, no spills (4 warps: 344 spills, 12 % slower)
+    "dq": {"default": (8, 1)},  # 64 spills (4 warps: 496; 2 stages exceed shared memory)
+    # MC = the tile's rows (no chunking): at head dim 256 / 128 rows on H100 chunks of 64 / 32 rows were 5x slower
+    # (more spills, not fewer); 8 warps: 76 spills, 4 warps: 814 (t20_token_memory, 2026-11-21)
+    "dkv": {"default": (8, 1, 128)},
 }
 
 
