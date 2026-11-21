@@ -623,6 +623,10 @@ def test_packed_block_selection_equals_per_span(seed, per_group, selector):
     ones (the dense fast path), CP-like chunks (q_offset > 0) and random budgets."""
     import random
 
+    if selector == "page_mean" and TF32_FORCED:
+        # the batched and per-span scores are differently shaped cuBLAS fp32 GEMMs, forced to TF32 here: near-ties may
+        # round apart (both selections valid, not bit-identical)
+        pytest.skip("page_mean scores through cuBLAS fp32 GEMMs, forced to TF32 here")
     rng = random.Random(seed)
     torch.manual_seed(seed)
     hq, g, d, page = 8, 2, 32, 64
