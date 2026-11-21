@@ -44,6 +44,14 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+def _rowmask():
+    """rowmask_attention (the Triton training kernels), imported by name: a literal relative import makes transformers'
+    remote-code check demand rowmask_attention.py next to an exported model, which ships this file alone."""
+    import importlib
+
+    return importlib.import_module((__package__ + "." if __package__ else "") + "rowmask_attention")
+
+
 def _acc(x: torch.Tensor) -> torch.Tensor:
     """The accumulation dtype: fp32, float64 kept (exact tests: the NGC container forces TF32 for fp32 GEMMs)."""
     return x if x.dtype == torch.float64 else x.float()
@@ -709,7 +717,8 @@ def flex_packed_page_attention(spans, cfg: PageSparseConfig, scale: float, q_blo
 
         short = [i for i, sp in enumerate(spans) if everything(sp)]
         if short:
-            from .rowmask_attention import dense_docs_attention, dense_docs_blocks as _dense_docs_blocks
+            rm = _rowmask()
+            dense_docs_attention, _dense_docs_blocks = rm.dense_docs_attention, rm.dense_docs_blocks
 
             outs = [None] * len(spans)
             ss = [spans[i] for i in short]
@@ -800,7 +809,8 @@ def flex_packed_page_attention(spans, cfg: PageSparseConfig, scale: float, q_blo
     vp = torch.cat([pad_rows(sp[2], koff[i + 1] - koff[i]) for i, sp in enumerate(spans)], 2)
 
     if kernel == "rowmask":  # one bit word per (query tile, page) instead of flex's per-element mask_mod
-        from .rowmask_attention import BM, lists_from_allowed, rowmask_block_attention
+        rm = _rowmask()
+        BM, lists_from_allowed, rowmask_block_attention = rm.BM, rm.lists_from_allowed, rm.rowmask_block_attention
 
         if q_block != BM:
             raise ValueError(f"rowmask kernel: q_block must be {BM}")
@@ -870,7 +880,7 @@ def token_allowed(q, k, cfg: PageSparseConfig, q_offset: int = 0, scale: float |
     if cfg.selector == "page_maxpool":
         win = maxpool_windows(k, cfg.page) if kstats is None else kstats
         if q.is_cuda and g == 1 and qsum.dtype == torch.float32 and d in (16, 32, 64, 128, 256):
-            from .rowmask_attention import maxpool_page_scores_triton  # scores + candidates fused
+            maxpool_page_scores_triton = _rowmask().maxpool_page_scores_triton  # scores + candidates fused
 
             sc = maxpool_page_scores_triton((qsum[0, 0] * scale).contiguous(), win[0, 0].contiguous(), P, q_offset,
                                             cfg.page, cfg.sink_pages, wp)
@@ -891,7 +901,7 @@ def token_span_lists(q, k, cfg: PageSparseConfig, q_offset: int, scale: float, i
     """Pure per-token selection of one span (every query its own top-k pages, per KV group) straight into the
     head-packed kernel's lists: (idx [g, ceil(n / tq), NB] span-local pages, bits [.., NB] tq-bit row words, cnt),
     selected ``chunk`` queries at a time -- the [n, P] page mask of a whole 256k span is never built."""
-    from .rowmask_attention import lists_from_allowed
+    lists_from_allowed = _rowmask().lists_from_allowed
 
     hq, n, g = q.shape[1], q.shape[2], k.shape[1]
     rep = hq // g
@@ -911,7 +921,8 @@ def token_span_lists(q, k, cfg: PageSparseConfig, q_offset: int, scale: float, i
     for c0 in range(0, n, chunk):
         c1 = min(n, c0 + chunk)
         if fused:  # scores + candidates, then the top-k, sinks / window and the lists: two Triton kernels per group
-            from .rowmask_attention import maxpool_page_scores_triton, token_lists_triton
+            rm = _rowmask()
+            maxpool_page_scores_triton, token_lists_triton = rm.maxpool_page_scores_triton, rm.token_lists_triton
 
             wp = cfg.window // cfg.page
             lists = []
@@ -940,7 +951,8 @@ def _token_packed_attention(spans, cfg: PageSparseConfig, scale: float, q_block:
     candidates, per_group): every query attends its own pages, in head-packed tiles of :func:`token_tile` queries
     (rowmask_attention.rowmask_head_packed_attention) -- the page union of 8 queries instead of 64 bounds the work.
     A span's selection is its lists (:func:`token_span_lists`)."""
-    from .rowmask_attention import BM, rowmask_head_packed_attention
+    rm = _rowmask()
+    BM, rowmask_head_packed_attention = rm.BM, rm.rowmask_head_packed_attention
 
     if q_block != BM:
         raise ValueError(f"rowmask kernel: q_block must be {BM}")
