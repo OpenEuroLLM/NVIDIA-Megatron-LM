@@ -688,7 +688,7 @@ def flex_page_sparse_attention(q, k, v, cfg: PageSparseConfig, q_offset: int = 0
 
 
 def flex_packed_page_attention(spans, cfg: PageSparseConfig, scale: float, q_block: int = 64, selections=None,
-                               return_selection: bool = False, kernel: str = "flex"):
+                               return_selection: bool = False, kernel: str = "flex", packed_select: bool = True):
     """:func:`flex_page_sparse_attention` for many sequences at once -- ONE FlexAttention call (forward and
     backward) for every document of a packed batch instead of one per document.
 
@@ -698,9 +698,9 @@ def flex_packed_page_attention(spans, cfg: PageSparseConfig, scale: float, q_blo
     multiple of ``q_block`` and its keys at a multiple of ``page``, so the kernel's key blocks are exactly the span's
     pages and one block mask covers them all; the per-token mask (same span, causal, selected page) keeps it exact.
     ``per_group``: one selection per KV group, a per-head block mask. Returns the per-span outputs [1, hq, n, d]
-    (and the per-span selections)."""
-    from torch.nn.attention.flex_attention import BlockMask
-
+    (and the per-span selections). ``packed_select``: block-wise page selectors score every span's anchors in ONE
+    batched computation (:func:`_packed_block_allowed`; the per-span loop's launches made many-document ranks the
+    step's stragglers, t19d / t19f 2026-11-21); False: the per-span reference."""
     page = cfg.page
     if q_block % page and page % q_block:
         raise ValueError("flex_packed_page_attention: q_block and page must divide one another")
@@ -745,17 +745,19 @@ def flex_packed_page_attention(spans, cfg: PageSparseConfig, scale: float, q_blo
             rest = [i for i in range(len(spans)) if outs[i] is None]
             if rest:
                 for i, part in zip(rest, flex_packed_page_attention([spans[i] for i in rest], cfg, scale, q_block,
-                                                                    kernel=kernel)):
+                                                                    kernel=kernel, packed_select=packed_select)):
                     outs[i] = part
             return outs
     q0, k0 = spans[0][0], spans[0][1]
-    hq, d, g = q0.shape[1], q0.shape[3], k0.shape[1]
+    hq, g = q0.shape[1], k0.shape[1]
     rep = hq // g
     per_group = cfg.per_group and g > 1 and cfg.selector != "window"
     G = g if per_group else 1
     dev = q0.device
     if kernel == "rowmask" and per_group and cfg.select_block <= 1 and cfg.block_candidates <= 0:
         return _token_packed_attention(spans, cfg, scale, q_block, selections, return_selection)
+    if packed_select and _packed_select_applies(spans, cfg, selections, return_selection):
+        return _packed_block_attention(spans, cfg, scale, q_block, kernel, per_group, G, rep)
     with torch.no_grad():
         sels, qoff, koff = [], [0], [0]
         for i, (q, k, v, off, idx) in enumerate(spans):
@@ -770,7 +772,7 @@ def flex_packed_page_attention(spans, cfg: PageSparseConfig, scale: float, q_blo
             qoff.append(qoff[-1] + -(-q.shape[2] // q_block) * q_block)
             koff.append(koff[-1] + -(-k.shape[2] // page) * page)
         Sq, Sk = qoff[-1], koff[-1]
-        Pk, nq = Sk // page, Sq // q_block
+        Pk = Sk // page
         allowed = torch.zeros(G, Sq, Pk, dtype=torch.bool, device=dev)
         q_abs = torch.full((Sq,), -1, dtype=torch.int32, device=dev)  # position within the span's sequence
         k_abs = torch.full((Sk,), 2**30, dtype=torch.int32, device=dev)
@@ -786,6 +788,22 @@ def flex_packed_page_attention(spans, cfg: PageSparseConfig, scale: float, q_blo
             k_abs[koff[i]:koff[i] + L] = torch.arange(L, device=dev, dtype=torch.int32)
             j = torch.arange(P, device=dev)
             kend[c:c + P] = torch.where((j + 1) * page <= L, (j + 1) * page - 1, 2**30)
+    return _packed_attend(spans, cfg, scale, q_block, kernel, per_group, G, rep, allowed, q_abs, k_abs, kend, qoff,
+                          koff, sels, return_selection)
+
+
+def _packed_attend(spans, cfg, scale, q_block, kernel, per_group, G, rep, allowed, q_abs, k_abs, kend, qoff, koff,
+                   sels=None, return_selection=False, qkv=None):
+    """:func:`flex_packed_page_attention`'s attention given the selection: ``allowed`` [G, Sq, Pk] (query row -> page
+    of the packed layout), the rows' / keys' positions within their span (q_abs -1 / k_abs 2**30 for padding), each
+    page's last position (kend, 2**30 for a partial page); ``qkv`` the packed (qp, kp, vp) if already built."""
+    from torch.nn.attention.flex_attention import BlockMask
+
+    page = cfg.page
+    hq, g = spans[0][0].shape[1], spans[0][1].shape[1]
+    Sq, Sk = qoff[-1], koff[-1]
+    Pk, nq = Sk // page, Sq // q_block
+    with torch.no_grad():
         rows = allowed.view(G, nq, q_block, Pk)
         blk = rows.any(2)  # [G, nq, Pk]
         pad_row = (q_abs < 0).view(1, nq, q_block, 1)
@@ -801,12 +819,7 @@ def flex_packed_page_attention(spans, cfg: PageSparseConfig, scale: float, q_blo
                                                   for t in (kv_num, kv_idx, full_num, full_idx))
         allowed_i = allowed.to(torch.int8)
 
-    def pad_rows(t, to):  # [1, h, n, d] -> [1, h, to, d]
-        return F.pad(t, (0, 0, 0, to - t.shape[2]))
-
-    qp = torch.cat([pad_rows(sp[0], qoff[i + 1] - qoff[i]) for i, sp in enumerate(spans)], 2)
-    kp = torch.cat([pad_rows(sp[1], koff[i + 1] - koff[i]) for i, sp in enumerate(spans)], 2)
-    vp = torch.cat([pad_rows(sp[2], koff[i + 1] - koff[i]) for i, sp in enumerate(spans)], 2)
+    qp, kp, vp = _packed_qkv(spans, qoff, koff) if qkv is None else qkv
 
     if kernel == "rowmask":  # one bit word per (query tile, page) instead of flex's per-element mask_mod
         rm = _rowmask()
@@ -845,6 +858,164 @@ def flex_packed_page_attention(spans, cfg: PageSparseConfig, scale: float, q_blo
     segs = out.split([qoff[i + 1] - qoff[i] for i in range(len(spans))], dim=2)
     outs = [seg[:, :, :sp[0].shape[2]] for seg, sp in zip(segs, spans)]
     return (outs, sels) if return_selection else outs
+
+
+def _packed_qkv(spans, qoff, koff):
+    """The spans' q / k / v in the packed layout: every span's queries padded to its qoff slot, keys to its koff."""
+    def pad_rows(t, to):  # [1, h, n, d] -> [1, h, to, d]
+        return F.pad(t, (0, 0, 0, to - t.shape[2]))
+
+    qp = torch.cat([pad_rows(sp[0], qoff[i + 1] - qoff[i]) for i, sp in enumerate(spans)], 2)
+    kp = torch.cat([pad_rows(sp[1], koff[i + 1] - koff[i]) for i, sp in enumerate(spans)], 2)
+    vp = torch.cat([pad_rows(sp[2], koff[i + 1] - koff[i]) for i, sp in enumerate(spans)], 2)
+    return qp, kp, vp
+
+
+def _packed_select_applies(spans, cfg: PageSparseConfig, selections, return_selection) -> bool:
+    """The packed selection covers the block-wise page selectors without learned scores or reused selections (the
+    rest keep the per-span path); spans that select every page went through the short-document path before."""
+    return (selections is None and not return_selection and cfg.selector in ("page_mean", "page_maxpool")
+            and cfg.topk > 0 and cfg.select_block > 1 and cfg.select_score == "first" and cfg.hier_group <= 0
+            and all(sp[4] is None for sp in spans)
+            and not any(_selects_everything(-(-sp[1].shape[2] // cfg.page), cfg) for sp in spans))
+
+
+_PACKED_TABLES: dict = {}
+
+
+def _packed_tables(layout, cfg: PageSparseConfig, q_block: int, G: int, dev):
+    """The packed layout's index tables for the spans ``layout`` = ((n, L, q_offset), ...), built on the host from the
+    span lengths (host ints: no device sync) and copied over at once, cached per layout (every attention layer, its
+    recompute and its backward share a micro-batch's spans). Device tensors:
+      q_abs [Sq] int32 / k_abs [Sk] int32 / kend [Pk] int64: as the per-span path builds them;
+      row_anchor [Sq]: each query row's anchor (A: an empty row, for padding rows);
+      anchor_row / anchor_c / anchor_cur [A]: each anchor's packed query row, its span's first page, its own page;
+      page_cnt [Pk] fp32: the keys per page (page_mean's partial last pages);
+      span_end_q [4 Pk] bool: each span's last quarter page but the final one's (page_maxpool: its window must not
+      reach into the next span -- the per-span zero padding);
+      span_start_page [Pk] bool: each span's first page but the first span's (its window before is padding);
+      band [G * Sq * (sinks + window pages)]: flat indices into allowed of every row's sink and window pages
+      (invalid entries at the dummy G * Sq * Pk)."""
+    page, B = cfg.page, cfg.select_block
+    key = (layout, page, q_block, cfg.sink_pages, cfg.window, B, G, str(dev))
+    hit = _PACKED_TABLES.get(key)
+    if hit is not None:
+        return hit
+    t = torch.tensor(layout, dtype=torch.int64).view(-1, 3)
+    n, L, off = t[:, 0], t[:, 1], t[:, 2]
+    sid = torch.arange(n.shape[0])
+    qlen = (n + q_block - 1) // q_block * q_block
+    P = (L + page - 1) // page
+    qoff = torch.cumsum(qlen, 0) - qlen
+    c = torch.cumsum(P, 0) - P  # each span's first page
+    Sq, Pk = int(qlen.sum()), int(P.sum())
+    Sk = Pk * page
+    wp = cfg.window // page
+    # query rows
+    rs = torch.repeat_interleave(sid, qlen)
+    tl = torch.arange(Sq) - qoff[rs]
+    valid = tl < n[rs]
+    pos = off[rs] + tl
+    q_abs = torch.where(valid, pos, -1)
+    cur = pos // page
+    # anchors, per span as selection_scores' closed form
+    na = (off + n - 1) // B - off // B + 1
+    a0 = torch.cumsum(na, 0) - na
+    A = int(na.sum())
+    row_anchor = torch.where(valid, a0[rs] + pos // B - off[rs] // B, A)
+    asp = torch.repeat_interleave(sid, na)
+    uniq = ((torch.arange(A) - a0[asp]) * B + (off[asp] // B) * B - off[asp]).clamp(min=0)
+    anchor_row = qoff[asp] + uniq
+    anchor_c = c[asp]
+    anchor_cur = (off[asp] + uniq) // page
+    # keys and pages
+    ks = torch.repeat_interleave(sid, P * page)
+    tk = torch.arange(Sk) - c[ks] * page
+    k_abs = torch.where(tk < L[ks], tk, 2**30)
+    pp = torch.repeat_interleave(sid, P)
+    jp = torch.arange(Pk) - c[pp]
+    kend = torch.where((jp + 1) * page <= L[pp], (jp + 1) * page - 1, 2**30)
+    page_cnt = torch.where(jp == P[pp] - 1, L[pp] - (P[pp] - 1) * page, page).to(torch.float32)
+    span_end_q = torch.zeros(4 * Pk, dtype=torch.bool)
+    span_end_q[4 * c[1:] - 1] = True
+    span_start_page = torch.zeros(Pk, dtype=torch.bool)
+    span_start_page[c[1:]] = True
+    # every row's sink and window pages (select_pages' base: sinks up to the query's page, its page and wp before)
+    sk = torch.arange(cfg.sink_pages)
+    sinks_ok = (sk[None, :] <= cur[:, None]) & (sk[None, :] < P[rs][:, None])
+    wpg = cur[:, None] - wp + torch.arange(wp + 1)[None, :]
+    band_p = torch.cat([sk[None, :].expand(Sq, -1), wpg], 1)
+    band_ok = torch.cat([sinks_ok, wpg >= 0], 1) & valid[:, None]
+    flat = torch.arange(Sq)[:, None] * Pk + c[rs][:, None] + band_p
+    flat = torch.arange(G)[:, None, None] * (Sq * Pk) + flat[None]
+    band = torch.where(band_ok[None], flat, G * Sq * Pk).reshape(-1)
+    ints = [q_abs, k_abs, kend, row_anchor, anchor_row, anchor_c, anchor_cur, band]
+    sizes = [x.numel() for x in ints]
+    host = torch.cat(ints)
+    flags = torch.cat([span_end_q, span_start_page])
+    if dev.type == "cuda":
+        host, page_cnt, flags = host.pin_memory(), page_cnt.pin_memory(), flags.pin_memory()
+    q_abs, k_abs, kend, row_anchor, anchor_row, anchor_c, anchor_cur, band = host.to(dev, non_blocking=True).split(
+        sizes)
+    flags = flags.to(dev, non_blocking=True)
+    out = dict(q_abs=q_abs.to(torch.int32), k_abs=k_abs.to(torch.int32), kend=kend, row_anchor=row_anchor,
+               anchor_row=anchor_row, anchor_c=anchor_c, anchor_cur=anchor_cur, band=band,
+               page_cnt=page_cnt.to(dev, non_blocking=True), span_end_q=flags[:4 * Pk], span_start_page=flags[4 * Pk:],
+               qoff=[0] + torch.cumsum(qlen, 0).tolist(), koff=[0] + (torch.cumsum(P, 0) * page).tolist(),
+               A=A, Sq=Sq, Pk=Pk)
+    _PACKED_TABLES[key] = out
+    while len(_PACKED_TABLES) > 4:  # ~12 MB of device tables each at 64k; a micro-batch needs one
+        _PACKED_TABLES.pop(next(iter(_PACKED_TABLES)))
+    return out
+
+
+def _packed_block_allowed(qp, kp, cfg: PageSparseConfig, scale: float, tb: dict, per_group: bool, G: int, rep: int):
+    """Every span's block-wise selection at once, as :func:`select_pages` per span (and per KV group): the anchors'
+    scores against every page of the packed layout, masked to their own span's candidates, one stable top-k, each
+    query row taking its anchor's pages plus its sinks and window. qp / kp: the packed layout. -> allowed [G, Sq, Pk]"""
+    page, wp = cfg.page, cfg.window // cfg.page
+    g, d = kp.shape[1], qp.shape[-1]
+    A, Sq, Pk = tb["A"], tb["Sq"], tb["Pk"]
+    qs = _acc(qp[:, :, tb["anchor_row"]]).view(1, g, rep, A, d).sum(2) * scale  # the heads' sum, [1, g, A, d]
+    kf = _acc(kp)
+    if cfg.selector == "page_mean":  # page_pool per span: the last page's mean over its keys only
+        keys = kf.view(1, g, Pk, page, d).sum(3) / tb["page_cnt"].view(1, 1, Pk, 1)
+    else:  # maxpool_windows per span: window j = quarters j, j + 1; a span's last window sees its zero padding
+        st = page // 4
+        qq = F.pad(kf.view(1, g, 4 * Pk, st, d).sum(3), (0, 0, 0, 1))  # [1, g, 4 Pk + 1, d]
+        nxt = qq[:, :, 1:].masked_fill(tb["span_end_q"].view(1, 1, -1, 1), 0.0)
+        keys = (qq[:, :, :-1] + nxt) / (page // 2)  # [1, g, 4 Pk, d]
+    if per_group:
+        sc = torch.einsum("gsd,gjd->gsj", qs[0], keys[0])  # [G, A, J]
+    else:
+        sc = torch.einsum("bgsd,bgjd->bsj", qs, keys)  # [1, A, J]
+    if cfg.selector == "page_maxpool":  # page p: max over windows 4p - 1 .. 4p + 3 (maxpool_page_scores' pooling)
+        w4 = sc.view(G, A, Pk, 4)
+        prev = F.pad(w4[..., :-1, 3], (1, 0), value=float("-inf"))  # window 4p - 1
+        prev = prev.masked_fill(tb["span_start_page"].view(1, 1, -1), float("-inf"))  # a span's first page: padding
+        sc = torch.maximum(w4.amax(-1), prev)
+    pl = torch.arange(Pk, device=qp.device)[None, :] - tb["anchor_c"][:, None]  # the page within its span
+    cand = (pl >= cfg.sink_pages) & (pl < tb["anchor_cur"][:, None] - wp)
+    val, sel = topk_stable(sc.masked_fill(~cand[None], float("-inf")), min(cfg.topk, Pk))
+    by_anchor = torch.zeros(G, A + 1, Pk, dtype=torch.bool, device=qp.device)  # row A: the padding rows'
+    by_anchor[:, :A].scatter_(-1, sel, torch.isfinite(val))
+    flat = torch.zeros(G * Sq * Pk + 1, dtype=torch.bool, device=qp.device)  # + the dummy of invalid band entries
+    allowed = flat[:-1].view(G, Sq, Pk)
+    torch.index_select(by_anchor, 1, tb["row_anchor"], out=allowed)
+    flat.index_fill_(0, tb["band"], True)
+    return allowed
+
+
+def _packed_block_attention(spans, cfg, scale, q_block, kernel, per_group, G, rep):
+    """:func:`flex_packed_page_attention` with the packed selection (no per-span or per-group loop)."""
+    layout = tuple((sp[0].shape[2], sp[1].shape[2], int(sp[3])) for sp in spans)
+    tb = _packed_tables(layout, cfg, q_block, G, spans[0][0].device)
+    qoff, koff = tb["qoff"], tb["koff"]
+    qkv = _packed_qkv(spans, qoff, koff)
+    with torch.no_grad():
+        allowed = _packed_block_allowed(qkv[0].detach(), qkv[1].detach(), cfg, scale, tb, per_group, G, rep)
+    return _packed_attend(spans, cfg, scale, q_block, kernel, per_group, G, rep, allowed, tb["q_abs"], tb["k_abs"],
+                          tb["kend"], qoff, koff, qkv=qkv)
 
 
 TOKEN_SELECT_CHUNK = 4096  # queries per selection block of the pure per-token path (scores [chunk, 4 P + 1] fp32)

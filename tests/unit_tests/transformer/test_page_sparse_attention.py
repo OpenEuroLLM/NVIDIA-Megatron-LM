@@ -591,3 +591,63 @@ def test_token_span_lists_fused_equals_select_pages(tq, off):
         valid = torch.arange(nb, device="cuda")[None, None] < r_cnt[..., None]
         torch.testing.assert_close(torch.where(valid, idx[..., :nb], 0), torch.where(valid, r_idx, 0))
         torch.testing.assert_close(torch.where(valid, bits[..., :nb], 0), torch.where(valid, r_bits, 0))
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+@pytest.mark.parametrize("per_group", [True, False])
+@pytest.mark.parametrize("selector", ["page_mean", "page_maxpool"])
+def test_packed_block_selection_equals_per_span(seed, per_group, selector):
+    """The block-wise selection of every span at once (flex_packed_page_attention's packed_select: one batched score,
+    one top-k, no per-span / per-group loop) equals the per-span select_pages exactly -- the selections, and the
+    outputs and q / k / v gradients of both kernels -- on mixed packed layouts: documents with partial pages, short
+    ones (the dense fast path), CP-like chunks (q_offset > 0) and random budgets."""
+    import random
+
+    rng = random.Random(seed)
+    torch.manual_seed(seed)
+    hq, g, d, page = 8, 2, 32, 64
+    cfg = ps.PageSparseConfig(selector=selector, page=page, topk=rng.choice([3, 8]), window=rng.choice([64, 128]),
+                              sink_pages=rng.choice([0, 1, 2]), per_group=per_group, select_block=64)
+    spans = []
+    for _ in range(rng.randint(5, 9)):
+        L = rng.choice([rng.randint(700, 2600), rng.randint(100, 600), rng.randint(2600, 4000)])
+        off = rng.choice([0, 0, (rng.randint(1, L // 2) // 64) * 64, rng.randint(1, L // 2)])
+        q = torch.randn(1, hq, L - off, d, device="cuda", dtype=torch.bfloat16)
+        k = torch.randn(1, g, L, d, device="cuda", dtype=torch.bfloat16)
+        v = torch.randn(1, g, L, d, device="cuda", dtype=torch.bfloat16)
+        spans.append((q, k, v, off, None))
+    # the selections: packed vs select_pages per span (and per group), on the spans the packed path covers
+    sel_spans = [sp for sp in spans if not ps._selects_everything(-(-sp[1].shape[2] // page), cfg)]
+    G, rep = (g if per_group else 1), hq // g
+    assert ps._packed_select_applies(sel_spans, cfg, None, False)
+    layout = tuple((sp[0].shape[2], sp[1].shape[2], sp[3]) for sp in sel_spans)
+    tb = ps._packed_tables(layout, cfg, 64, G, torch.device("cuda"))
+    qp, kp, _ = ps._packed_qkv(sel_spans, tb["qoff"], tb["koff"])
+    got = ps._packed_block_allowed(qp, kp, cfg, d**-0.5, tb, per_group, G, rep)
+    ref = torch.zeros_like(got)
+    for i, (q, k, v, off, _) in enumerate(sel_spans):
+        n, P, a, c = q.shape[2], -(-k.shape[2] // page), tb["qoff"][i], tb["koff"][i] // page
+        sel = ([ps.select_pages(q[:, gi * rep:(gi + 1) * rep], k[:, gi:gi + 1], cfg, off, d**-0.5)[0]
+                for gi in range(g)] if per_group else [ps.select_pages(q, k, cfg, off, d**-0.5)[0]])
+        for gi in range(G):
+            ref[gi, a:a + n, c:c + P] = sel[gi]
+    assert torch.equal(got, ref)
+    torch.testing.assert_close(tb["q_abs"], torch.cat([
+        torch.cat([torch.arange(sp[3], sp[3] + sp[0].shape[2]), torch.full((-sp[0].shape[2] % 64,), -1)])
+        for sp in sel_spans]).to(torch.int32).cuda())
+    # end to end, both kernels: outputs and gradients identical to the per-span path
+    for kernel, dtype in (("flex", torch.float32), ("rowmask", torch.bfloat16)):  # (local GPUs: no bf16 flex bwd)
+        res = []
+        for packed in (True, False):
+            leaves = [[t.to(dtype).clone().requires_grad_() for t in sp[:3]] for sp in spans]
+            outs = ps.flex_packed_page_attention([(*lv, sp[3], None) for lv, sp in zip(leaves, spans)], cfg,
+                                                 d**-0.5, 64, kernel=kernel, packed_select=packed)
+            gos = [torch.randn(o.shape, device="cuda", generator=torch.Generator(device="cuda").manual_seed(i))
+                   for i, o in enumerate(outs)]
+            sum((o.float() * go).sum() for o, go in zip(outs, gos)).backward()
+            res.append((outs, [[t.grad for t in lv] for lv in leaves]))
+        for a, b in zip(res[0][0], res[1][0]):
+            assert torch.equal(a, b)
+        for la, lb in zip(res[0][1], res[1][1]):
+            for a, b in zip(la, lb):
+                assert torch.equal(a, b)
