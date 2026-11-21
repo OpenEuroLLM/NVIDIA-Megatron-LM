@@ -229,8 +229,11 @@ def selection_scores(q, k, cfg: PageSparseConfig, q_offset: int, scale: float, i
     if cfg.select_block > 1 and cfg.select_score == "first":  # score the anchors only (select_block x cheaper)
         B = cfg.select_block
         pos = q_offset + torch.arange(s, device=q.device)
-        anchor = ((pos // B) * B - q_offset).clamp(min=0)
-        uniq, inv = torch.unique(anchor, return_inverse=True)
+        # the distinct anchors in closed form (torch.unique syncs the host): the chunk's first query, then every block
+        # start after it; query i uses anchor row pos_i // B - q_offset // B
+        n_anchor = (q_offset + s - 1) // B - q_offset // B + 1
+        uniq = (torch.arange(n_anchor, device=q.device) * B + (q_offset // B) * B - q_offset).clamp(min=0)
+        inv = pos // B - q_offset // B
         apos = q_offset + uniq
         cand = candidate_mask(len(uniq), P, q_offset, cfg, q.device, pos=apos)
         idx = None if indexer_scores is None else indexer_scores[:, uniq]
@@ -619,7 +622,8 @@ def restrict_to_block_candidates(sc, cfg: PageSparseConfig, q_offset: int = 0):
         return sc
     lead = q_offset % B
     qblk = (torch.arange(s, device=sc.device) + lead) // B  # [s] block of each query (0: the call's first)
-    first = torch.searchsorted(qblk, torch.arange(int(qblk[-1]) + 1, device=sc.device))  # each block's first row
+    # each block's first row, in closed form (searchsorted up to int(qblk[-1]) synced the host)
+    first = (torch.arange((s - 1 + lead) // B + 1, device=sc.device) * B - lead).clamp(min=0)
     rv, cand = topk_stable(sc[:, first], min(U, P))  # [b, nb, U]
     keep = torch.zeros(b, len(first), P, dtype=torch.bool, device=sc.device).scatter_(-1, cand, torch.isfinite(rv))
     return sc.masked_fill(~keep[:, qblk], float("-inf"))
@@ -705,7 +709,7 @@ def flex_packed_page_attention(spans, cfg: PageSparseConfig, scale: float, q_blo
 
         short = [i for i, sp in enumerate(spans) if everything(sp)]
         if short:
-            from .rowmask_attention import dense_docs_attention
+            from .rowmask_attention import dense_docs_attention, dense_docs_blocks as _dense_docs_blocks
 
             outs = [None] * len(spans)
             ss = [spans[i] for i in short]
@@ -713,15 +717,20 @@ def flex_packed_page_attention(spans, cfg: PageSparseConfig, scale: float, q_blo
             kcat = torch.cat([sp[1] for sp in ss], 2)
             vcat = torch.cat([sp[2] for sp in ss], 2)
             dev = qcat.device
-            n_ = torch.tensor([sp[0].shape[2] for sp in ss], device=dev)
-            L_ = torch.tensor([sp[1].shape[2] for sp in ss], device=dev)
-            off_ = torch.tensor([sp[3] for sp in ss], device=dev)
+            # the per-query bounds on the host (the lengths are host ints: device tensors + repeat_interleave
+            # synced the host several times per layer, idling the GPU -- t19d profile, 2026-11-21), one copy over
+            n_ = torch.tensor([sp[0].shape[2] for sp in ss])
+            L_ = torch.tensor([sp[1].shape[2] for sp in ss])
+            off_ = torch.tensor([sp[3] for sp in ss])
             ko_ = torch.cumsum(L_, 0) - L_  # each document's first key in kcat
             qlo = torch.repeat_interleave(ko_, n_)
             first_q = torch.cumsum(n_, 0) - n_
-            local = torch.arange(int(n_.sum()), device=dev) - torch.repeat_interleave(first_q, n_)
+            local = torch.arange(int(n_.sum())) - torch.repeat_interleave(first_q, n_)
             qpos = qlo + torch.repeat_interleave(off_, n_) + local
-            o = dense_docs_attention(qcat[0], kcat[0], vcat[0], qpos.to(torch.int32), qlo.to(torch.int32), scale)[None]
+            nb = _dense_docs_blocks(qpos, qlo)
+            bounds = torch.stack([qpos, qlo]).to(torch.int32)
+            bounds = bounds.pin_memory().to(dev, non_blocking=True) if dev.type == "cuda" else bounds.to(dev)
+            o = dense_docs_attention(qcat[0], kcat[0], vcat[0], bounds[0], bounds[1], scale, nb=nb)[None]
             for i, part in zip(short, o.split([sp[0].shape[2] for sp in ss], 2)):
                 outs[i] = part
             rest = [i for i in range(len(spans)) if outs[i] is None]
@@ -795,7 +804,11 @@ def flex_packed_page_attention(spans, cfg: PageSparseConfig, scale: float, q_blo
 
         if q_block != BM:
             raise ValueError(f"rowmask kernel: q_block must be {BM}")
-        idx, bits, cnt = lists_from_allowed(allowed)
+        # the list width as a static bound (no host sync): a 64-query tile spans at most two selection / candidate
+        # blocks and two pages, so it lists at most the sinks, wp + 2 window pages and twice the per-row choice
+        per_row = 0 if cfg.selector == "window" else (cfg.block_candidates if cfg.block_candidates > 0 else cfg.topk)
+        nb = max(1, min(Pk, cfg.sink_pages + cfg.window // page + 2 + 2 * per_row))
+        idx, bits, cnt = lists_from_allowed(allowed, nb=nb)
         out = rowmask_block_attention(qp[0], kp[0], vp[0], idx, bits, cnt, q_abs, k_abs, scale, per_group,
                                       page)[None]
         segs = out.split([qoff[i + 1] - qoff[i] for i in range(len(spans))], dim=2)

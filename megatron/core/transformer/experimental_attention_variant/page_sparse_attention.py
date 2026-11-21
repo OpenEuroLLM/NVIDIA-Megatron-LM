@@ -35,6 +35,24 @@ from megatron.core.transformer.module import MegatronModule
 _SHARED_SELECTION: dict = {}
 
 
+
+_BOUNDS: dict = {}
+
+
+def _host_bounds(cu: torch.Tensor) -> list:
+    """``cu`` (a micro-batch's document boundaries) as host ints, cached by tensor identity (fla_cp.thd_stream's
+    scheme): every attention layer, its recompute and its backward share one micro-batch's cu, and the copy syncs the
+    host (one sync per layer idled the GPU, t19d profile 2026-11-21). The cache holds the tensor, so its id is not
+    reused while cached."""
+    hit = _BOUNDS.get(id(cu))
+    if hit is not None and hit[0] is cu:
+        return hit[1]
+    bounds = cu.to(torch.long).cpu().tolist()
+    _BOUNDS[id(cu)] = (cu, bounds)
+    while len(_BOUNDS) > 8:
+        _BOUNDS.pop(next(iter(_BOUNDS)))
+    return bounds
+
 class IndexerLossLoggingHelper:
     """The selector's indexer KL (``page_sparse_indexer_loss_coeff``: the page indexer or CSA2's lightning
     indexer vs the dense attention mass), averaged over the attention layers, micro-batches and ranks of a step
@@ -356,7 +374,7 @@ class PageSparseCoreAttention(MegatronModule):
             cp, rank, bounds = st.cp, st.rank, st.cu_cpu.tolist()
         else:
             kfull, vfull, ffull = key, value, feat
-            cp, rank, bounds = 1, 0, cu.to(torch.long).cpu().tolist()
+            cp, rank, bounds = 1, 0, _host_bounds(cu)
         # page selectors under flex: every document's spans in ONE flex call (per-document calls cost a kernel
         # launch per document and layer, forward and backward)
         packed = (self.flex and self.packed_flex and query.is_cuda and self.variant is None

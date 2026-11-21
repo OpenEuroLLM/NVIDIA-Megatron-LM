@@ -323,13 +323,18 @@ def _csr(idx, bits, cnt, nkb):
     valid = slot[None, None, :] < cnt[..., None]
     g_of = torch.arange(Gs, device=idx.device)[:, None, None].expand_as(idx)
     r_of = torch.arange(nq, device=idx.device)[None, :, None].expand_as(idx)
-    key = (g_of * nkb + idx.long())[valid]
+    # static shapes only (boolean indexing and bincount sync the host): unused slots get the key Gs * nkb, sort
+    # after every real entry and are never read (the offsets end before them)
+    key = torch.where(valid, g_of * nkb + idx.long(), Gs * nkb).reshape(-1)
     order = torch.argsort(key, stable=True)
-    counts = torch.bincount(key, minlength=Gs * nkb).view(Gs, nkb)
+    counts = torch.zeros(Gs * nkb + 1, dtype=torch.long, device=idx.device)
+    counts.scatter_add_(0, key, torch.ones_like(key))
+    counts = counts[:-1].view(Gs, nkb)
     off = torch.zeros(Gs, nkb + 1, dtype=torch.long, device=idx.device)
     off[:, 1:] = counts.cumsum(1)
     off = off + (counts.sum(1).cumsum(0) - counts.sum(1))[:, None]  # global offsets
-    return off.to(torch.int32).contiguous(), r_of[valid][order].to(torch.int32), bits[valid][order].contiguous()
+    return (off.to(torch.int32).contiguous(), r_of.reshape(-1)[order].to(torch.int32).contiguous(),
+            bits.reshape(-1)[order].contiguous())
 
 
 class _RowMaskAttention(torch.autograd.Function):
@@ -433,18 +438,31 @@ def rowmask_block_attention(q, k, v, idx, bits, cnt, q_pos, k_pos, scale: float,
     return _RowMaskAttention.apply(q, k, v, idx, bits, cnt, q_pos, k_pos, q_lo, scale, per_group, bn)
 
 
-def dense_docs_attention(q, k, v, q_pos, q_lo, scale: float):
+def _dense_docs_tiles(q_pos, q_lo):
+    """Each 64-query tile's first key block and key-block count (the documents its rows cover)."""
+    Sq = q_pos.shape[0]
+    nq = -(-Sq // BM)
+    first = q_lo[::BM].to(torch.long) // 64  # a tile's first row has the lowest bound
+    last_pos = F_pad(q_pos, nq * BM - Sq).view(nq, BM).amax(1).clamp(min=0).to(torch.long)
+    return first, (last_pos // 64 - first + 1).clamp(min=0)
+
+
+def dense_docs_blocks(q_pos, q_lo) -> int:
+    """:func:`dense_docs_attention`'s list width (``nb``), from HOST copies of q_pos / q_lo: passing it avoids the
+    device-to-host sync of computing it from device tensors."""
+    return max(1, int(_dense_docs_tiles(q_pos, q_lo)[1].max()))
+
+
+def dense_docs_attention(q, k, v, q_pos, q_lo, scale: float, nb: int | None = None):
     """Causal attention within documents packed WITHOUT padding: q [Hq, Sq, D] (query i at key position q_pos[i],
     its document from key q_lo[i]; rows ascending in both), k / v [Hk, Sk, D] -> [Hq, Sq, D]. Every tile attends the
     contiguous key blocks its rows' documents cover (all bits set; the per-element bound q_lo <= k <= q_pos masks the
-    rest) -- one call for any number of short documents."""
+    rest) -- one call for any number of short documents. ``nb``: :func:`dense_docs_blocks` (else computed here, which
+    syncs the host)."""
     Sq, Sk = q.shape[1], k.shape[1]
     nq = -(-Sq // BM)
-    pad = nq * BM - Sq
-    first = q_lo[::BM].to(torch.long) // 64  # a tile's first row has the lowest bound
-    last_pos = F_pad(q_pos, pad).view(nq, BM).amax(1).clamp(min=0).to(torch.long)
-    cnt = (last_pos // 64 - first + 1).clamp(min=0)
-    NB = max(1, int(cnt.max()))
+    first, cnt = _dense_docs_tiles(q_pos, q_lo)
+    NB = max(1, int(cnt.max())) if nb is None else nb
     idx = (first[:, None] + torch.arange(NB, device=q.device)[None]).clamp(max=-(-Sk // 64) - 1)
     bits = torch.full((1, nq, NB), -1, dtype=torch.int64, device=q.device)
     k_pos = torch.arange(Sk, device=q.device, dtype=torch.int32)
