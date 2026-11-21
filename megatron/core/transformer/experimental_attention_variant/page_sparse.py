@@ -783,7 +783,7 @@ def flex_packed_page_attention(spans, cfg: PageSparseConfig, scale: float, q_blo
     per_group = cfg.per_group and g > 1 and cfg.selector != "window"
     G = g if per_group else 1
     dev = q0.device
-    if kernel == "rowmask" and per_group and cfg.select_block <= 1 and cfg.block_candidates <= 0:
+    if _token_packed_applies(cfg, kernel, g):
         return _token_packed_attention(spans, cfg, scale, q_block, selections, return_selection, packed_select)
     if packed_select and _packed_select_applies(spans, cfg, selections, return_selection):
         return _packed_block_attention(spans, cfg, scale, q_block, kernel, per_group, G, rep)
@@ -1115,7 +1115,7 @@ def token_span_lists(q, k, cfg: PageSparseConfig, q_offset: int, scale: float, i
         kstats = [maxpool_windows(k[:, gi:gi + 1], cfg.page) if cfg.selector == "page_maxpool"
                   else page_pool(k[:, gi:gi + 1], cfg.page, "mean") for gi in range(g)]
     fused = (q.is_cuda and indexer_scores is None and cfg.selector == "page_maxpool" and cfg.hier_group <= 0
-             and cfg.block_candidates <= 0 and cfg.topk > 0 and q.dtype != torch.float64
+             and cfg.block_candidates <= 0 and cfg.select_block <= 1 and cfg.topk > 0 and q.dtype != torch.float64
              and q.shape[-1] in (16, 32, 64, 128, 256) and not _selects_everything(P, cfg))
     parts = []
     for c0 in range(0, n, chunk):
@@ -1148,13 +1148,18 @@ def token_span_lists(q, k, cfg: PageSparseConfig, q_offset: int, scale: float, i
 _TOKEN_TABLES: dict = {}
 
 
-def _token_tables(layout, page: int, dev):
+def _token_tables(layout, page: int, dev, B: int = 1, qchunk: int = 0):
     """The packed per-token layout's tables for the spans ``layout`` = ((n, L, q_offset), ...), from the host span
     lengths (no device sync), one pinned copy, cached per layout (a micro-batch's attention layers, their recompute
     and backward share it): q_abs [Sq] / k_abs [Sk] int32 (position in the span; -1 / 2**30 for padding), tile_p0 /
     tile_np [Sq / 64] int32 (each 64-row tile's span's first page in the layout, its page count), span_end_q [4 Pk]
-    bool (each span's last quarter page but the final span's: its window must not reach into the next span)."""
-    key = (layout, page, str(dev))
+    bool (each span's last quarter page but the final span's: its window must not reach into the next span).
+    ``B`` > 1 (one selection per block of B queries) adds the anchor layout: every span's anchors (its first query,
+    then each block start, select_pages' rule) padded to 64 rows -- a_qrow [Ra] (the anchor's packed query row),
+    a_pos [Ra] (its position, -1 padding), a_tile_p0 / a_tile_np [Ra / 64], arow [Sq] (each query row's anchor row;
+    a span's padding rows its last anchor, so arow never decreases) -- and the host ``chunks`` (r0, r1, a0, a1) of
+    ``qchunk`` query rows with the 64-aligned anchor rows they read, ``amax`` the widest."""
+    key = (layout, page, str(dev), B, qchunk)
     hit = _TOKEN_TABLES.get(key)
     if hit is not None:
         return hit
@@ -1178,14 +1183,43 @@ def _token_tables(layout, page: int, dev):
     span_end_q = torch.zeros(4 * Pk, dtype=torch.bool)
     span_end_q[4 * c[1:] - 1] = True
     ints = [q_abs, k_abs, tile_p0, tile_np]
+    extra = {}
+    if B > 1:
+        na = torch.where(n > 0, (off + n - 1) // B - off // B + 1, 0)  # anchors per span
+        alen = (na + 63) // 64 * 64
+        aoff = torch.cumsum(alen, 0) - alen
+        Ra = int(alen.sum())
+        ra_s = torch.repeat_interleave(sid, alen)
+        al = torch.arange(Ra) - aoff[ra_s]  # anchor index within its span
+        real = al < na[ra_s]
+        uq = (al * B + (off[ra_s] // B) * B - off[ra_s]).clamp(min=0)  # the anchor's query index in its span
+        a_qrow = torch.where(real, qoff[ra_s] + uq, qoff[ra_s])
+        a_pos = torch.where(real, off[ra_s] + uq, -1)
+        at = ra_s[::64]
+        a_tile_p0, a_tile_np = c[at], P[at]
+        inv = (off[rs] + tl_) // B - off[rs] // B
+        arow = aoff[rs] + torch.where(tl_ < n[rs], inv, (na[rs] - 1).clamp(min=0))
+        chunks, amax = [], 64
+        step = max(64, qchunk // 64 * 64) if qchunk else Sq
+        for r0 in range(0, Sq, step):
+            r1 = min(Sq, r0 + step)
+            a0 = int(arow[r0]) // 64 * 64
+            a1 = min(Ra, (int(arow[r1 - 1]) // 64 + 1) * 64)
+            chunks.append((r0, r1, a0, a1))
+            amax = max(amax, a1 - a0)
+        ints += [a_qrow, a_pos, a_tile_p0, a_tile_np, arow]
+        extra = dict(chunks=chunks, amax=amax, Ra=Ra)
     sizes = [x.numel() for x in ints]
     host = torch.cat(ints).to(torch.int32)
     if dev.type == "cuda":
         host, span_end_q = host.pin_memory(), span_end_q.pin_memory()
-    q_abs, k_abs, tile_p0, tile_np = host.to(dev, non_blocking=True).split(sizes)
+    parts = host.to(dev, non_blocking=True).split(sizes)
+    q_abs, k_abs, tile_p0, tile_np = parts[:4]
     out = dict(q_abs=q_abs, k_abs=k_abs, tile_p0=tile_p0, tile_np=tile_np,
                span_end_q=span_end_q.to(dev, non_blocking=True), qoff=[0] + torch.cumsum(qlen, 0).tolist(),
-               koff=[0] + (torch.cumsum(P, 0) * page).tolist(), Sq=Sq, Pk=Pk, PM=int(P.max()))
+               koff=[0] + (torch.cumsum(P, 0) * page).tolist(), Sq=Sq, Pk=Pk, PM=int(P.max()), **extra)
+    if B > 1:
+        out.update(zip(("a_qrow", "a_pos", "a_tile_p0", "a_tile_np", "arow"), parts[4:]))
     _TOKEN_TABLES[key] = out
     while len(_TOKEN_TABLES) > 4:
         _TOKEN_TABLES.pop(next(iter(_TOKEN_TABLES)))
@@ -1196,8 +1230,9 @@ _TOKEN_WARMED: set = set()
 
 
 def _token_packed_applies(cfg: PageSparseConfig, kernel: str, g: int) -> bool:
-    """Pure per-token selection on the rowmask kernel (:func:`_token_packed_attention`)."""
-    return (kernel == "rowmask" and cfg.per_group and g > 1 and cfg.selector != "window" and cfg.select_block <= 1
+    """Per-token selection, or one selection per block of fewer than 64 queries, on the rowmask kernel's head-packed
+    tiles (:func:`_token_packed_attention`); 64-query blocks keep the 64-row block kernel."""
+    return (kernel == "rowmask" and cfg.per_group and g > 1 and cfg.selector != "window" and cfg.select_block < 64
             and cfg.block_candidates <= 0)
 
 
@@ -1206,7 +1241,8 @@ def warm_token_kernels(cfg: PageSparseConfig, hq: int, hk: int, d: int, device, 
     process and shape, on every rank at the first sparse call: a rank first meeting a long document mid-run would
     otherwise stall every other rank while it compiles (cf. rowmask_attention.warm_dense_docs). The kernels have fixed
     launch configs (no autotune). Zero inputs, no RNG (a recompute replays the forward's random stream)."""
-    key = (str(device), dtype, hq, hk, d, cfg.page, cfg.topk, cfg.window, cfg.sink_pages, cfg.selector)
+    key = (str(device), dtype, hq, hk, d, cfg.page, cfg.topk, cfg.window, cfg.sink_pages, cfg.selector,
+           cfg.select_block)
     if key in _TOKEN_WARMED:
         return
     _TOKEN_WARMED.add(key)
@@ -1231,7 +1267,13 @@ def _token_packed_select_attention(spans, cfg: PageSparseConfig, scale: float, t
     hq, g, d = spans[0][0].shape[1], spans[0][1].shape[1], spans[0][0].shape[-1]
     rep = hq // g
     dev = spans[0][0].device
-    tb = _token_tables(tuple((sp[0].shape[2], sp[1].shape[2], sp[3]) for sp in spans), page, dev)
+    layout = tuple((sp[0].shape[2], sp[1].shape[2], sp[3]) for sp in spans)
+    B = max(1, cfg.select_block)
+    qchunk = 0
+    if B > 1:  # the anchors' score rows per chunk within the budget; B x as many query rows read them
+        PM0 = max(-(-sp[1].shape[2] // page) for sp in spans)
+        qchunk = max(64, TOKEN_PACKED_SCORE_BYTES // (4 * g * PM0) // 64 * 64) * B
+    tb = _token_tables(layout, page, dev, B, qchunk)
     qoff, koff, Sq, Pk, PM = tb["qoff"], tb["koff"], tb["Sq"], tb["Pk"], tb["PM"]
     qp, kp, vp = _packed_qkv(spans, qoff, koff)
     with torch.no_grad():
@@ -1241,14 +1283,26 @@ def _token_packed_select_attention(spans, cfg: PageSparseConfig, scale: float, t
         qq = F.pad(kp[0].view(g, 4 * Pk, st, d).sum(2, dtype=acc), (0, 0, 0, 1))  # [G, 4 Pk + 1, d] quarter sums
         nxt = qq[:, 1:].masked_fill(tb["span_end_q"].view(1, -1, 1), 0.0)  # a span's last window: zero padding
         win = (qq[:, :-1] + nxt) / (page // 2)  # [G, 4 Pk, d]
-        nb = min(PM, tq * (cfg.topk + cfg.sink_pages + wp + 1))
+        if B > 1:  # a tile's rows read at most ceil(tq / B) + 1 anchors' pages, its sinks and wp + 2 window pages
+            nsel = min(tq, -(-tq // B) + 1)
+            nb = min(PM, nsel * cfg.topk + cfg.sink_pages + wp + 2)
+        else:
+            nb = min(PM, tq * (cfg.topk + cfg.sink_pages + wp + 1))
         nt = Sq // tq
         idx = torch.zeros(g, nt, nb, dtype=torch.int32, device=dev)
         bits = torch.zeros(g, nt, nb, dtype=torch.int64, device=dev)
         cnt = torch.zeros(g, nt, dtype=torch.int32, device=dev)
-        chunk = max(64, TOKEN_PACKED_SCORE_BYTES // (4 * g * PM) // 64 * 64)
-        rm.token_lists_packed(qsum.float().contiguous(), win.float().contiguous(), tb["q_abs"], tb["tile_p0"],
-                              tb["tile_np"], PM, cfg.topk, page, cfg.sink_pages, wp, tq, idx, bits, cnt, chunk)
+        if B > 1:
+            qsum_a = qsum.index_select(1, tb["a_qrow"].long()).float().contiguous()
+            rm.token_lists_packed_anchor(qsum_a, win.float().contiguous(), tb["a_pos"], tb["a_tile_p0"],
+                                         tb["a_tile_np"], tb["q_abs"], tb["tile_p0"], tb["tile_np"], tb["arow"],
+                                         tb["chunks"], tb["amax"], PM, cfg.topk, page, cfg.sink_pages, wp, tq, idx,
+                                         bits, cnt)
+            del qsum_a
+        else:
+            chunk = max(64, TOKEN_PACKED_SCORE_BYTES // (4 * g * PM) // 64 * 64)
+            rm.token_lists_packed(qsum.float().contiguous(), win.float().contiguous(), tb["q_abs"], tb["tile_p0"],
+                                  tb["tile_np"], PM, cfg.topk, page, cfg.sink_pages, wp, tq, idx, bits, cnt, chunk)
         del qsum, qq, nxt, win
     out = rm.rowmask_head_packed_attention(qp[0], kp[0], vp[0], idx, bits, cnt, tb["q_abs"], tb["k_abs"], scale, tq,
                                            page)[None]
@@ -1274,6 +1328,7 @@ def _token_packed_attention(spans, cfg: PageSparseConfig, scale: float, q_block:
     dev = q0.device
     if (packed_select and selections is None and not return_selection and cfg.selector == "page_maxpool"
             and cfg.topk > 0 and cfg.hier_group <= 0 and q0.is_cuda and q0.shape[-1] in (16, 32, 64, 128, 256)
+            and (cfg.select_block <= 1 or cfg.select_score == "first")
             and all(sp[4] is None for sp in spans)
             and not any(_selects_everything(-(-sp[1].shape[2] // page), cfg) for sp in spans)):
         return _token_packed_select_attention(spans, cfg, scale, tq)

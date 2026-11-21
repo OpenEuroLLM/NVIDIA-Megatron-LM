@@ -531,6 +531,51 @@ def test_rowmask_pure_token_packed_matches_gathered(hq, selector, exact_scores):
         torch.testing.assert_close(got[:, :, : t + 1], base[:, :, : t + 1])
 
 
+@pytest.mark.parametrize("select_block", [4, 8, 16, 32])
+@pytest.mark.parametrize("hq", [16, 4])
+@pytest.mark.parametrize("selector", ["page_mean", "page_maxpool"])
+def test_rowmask_block_token_packed_matches_gathered(select_block, hq, selector, exact_scores):
+    """One selection per block of B < 64 queries on the rowmask backend's head-packed tiles (only the anchors scored:
+    each block's first query by absolute position, or a chunk's first; every query its anchor's top-k plus its own
+    sinks and window) equals the gathered reference -- select_pages' block-wise semantics -- per span on packed
+    documents, partial pages and CP-like chunks starting at and between block boundaries, outputs and q / k / v
+    gradients; and it is causal."""
+    if selector == "page_mean" and TF32_FORCED:
+        pytest.skip("page_mean scores through cuBLAS fp32 GEMMs, forced to TF32 here")
+    torch.manual_seed(4)
+    g, d = 2, 32
+    cfg = ps.PageSparseConfig(selector=selector, page=64, topk=3, window=128, sink_pages=1,
+                              select_block=select_block, per_group=True)
+    spans = []
+    for L, off in [(1300, 0), (260, 0), (900, 320), (1111, 333)]:
+        q = torch.randn(1, hq, L - off, d, device="cuda", dtype=torch.bfloat16)
+        k = torch.randn(1, g, L, d, device="cuda", dtype=torch.bfloat16)
+        v = torch.randn(1, g, L, d, device="cuda", dtype=torch.bfloat16)
+        spans.append((q, k, v, off, None))
+    leaves = [[t.clone().requires_grad_() for t in sp[:3]] for sp in spans]
+    outs = ps.flex_packed_page_attention([(*lv, sp[3], None) for lv, sp in zip(leaves, spans)], cfg, d**-0.5, 64,
+                                         kernel="rowmask")
+    gos = [torch.randn(o.shape, device="cuda", generator=torch.Generator(device="cuda").manual_seed(i))
+           for i, o in enumerate(outs)]
+    sum((o.float() * go).sum() for o, go in zip(outs, gos)).backward()
+    for (q, k, v, off, _), lv, o, go in zip(spans, leaves, outs, gos):
+        qd, kd, vd = (t.detach().double().requires_grad_() for t in (q, k, v))
+        ref = ps.page_sparse_attention(qd, kd, vd, cfg, off, d**-0.5)
+        assert float((o.double() - ref).abs().max() / ref.abs().max()) < 2e-2
+        (ref * go.double()).sum().backward()
+        for a, b in zip(lv, (qd, kd, vd)):
+            assert float((a.grad.double() - b.grad).abs().max() / b.grad.abs().max()) < 3e-2
+    q, k, v, off, _ = spans[0]
+    base = ps.flex_packed_page_attention([(q, k, v, 0, None)], cfg, d**-0.5, 64, kernel="rowmask")[0]
+    for t in (130, 700):
+        q2, k2, v2 = q.clone(), k.clone(), v.clone()
+        q2[:, :, t + 1:] = torch.randn_like(q2[:, :, t + 1:])
+        k2[:, :, t + 1:] = torch.randn_like(k2[:, :, t + 1:])
+        v2[:, :, t + 1:] = torch.randn_like(v2[:, :, t + 1:])
+        got = ps.flex_packed_page_attention([(q2, k2, v2, 0, None)], cfg, d**-0.5, 64, kernel="rowmask")[0]
+        torch.testing.assert_close(got[:, :, : t + 1], base[:, :, : t + 1])
+
+
 @pytest.mark.parametrize("selector", ["page_mean", "page_maxpool"])
 def test_rowmask_pure_token_backend_thd_matches_gathered(single, selector, exact_scores):
     """PageSparseCoreAttention with page_sparse_backend rowmask and per-token selection (select_block 1, per group)
@@ -677,18 +722,19 @@ def test_packed_block_selection_equals_per_span(seed, per_group, selector):
                 assert torch.equal(a, b)
 
 
+@pytest.mark.parametrize("select_block", [1, 4, 16])
 @pytest.mark.parametrize("hq", [16, 4])
-def test_token_packed_select_equals_per_span(hq):
+def test_token_packed_select_equals_per_span(hq, select_block):
     """The per-token rowmask path's packed selection (every span in one pass) gives bit-identical outputs and q / k / v
     gradients to the per-span selection on a mixed layout: long documents, short ones (the dense fast path), a span
     whose length is not a page multiple and a CP-like chunk with an offset; quantized keys (score ties) too."""
     torch.manual_seed(11)
     g, d = 2, 32
-    cfg = ps.PageSparseConfig(selector="page_maxpool", page=64, topk=3, window=128, sink_pages=1, select_block=1,
-                              per_group=True)
+    cfg = ps.PageSparseConfig(selector="page_maxpool", page=64, topk=3, window=128, sink_pages=1,
+                              select_block=select_block, per_group=True)
     for quant in (False, True):
         spans = []
-        for L, off in [(1300, 0), (200, 0), (2050, 0), (130, 0), (900, 320), (777, 0)]:
+        for L, off in [(1300, 0), (200, 0), (2050, 0), (130, 0), (900, 320), (777, 0), (1111, 333)]:
             q = torch.randn(1, hq, L - off, d, device="cuda", dtype=torch.bfloat16)
             k = torch.randn(1, g, L, d, device="cuda", dtype=torch.bfloat16)
             if quant:

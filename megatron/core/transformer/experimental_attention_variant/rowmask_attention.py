@@ -750,9 +750,9 @@ def _maxpool_scores_packed_kernel(QS, WIN, OUT, QPOS, TP0, TPN, R, PM, NW, page,
 
 
 @triton.jit(do_not_specialize=['R', 'PM', 'NB', 'n'])
-def _token_lists_packed_kernel(SC, V, IDX, BITS, CNT, QPOS, TP0, TPN, R, PM, NB, page, sink, wp, n,
+def _token_lists_packed_kernel(SC, V, IDX, BITS, CNT, QPOS, TP0, TPN, ANC, R, PM, NB, page, sink, wp, n,
                                scg, svg, sig, scn,
-                               TQ: tl.constexpr, BP: tl.constexpr):
+                               TQ: tl.constexpr, BP: tl.constexpr, HAS_ANC: tl.constexpr):
     t = tl.program_id(0)
     g = tl.program_id(1)
     rows = t * TQ + tl.arange(0, TQ)
@@ -760,13 +760,17 @@ def _token_lists_packed_kernel(SC, V, IDX, BITS, CNT, QPOS, TP0, TPN, R, PM, NB,
     tile = (t * TQ) // 64
     p0 = tl.load(TP0 + tile)
     psp = tl.load(TPN + tile)
-    v = tl.load(V + g * svg + rows, mask=rmask, other=float("inf"))
+    if HAS_ANC:  # one selection per block of queries: each row reads its anchor's scores (sinks / window its own)
+        srows = tl.load(ANC + rows, mask=rmask, other=0)
+    else:
+        srows = rows
+    v = tl.load(V + g * svg + srows, mask=rmask, other=float("inf"))
     qpos = tl.load(QPOS + rows, mask=rmask, other=-1)
     cur = tl.where(qpos >= 0, qpos // page, -1)
     ngt = tl.zeros([TQ], tl.int32)
     for c0 in range(0, psp, BP):  # each row's count above its n-th largest score
         p = c0 + tl.arange(0, BP)
-        s = tl.load(SC + g * scg + rows[:, None] * PM + p[None, :], mask=rmask[:, None] & (p < psp)[None, :],
+        s = tl.load(SC + g * scg + srows[:, None] * PM + p[None, :], mask=rmask[:, None] & (p < psp)[None, :],
                     other=float("-inf"))
         ngt += tl.sum((s > v[:, None]).to(tl.int32), 1)
     room = n - ngt
@@ -776,7 +780,7 @@ def _token_lists_packed_kernel(SC, V, IDX, BITS, CNT, QPOS, TP0, TPN, R, PM, NB,
     for c0 in range(0, psp, BP):
         p = c0 + tl.arange(0, BP)
         pin = p < psp
-        s = tl.load(SC + g * scg + rows[:, None] * PM + p[None, :], mask=rmask[:, None] & pin[None, :],
+        s = tl.load(SC + g * scg + srows[:, None] * PM + p[None, :], mask=rmask[:, None] & pin[None, :],
                     other=float("-inf"))
         gt = s > v[:, None]
         eq = (s == v[:, None]) & (s > float("-inf"))
@@ -823,5 +827,40 @@ def token_lists_packed(qsum: torch.Tensor, win: torch.Tensor, q_pos: torch.Tenso
         v = scr.topk(nn_, dim=-1).values[..., -1].contiguous()  # [G, rc]
         t0 = r0 // tq
         _token_lists_packed_kernel[(rc // tq, G)](
-            scr, v, idx[:, t0:], bits[:, t0:], cnt[:, t0:], qp, tp0, tpn, rc, PM, NB, page, sink, wp, nn_,
-            scr.stride(0), v.stride(0), idx.stride(0), cnt.stride(0), TQ=tq, BP=64, num_warps=4)
+            scr, v, idx[:, t0:], bits[:, t0:], cnt[:, t0:], qp, tp0, tpn, qp, rc, PM, NB, page, sink, wp, nn_,
+            scr.stride(0), v.stride(0), idx.stride(0), cnt.stride(0), TQ=tq, BP=64, HAS_ANC=False, num_warps=4)
+
+
+def token_lists_packed_anchor(qsum_a: torch.Tensor, win: torch.Tensor, a_pos: torch.Tensor, a_tile_p0: torch.Tensor,
+                              a_tile_np: torch.Tensor, q_pos: torch.Tensor, tile_p0: torch.Tensor,
+                              tile_np: torch.Tensor, arow: torch.Tensor, chunks, amax: int, PM: int, n: int, page: int,
+                              sink: int, wp: int, tq: int, idx: torch.Tensor, bits: torch.Tensor,
+                              cnt: torch.Tensor) -> None:
+    """:func:`token_lists_packed` with one selection per block of queries (page_sparse select_block B > 1): only the
+    anchors are scored -- qsum_a [G, Ra, d] in an anchor layout (each span's anchors, padded to 64 rows; a_pos their
+    positions, -1 padding; a_tile_p0 / a_tile_np per 64-row anchor tile) -- with the anchors' candidates and one top-k
+    per anchor; every query row then takes its anchor's (arow [R]: its anchor-layout row) top-k pages plus its OWN
+    sinks and window. ``chunks``: host (r0, r1, a0, a1) -- query rows [r0, r1) read anchor rows [a0, a1) (64-aligned),
+    ``amax`` the widest a1 - a0. Same lists as page_sparse.select_pages(select_block=B) per span."""
+    G, Ra, d = qsum_a.shape
+    NB = idx.shape[-1]
+    nn_ = min(n, PM)
+    ieee = not (torch.backends.cuda.matmul.allow_tf32 or os.environ.get("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE") == "1")
+    BQ, BP = 64, 16
+    sc = torch.empty(G, amax, PM, device=qsum_a.device, dtype=torch.float32)
+    for r0, r1, a0, a1 in chunks:
+        ra, rc = a1 - a0, r1 - r0
+        scr = sc[:, :ra]
+        qs = qsum_a[:, a0:a1]
+        _maxpool_scores_packed_kernel[(ra // BQ, triton.cdiv(PM, BP), G)](
+            qs, win, scr, a_pos[a0:a1], a_tile_p0[a0 // 64:a1 // 64], a_tile_np[a0 // 64:a1 // 64], ra, PM,
+            win.shape[1], page, sink, wp,
+            qs.stride(0), qs.stride(1), win.stride(0), win.stride(1), scr.stride(0), scr.stride(1),
+            D=d, BQ=BQ, BP=BP, IEEE=ieee, num_warps=4)
+        v = scr.topk(nn_, dim=-1).values[..., -1].contiguous()  # [G, ra]
+        anc = (arow[r0:r1] - a0).contiguous()
+        t0 = r0 // tq
+        _token_lists_packed_kernel[(rc // tq, G)](
+            scr, v, idx[:, t0:], bits[:, t0:], cnt[:, t0:], q_pos[r0:r1], tile_p0[r0 // 64:r1 // 64],
+            tile_np[r0 // 64:r1 // 64], anc, rc, PM, NB, page, sink, wp, nn_,
+            scr.stride(0), v.stride(0), idx.stride(0), cnt.stride(0), TQ=tq, BP=64, HAS_ANC=True, num_warps=4)
