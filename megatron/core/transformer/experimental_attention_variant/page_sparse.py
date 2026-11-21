@@ -873,6 +873,9 @@ def token_span_lists(q, k, cfg: PageSparseConfig, q_offset: int, scale: float, i
     rep = hq // g
     if chunk % 64:
         raise ValueError("token_span_lists: chunk must be a multiple of 64")
+    # the list width: a static bound (a query attends at most its sinks, window pages and top-k), no host sync
+    P = -(-k.shape[2] // cfg.page)
+    nb = min(P, tq * (cfg.topk + cfg.sink_pages + cfg.window // cfg.page + 1))
     kstats = [None] * g
     if indexer_scores is None and cfg.selector in ("page_mean", "page_maxpool"):
         kstats = [maxpool_windows(k[:, gi:gi + 1], cfg.page) if cfg.selector == "page_maxpool"
@@ -886,7 +889,7 @@ def token_span_lists(q, k, cfg: PageSparseConfig, q_offset: int, scale: float, i
         else:
             allowed = torch.stack([select_pages(q[:, gi * rep:(gi + 1) * rep, c0:c1], k[:, gi:gi + 1], cfg,
                                                 q_offset + c0, scale, indexer_scores[:, c0:c1])[0] for gi in range(g)])
-        parts.append(lists_from_allowed(allowed, tq=tq))
+        parts.append(lists_from_allowed(allowed, tq=tq, nb=nb))
     NB = max(p[0].shape[-1] for p in parts)
     return tuple(torch.cat([F.pad(p[j], (0, NB - p[j].shape[-1])) if j < 2 else p[j] for p in parts], 1)
                  for j in range(3))

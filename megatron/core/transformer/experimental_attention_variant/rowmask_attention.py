@@ -456,10 +456,11 @@ def F_pad(x, pad):
     return torch.nn.functional.pad(x, (0, pad), value=-1)
 
 
-def lists_from_allowed(allowed: torch.Tensor, chunk: int = 64, tq: int = BM):
+def lists_from_allowed(allowed: torch.Tensor, chunk: int = 64, tq: int = BM, nb: int | None = None):
     """allowed [Gs, Sq, P] bool (query row -> key block) -> (idx [Gs, nq, NB] int32, bits [Gs, nq, NB] int64,
     cnt [Gs, nq] int32): each tile's blocks some row allows, ascending, with the rows' bit word (bit i = row i).
-    Tiles of ``tq`` queries (default BM = 64; fewer for the head-packed kernel). In chunks of ``chunk`` x 64 queries,
+    Tiles of ``tq`` queries (default BM = 64; fewer for the head-packed kernel); ``nb``: a static upper bound of the
+    blocks per tile (the list width) -- no host sync; else the widest tile's count. In chunks of ``chunk`` x 64 queries,
     64-row words packed from bytes (8 rows -> one byte, 8 bytes -> the word): an int64 word per (tile, page) of the
     whole batch at once took 8x the mask's memory (OOM at 256k under CP 4, 2026-11-20)."""
     Gs, Sq, P = allowed.shape
@@ -486,15 +487,15 @@ def lists_from_allowed(allowed: torch.Tensor, chunk: int = 64, tq: int = BM):
                 words = words | (byte[..., j].to(torch.int64) << (8 * j))
         blk = words != 0
         cnt = blk.sum(-1)
-        nb = max(1, int(cnt.max()))
+        nbc = max(1, int(cnt.max())) if nb is None else nb
         # each tile's blocks in ascending order: the slot of block p is the number of listed blocks before it (a
         # scatter instead of a sort over all P blocks per tile); unlisted blocks go to a dropped slot nb
-        slot = torch.where(blk, blk.cumsum(-1) - 1, nb)
-        idx = torch.zeros(Gs, c, nb + 1, dtype=torch.int64, device=dev)
+        slot = torch.where(blk, blk.cumsum(-1) - 1, nbc)
+        idx = torch.zeros(Gs, c, nbc + 1, dtype=torch.int64, device=dev)
         idx.scatter_(-1, slot, torch.arange(P, device=dev).expand(Gs, c, P))
-        wsel = torch.zeros(Gs, c, nb + 1, dtype=torch.int64, device=dev)
+        wsel = torch.zeros(Gs, c, nbc + 1, dtype=torch.int64, device=dev)
         wsel.scatter_(-1, slot, words)
-        parts.append((idx[..., :nb], wsel[..., :nb], cnt))
+        parts.append((idx[..., :nbc], wsel[..., :nbc], cnt))
     NB = max(p[0].shape[-1] for p in parts)
     idx = torch.cat([torch.nn.functional.pad(p[0], (0, NB - p[0].shape[-1])) for p in parts], 1)
     bits = torch.cat([torch.nn.functional.pad(p[1], (0, NB - p[1].shape[-1])) for p in parts], 1)
