@@ -697,3 +697,92 @@ def test_page_maxpool_ties_break_by_page_index():
         sel = sorted({int(t) // page for t in tok[ok].tolist()} - {50 // page, 50 // page - 1})
         picks.add(tuple(sel))
     assert picks == {(p,)}
+
+
+# --------------------------------------------------------------- any selection granularity on the flex paths
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="FlexAttention needs a GPU")
+@pytest.mark.parametrize("off", [0, 128, 144])
+@pytest.mark.parametrize("select_block", [1, 4, 8, 16, 64])
+def test_lsa_flex_any_select_block_matches_reference(select_block, off):
+    """LSA's flex path at every selection granularity -- per token, per 4 / 8 / 16 queries (64-query flex rows spanning
+    several selection blocks: the union listed, mask_mod applying each query's own) and per 64 -- equals the exact
+    reference, forward and backward (D-LSA maps trained off the identity; off 144 starts mid-block)."""
+    q, k, v, _ = (t.float().clone().requires_grad_() for t in qkvx(L=512))
+    lsa = sv.LSA(sv.LSAConfig(pool=2, block=16, buckets=4, iters=3, topk=2, window=32, page=16, sink_pages=1,
+                              select_block=select_block, kv_block=16, visibility="block", latent=True), G, D).to(DEV)
+    with torch.no_grad():
+        lsa.proj_k.add_(0.2 * torch.randn_like(lsa.proj_k))
+        lsa.proj_q.add_(0.2 * torch.randn_like(lsa.proj_q))
+
+    def run():
+        return lsa(q[:, :, off:], k, v, off, D**-0.5)
+
+    ref = run()
+    lsa.flex = True
+    out = run()
+    assert float((out - ref).abs().max() / ref.abs().max()) < 1e-2
+    g = torch.randn_like(ref)
+    gf = torch.autograd.grad((out * g).sum(), (q, k, v))
+    lsa.flex = False
+    gr = torch.autograd.grad((run() * g).sum(), (q, k, v))
+    for x, y in zip(gf, gr):
+        assert float((x - y).abs().max() / y.abs().max()) < 2e-2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="FlexAttention needs a GPU")
+@pytest.mark.parametrize("select_block", [1, 4, 8])
+def test_lsa_flex_small_blocks_are_causal(select_block):
+    """Changing every key / value / query after position t leaves the flex outputs up to t unchanged."""
+    q, k, v, _ = (t.float() for t in qkvx(L=512))
+    lsa = sv.LSA(sv.LSAConfig(pool=2, block=16, buckets=4, iters=3, topk=2, window=32, page=16, sink_pages=1,
+                              select_block=select_block, kv_block=16, visibility="block", latent=True), G, D).to(DEV)
+    lsa.flex = True
+    t = 300
+    a = lsa(q, k, v, 0, D**-0.5)
+    q2, k2, v2 = q.clone(), k.clone(), v.clone()
+    for x in (q2, k2, v2):
+        x[:, :, t + 1:] = torch.randn_like(x[:, :, t + 1:])
+    b = lsa(q2, k2, v2, 0, D**-0.5)
+    torch.testing.assert_close(a[:, :, : t + 1], b[:, :, : t + 1])
+
+
+def test_dlsa_kl_every_matches_the_anchor_grid():
+    """kl_every K distills on the anchors of select_block K: select_block 4 with kl_every 16 has exactly the KL of
+    select_block 16 (the same anchors, the same buckets), and kl_every 1 keeps every selecting query."""
+    q, k, _, _ = qkvx(L=256)
+    torch.manual_seed(0)
+    a = _dlsa(select_block=16)
+    b = _dlsa(select_block=4)
+    b.cfg = dataclasses.replace(b.cfg, kl_every=16)
+    b.load_state_dict(a.state_dict())
+    torch.testing.assert_close(a.indexer_loss(q, k, 0, D**-0.5), b.indexer_loss(q, k, 0, D**-0.5))
+    c = _dlsa(select_block=4)
+    c.load_state_dict(a.state_dict())
+    assert not torch.allclose(c.indexer_loss(q, k, 0, D**-0.5), a.indexer_loss(q, k, 0, D**-0.5))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="FlexAttention needs a GPU")
+@pytest.mark.parametrize("off", [0, 144])
+@pytest.mark.parametrize("select_block", [1, 4, 16, 64])
+def test_csa2_flex_any_select_block_matches_reference(select_block, off):
+    """CSA2's flex path at every selection granularity (64-query flex rows over several selection blocks) equals the
+    reference, forward and backward."""
+    q, k, v, x = (t.float().clone().requires_grad_() for t in qkvx(L=512))
+    cfg = sv.CSA2Config(compress=2, topk_entries=6, window=32, page=16, sink_pages=1, index_heads=2, index_dim=8,
+                        select_block=select_block, kv_block=16)
+    csa = sv.CSA2(H, G, D, cfg).to(DEV)
+    torch.nn.init.normal_(csa.z.weight, std=0.3)
+
+    def run():
+        return csa(q[:, :, off:], k, v, x[:, off:], csa.token_features(x), off, D**-0.5)
+
+    ref = run()
+    csa.flex = True
+    out = run()
+    assert float((out - ref).abs().max() / ref.abs().max()) < 1e-2
+    g = torch.randn_like(ref)
+    gf = torch.autograd.grad((out * g).sum(), (q, k, v, csa.z.weight))
+    csa.flex = False
+    gr = torch.autograd.grad((run() * g).sum(), (q, k, v, csa.z.weight))
+    for a, b in zip(gf, gr):
+        assert float((a - b).abs().max() / b.abs().max()) < 2e-2

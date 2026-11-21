@@ -139,7 +139,8 @@ class PageSparseCoreAttention(MegatronModule):
                                                sink_pages=self.cfg.sink_pages,
                                                select_block=config.page_sparse_select_block,
                                                latent=config.page_sparse_lsa_latent,
-                                               visibility=config.page_sparse_lsa_visibility),
+                                               visibility=config.page_sparse_lsa_visibility,
+                                               kl_every=config.page_sparse_lsa_kl_every),
                                   config.num_query_groups or config.num_attention_heads, config.kv_channels)
             self.variant.flex = config.page_sparse_backend == "flex"
         if config.page_sparse_selector_adam:  # the selector's parameters on Adam, not the matrix optimizer
