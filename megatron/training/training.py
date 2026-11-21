@@ -4306,11 +4306,13 @@ def checkpoint_and_decide_exit(
 
             return True
 
-    # Exit based on iterations.
+    # Exit based on iterations. --packing-plan-path: at the end of the planned steps (a run past its
+    # plans would silently fall back to the regular samples).
+    plan_end = getattr(args, 'packing_plan_end_iteration', None)
     if (
         args.exit_interval
         and iteration % args.exit_interval == 0
-    ) or phase_transition_reached(args, iteration):
+    ) or phase_transition_reached(args, iteration) or (plan_end is not None and iteration >= plan_end):
         if args.save and not saved_checkpoint:
             save_checkpoint_and_time(
                 iteration,

@@ -86,3 +86,36 @@ def test_plan_for_another_blend_is_refused(gpt):
         json.dump({"format": 1, "blend_md5": "other", "seq_length": SEQ}, f)
     with pytest.raises(AssertionError, match="plan built for blend"):
         PackingPlanDataset(ds, [p], "none")
+
+
+class _Meta:
+    def __init__(self, a, b, **geo):
+        self.path = f"plan{a}"
+        geometry = dict(global_batch_size=1024, ref_dp=512, ref_mbs=1, ref_gbs=None, phase_start=23691,
+                        train_iters=236733)
+        self.meta = {"from_ckpt": a, "to_ckpt": b, "geometry": {**geometry, **geo}}
+
+
+def test_plan_coverage_contiguous_range():
+    from megatron.core.datasets.packing_plan import plan_coverage
+
+    plans = [_Meta(500, 1000), _Meta(0, 500), _Meta(1000, 1500), _Meta(2000, 2500)]
+    assert plan_coverage(plans, 0) == 1500
+    assert plan_coverage(plans, 1499) == 1500  # the step after 1499 is the last planned one
+    assert plan_coverage(plans, 1500) is None  # gap 1500-2000: unplanned
+    assert plan_coverage(plans, 2100) == 2500
+
+
+def test_plan_geometry_must_match_the_run():
+    from types import SimpleNamespace
+
+    from megatron.core.datasets.packing_plan import check_plan_geometry
+
+    args = SimpleNamespace(global_batch_size=1024, data_sampler_reference_dp_size=512,
+                           data_sampler_reference_micro_batch_size=1, data_sampler_reference_global_batch_size=None,
+                           train_iters=236733, phase_transition_iterations=[23691])
+    check_plan_geometry([_Meta(0, 500)], args)
+    with pytest.raises(AssertionError, match="global_batch_size"):
+        check_plan_geometry([_Meta(0, 500, **{"global_batch_size": 512})], SimpleNamespace(**{**vars(args)}))
+    with pytest.raises(AssertionError, match="phase"):
+        check_plan_geometry([_Meta(0, 500)], SimpleNamespace(**{**vars(args), "phase_transition_iterations": [100]}))

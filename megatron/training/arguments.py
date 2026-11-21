@@ -4001,6 +4001,10 @@ def _add_data_args(parser):
                        'doc = one segment per document piece, group = one per run of pieces of the '
                        'same plan group (semantic cluster), none = the whole sequence (attention '
                        'across documents).')
+    group.add_argument('--packing-plan-at-end', choices=['exit', 'continue'], default='exit',
+                       help='With --packing-plan-path: at the end of the planned steps save and exit '
+                       '(exit; also refuses to start on an unplanned step) or train on the regular '
+                       'samples from there on (continue).')
     group.add_argument('--packed-doc-attention-log-cu-seqlens', type=int, default=0,
                        help='With --dataloader-inter-document-masking, print this rank\'s '
                        'cu_seqlens for the first N calls to get_batch. cu_seqlens is a few '

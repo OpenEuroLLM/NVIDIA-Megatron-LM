@@ -151,8 +151,48 @@ class PackingPlanDataset(torch.utils.data.Dataset):
         return sample
 
 
+def plan_coverage(plans, start: int):
+    """End of the contiguous planned range that contains the step taken from checkpoint ``start``
+    (plans cover steps from checkpoints [from_ckpt, to_ckpt)), or None if that step is unplanned."""
+    ranges = sorted((int(p.meta["from_ckpt"]), int(p.meta["to_ckpt"])) for p in plans)
+    end = None
+    for a, b in ranges:
+        if end is None:
+            if a <= start < b:
+                end = b
+        elif a == end:
+            end = b
+        elif a > end:
+            break
+    return end
+
+
+def check_plan_geometry(plans, args):
+    """The plans replace the sample indices the sampler serves in their steps: they are only valid for
+    the sampler geometry they were built with (global batch, reference layout, phase, train_iters)."""
+    phases = getattr(args, "phase_transition_iterations", None) or []
+    want = {
+        "global_batch_size": args.global_batch_size,
+        "ref_dp": getattr(args, "data_sampler_reference_dp_size", None),
+        "ref_mbs": getattr(args, "data_sampler_reference_micro_batch_size", None),
+        "ref_gbs": getattr(args, "data_sampler_reference_global_batch_size", None),
+        "train_iters": args.train_iters,
+    }
+    for p in plans:
+        geo = p.meta.get("geometry")
+        assert geo is not None, f"{p.path}: plan without sampler geometry (built before format checks)"
+        for k, v in want.items():
+            assert geo.get(k) == v, f"{p.path}: plan built for {k}={geo.get(k)}, this run has {v}"
+        assert geo.get("phase_start") in [0, *phases], (
+            f"{p.path}: plan built for a phase starting at {geo.get('phase_start')}, this run's phase "
+            f"transitions are {phases}")
+
+
 def wrap_with_packing_plans(train_ds, args):
-    """The provider's hook: wrap the training dataset when --packing-plan-path is given."""
+    """The provider's hook: wrap the training dataset when --packing-plan-path is given. Checks the
+    plans' sampler geometry against the run and that the next step is planned; records the end of the
+    planned range in args.packing_plan_end_iteration (the training loop saves and exits there unless
+    --packing-plan-at-end continue)."""
     paths = getattr(args, "packing_plan_path", None)
     if not paths or train_ds is None:
         return train_ds
@@ -166,10 +206,21 @@ def wrap_with_packing_plans(train_ds, args):
             assert subs, f"--packing-plan-path {p}: no plan directory"
             expanded.extend(subs)
     ds = PackingPlanDataset(train_ds, expanded, getattr(args, "packing_plan_boundaries", "doc"))
+    check_plan_geometry(ds.plans, args)
+    at_end = getattr(args, "packing_plan_at_end", "exit")
+    start = int(getattr(args, "iteration", 0) or 0)
+    end = plan_coverage(ds.plans, start)
+    if end is None:
+        msg = (f"--packing-plan-path: the step after checkpoint {start} is not planned "
+               f"(plans cover {[(p.meta['from_ckpt'], p.meta['to_ckpt']) for p in ds.plans]})")
+        assert at_end == "continue", msg + "; pass --packing-plan-at-end continue to train without plans"
+        print(f"> WARNING: {msg}; training on the regular samples", flush=True)
+    args.packing_plan_end_iteration = end if at_end == "exit" else None
     k, _, _ = ds._lookup_tables()
     ranges = [(p.meta.get("from_ckpt"), p.meta.get("to_ckpt")) for p in ds.plans]
     logger.info("packing plans: %d (%s), %d replaced samples, boundaries=%s",
                 len(ds.plans), ranges, len(k), ds.boundaries)
     print(f"> packing plans: {len(ds.plans)} plans covering checkpoints {ranges}, {len(k)} replaced "
-          f"samples, boundaries={ds.boundaries}", flush=True)
+          f"samples, boundaries={ds.boundaries}; planned from {start} to {end} "
+          f"(at the end: {at_end})", flush=True)
     return ds
