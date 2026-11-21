@@ -840,10 +840,13 @@ def flex_packed_page_attention(spans, cfg: PageSparseConfig, scale: float, q_blo
 TOKEN_SELECT_CHUNK = 4096  # queries per selection block of the pure per-token path (scores [chunk, 4 P + 1] fp32)
 
 
-def token_tile(rep: int) -> int:
-    """Queries per head-packed tile for a KV group of ``rep`` query heads: 64 rows (8 queries x 8 heads at v4b's
-    16 / 2), at least 8 queries."""
-    return max(8, 64 // (1 << (rep - 1).bit_length()))
+def token_tile(rep: int, device=None) -> int:
+    """Queries per head-packed tile for a KV group of ``rep`` query heads: 128 rows on GPUs with an H100's shared
+    memory (16 queries x 8 heads at v4b's 16 / 2: 1.3x faster than 8 x 8 on real selections at 64k and 256k despite
+    the larger page union, 2026-11-21), 64 on smaller ones; at least 8 queries."""
+    smem = torch.cuda.get_device_properties(device).shared_memory_per_block_optin if torch.cuda.is_available() else 0
+    rows = 128 if smem >= 160 * 1024 else 64
+    return max(8, rows // (1 << (rep - 1).bit_length()))
 
 
 def token_allowed(q, k, cfg: PageSparseConfig, q_offset: int = 0, scale: float | None = None, kstats=None):
@@ -859,18 +862,26 @@ def token_allowed(q, k, cfg: PageSparseConfig, q_offset: int = 0, scale: float |
         return select_pages(q, k, cfg, q_offset, scale)[0]
     b, hq, _, d = q.shape
     g = k.shape[1]
-    qsum = _acc(q).view(b, g, hq // g, s, d).sum(2)
-    if cfg.selector == "page_maxpool":
-        win = maxpool_windows(k, cfg.page) if kstats is None else kstats
-        sc = maxpool_page_scores(qsum, win, scale, P)[0]
-    else:
-        kp = page_pool(k, cfg.page, "mean") if kstats is None else kstats
-        sc = torch.einsum("bgsd,bgpd->bsp", qsum * scale, kp)[0]
+    qsum = q.view(b, g, hq // g, s, d).sum(2, dtype=torch.float32 if q.dtype != torch.float64 else q.dtype)
     pos = q_offset + torch.arange(s, device=q.device)
     cur = pos // cfg.page
     p = torch.arange(P, device=q.device)
     wp = cfg.window // cfg.page
-    sc = sc.masked_fill(~((p[None, :] >= cfg.sink_pages) & (p[None, :] < (cur - wp)[:, None])), float("-inf"))
+    if cfg.selector == "page_maxpool":
+        win = maxpool_windows(k, cfg.page) if kstats is None else kstats
+        if q.is_cuda and g == 1 and qsum.dtype == torch.float32 and d in (16, 32, 64, 128, 256):
+            from .rowmask_attention import maxpool_page_scores_triton  # scores + candidates fused
+
+            sc = maxpool_page_scores_triton((qsum[0, 0] * scale).contiguous(), win[0, 0].contiguous(), P, q_offset,
+                                            cfg.page, cfg.sink_pages, wp)
+        else:
+            sc = maxpool_page_scores(qsum, win, scale, P)[0]
+            sc = sc.masked_fill(~((p[None, :] >= cfg.sink_pages) & (p[None, :] < (cur - wp)[:, None])),
+                                float("-inf"))
+    else:
+        kp = page_pool(k, cfg.page, "mean") if kstats is None else kstats
+        sc = torch.einsum("bgsd,bgpd->bsp", qsum * scale, kp)[0]
+        sc = sc.masked_fill(~((p[None, :] >= cfg.sink_pages) & (p[None, :] < (cur - wp)[:, None])), float("-inf"))
     fixed = (p[None, :] < cfg.sink_pages) | ((p[None, :] >= (cur - wp)[:, None]) & (p[None, :] <= cur[:, None]))
     return (topk_mask(sc, cfg.topk) | fixed) & (p[None, :] <= cur[:, None])
 
@@ -921,7 +932,7 @@ def _token_packed_attention(spans, cfg: PageSparseConfig, scale: float, q_block:
     page = cfg.page
     q0, k0 = spans[0][0], spans[0][1]
     hq, g = q0.shape[1], k0.shape[1]
-    tq = token_tile(hq // g)
+    tq = token_tile(hq // g, q0.device)
     dev = q0.device
     with torch.no_grad():
         sels, qoff, koff = [], [0], [0]

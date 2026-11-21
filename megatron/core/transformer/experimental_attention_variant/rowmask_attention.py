@@ -17,6 +17,8 @@ forward and dq loop over a tile's list; dk / dv loop over the tiles listing a bl
 
 from __future__ import annotations
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -519,3 +521,55 @@ def lists_from_allowed(allowed: torch.Tensor, chunk: int = 64, tq: int = BM, nb:
     bits = torch.cat([torch.nn.functional.pad(p[1], (0, NB - p[1].shape[-1])) for p in parts], 1)
     cnt = torch.cat([p[2] for p in parts], 1)
     return idx.to(torch.int32).contiguous(), bits.contiguous(), cnt.to(torch.int32).contiguous()
+
+
+# ------------------------------------------------------------------------- per-token page_maxpool scores
+@triton.jit
+def _maxpool_scores_kernel(QS, WIN, OUT, S, P, NW, q_offset, page, sink, wp,
+                           sqs, sws, sos,
+                           D: tl.constexpr, BQ: tl.constexpr, BP: tl.constexpr, IEEE: tl.constexpr):
+    pq = tl.program_id(0)
+    pp = tl.program_id(1)
+    rows = pq * BQ + tl.arange(0, BQ)
+    rmask = rows < S
+    dd = tl.arange(0, D)
+    q = tl.load(QS + rows[:, None] * sqs + dd[None, :], mask=rmask[:, None], other=0.0)
+    p = pp * BP + tl.arange(0, BP)
+    j = pp * 4 * BP + tl.arange(0, 4 * BP)  # windows 4p .. 4p + 3 of the tile's pages
+    jok = j < NW
+    w = tl.load(WIN + j[:, None] * sws + dd[None, :], mask=jok[:, None], other=0.0)
+    jp = 4 * p - 1  # each page's fifth window (its left neighbour's last): the same dot, the same bits
+    jpok = (jp >= 0) & (jp < NW)
+    wl = tl.load(WIN + jp[:, None] * sws + dd[None, :], mask=jpok[:, None], other=0.0)
+    if IEEE:  # fp32 accuracy from three TF32 products (the FMA "ieee" path was 70x slower)
+        sm = tl.dot(q, tl.trans(w), input_precision="tf32x3")
+        sl = tl.dot(q, tl.trans(wl), input_precision="tf32x3")
+    else:
+        sm = tl.dot(q, tl.trans(w), input_precision="tf32")
+        sl = tl.dot(q, tl.trans(wl), input_precision="tf32")
+    sm = tl.where(jok[None, :], sm, float("-inf"))
+    sl = tl.where(jpok[None, :], sl, float("-inf"))
+    sc = tl.maximum(tl.max(tl.reshape(sm, (BQ, BP, 4)), axis=2), sl)
+    cur = (q_offset + rows) // page
+    cand = (p[None, :] >= sink) & (p[None, :] < (cur - wp)[:, None])
+    sc = tl.where(cand, sc, float("-inf"))
+    tl.store(OUT + rows[:, None] * sos + p[None, :], sc, mask=rmask[:, None] & (p < P)[None, :])
+
+
+def maxpool_page_scores_triton(qsum: torch.Tensor, win: torch.Tensor, P: int, q_offset: int, page: int, sink: int,
+                               wp: int) -> torch.Tensor:
+    """page_sparse.maxpool_page_scores for one KV group with the candidate mask applied, fused: qsum [s, d] fp32 (the
+    query heads' sum, scaled), win [4 P + 1, d] fp32 -> [s, P] fp32, -inf outside each query's candidates (pages
+    sink .. its window's first - 1). One pass instead of the [s, 4 P + 1] window scores, the pooling and the mask
+    (most of the per-token selection's memory traffic). TF32 products iff torch allows them for fp32 GEMMs, else
+    three TF32 products (fp32 accuracy)."""
+    s, d = qsum.shape
+    out = torch.empty(s, P, device=qsum.device, dtype=torch.float32)
+    BQ, BP = 64, 16
+    # torch's fp32 GEMM precision: TF32 when allowed (or forced, as NGC containers do through the cuBLAS override)
+    ieee = not (torch.backends.cuda.matmul.allow_tf32 or os.environ.get("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE") == "1")
+    grid = (triton.cdiv(s, BQ), triton.cdiv(P, BP))
+    _maxpool_scores_kernel[grid](qsum.contiguous(), win.contiguous(), out, s, P, win.shape[0], q_offset, page, sink,
+                                 wp, qsum.stride(0) if qsum.is_contiguous() else d, d, P,
+                                 D=d, BQ=BQ, BP=BP, IEEE=ieee, num_warps=4)
+    return out
