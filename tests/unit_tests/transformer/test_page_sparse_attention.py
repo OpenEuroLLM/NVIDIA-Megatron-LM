@@ -472,3 +472,97 @@ def test_selection_is_causal(mode, selector):
         q2[:, :, t + 1:] = torch.randn_like(q2[:, :, t + 1:])
         k2[:, :, (t // page + 1) * page:] = torch.randn_like(k2[:, :, (t // page + 1) * page:])
         torch.testing.assert_close(ps.select_pages(q2, k2, cfg, 0, 0.25)[0][: t + 1], base[: t + 1])
+
+
+@pytest.mark.parametrize("hq", [16, 10, 4])
+@pytest.mark.parametrize("selector", ["page_mean", "page_maxpool"])
+def test_rowmask_pure_token_packed_matches_gathered(hq, selector):
+    """Pure per-token selection (select_block 1, no block candidates, per KV group) through the rowmask backend's
+    head-packed tiles (8 queries x 8 heads at 16 / 2; padded heads at 10 / 2; 32 queries x 2 heads at 4 / 2) equals
+    the gathered reference per span on packed documents and an offset (CP-like) chunk, outputs and q / k / v
+    gradients; and it is causal: outputs up to t do not change when every later query / key / value does."""
+    torch.manual_seed(2)
+    g, d = 2, 32
+    cfg = ps.PageSparseConfig(selector=selector, page=64, topk=3, window=128, sink_pages=1, select_block=1,
+                              per_group=True)
+    spans = []
+    for L, off in [(1300, 0), (260, 0), (900, 320)]:
+        q = torch.randn(1, hq, L - off, d, device="cuda", dtype=torch.bfloat16)
+        k = torch.randn(1, g, L, d, device="cuda", dtype=torch.bfloat16)
+        v = torch.randn(1, g, L, d, device="cuda", dtype=torch.bfloat16)
+        spans.append((q, k, v, off, None))
+    leaves = [[t.clone().requires_grad_() for t in sp[:3]] for sp in spans]
+    outs = ps.flex_packed_page_attention([(*lv, sp[3], None) for lv, sp in zip(leaves, spans)], cfg, d**-0.5, 64,
+                                         kernel="rowmask")
+    gos = [torch.randn(o.shape, device="cuda", generator=torch.Generator(device="cuda").manual_seed(i))
+           for i, o in enumerate(outs)]
+    sum((o.float() * go).sum() for o, go in zip(outs, gos)).backward()
+    for (q, k, v, off, _), lv, o, go in zip(spans, leaves, outs, gos):
+        qd, kd, vd = (t.detach().double().requires_grad_() for t in (q, k, v))
+        ref = ps.page_sparse_attention(qd, kd, vd, cfg, off, d**-0.5)
+        assert float((o.double() - ref).abs().max() / ref.abs().max()) < 2e-2
+        (ref * go.double()).sum().backward()
+        for a, b in zip(lv, (qd, kd, vd)):
+            assert float((a.grad.double() - b.grad).abs().max() / b.grad.abs().max()) < 3e-2
+    q, k, v, off, _ = spans[0]
+    base = ps.flex_packed_page_attention([(q, k, v, 0, None)], cfg, d**-0.5, 64, kernel="rowmask")[0]
+    for t in (130, 700):
+        q2, k2, v2 = q.clone(), k.clone(), v.clone()
+        q2[:, :, t + 1:] = torch.randn_like(q2[:, :, t + 1:])
+        k2[:, :, t + 1:] = torch.randn_like(k2[:, :, t + 1:])
+        v2[:, :, t + 1:] = torch.randn_like(v2[:, :, t + 1:])
+        got = ps.flex_packed_page_attention([(q2, k2, v2, 0, None)], cfg, d**-0.5, 64, kernel="rowmask")[0]
+        torch.testing.assert_close(got[:, :, : t + 1], base[:, :, : t + 1])
+
+
+@pytest.mark.parametrize("selector", ["page_mean", "page_maxpool"])
+def test_rowmask_pure_token_backend_thd_matches_gathered(single, selector):
+    """PageSparseCoreAttention with page_sparse_backend rowmask and per-token selection (select_block 1, per group)
+    equals the gathered backend on a packed batch of long and short documents, forward and backward."""
+    lengths = (1300, 260, 120, 900)
+    kw = dict(page_sparse_selector=selector, page_sparse_page=64, page_sparse_topk=3, page_sparse_window=128,
+              page_sparse_select_block=1, page_sparse_per_group=True, page_sparse_flex_q_block=64,
+              page_sparse_packed_flex=True)
+    tok = PageSparseCoreAttention(_config(**kw, page_sparse_backend="rowmask"), 1, pg_collection=single)
+    ref = PageSparseCoreAttention(_config(**kw, page_sparse_backend="gathered"), 1, pg_collection=single)
+    gen = torch.Generator().manual_seed(4)
+    t = sum(lengths)
+    q, k, v = (torch.randn(t, n, D, generator=gen).cuda().to(torch.bfloat16) for n in (HQ, G, G))
+    dout = torch.randn(t, HQ * D, generator=gen).cuda()
+    leaves_a = [x.clone().requires_grad_() for x in (q, k, v)]
+    leaves_b = [x.clone().double().requires_grad_() for x in (q, k, v)]
+    out_a = tok(*leaves_a, packed_seq_params=_packed(lengths))
+    out_b = ref(*leaves_b, packed_seq_params=_packed(lengths))
+    assert float((out_a.double() - out_b).abs().max() / out_b.abs().max()) < 2e-2
+    (out_a.float() * dout).sum().backward()
+    (out_b * dout.double()).sum().backward()
+    for a, b in zip(leaves_a, leaves_b):
+        assert float((a.grad.double() - b.grad).abs().max() / b.grad.abs().max()) < 3e-2
+
+
+def test_topk_mask_equals_stable_topk():
+    """topk_mask selects exactly topk_stable's pages (ties to the lower index, -inf never), incl. rows with exact ties
+    across the n-th value and rows with fewer finite scores than n."""
+    torch.manual_seed(7)
+    sc = torch.randint(0, 6, (300, 50)).float()  # many exact ties
+    sc[::7, 10:] = float("-inf")  # rows with 10 finite scores
+    sc[::11] = float("-inf")
+    for n in (1, 4, 12, 50):
+        val, sel = ps.topk_stable(sc, n)
+        ref = torch.zeros_like(sc, dtype=torch.bool).scatter_(-1, sel, torch.isfinite(val))
+        torch.testing.assert_close(ps.topk_mask(sc, n), ref)
+
+
+@pytest.mark.parametrize("selector", ["page_mean", "page_maxpool"])
+@pytest.mark.parametrize("off", [0, 192])
+def test_token_allowed_equals_select_pages(selector, off):
+    """token_allowed (the per-token training path's selection: span-wide key statistics, the top-k mask) selects the
+    same pages as select_pages with select_block 1, also with quantized keys (exact score ties between pages)."""
+    torch.manual_seed(off)
+    L = 2000
+    q = torch.randn(1, 8, L - off, 32, device="cuda")
+    for k in (torch.randn(1, 1, L, 32, device="cuda"), torch.randint(-1, 2, (1, 1, L, 32), device="cuda").float()):
+        cfg = ps.PageSparseConfig(selector=selector, page=64, topk=5, window=128, sink_pages=1, select_block=1)
+        kst = ps.maxpool_windows(k, 64) if selector == "page_maxpool" else ps.page_pool(k, 64, "mean")
+        got = ps.token_allowed(q, k, cfg, off, 0.2, kst)
+        torch.testing.assert_close(got, ps.select_pages(q, k, cfg, off, 0.2)[0])

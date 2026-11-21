@@ -203,3 +203,64 @@ def test_packed_short_documents_fast_path(kernel):
     ref = run(lambda sp: [ps.flex_page_sparse_attention(q, k, v, cfg, off, d**-0.5, None, 64) for q, k, v, off, _ in sp])
     for x, y in zip(got, ref):
         assert float((x - y).abs().max() / y.abs().max().clamp(min=1e-6)) < 2e-2
+
+
+@pytest.mark.parametrize("rep", [2, 5, 8])
+@pytest.mark.parametrize("tq", [8, 16])
+@pytest.mark.parametrize("D", [64, 128])
+def test_head_packed_matches_dense_masked(rep, tq, D):
+    """rowmask_head_packed_attention (tiles of tq queries x a KV group's heads, padded to a power of 2) equals dense
+    masked attention under per-token, per-group page masks on packed spans with padding rows / keys, forward and
+    gradients; lists_from_allowed's tq-bit words round-trip."""
+    from megatron.core.transformer.experimental_attention_variant import rowmask_attention as ra
+
+    repp = 1 << (rep - 1).bit_length()
+    smem = torch.cuda.get_device_properties(0).shared_memory_per_block_optin
+    if tq * repp * D > 64 * 128 and smem < 160 * 1024:
+        pytest.skip("a 128-row tile at this head dim needs an H100's shared memory")
+    torch.manual_seed(0)
+    Hk, bn = 2, 64
+    Hq = Hk * rep
+    lengths = (200, 136, 70)
+    starts, tot = [], 0
+    for L in lengths:
+        starts.append(tot)
+        tot += -(-L // 64) * 64
+    Sq = Sk = tot
+    q_pos = torch.full((Sq,), -1, dtype=torch.int32)
+    k_pos = torch.full((Sk,), 2**30, dtype=torch.int32)
+    P = Sk // bn
+    allowed = torch.zeros(Hk, Sq, P, dtype=torch.bool)
+    for a0, L in zip(starts, lengths):
+        q_pos[a0:a0 + L] = torch.arange(L, dtype=torch.int32)
+        k_pos[a0:a0 + L] = torch.arange(L, dtype=torch.int32)
+        p0, p1 = a0 // bn, -(-(a0 + L) // bn)
+        allowed[:, a0:a0 + L, p0:p1] = torch.rand(Hk, L, p1 - p0) < 0.4
+        cur = p0 + torch.arange(L) // bn
+        allowed[:, torch.arange(a0, a0 + L), cur] = True
+    q = torch.randn(Hq, Sq, D, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn(Hk, Sk, D, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    v = torch.randn(Hk, Sk, D, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    allowed, q_pos, k_pos = allowed.cuda(), q_pos.cuda(), k_pos.cuda()
+    idx, bits, cnt = ra.lists_from_allowed(allowed, chunk=1, tq=tq)
+    nt = idx.shape[1]
+    dense = torch.zeros(Hk, nt * tq, P, dtype=torch.bool, device="cuda")
+    for g in range(Hk):
+        for t in range(nt):
+            for j in range(int(cnt[g, t])):
+                w = int(bits[g, t, j])
+                for i in range(tq):
+                    if (w >> i) & 1:
+                        dense[g, t * tq + i, int(idx[g, t, j])] = True
+    torch.testing.assert_close(dense[:, :Sq], allowed)
+    scale = D**-0.5
+    out = ra.rowmask_head_packed_attention(q, k, v, idx, bits, cnt, q_pos, k_pos, scale, tq, bn)
+    qd, kd, vd = (x.detach().double().requires_grad_() for x in (q, k, v))
+    ref = _reference(qd, kd, vd, allowed, q_pos, k_pos, scale, rep, True, bn)
+    real = (q_pos >= 0)[None, :, None]
+    assert float(((out.double() - ref).abs() * real).max() / ref.abs().max()) < 2e-2
+    go = torch.randn_like(out) * real
+    g = torch.autograd.grad((out.float() * go.float()).sum(), (q, k, v))
+    gr = torch.autograd.grad((ref * go.double()).sum(), (qd, kd, vd))
+    for x, y in zip(g, gr):
+        assert float((x.double() - y).abs().max() / y.abs().max()) < 3e-2

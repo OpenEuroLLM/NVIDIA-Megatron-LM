@@ -158,20 +158,9 @@ def page_scores(q, k, cfg: PageSparseConfig, q_offset: int, scale: float, indexe
         return _acc(indexer_scores)
     if cfg.selector == "page_mean":
         kp = page_pool(k, cfg.page, "mean")
-        return torch.einsum("bgrsd,bgpd->bsp", qg, kp) * scale
+        return torch.einsum("bgsd,bgpd->bsp", qg.sum(2) * scale, kp)  # the heads' sum first: rep x fewer flops
     if cfg.selector == "page_maxpool":
-        # InfLLM-v2: keys mean-pooled over half-page windows at a quarter-page stride, a page scored by the max
-        # over the 5 windows overlapping it (a match straddling a page boundary is not diluted by its page)
-        if cfg.page % 4:
-            raise ValueError("page_maxpool: page must be a multiple of 4")
-        st, sub = cfg.page // 4, cfg.page // 2
-        # windows [j st, j st + sub), j = 0 .. 4P: each the sum of two adjacent quarter-page sums (a cumsum over the
-        # keys was 72 % of the selection: torch's outer-dim scan, 17.6 ms per KV group at 64k, 2026-11-20)
-        qs = F.pad(_acc(k), (0, 0, 0, (4 * P + 2) * st - L)).view(b, g, 4 * P + 2, st, d).sum(3)
-        win = (qs[:, :, :-1] + qs[:, :, 1:]) / sub  # [b, g, 4P + 1, d]
-        sc = torch.einsum("bgrsd,bgjd->bsj", qg, win) * scale
-        pooled = F.max_pool1d(sc.reshape(b * s, 1, 4 * P + 1), kernel_size=5, stride=4, padding=1)  # page p: 4p-1 .. 4p+3
-        return pooled.view(b, s, -1)[..., :P]
+        return maxpool_page_scores(qg.sum(2), maxpool_windows(k, cfg.page), scale, P)
     if cfg.selector == "quest":
         hi, lo = page_pool(k, cfg.page, "minmax")
         hi, lo = hi.nan_to_num(0.0), lo.nan_to_num(0.0)
@@ -188,6 +177,44 @@ def page_scores(q, k, cfg: PageSparseConfig, q_offset: int, scale: float, indexe
             out.append(pr.mean(1))
         return torch.cat(out, 1)
     raise ValueError(f"page_scores: selector {cfg.selector!r} does not score pages")
+
+
+def maxpool_windows(k: torch.Tensor, page: int) -> torch.Tensor:
+    """page_maxpool's key statistics: k [b, g, L, d] -> windows [b, g, 4 P + 1, d] (fp32), the keys mean-pooled over
+    half-page windows at a quarter-page stride (InfLLM-v2), window j = keys [j page / 4, j page / 4 + page / 2)."""
+    if page % 4:
+        raise ValueError("page_maxpool: page must be a multiple of 4")
+    b, g, L, d = k.shape
+    P = -(-L // page)
+    st, sub = page // 4, page // 2
+    # each window the sum of two adjacent quarter-page sums (a cumsum over the keys was 72 % of the selection:
+    # torch's outer-dim scan, 17.6 ms per KV group at 64k, 2026-11-20)
+    qs = F.pad(_acc(k), (0, 0, 0, (4 * P + 2) * st - L)).view(b, g, 4 * P + 2, st, d).sum(3)
+    return (qs[:, :, :-1] + qs[:, :, 1:]) / sub
+
+
+def maxpool_page_scores(qsum: torch.Tensor, win: torch.Tensor, scale: float, P: int) -> torch.Tensor:
+    """page_maxpool scores [b, s, P] from the queries summed over their heads qsum [b, g, s, d] (fp32) and the windows
+    of :func:`maxpool_windows`: a page scored by the max over the 5 windows overlapping it (a match straddling a page
+    boundary is not diluted by its page)."""
+    b, s = qsum.shape[0], qsum.shape[2]
+    sc = torch.einsum("bgsd,bgjd->bsj", qsum * scale, win)  # scaled before: one pass less over [s, 4 P + 1]
+    pooled = F.max_pool1d(sc.reshape(b * s, 1, -1), kernel_size=5, stride=4, padding=1)  # page p: 4p-1 .. 4p+3
+    return pooled.view(b, s, -1)[..., :P]
+
+
+def topk_mask(scores: torch.Tensor, n: int) -> torch.Tensor:
+    """The pages :func:`topk_stable` selects (its n largest, ties to the lower index), finite scores only, as a bool
+    mask of ``scores``' shape -- without the full sort: torch.topk's n-th largest value, then every larger score
+    and the lowest-index ties of it until n (the stable sort was a third of the per-token selection, 2026-11-21)."""
+    n = min(n, scores.shape[-1])
+    if n <= 0:
+        return torch.zeros_like(scores, dtype=torch.bool)
+    v = scores.topk(n, dim=-1).values[..., -1:]  # the n-th largest
+    gt = scores > v
+    eq = (scores == v) & torch.isfinite(scores)
+    room = n - gt.sum(-1, keepdim=True)
+    return gt | (eq & (eq.cumsum(-1) <= room))
 
 
 def selection_scores(q, k, cfg: PageSparseConfig, q_offset: int, scale: float, indexer_scores=None,
@@ -709,6 +736,8 @@ def flex_packed_page_attention(spans, cfg: PageSparseConfig, scale: float, q_blo
     per_group = cfg.per_group and g > 1 and cfg.selector != "window"
     G = g if per_group else 1
     dev = q0.device
+    if kernel == "rowmask" and per_group and cfg.select_block <= 1 and cfg.block_candidates <= 0:
+        return _token_packed_attention(spans, cfg, scale, q_block, selections, return_selection)
     with torch.no_grad():
         sels, qoff, koff = [], [0], [0]
         for i, (q, k, v, off, idx) in enumerate(spans):
@@ -790,6 +819,130 @@ def flex_packed_page_attention(spans, cfg: PageSparseConfig, scale: float, q_blo
                   kernel_options=flex_kernel_options(qp, q_block, page))
     # split, then trim each span's padding: a slice per span backpropagates a zero tensor of the whole packed output
     # per span (64 x 1k documents: 3/4 of the step was those adds / fills, 2026-11-20), split's backward is one cat
+    segs = out.split([qoff[i + 1] - qoff[i] for i in range(len(spans))], dim=2)
+    outs = [seg[:, :, :sp[0].shape[2]] for seg, sp in zip(segs, spans)]
+    return (outs, sels) if return_selection else outs
+
+
+TOKEN_SELECT_CHUNK = 4096  # queries per selection block of the pure per-token path (scores [chunk, 4 P + 1] fp32)
+
+
+def token_tile(rep: int) -> int:
+    """Queries per head-packed tile for a KV group of ``rep`` query heads: 64 rows (8 queries x 8 heads at v4b's
+    16 / 2), at least 8 queries."""
+    return max(8, 64 // (1 << (rep - 1).bit_length()))
+
+
+def token_allowed(q, k, cfg: PageSparseConfig, q_offset: int = 0, scale: float | None = None, kstats=None):
+    """:func:`select_pages` (b = 1, [s, P]) for pure per-token selection with page_mean / page_maxpool: the same pages,
+    with the key statistics ``kstats`` (:func:`maxpool_windows` / the page means) computed once per span and the
+    top-k as a mask (:func:`topk_mask`) instead of a stable sort; other configurations go to select_pages."""
+    s, L = q.shape[2], k.shape[2]
+    P = -(-L // cfg.page)
+    scale = q.shape[-1] ** -0.5 if scale is None else scale
+    fast = (cfg.selector in ("page_mean", "page_maxpool") and cfg.select_block <= 1 and cfg.hier_group <= 0
+            and cfg.block_candidates <= 0 and cfg.topk > 0 and not _selects_everything(P, cfg))
+    if not fast:
+        return select_pages(q, k, cfg, q_offset, scale)[0]
+    b, hq, _, d = q.shape
+    g = k.shape[1]
+    qsum = _acc(q).view(b, g, hq // g, s, d).sum(2)
+    if cfg.selector == "page_maxpool":
+        win = maxpool_windows(k, cfg.page) if kstats is None else kstats
+        sc = maxpool_page_scores(qsum, win, scale, P)[0]
+    else:
+        kp = page_pool(k, cfg.page, "mean") if kstats is None else kstats
+        sc = torch.einsum("bgsd,bgpd->bsp", qsum * scale, kp)[0]
+    pos = q_offset + torch.arange(s, device=q.device)
+    cur = pos // cfg.page
+    p = torch.arange(P, device=q.device)
+    wp = cfg.window // cfg.page
+    sc = sc.masked_fill(~((p[None, :] >= cfg.sink_pages) & (p[None, :] < (cur - wp)[:, None])), float("-inf"))
+    fixed = (p[None, :] < cfg.sink_pages) | ((p[None, :] >= (cur - wp)[:, None]) & (p[None, :] <= cur[:, None]))
+    return (topk_mask(sc, cfg.topk) | fixed) & (p[None, :] <= cur[:, None])
+
+
+def token_span_lists(q, k, cfg: PageSparseConfig, q_offset: int, scale: float, indexer_scores=None, tq: int = 8,
+                     chunk: int = TOKEN_SELECT_CHUNK):
+    """Pure per-token selection of one span (every query its own top-k pages, per KV group) straight into the
+    head-packed kernel's lists: (idx [g, ceil(n / tq), NB] span-local pages, bits [.., NB] tq-bit row words, cnt),
+    selected ``chunk`` queries at a time -- the [n, P] page mask of a whole 256k span is never built."""
+    from .rowmask_attention import lists_from_allowed
+
+    hq, n, g = q.shape[1], q.shape[2], k.shape[1]
+    rep = hq // g
+    if chunk % 64:
+        raise ValueError("token_span_lists: chunk must be a multiple of 64")
+    kstats = [None] * g
+    if indexer_scores is None and cfg.selector in ("page_mean", "page_maxpool"):
+        kstats = [maxpool_windows(k[:, gi:gi + 1], cfg.page) if cfg.selector == "page_maxpool"
+                  else page_pool(k[:, gi:gi + 1], cfg.page, "mean") for gi in range(g)]
+    parts = []
+    for c0 in range(0, n, chunk):
+        c1 = min(n, c0 + chunk)
+        if indexer_scores is None:
+            allowed = torch.stack([token_allowed(q[:, gi * rep:(gi + 1) * rep, c0:c1], k[:, gi:gi + 1], cfg,
+                                                 q_offset + c0, scale, kstats[gi]) for gi in range(g)])
+        else:
+            allowed = torch.stack([select_pages(q[:, gi * rep:(gi + 1) * rep, c0:c1], k[:, gi:gi + 1], cfg,
+                                                q_offset + c0, scale, indexer_scores[:, c0:c1])[0] for gi in range(g)])
+        parts.append(lists_from_allowed(allowed, tq=tq))
+    NB = max(p[0].shape[-1] for p in parts)
+    return tuple(torch.cat([F.pad(p[j], (0, NB - p[j].shape[-1])) if j < 2 else p[j] for p in parts], 1)
+                 for j in range(3))
+
+
+def _token_packed_attention(spans, cfg: PageSparseConfig, scale: float, q_block: int, selections=None,
+                            return_selection: bool = False):
+    """:func:`flex_packed_page_attention`'s rowmask kernel for pure per-token selection (select_block 1, no block
+    candidates, per_group): every query attends its own pages, in head-packed tiles of :func:`token_tile` queries
+    (rowmask_attention.rowmask_head_packed_attention) -- the page union of 8 queries instead of 64 bounds the work.
+    A span's selection is its lists (:func:`token_span_lists`)."""
+    from .rowmask_attention import BM, rowmask_head_packed_attention
+
+    if q_block != BM:
+        raise ValueError(f"rowmask kernel: q_block must be {BM}")
+    page = cfg.page
+    q0, k0 = spans[0][0], spans[0][1]
+    hq, g = q0.shape[1], k0.shape[1]
+    tq = token_tile(hq // g)
+    dev = q0.device
+    with torch.no_grad():
+        sels, qoff, koff = [], [0], [0]
+        for i, (q, k, v, off, idx) in enumerate(spans):
+            sel = selections[i] if selections is not None else None
+            if sel is None:
+                sel = token_span_lists(q, k, cfg, off, scale, idx, tq)
+            sels.append(sel)
+            qoff.append(qoff[-1] + -(-q.shape[2] // q_block) * q_block)
+            koff.append(koff[-1] + -(-k.shape[2] // page) * page)
+        Sq, Sk = qoff[-1], koff[-1]
+        NB = max(s_[0].shape[-1] for s_ in sels)
+        idx_l, bits_l, cnt_l = [], [], []
+        q_abs = torch.full((Sq,), -1, dtype=torch.int32, device=dev)
+        k_abs = torch.full((Sk,), 2**30, dtype=torch.int32, device=dev)
+        for i, (q, k, v, off, _) in enumerate(spans):
+            n, L = q.shape[2], k.shape[2]
+            si, sb, sc = sels[i]
+            nt = (qoff[i + 1] - qoff[i]) // tq  # the span's tiles incl. its padding rows (count 0)
+            pad_t = nt - si.shape[1]
+            idx_l.append(F.pad(si + koff[i] // page, (0, NB - si.shape[-1], 0, pad_t)))
+            bits_l.append(F.pad(sb, (0, NB - sb.shape[-1], 0, pad_t)))
+            cnt_l.append(F.pad(sc, (0, pad_t)))
+            q_abs[qoff[i]:qoff[i] + n] = torch.arange(off, off + n, device=dev, dtype=torch.int32)
+            k_abs[koff[i]:koff[i] + L] = torch.arange(L, device=dev, dtype=torch.int32)
+        idx_t = torch.cat(idx_l, 1).contiguous()
+        bits_t = torch.cat(bits_l, 1).contiguous()
+        cnt_t = torch.cat(cnt_l, 1).contiguous()
+
+    def pad_rows(t, to):  # [1, h, n, d] -> [1, h, to, d]
+        return F.pad(t, (0, 0, 0, to - t.shape[2]))
+
+    qp = torch.cat([pad_rows(sp[0], qoff[i + 1] - qoff[i]) for i, sp in enumerate(spans)], 2)
+    kp = torch.cat([pad_rows(sp[1], koff[i + 1] - koff[i]) for i, sp in enumerate(spans)], 2)
+    vp = torch.cat([pad_rows(sp[2], koff[i + 1] - koff[i]) for i, sp in enumerate(spans)], 2)
+    out = rowmask_head_packed_attention(qp[0], kp[0], vp[0], idx_t, bits_t, cnt_t, q_abs, k_abs, scale, tq,
+                                        page)[None]
     segs = out.split([qoff[i + 1] - qoff[i] for i in range(len(spans))], dim=2)
     outs = [seg[:, :, :sp[0].shape[2]] for seg, sp in zip(segs, spans)]
     return (outs, sels) if return_selection else outs
