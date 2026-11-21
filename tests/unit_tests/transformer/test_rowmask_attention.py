@@ -207,7 +207,7 @@ def test_packed_short_documents_fast_path(kernel):
 
 @pytest.mark.parametrize("rep", [2, 5, 8])
 @pytest.mark.parametrize("tq", [8, 16])
-@pytest.mark.parametrize("D", [64, 128])
+@pytest.mark.parametrize("D", [64, 128, 256])
 def test_head_packed_matches_dense_masked(rep, tq, D):
     """rowmask_head_packed_attention (tiles of tq queries x a KV group's heads, padded to a power of 2) equals dense
     masked attention under per-token, per-group page masks on packed spans with padding rows / keys, forward and
@@ -216,7 +216,7 @@ def test_head_packed_matches_dense_masked(rep, tq, D):
 
     repp = 1 << (rep - 1).bit_length()
     smem = torch.cuda.get_device_properties(0).shared_memory_per_block_optin
-    if tq * repp * D > 64 * 128 and smem < 160 * 1024:
+    if (tq * repp * D > 64 * 128 or D > 128) and smem < 160 * 1024:
         pytest.skip("a 128-row tile at this head dim needs an H100's shared memory")
     torch.manual_seed(0)
     Hk, bn = 2, 64
