@@ -501,6 +501,24 @@ def dense_attention(q, k, v, q_offset: int = 0, scale: float | None = None):
 
 
 # --------------------------------------------------------------------------- learned indexer
+def lightning_scores(qi: torch.Tensor, keys: torch.Tensor, w: torch.Tensor, budget: int = 2 << 30) -> torch.Tensor:
+    """sum_h w[b, s, h] relu(qi[b, s, h, :] . keys[b, n, :]) -> [b, s, n] (the lightning-indexer score; fp32 inputs).
+    Without autograd (inference) the queries go in chunks whose [b, c, h, n] fp32 intermediate stays within ``budget``
+    bytes: one call over a 512k-1M prefill materialised 10-14 GiB (t22 long-context evals OOM'd, 2026-11-21). Each row is
+    independent, so the chunks give the same rows. Under autograd: one einsum, as trained."""
+    b, s, h, _ = qi.shape
+    n = keys.shape[1]
+    c = s if torch.is_grad_enabled() else max(1, budget // max(1, b * h * n * 4))
+    if c >= s:
+        return torch.einsum("bshn,bsh->bsn", torch.relu(torch.einsum("bshd,bnd->bshn", qi, keys)), w)
+    out = qi.new_empty(b, s, n)
+    for c0 in range(0, s, c):
+        c1 = min(s, c0 + c)
+        out[:, c0:c1] = torch.einsum("bshn,bsh->bsn", torch.relu(torch.einsum("bshd,bnd->bshn", qi[:, c0:c1], keys)),
+                                     w[:, c0:c1])
+    return out
+
+
 class PageIndexer(nn.Module):
     """A learned page selector in the lightning-indexer form: index queries (``heads`` x ``dim``) and ONE index
     key per token (``dim``), mean-pooled per page; score(page) = sum_h w_h(x) relu(q_h . k_page). Inference keeps
@@ -524,8 +542,7 @@ class PageIndexer(nn.Module):
         b, s, _ = x_q.shape
         qi = self.wq(x_q).view(b, s, self.heads, self.dim).float()
         w = self.ww(x_q).float()  # [b, s, heads]
-        logits = torch.relu(torch.einsum("bshd,bpd->bshp", qi, page_keys.float()))
-        return torch.einsum("bshp,bsh->bsp", logits, w) * self.dim**-0.5
+        return lightning_scores(qi, page_keys.float(), w) * self.dim**-0.5
 
 
 def indexer_kl_loss(scores: torch.Tensor, target_mass: torch.Tensor, cand: torch.Tensor) -> torch.Tensor:

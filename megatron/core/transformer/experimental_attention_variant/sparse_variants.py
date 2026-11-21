@@ -355,7 +355,7 @@ class CSA2(nn.Module):
         qi = ps._acc(self.idx_q(xq).view(1, s, cfg.index_heads, cfg.index_dim))
         ki = ps._acc(self.idx_k(ps._acc(kc).mean(1).to(self.idx_k.weight.dtype)))  # [1, Lc, dim]
         w = ps._acc(self.idx_w(xq))
-        return torch.einsum("bshn,bsh->bsn", torch.relu(torch.einsum("bshd,bnd->bshn", qi, ki)), w)
+        return ps.lightning_scores(qi, ki, w)
 
     def _anchors(self, s, q_offset, device):
         """Each query's anchor (its selection block's first query, or the chunk's first) as a local index, and
