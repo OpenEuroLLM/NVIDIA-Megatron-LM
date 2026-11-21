@@ -279,8 +279,16 @@ class GPTDataset(MegatronDataset):
             text, _, document_lengths = self._query_document_sample_shuffle_indices(0)
         else:
             text, _, document_lengths = self._query_document_sample_shuffle_indices(idx)
+        return self._sample_from_text(text, document_lengths, padding=idx is None)
 
-        text = torch.from_numpy(text).long()
+    def _sample_from_text(
+        self, text: numpy.ndarray, document_lengths: list, padding: bool = False
+    ) -> Dict[str, torch.Tensor]:
+        """The sample dict of ``sequence_length + add_extra_token_to_sequence`` tokens whose document
+        parts have ``document_lengths`` (summing to len(text)); ``padding``: a batch padding sample
+        (loss masked). Also used by packing_plan.PackingPlanDataset for precomputed sequences."""
+        document_lengths = list(document_lengths)
+        text = torch.from_numpy(numpy.asarray(text)).long()
         if self.config.add_extra_token_to_sequence:
             tokens = text[:-1].contiguous()
             labels = text[1:].contiguous()
@@ -319,7 +327,7 @@ class GPTDataset(MegatronDataset):
         labels[labels == self._pad_token_id] = 0
 
         # Batch padding sequence so we mask the loss
-        if idx is None:
+        if padding:
             loss_mask = torch.zeros_like(loss_mask)
 
         if self.config.inter_document_masking:

@@ -3990,6 +3990,17 @@ def _add_data_args(parser):
                        'there). A sample of k x N tokens then trains exactly as k contiguous '
                        'samples of N tokens in one packed micro-batch: fewer, larger micro-batches '
                        '(packed sequences take micro batch 1) at the same context length N.')
+    group.add_argument('--packing-plan-path', nargs='+', default=None,
+                       help='Packing plan directories (or directories of them): precomputed '
+                       'sequences served in place of the training samples they list '
+                       '(megatron/core/datasets/packing_plan.py; e.g. semantically grouped '
+                       'documents for steps from a given checkpoint on). Sampler, consumed samples '
+                       'and every unlisted sample stay as without the flag.')
+    group.add_argument('--packing-plan-boundaries', choices=['doc', 'group', 'none'], default='doc',
+                       help='cu_seqlens of plan sequences (with --dataloader-inter-document-masking): '
+                       'doc = one segment per document piece, group = one per run of pieces of the '
+                       'same plan group (semantic cluster), none = the whole sequence (attention '
+                       'across documents).')
     group.add_argument('--packed-doc-attention-log-cu-seqlens', type=int, default=0,
                        help='With --dataloader-inter-document-masking, print this rank\'s '
                        'cu_seqlens for the first N calls to get_batch. cu_seqlens is a few '

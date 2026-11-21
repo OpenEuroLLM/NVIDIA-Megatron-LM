@@ -27,6 +27,7 @@ from gpt_builders import gpt_builder
 from megatron.core import mpu
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
+from megatron.core.datasets.packing_plan import wrap_with_packing_plans
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
 from megatron.core.package_info import __version__ as mcore_version
@@ -643,6 +644,8 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
         train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
             dataset_type, train_val_test_num_samples, is_dataset_built, config
         ).build()
+
+    train_ds = wrap_with_packing_plans(train_ds, args)
 
     print_rank_0("> finished creating GPT datasets ...")
 
