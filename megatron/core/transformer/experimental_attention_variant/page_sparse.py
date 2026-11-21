@@ -904,9 +904,24 @@ def token_span_lists(q, k, cfg: PageSparseConfig, q_offset: int, scale: float, i
     if indexer_scores is None and cfg.selector in ("page_mean", "page_maxpool"):
         kstats = [maxpool_windows(k[:, gi:gi + 1], cfg.page) if cfg.selector == "page_maxpool"
                   else page_pool(k[:, gi:gi + 1], cfg.page, "mean") for gi in range(g)]
+    fused = (q.is_cuda and indexer_scores is None and cfg.selector == "page_maxpool" and cfg.hier_group <= 0
+             and cfg.block_candidates <= 0 and cfg.topk > 0 and q.dtype != torch.float64
+             and q.shape[-1] in (16, 32, 64, 128, 256) and not _selects_everything(P, cfg))
     parts = []
     for c0 in range(0, n, chunk):
         c1 = min(n, c0 + chunk)
+        if fused:  # scores + candidates, then the top-k, sinks / window and the lists: two Triton kernels per group
+            from .rowmask_attention import maxpool_page_scores_triton, token_lists_triton
+
+            wp = cfg.window // cfg.page
+            lists = []
+            for gi in range(g):
+                qsum = q[0, gi * rep:(gi + 1) * rep, c0:c1].sum(0, dtype=torch.float32) * scale
+                sc = maxpool_page_scores_triton(qsum.contiguous(), kstats[gi][0, 0].contiguous(), P, q_offset + c0,
+                                                cfg.page, cfg.sink_pages, wp)
+                lists.append(token_lists_triton(sc, cfg.topk, q_offset + c0, cfg.page, cfg.sink_pages, wp, tq, nb))
+            parts.append(tuple(torch.stack([x[j] for x in lists]) for j in range(3)))
+            continue
         if indexer_scores is None:
             allowed = torch.stack([token_allowed(q[:, gi * rep:(gi + 1) * rep, c0:c1], k[:, gi:gi + 1], cfg,
                                                  q_offset + c0, scale, kstats[gi]) for gi in range(g)])

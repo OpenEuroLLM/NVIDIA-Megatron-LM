@@ -573,3 +573,58 @@ def maxpool_page_scores_triton(qsum: torch.Tensor, win: torch.Tensor, P: int, q_
                                  wp, qsum.stride(0) if qsum.is_contiguous() else d, d, P,
                                  D=d, BQ=BQ, BP=BP, IEEE=ieee, num_warps=4)
     return out
+
+
+@triton.jit
+def _token_lists_kernel(SC, V, IDX, BITS, CNT, S, P, NB, q_offset, page, sink, wp, n,
+                        TQ: tl.constexpr, BP: tl.constexpr):
+    t = tl.program_id(0)
+    rows = t * TQ + tl.arange(0, TQ)
+    rmask = rows < S
+    v = tl.load(V + rows, mask=rmask, other=float("inf"))
+    cur = (q_offset + rows) // page
+    ngt = tl.zeros([TQ], tl.int32)
+    for p0 in range(0, P, BP):  # each row's count above its n-th largest score
+        p = p0 + tl.arange(0, BP)
+        s = tl.load(SC + rows[:, None] * P + p[None, :], mask=rmask[:, None] & (p < P)[None, :], other=float("-inf"))
+        ngt += tl.sum((s > v[:, None]).to(tl.int32), 1)
+    room = n - ngt
+    ties = tl.zeros([TQ], tl.int32)
+    count = tl.zeros([1], tl.int32)
+    shift = tl.arange(0, TQ).to(tl.int64)
+    for p0 in range(0, P, BP):
+        p = p0 + tl.arange(0, BP)
+        pin = p < P
+        s = tl.load(SC + rows[:, None] * P + p[None, :], mask=rmask[:, None] & pin[None, :], other=float("-inf"))
+        gt = s > v[:, None]
+        eq = (s == v[:, None]) & (s > float("-inf"))
+        teq = tl.cumsum(eq.to(tl.int32), 1) + ties[:, None]  # the ties of the n-th value: lowest pages first
+        sel = gt | (eq & (teq <= room[:, None]))
+        ties += tl.sum(eq.to(tl.int32), 1)
+        fixed = (p[None, :] < sink) | ((p[None, :] >= (cur - wp)[:, None]) & (p[None, :] <= cur[:, None]))
+        allowed = (sel | fixed) & (p[None, :] <= cur[:, None]) & rmask[:, None] & pin[None, :]
+        word = tl.sum(allowed.to(tl.int64) << shift[:, None], 0)  # [BP]: bit i = row i
+        blk = word != 0
+        slot = count + tl.cumsum(blk.to(tl.int32), 0) - 1
+        tl.store(IDX + t * NB + slot, p, mask=blk)
+        tl.store(BITS + t * NB + slot, word, mask=blk)
+        count += tl.sum(blk.to(tl.int32), 0)
+    tl.store(CNT + t + tl.arange(0, 1), count)
+
+
+def token_lists_triton(sc: torch.Tensor, n: int, q_offset: int, page: int, sink: int, wp: int, tq: int, nb: int):
+    """One KV group's per-token selection straight into head-packed lists: sc [s, P] fp32 page scores with -inf
+    outside the candidates (:func:`maxpool_page_scores_triton`) -> (idx [ceil(s / tq), nb] int32, bits int64 tq-bit
+    row words, cnt int32) of each tile's pages, ascending: its rows' top-n pages (page_sparse.topk_mask: ties to the
+    lower page), sinks and window pages. Replaces the [s, P] masks and their packing / compaction (the per-token
+    selection's remaining passes); ``nb`` a static bound of a tile's pages (no host sync)."""
+    s, P = sc.shape
+    nt = -(-s // tq)
+    n = min(n, P)
+    v = sc.topk(n, dim=-1).values[:, -1].contiguous() if n > 0 else torch.full((s,), float("inf"), device=sc.device)
+    idx = torch.zeros(nt, nb, dtype=torch.int32, device=sc.device)
+    bits = torch.zeros(nt, nb, dtype=torch.int64, device=sc.device)
+    cnt = torch.empty(nt, dtype=torch.int32, device=sc.device)
+    _token_lists_kernel[(nt,)](sc, v, idx, bits, cnt, s, P, nb, q_offset, page, sink, wp, n, TQ=tq, BP=64,
+                               num_warps=4)
+    return idx, bits, cnt

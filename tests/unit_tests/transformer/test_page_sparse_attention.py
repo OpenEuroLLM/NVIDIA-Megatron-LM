@@ -566,3 +566,28 @@ def test_token_allowed_equals_select_pages(selector, off):
         kst = ps.maxpool_windows(k, 64) if selector == "page_maxpool" else ps.page_pool(k, 64, "mean")
         got = ps.token_allowed(q, k, cfg, off, 0.2, kst)
         torch.testing.assert_close(got, ps.select_pages(q, k, cfg, off, 0.2)[0])
+
+
+@pytest.mark.parametrize("tq", [8, 16])
+@pytest.mark.parametrize("off", [0, 320])
+def test_token_span_lists_fused_equals_select_pages(tq, off):
+    """token_span_lists' fused path (Triton scores + top-k / sinks / window -> lists) lists exactly the pages
+    select_pages chooses per query (per KV group, ties to the lower page incl. quantized keys), over several selection
+    chunks and a CP-like offset."""
+    from megatron.core.transformer.experimental_attention_variant import rowmask_attention as ra
+
+    torch.manual_seed(tq + off)
+    L, g, rep = 2600, 2, 4
+    cfg = ps.PageSparseConfig(selector="page_maxpool", page=64, topk=5, window=128, sink_pages=1, select_block=1)
+    q = torch.randn(1, g * rep, L - off, 32, device="cuda", dtype=torch.bfloat16)
+    for k in (torch.randn(1, g, L, 32, device="cuda", dtype=torch.bfloat16),
+              torch.randint(-1, 2, (1, g, L, 32), device="cuda").to(torch.bfloat16)):
+        idx, bits, cnt = ps.token_span_lists(q, k, cfg, off, 0.2, None, tq, chunk=1024)
+        ref = torch.stack([ps.select_pages(q[:, gi * rep:(gi + 1) * rep].float(), k[:, gi:gi + 1].float(), cfg, off,
+                                           0.2)[0] for gi in range(g)])
+        r_idx, r_bits, r_cnt = ra.lists_from_allowed(ref, tq=tq)
+        torch.testing.assert_close(cnt, r_cnt)
+        nb = r_idx.shape[-1]
+        valid = torch.arange(nb, device="cuda")[None, None] < r_cnt[..., None]
+        torch.testing.assert_close(torch.where(valid, idx[..., :nb], 0), torch.where(valid, r_idx, 0))
+        torch.testing.assert_close(torch.where(valid, bits[..., :nb], 0), torch.where(valid, r_bits, 0))
