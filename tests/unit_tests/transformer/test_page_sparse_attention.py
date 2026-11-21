@@ -651,3 +651,34 @@ def test_packed_block_selection_equals_per_span(seed, per_group, selector):
         for la, lb in zip(res[0][1], res[1][1]):
             for a, b in zip(la, lb):
                 assert torch.equal(a, b)
+
+
+@pytest.mark.parametrize("hq", [16, 4])
+def test_token_packed_select_equals_per_span(hq):
+    """The per-token rowmask path's packed selection (every span in one pass) gives bit-identical outputs and q / k / v
+    gradients to the per-span selection on a mixed layout: long documents, short ones (the dense fast path), a span
+    whose length is not a page multiple and a CP-like chunk with an offset; quantized keys (score ties) too."""
+    torch.manual_seed(11)
+    g, d = 2, 32
+    cfg = ps.PageSparseConfig(selector="page_maxpool", page=64, topk=3, window=128, sink_pages=1, select_block=1,
+                              per_group=True)
+    for quant in (False, True):
+        spans = []
+        for L, off in [(1300, 0), (200, 0), (2050, 0), (130, 0), (900, 320), (777, 0)]:
+            q = torch.randn(1, hq, L - off, d, device="cuda", dtype=torch.bfloat16)
+            k = torch.randn(1, g, L, d, device="cuda", dtype=torch.bfloat16)
+            if quant:
+                k = k.round().clamp(-1, 1)
+            v = torch.randn(1, g, L, d, device="cuda", dtype=torch.bfloat16)
+            spans.append((q, k, v, off, None))
+
+        def run(packed):
+            leaves = [[t.clone().requires_grad_() for t in sp[:3]] for sp in spans]
+            outs = ps.flex_packed_page_attention([(*lv, sp[3], None) for lv, sp in zip(leaves, spans)], cfg, d**-0.5,
+                                                 64, kernel="rowmask", packed_select=packed)
+            gen = torch.Generator(device="cuda").manual_seed(3)
+            sum((o.float() * torch.randn(o.shape, device="cuda", generator=gen)).sum() for o in outs).backward()
+            return [o.detach() for o in outs] + [t.grad for lv in leaves for t in lv]
+
+        for a, b in zip(run(True), run(False)):
+            torch.testing.assert_close(a, b, atol=0, rtol=0)

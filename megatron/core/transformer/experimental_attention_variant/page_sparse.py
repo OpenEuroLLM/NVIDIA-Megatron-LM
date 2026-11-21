@@ -197,7 +197,9 @@ def maxpool_windows(k: torch.Tensor, page: int) -> torch.Tensor:
     st, sub = page // 4, page // 2
     # each window the sum of two adjacent quarter-page sums (a cumsum over the keys was 72 % of the selection:
     # torch's outer-dim scan, 17.6 ms per KV group at 64k, 2026-11-20)
-    qs = F.pad(_acc(k), (0, 0, 0, (4 * P + 2) * st - L)).view(b, g, 4 * P + 2, st, d).sum(3)
+    # summed in fp32 without an fp32 copy of the keys (the packed per-token path sums the same way: equal windows)
+    acc = torch.float64 if k.dtype == torch.float64 else torch.float32
+    qs = F.pad(k, (0, 0, 0, (4 * P + 2) * st - L)).view(b, g, 4 * P + 2, st, d).sum(3, dtype=acc)
     return (qs[:, :, :-1] + qs[:, :, 1:]) / sub
 
 
@@ -712,6 +714,8 @@ def flex_packed_page_attention(spans, cfg: PageSparseConfig, scale: float, q_blo
             rm = None
         if rm is not None:
             rm.warm_dense_docs(q0.shape[1], k0.shape[1], q0.shape[3], q0.device, q0.dtype)
+            if _token_packed_applies(cfg, kernel, k0.shape[1]):
+                warm_token_kernels(cfg, q0.shape[1], k0.shape[1], q0.shape[3], q0.device, q0.dtype)
     if selections is None and not return_selection:
         # documents short enough to attend every page (the sparse result is dense causal attention within them): all
         # in ONE call packed without padding -- per-span selection, padding and lists made the many-document
@@ -763,7 +767,7 @@ def flex_packed_page_attention(spans, cfg: PageSparseConfig, scale: float, q_blo
     G = g if per_group else 1
     dev = q0.device
     if kernel == "rowmask" and per_group and cfg.select_block <= 1 and cfg.block_candidates <= 0:
-        return _token_packed_attention(spans, cfg, scale, q_block, selections, return_selection)
+        return _token_packed_attention(spans, cfg, scale, q_block, selections, return_selection, packed_select)
     if packed_select and _packed_select_applies(spans, cfg, selections, return_selection):
         return _packed_block_attention(spans, cfg, scale, q_block, kernel, per_group, G, rep)
     with torch.no_grad():
@@ -1124,8 +1128,119 @@ def token_span_lists(q, k, cfg: PageSparseConfig, q_offset: int, scale: float, i
                  for j in range(3))
 
 
+_TOKEN_TABLES: dict = {}
+
+
+def _token_tables(layout, page: int, dev):
+    """The packed per-token layout's tables for the spans ``layout`` = ((n, L, q_offset), ...), from the host span
+    lengths (no device sync), one pinned copy, cached per layout (a micro-batch's attention layers, their recompute
+    and backward share it): q_abs [Sq] / k_abs [Sk] int32 (position in the span; -1 / 2**30 for padding), tile_p0 /
+    tile_np [Sq / 64] int32 (each 64-row tile's span's first page in the layout, its page count), span_end_q [4 Pk]
+    bool (each span's last quarter page but the final span's: its window must not reach into the next span)."""
+    key = (layout, page, str(dev))
+    hit = _TOKEN_TABLES.get(key)
+    if hit is not None:
+        return hit
+    t = torch.tensor(layout, dtype=torch.int64).view(-1, 3)
+    n, L, off = t[:, 0], t[:, 1], t[:, 2]
+    sid = torch.arange(n.shape[0])
+    qlen = (n + 63) // 64 * 64
+    P = (L + page - 1) // page
+    qoff = torch.cumsum(qlen, 0) - qlen
+    c = torch.cumsum(P, 0) - P
+    Sq, Pk = int(qlen.sum()), int(P.sum())
+    Sk = Pk * page
+    rs = torch.repeat_interleave(sid, qlen)
+    tl_ = torch.arange(Sq) - qoff[rs]
+    q_abs = torch.where(tl_ < n[rs], off[rs] + tl_, -1)
+    ks = torch.repeat_interleave(sid, P * page)
+    tk = torch.arange(Sk) - c[ks] * page
+    k_abs = torch.where(tk < L[ks], tk, 2**30)
+    ts = rs[::64]
+    tile_p0, tile_np = c[ts], P[ts]
+    span_end_q = torch.zeros(4 * Pk, dtype=torch.bool)
+    span_end_q[4 * c[1:] - 1] = True
+    ints = [q_abs, k_abs, tile_p0, tile_np]
+    sizes = [x.numel() for x in ints]
+    host = torch.cat(ints).to(torch.int32)
+    if dev.type == "cuda":
+        host, span_end_q = host.pin_memory(), span_end_q.pin_memory()
+    q_abs, k_abs, tile_p0, tile_np = host.to(dev, non_blocking=True).split(sizes)
+    out = dict(q_abs=q_abs, k_abs=k_abs, tile_p0=tile_p0, tile_np=tile_np,
+               span_end_q=span_end_q.to(dev, non_blocking=True), qoff=[0] + torch.cumsum(qlen, 0).tolist(),
+               koff=[0] + (torch.cumsum(P, 0) * page).tolist(), Sq=Sq, Pk=Pk, PM=int(P.max()))
+    _TOKEN_TABLES[key] = out
+    while len(_TOKEN_TABLES) > 4:
+        _TOKEN_TABLES.pop(next(iter(_TOKEN_TABLES)))
+    return out
+
+
+_TOKEN_WARMED: set = set()
+
+
+def _token_packed_applies(cfg: PageSparseConfig, kernel: str, g: int) -> bool:
+    """Pure per-token selection on the rowmask kernel (:func:`_token_packed_attention`)."""
+    return (kernel == "rowmask" and cfg.per_group and g > 1 and cfg.selector != "window" and cfg.select_block <= 1
+            and cfg.block_candidates <= 0)
+
+
+def warm_token_kernels(cfg: PageSparseConfig, hq: int, hk: int, d: int, device, dtype) -> None:
+    """Compile / load the per-token path's Triton kernels (selection, head-packed forward / dq / dk-dv, delta) once per
+    process and shape, on every rank at the first sparse call: a rank first meeting a long document mid-run would
+    otherwise stall every other rank while it compiles (cf. rowmask_attention.warm_dense_docs). The kernels have fixed
+    launch configs (no autotune). Zero inputs, no RNG (a recompute replays the forward's random stream)."""
+    key = (str(device), dtype, hq, hk, d, cfg.page, cfg.topk, cfg.window, cfg.sink_pages, cfg.selector)
+    if key in _TOKEN_WARMED:
+        return
+    _TOKEN_WARMED.add(key)
+    n = (cfg.sink_pages + cfg.window // cfg.page + cfg.topk + 4) * cfg.page  # long enough to select
+    with torch.enable_grad():
+        q = torch.zeros(1, hq, n, d, device=device, dtype=dtype, requires_grad=True)
+        k = torch.zeros(1, hk, n, d, device=device, dtype=dtype, requires_grad=True)
+        v = torch.zeros(1, hk, n, d, device=device, dtype=dtype, requires_grad=True)
+        out = _token_packed_attention([(q, k, v, 0, None)], cfg, d**-0.5, 64)[0]
+        out.float().sum().backward()
+
+
+TOKEN_PACKED_SCORE_BYTES = 128 << 20  # the packed per-token selection's score buffer [G, chunk, PM] fp32
+
+
+def _token_packed_select_attention(spans, cfg: PageSparseConfig, scale: float, tq: int):
+    """:func:`_token_packed_attention` with every span's selection in one pass over the packed layout
+    (rowmask_attention.token_lists_packed: the scores, one top-k and the lists per row chunk, no per-span or per-group
+    launches; the per-span loop made many-document ranks CPU-bound). Same lists as the per-span path."""
+    rm = _rowmask()
+    page, wp = cfg.page, cfg.window // cfg.page
+    hq, g, d = spans[0][0].shape[1], spans[0][1].shape[1], spans[0][0].shape[-1]
+    rep = hq // g
+    dev = spans[0][0].device
+    tb = _token_tables(tuple((sp[0].shape[2], sp[1].shape[2], sp[3]) for sp in spans), page, dev)
+    qoff, koff, Sq, Pk, PM = tb["qoff"], tb["koff"], tb["Sq"], tb["Pk"], tb["PM"]
+    qp, kp, vp = _packed_qkv(spans, qoff, koff)
+    with torch.no_grad():
+        acc = torch.float64 if qp.dtype == torch.float64 else torch.float32
+        qsum = qp[0].view(g, rep, Sq, d).sum(1, dtype=acc) * scale  # [G, Sq, d]
+        st = page // 4
+        qq = F.pad(kp[0].view(g, 4 * Pk, st, d).sum(2, dtype=acc), (0, 0, 0, 1))  # [G, 4 Pk + 1, d] quarter sums
+        nxt = qq[:, 1:].masked_fill(tb["span_end_q"].view(1, -1, 1), 0.0)  # a span's last window: zero padding
+        win = (qq[:, :-1] + nxt) / (page // 2)  # [G, 4 Pk, d]
+        nb = min(PM, tq * (cfg.topk + cfg.sink_pages + wp + 1))
+        nt = Sq // tq
+        idx = torch.zeros(g, nt, nb, dtype=torch.int32, device=dev)
+        bits = torch.zeros(g, nt, nb, dtype=torch.int64, device=dev)
+        cnt = torch.zeros(g, nt, dtype=torch.int32, device=dev)
+        chunk = max(64, TOKEN_PACKED_SCORE_BYTES // (4 * g * PM) // 64 * 64)
+        rm.token_lists_packed(qsum.float().contiguous(), win.float().contiguous(), tb["q_abs"], tb["tile_p0"],
+                              tb["tile_np"], PM, cfg.topk, page, cfg.sink_pages, wp, tq, idx, bits, cnt, chunk)
+        del qsum, qq, nxt, win
+    out = rm.rowmask_head_packed_attention(qp[0], kp[0], vp[0], idx, bits, cnt, tb["q_abs"], tb["k_abs"], scale, tq,
+                                           page)[None]
+    segs = out.split([qoff[i + 1] - qoff[i] for i in range(len(spans))], dim=2)
+    return [seg[:, :, :sp[0].shape[2]] for seg, sp in zip(segs, spans)]
+
+
 def _token_packed_attention(spans, cfg: PageSparseConfig, scale: float, q_block: int, selections=None,
-                            return_selection: bool = False):
+                            return_selection: bool = False, packed_select: bool = True):
     """:func:`flex_packed_page_attention`'s rowmask kernel for pure per-token selection (select_block 1, no block
     candidates, per_group): every query attends its own pages, in head-packed tiles of :func:`token_tile` queries
     (rowmask_attention.rowmask_head_packed_attention) -- the page union of 8 queries instead of 64 bounds the work.
@@ -1140,6 +1255,11 @@ def _token_packed_attention(spans, cfg: PageSparseConfig, scale: float, q_block:
     hq, g = q0.shape[1], k0.shape[1]
     tq = token_tile(hq // g, q0.device)
     dev = q0.device
+    if (packed_select and selections is None and not return_selection and cfg.selector == "page_maxpool"
+            and cfg.topk > 0 and cfg.hier_group <= 0 and q0.is_cuda and q0.shape[-1] in (16, 32, 64, 128, 256)
+            and all(sp[4] is None for sp in spans)
+            and not any(_selects_everything(-(-sp[1].shape[2] // page), cfg) for sp in spans)):
+        return _token_packed_select_attention(spans, cfg, scale, tq)
     with torch.no_grad():
         sels, qoff, koff = [], [0], [0]
         for i, (q, k, v, off, idx) in enumerate(spans):

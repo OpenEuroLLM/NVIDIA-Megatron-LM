@@ -172,8 +172,7 @@ def _dkv_kernel(Q, K, V, DO, LSE, DELTA, DK, DV, CSR_OFF, CSR_R, CSR_B, QPOS, KP
 # share the group's selection, so every key block is loaded once for all heads, and the tile's page union is that of
 # TQ queries instead of 64 -- pure per-token selection (every query its own pages) has a much smaller union per 8
 # queries than per 64. Row m = query m // REPP, head m % REPP; a bit word per (tile, key block) has TQ bits.
-@triton.autotune(configs=_CONFIGS, key=['D', 'REP', 'REPP', 'TQ'])
-@triton.jit
+@triton.jit(do_not_specialize=['scale', 'Sq', 'Sk', 'NT', 'NB'])
 def _fwd_hp_kernel(Q, K, V, O, LSE, IDX, BITS, CNT, QPOS, KPOS, QLO, scale,
                    Sq, Sk, NT, NB,
                    sqh, sqs, skh, sks, soh, sos,
@@ -223,8 +222,7 @@ def _fwd_hp_kernel(Q, K, V, O, LSE, IDX, BITS, CNT, QPOS, KPOS, QLO, scale,
     tl.store(LSE + h * Sq + rows, lse, mask=rmask)
 
 
-@triton.autotune(configs=_CONFIGS, key=['D', 'REP', 'REPP', 'TQ'])
-@triton.jit
+@triton.jit(do_not_specialize=['scale', 'Sq', 'Sk', 'NT', 'NB'])
 def _dq_hp_kernel(Q, K, V, DO, LSE, DELTA, DQ, IDX, BITS, CNT, QPOS, KPOS, QLO, scale,
                   Sq, Sk, NT, NB,
                   sqh, sqs, skh, sks, soh, sos,
@@ -269,12 +267,12 @@ def _dq_hp_kernel(Q, K, V, DO, LSE, DELTA, DQ, IDX, BITS, CNT, QPOS, KPOS, QLO, 
              mask=rmask[:, None])
 
 
-@triton.autotune(configs=_CONFIGS, key=['D', 'REP', 'REPP', 'TQ'])
-@triton.jit
+@triton.jit(do_not_specialize=['scale', 'Sq', 'Sk', 'NKB'])
 def _dkv_hp_kernel(Q, K, V, DO, LSE, DELTA, DK, DV, CSR_OFF, CSR_R, CSR_B, QPOS, KPOS, QLO, scale,
                    Sq, Sk, NKB,
                    sqh, sqs, skh, sks, soh, sos,
-                   REP: tl.constexpr, REPP: tl.constexpr, TQ: tl.constexpr, D: tl.constexpr, BN: tl.constexpr):
+                   REP: tl.constexpr, REPP: tl.constexpr, TQ: tl.constexpr, D: tl.constexpr, BN: tl.constexpr,
+                   MC: tl.constexpr):
     pb = tl.program_id(0)  # key block
     hk = tl.program_id(1)
     cols = pb * BN + tl.arange(0, BN)
@@ -285,37 +283,85 @@ def _dkv_hp_kernel(Q, K, V, DO, LSE, DELTA, DK, DV, CSR_OFF, CSR_R, CSR_B, QPOS,
     kpos = tl.load(KPOS + cols, mask=cmask, other=2147483647)
     dk = tl.zeros([BN, D], tl.float32)
     dv = tl.zeros([BN, D], tl.float32)
-    m = tl.arange(0, TQ * REPP)
-    qi = m // REPP
-    hh = m % REPP
-    h = hk * REP + hh
-    shift = qi.to(tl.int64)
     e0 = tl.load(CSR_OFF + hk * (NKB + 1) + pb)
     e1 = tl.load(CSR_OFF + hk * (NKB + 1) + pb + 1)
     for e in range(e0, e1):
         r = tl.load(CSR_R + e)
         b = tl.load(CSR_B + e)
-        rows = r * TQ + qi
-        rin = rows < Sq
-        rmask = rin & (hh < REP)
-        qpos = tl.load(QPOS + rows, mask=rin, other=-1)
-        qlo = tl.load(QLO + rows, mask=rin, other=0)
-        rowbit = ((b >> shift) & 1) != 0
-        ok = (rowbit & rmask)[:, None] & (kpos[None, :] <= qpos[:, None]) & (kpos[None, :] >= qlo[:, None])
-        q = tl.load(Q + h[:, None] * sqh + rows[:, None] * sqs + dd[None, :], mask=rmask[:, None], other=0.0)
-        do = tl.load(DO + h[:, None] * soh + rows[:, None] * sos + dd[None, :], mask=rmask[:, None], other=0.0)
-        lse = tl.load(LSE + h * Sq + rows, mask=rmask, other=float("-inf"))
-        lse2 = tl.where(lse == float("-inf"), float("inf"), lse) * 1.4426950408889634
-        delta = tl.load(DELTA + h * Sq + rows, mask=rmask, other=0.0)
-        s = tl.dot(q, tl.trans(kb)) * (scale * 1.4426950408889634)
-        pij = tl.where(ok, tl.exp2(s - lse2[:, None]), 0.0)  # [M rows, BN keys]
-        dv += tl.dot(tl.trans(pij.to(do.dtype)), do)
-        dp = tl.dot(do, tl.trans(vb))
-        ds = pij * (dp - delta[:, None])
-        dk += tl.dot(tl.trans(ds.to(q.dtype)), q)
+        # the tile's TQ * REPP rows in chunks of MC: [MC, D] operand tiles instead of [TQ * REPP, D] (register
+        # spills at head dim 256 grow the context's local memory for good -- non-PyTorch memory, 2026-11-21)
+        for c in tl.static_range(TQ * REPP // MC):
+            m = c * MC + tl.arange(0, MC)
+            qi = m // REPP
+            hh = m % REPP
+            h = hk * REP + hh
+            rows = r * TQ + qi
+            rin = rows < Sq
+            rmask = rin & (hh < REP)
+            qpos = tl.load(QPOS + rows, mask=rin, other=-1)
+            qlo = tl.load(QLO + rows, mask=rin, other=0)
+            rowbit = ((b >> qi.to(tl.int64)) & 1) != 0
+            ok = (rowbit & rmask)[:, None] & (kpos[None, :] <= qpos[:, None]) & (kpos[None, :] >= qlo[:, None])
+            q = tl.load(Q + h[:, None] * sqh + rows[:, None] * sqs + dd[None, :], mask=rmask[:, None], other=0.0)
+            do = tl.load(DO + h[:, None] * soh + rows[:, None] * sos + dd[None, :], mask=rmask[:, None], other=0.0)
+            lse = tl.load(LSE + h * Sq + rows, mask=rmask, other=float("-inf"))
+            lse2 = tl.where(lse == float("-inf"), float("inf"), lse) * 1.4426950408889634
+            delta = tl.load(DELTA + h * Sq + rows, mask=rmask, other=0.0)
+            s = tl.dot(q, tl.trans(kb)) * (scale * 1.4426950408889634)
+            pij = tl.where(ok, tl.exp2(s - lse2[:, None]), 0.0)  # [MC rows, BN keys]
+            dv += tl.dot(tl.trans(pij.to(do.dtype)), do)
+            dp = tl.dot(do, tl.trans(vb))
+            ds = pij * (dp - delta[:, None])
+            dk += tl.dot(tl.trans(ds.to(q.dtype)), q)
     tl.store(DK + hk * skh + cols[:, None] * sks + dd[None, :], (dk * scale).to(DK.dtype.element_ty),
              mask=cmask[:, None])
     tl.store(DV + hk * skh + cols[:, None] * sks + dd[None, :], dv.to(DV.dtype.element_ty), mask=cmask[:, None])
+
+
+# fixed launch configs of the head-packed kernels, (num_warps, num_stages[, MC]) by (kernel, head dim, tile rows):
+# no autotune -- autotuning launches every candidate once, and a candidate that spills registers grows the CUDA
+# context's local memory for the rest of the process (~+4 GB non-PyTorch memory per GPU at v4b shapes: the 64-node
+# per-token run OOMed at step 5, t19g / t19j 2026-11-21), and a rank first meeting a kernel mid-run stalls every
+# other rank while it benchmarks. ROWMASK_HP_CONFIG="fwd=8,2;dq=8,1;dkv=8,1,64" overrides (benchmarks).
+_HP_CONFIG = {
+    "fwd": {"default": (8, 2)},
+    "dq": {"default": (8, 1)},
+    "dkv": {"default": (8, 1, 64)},
+}
+
+
+def _hp_config(kind: str, D: int, rows: int):
+    env = os.environ.get("ROWMASK_HP_CONFIG", "")
+    for part in filter(None, env.split(";")):
+        name, _, vals = part.partition("=")
+        if name.strip() == kind:
+            return tuple(int(x) for x in vals.split(","))
+    table = _HP_CONFIG[kind]
+    return table.get((D, rows), table["default"])
+
+
+@triton.jit(do_not_specialize=['N'])
+def _delta_kernel(DO, O, DELTA, N, D: tl.constexpr, BR: tl.constexpr):
+    r = tl.program_id(0) * BR + tl.arange(0, BR)
+    rm = r < N
+    dd = tl.arange(0, D)
+    do = tl.load(DO + r[:, None] * D + dd[None, :], mask=rm[:, None], other=0.0).to(tl.float32)
+    o = tl.load(O + r[:, None] * D + dd[None, :], mask=rm[:, None], other=0.0).to(tl.float32)
+    tl.store(DELTA + r, tl.sum(do * o, 1), mask=rm)
+
+
+def row_delta(do: torch.Tensor, o: torch.Tensor) -> torch.Tensor:
+    """The backward's delta = rowsum(dO * O) [Hq, Sq] fp32 from contiguous [Hq, Sq, D] tensors, without fp32 copies:
+    (do.float() * o.float()).sum(-1) made three [Hq, Sq, D] fp32 temporaries -- 3 GB per attention layer at v4b's 64k
+    (the 64-node per-token run's OOM, t19g / t19j 2026-11-21)."""
+    Hq, Sq, D = o.shape
+    if D & (D - 1) or not o.is_cuda:
+        return (do.float() * o.float()).sum(-1)
+    delta = torch.empty(Hq, Sq, device=o.device, dtype=torch.float32)
+    N = Hq * Sq
+    BR = max(1, 4096 // D)
+    _delta_kernel[(triton.cdiv(N, BR),)](do.contiguous(), o.contiguous(), delta, N, D=D, BR=BR, num_warps=4)
+    return delta
 
 
 def _csr(idx, bits, cnt, nkb):
@@ -362,7 +408,7 @@ class _RowMaskAttention(torch.autograd.Function):
         Hq, Sq, D = q.shape
         Hk, Sk, _ = k.shape
         do = do.contiguous()
-        delta = (do.float() * o.float()).sum(-1)  # [Hq, Sq]
+        delta = row_delta(do, o)  # [Hq, Sq]
         nq, NB = -(-Sq // BM), idx.shape[2]
         rep = Hq // Hk
         dq = torch.empty_like(q)
@@ -389,9 +435,10 @@ class _RowMaskHeadPacked(torch.autograd.Function):
         nt, NB = idx.shape[1], idx.shape[2]
         o = torch.empty_like(q)
         lse = torch.empty(Hq, Sq, device=q.device, dtype=torch.float32)
+        w, st = _hp_config("fwd", D, tq * repp)[:2]
         _fwd_hp_kernel[(nt, Hk)](q, k, v, o, lse, idx, bits, cnt, q_pos, k_pos, q_lo, scale, Sq, Sk, nt, NB,
                                  q.stride(0), q.stride(1), k.stride(0), k.stride(1), o.stride(0), o.stride(1),
-                                 REP=rep, REPP=repp, TQ=tq, D=D, BN=bn)
+                                 REP=rep, REPP=repp, TQ=tq, D=D, BN=bn, num_warps=w, num_stages=st)
         ctx.save_for_backward(q, k, v, o, lse, idx, bits, cnt, q_pos, k_pos, q_lo)
         ctx.scale, ctx.tq, ctx.bn, ctx.rep, ctx.repp = scale, tq, bn, rep, repp
         return o
@@ -402,19 +449,22 @@ class _RowMaskHeadPacked(torch.autograd.Function):
         Hq, Sq, D = q.shape
         Hk, Sk, _ = k.shape
         do = do.contiguous()
-        delta = (do.float() * o.float()).sum(-1)  # [Hq, Sq]
+        delta = row_delta(do, o)  # [Hq, Sq]
         nt, NB = idx.shape[1], idx.shape[2]
         kw = dict(REP=ctx.rep, REPP=ctx.repp, TQ=ctx.tq, D=D, BN=ctx.bn)
         dq = torch.empty_like(q)
+        rows = ctx.tq * ctx.repp
+        w, st = _hp_config("dq", D, rows)[:2]
         _dq_hp_kernel[(nt, Hk)](q, k, v, do, lse, delta, dq, idx, bits, cnt, q_pos, k_pos, q_lo, ctx.scale, Sq, Sk,
                                 nt, NB, q.stride(0), q.stride(1), k.stride(0), k.stride(1), do.stride(0),
-                                do.stride(1), **kw)
+                                do.stride(1), **kw, num_warps=w, num_stages=st)
         nkb = -(-Sk // ctx.bn)
         off, rr, bb = _csr(idx, bits, cnt, nkb)
         dk, dv = torch.empty_like(k), torch.empty_like(v)
+        w, st, mc = _hp_config("dkv", D, rows)
         _dkv_hp_kernel[(nkb, Hk)](q, k, v, do, lse, delta, dk, dv, off, rr, bb, q_pos, k_pos, q_lo, ctx.scale, Sq,
                                   Sk, nkb, q.stride(0), q.stride(1), k.stride(0), k.stride(1), do.stride(0),
-                                  do.stride(1), **kw)
+                                  do.stride(1), **kw, MC=min(mc, rows), num_warps=w, num_stages=st)
         return dq, dk, dv, None, None, None, None, None, None, None, None, None
 
 
@@ -651,3 +701,125 @@ def token_lists_triton(sc: torch.Tensor, n: int, q_offset: int, page: int, sink:
     _token_lists_kernel[(nt,)](sc, v, idx, bits, cnt, s, P, nb, q_offset, page, sink, wp, n, TQ=tq, BP=64,
                                num_warps=4)
     return idx, bits, cnt
+
+
+# ------------------------------------------------------------------------- per-token selection, packed layout
+# Every span of a packed batch at once (the per-span loop's launches made many-document ranks CPU-bound stragglers):
+# spans' queries start at multiples of 64 rows and their keys at multiples of the page, so a 64-row tile lies in one
+# span; per tile its span's first page (TP0, in the packed layout) and page count (TPN); per row its position in its
+# span (QPOS, -1 for padding). Scores are span-local pages [rows, PM] (PM = the longest span's pages, -inf beyond).
+@triton.jit(do_not_specialize=['R', 'PM', 'NW'])
+def _maxpool_scores_packed_kernel(QS, WIN, OUT, QPOS, TP0, TPN, R, PM, NW, page, sink, wp,
+                                  sqg, sqs, swg, sws, sog, sos,
+                                  D: tl.constexpr, BQ: tl.constexpr, BP: tl.constexpr, IEEE: tl.constexpr):
+    pq = tl.program_id(0)
+    pp = tl.program_id(1)
+    g = tl.program_id(2)
+    rows = pq * BQ + tl.arange(0, BQ)
+    rmask = rows < R
+    p = pp * BP + tl.arange(0, BP)
+    p0 = tl.load(TP0 + pq)
+    psp = tl.load(TPN + pq)
+    if pp * BP < psp:
+        dd = tl.arange(0, D)
+        q = tl.load(QS + g * sqg + rows[:, None] * sqs + dd[None, :], mask=rmask[:, None], other=0.0)
+        jl = pp * 4 * BP + tl.arange(0, 4 * BP)  # span-local windows 4p .. 4p + 3 of the tile's pages
+        jok = jl < 4 * psp
+        w = tl.load(WIN + g * swg + (4 * p0 + jl)[:, None] * sws + dd[None, :], mask=jok[:, None], other=0.0)
+        jp = 4 * p - 1  # each page's fifth window (its left neighbour's last); page 0's is the span's padding
+        jpok = (jp >= 0) & (p < psp)
+        wl = tl.load(WIN + g * swg + (4 * p0 + jp)[:, None] * sws + dd[None, :], mask=jpok[:, None], other=0.0)
+        if IEEE:
+            sm = tl.dot(q, tl.trans(w), input_precision="tf32x3")
+            sl = tl.dot(q, tl.trans(wl), input_precision="tf32x3")
+        else:
+            sm = tl.dot(q, tl.trans(w), input_precision="tf32")
+            sl = tl.dot(q, tl.trans(wl), input_precision="tf32")
+        sm = tl.where(jok[None, :], sm, float("-inf"))
+        sl = tl.where(jpok[None, :], sl, float("-inf"))
+        sc = tl.maximum(tl.max(tl.reshape(sm, (BQ, BP, 4)), axis=2), sl)
+        qpos = tl.load(QPOS + rows, mask=rmask, other=-1)
+        cur = tl.where(qpos >= 0, qpos // page, -1)
+        cand = (p[None, :] >= sink) & (p[None, :] < (cur - wp)[:, None]) & (p < psp)[None, :]
+        sc = tl.where(cand, sc, float("-inf"))
+    else:
+        sc = tl.full([BQ, BP], float("-inf"), tl.float32)
+    tl.store(OUT + g * sog + rows[:, None] * sos + p[None, :], sc, mask=rmask[:, None] & (p < PM)[None, :])
+
+
+@triton.jit(do_not_specialize=['R', 'PM', 'NB', 'n'])
+def _token_lists_packed_kernel(SC, V, IDX, BITS, CNT, QPOS, TP0, TPN, R, PM, NB, page, sink, wp, n,
+                               scg, svg, sig, scn,
+                               TQ: tl.constexpr, BP: tl.constexpr):
+    t = tl.program_id(0)
+    g = tl.program_id(1)
+    rows = t * TQ + tl.arange(0, TQ)
+    rmask = rows < R
+    tile = (t * TQ) // 64
+    p0 = tl.load(TP0 + tile)
+    psp = tl.load(TPN + tile)
+    v = tl.load(V + g * svg + rows, mask=rmask, other=float("inf"))
+    qpos = tl.load(QPOS + rows, mask=rmask, other=-1)
+    cur = tl.where(qpos >= 0, qpos // page, -1)
+    ngt = tl.zeros([TQ], tl.int32)
+    for c0 in range(0, psp, BP):  # each row's count above its n-th largest score
+        p = c0 + tl.arange(0, BP)
+        s = tl.load(SC + g * scg + rows[:, None] * PM + p[None, :], mask=rmask[:, None] & (p < psp)[None, :],
+                    other=float("-inf"))
+        ngt += tl.sum((s > v[:, None]).to(tl.int32), 1)
+    room = n - ngt
+    ties = tl.zeros([TQ], tl.int32)
+    count = tl.zeros([1], tl.int32)
+    shift = tl.arange(0, TQ).to(tl.int64)
+    for c0 in range(0, psp, BP):
+        p = c0 + tl.arange(0, BP)
+        pin = p < psp
+        s = tl.load(SC + g * scg + rows[:, None] * PM + p[None, :], mask=rmask[:, None] & pin[None, :],
+                    other=float("-inf"))
+        gt = s > v[:, None]
+        eq = (s == v[:, None]) & (s > float("-inf"))
+        teq = tl.cumsum(eq.to(tl.int32), 1) + ties[:, None]  # the ties of the n-th value: lowest pages first
+        sel = gt | (eq & (teq <= room[:, None]))
+        ties += tl.sum(eq.to(tl.int32), 1)
+        fixed = (p[None, :] < sink) | ((p[None, :] >= (cur - wp)[:, None]) & (p[None, :] <= cur[:, None]))
+        allowed = (sel | fixed) & (p[None, :] <= cur[:, None]) & rmask[:, None] & pin[None, :]
+        word = tl.sum(allowed.to(tl.int64) << shift[:, None], 0)  # [BP]: bit i = row i
+        blk = word != 0
+        slot = count + tl.cumsum(blk.to(tl.int32), 0) - 1
+        tl.store(IDX + g * sig + t * NB + slot, p0 + p, mask=blk)
+        tl.store(BITS + g * sig + t * NB + slot, word, mask=blk)
+        count += tl.sum(blk.to(tl.int32), 0)
+    tl.store(CNT + g * scn + t + tl.arange(0, 1), count)
+
+
+def token_lists_packed(qsum: torch.Tensor, win: torch.Tensor, q_pos: torch.Tensor, tile_p0: torch.Tensor,
+                       tile_np: torch.Tensor, PM: int, n: int, page: int, sink: int, wp: int, tq: int,
+                       idx: torch.Tensor, bits: torch.Tensor, cnt: torch.Tensor, chunk: int) -> None:
+    """Pure per-token page_maxpool selection of every span of a packed layout, straight into the head-packed lists:
+    qsum [G, R, d] fp32 (each group's query-head sum, scaled; R rows, spans at multiples of 64), win [G, 4 Pk, d]
+    (each span's windows at 4 x its first page, a span's last window zero-padded), q_pos [R] (position in the span,
+    -1 padding), tile_p0 / tile_np [R / 64] (each 64-row tile's span's first page and page count), PM the longest
+    span's pages. Writes idx [G, R / tq, NB] (packed-layout pages), bits, cnt in ``chunk`` rows at a time (the [G,
+    chunk, PM] scores and one top-k per chunk: no per-span launches). Same lists as token_lists_triton per span."""
+    G, R, d = qsum.shape
+    NB = idx.shape[-1]
+    nn_ = min(n, PM)
+    ieee = not (torch.backends.cuda.matmul.allow_tf32 or os.environ.get("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE") == "1")
+    BQ, BP = 64, 16
+    sc = torch.empty(G, min(chunk, R), PM, device=qsum.device, dtype=torch.float32)
+    for r0 in range(0, R, chunk):
+        r1 = min(R, r0 + chunk)
+        rc = r1 - r0
+        scr = sc[:, :rc]
+        qs = qsum[:, r0:r1]
+        tp0, tpn = tile_p0[r0 // 64:r1 // 64], tile_np[r0 // 64:r1 // 64]
+        qp = q_pos[r0:r1]
+        _maxpool_scores_packed_kernel[(rc // BQ, triton.cdiv(PM, BP), G)](
+            qs, win, scr, qp, tp0, tpn, rc, PM, win.shape[1], page, sink, wp,
+            qs.stride(0), qs.stride(1), win.stride(0), win.stride(1), scr.stride(0), scr.stride(1),
+            D=d, BQ=BQ, BP=BP, IEEE=ieee, num_warps=4)
+        v = scr.topk(nn_, dim=-1).values[..., -1].contiguous()  # [G, rc]
+        t0 = r0 // tq
+        _token_lists_packed_kernel[(rc // tq, G)](
+            scr, v, idx[:, t0:], bits[:, t0:], cnt[:, t0:], qp, tp0, tpn, rc, PM, NB, page, sink, wp, nn_,
+            scr.stride(0), v.stride(0), idx.stride(0), cnt.stride(0), TQ=tq, BP=64, num_warps=4)
