@@ -733,6 +733,12 @@ def flex_packed_page_attention(spans, cfg: PageSparseConfig, scale: float, q_blo
             rm.warm_dense_docs(q0.shape[1], k0.shape[1], q0.shape[3], q0.device, q0.dtype)
             if _token_packed_applies(cfg, kernel, k0.shape[1]):
                 warm_token_kernels(cfg, q0.shape[1], k0.shape[1], q0.shape[3], q0.device, q0.dtype)
+    if (selections is None and not return_selection and _token_packed_applies(cfg, kernel, k0.shape[1])
+            and _token_fixed_applies(spans, cfg)):
+        # pure per-token selection with CONSTANT tensor sizes: every span (short ones too) in one packed layout of a
+        # fixed length per micro-batch shape (_token_fixed_lengths)
+        tq = token_tile(q0.shape[1] // k0.shape[1], q0.device)
+        return _token_packed_select_attention(spans, cfg, scale, tq, fixed=_token_fixed_lengths(spans, cfg))
     if selections is None and not return_selection:
         # documents short enough to attend every page (the sparse result is dense causal attention within them): all
         # in ONE call packed without padding -- per-span selection, padding and lists made the many-document
@@ -1147,9 +1153,48 @@ def token_span_lists(q, k, cfg: PageSparseConfig, q_offset: int, scale: float, i
 
 _TOKEN_TABLES: dict = {}
 TOKEN_PACKED_BUCKET = 2048  # rows / keys the packed per-token layout is rounded up to (0: exact lengths)
+# pure per-token selection: the packed layout's length is FIXED per micro-batch shape -- the tokens rounded up to
+# TOKEN_PACKED_BUCKET plus TOKEN_FIXED_PAD rows / keys for the per-span padding to 64 -- so every per-token tensor
+# (packed q / k / v, outputs, LSE, lists, CSR, score chunks, layout tables) has the same size every step: no
+# allocator fragmentation from layout-dependent sizes (user 2026-11-22). A layout whose padding exceeds the budget
+# (> ~TOKEN_FIXED_PAD / 32 documents) takes the bucketed path (logged). 0 disables.
+TOKEN_FIXED_PAD = 8192
+_TOKEN_FIXED_FALLBACKS = [0]
 
 
-def _token_tables(layout, page: int, dev, B: int = 1, qchunk: int = 0):
+def _token_fixed_lengths(spans, cfg: PageSparseConfig):
+    """(rows, keys) of the fixed packed layout for these spans' micro-batch shape."""
+    nq = sum(sp[0].shape[2] for sp in spans)
+    nk = sum(sp[1].shape[2] for sp in spans)
+    b = max(TOKEN_PACKED_BUCKET, 64)
+    return -(-nq // b) * b + TOKEN_FIXED_PAD, -(-nk // b) * b + TOKEN_FIXED_PAD
+
+
+def _token_fixed_applies(spans, cfg: PageSparseConfig) -> bool:
+    """The constant-size per-token path: pure per-token page_maxpool selection (no learned scores, CUDA, a supported
+    head dim) whose layout's per-span padding fits the fixed budget."""
+    q0 = spans[0][0]
+    if not (TOKEN_FIXED_PAD > 0 and cfg.selector == "page_maxpool" and cfg.topk > 0 and cfg.hier_group <= 0
+            and cfg.select_block <= 1 and q0.is_cuda and q0.shape[-1] in (16, 32, 64, 128, 256)
+            and all(sp[4] is None for sp in spans)):
+        return False
+    padq = sum(-sp[0].shape[2] % 64 for sp in spans)
+    padk = sum(-sp[1].shape[2] % cfg.page for sp in spans)
+    if padq <= TOKEN_FIXED_PAD and padk <= TOKEN_FIXED_PAD:
+        return True
+    _TOKEN_FIXED_FALLBACKS[0] += 1
+    n = _TOKEN_FIXED_FALLBACKS[0]
+    if n & (n - 1) == 0:  # 1, 2, 4, 8, ...: rate-limited
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "per-token sparse attention: a layout of %d spans needs %d / %d padding rows / keys > TOKEN_FIXED_PAD %d "
+            "-- the bucketed path (layout-dependent sizes) takes it (%d times so far)", len(spans), padq, padk,
+            TOKEN_FIXED_PAD, n)
+    return False
+
+
+def _token_tables(layout, page: int, dev, B: int = 1, qchunk: int = 0, fixed=None):
     """The packed per-token layout's tables for the spans ``layout`` = ((n, L, q_offset), ...), from the host span
     lengths (no device sync), one pinned copy, cached per layout (a micro-batch's attention layers, their recompute
     and backward share it): q_abs [Sq] / k_abs [Sk] int32 (position in the span; -1 / 2**30 for padding), tile_p0 /
@@ -1160,7 +1205,7 @@ def _token_tables(layout, page: int, dev, B: int = 1, qchunk: int = 0):
     a_pos [Ra] (its position, -1 padding), a_tile_p0 / a_tile_np [Ra / 64], arow [Sq] (each query row's anchor row;
     a span's padding rows its last anchor, so arow never decreases) -- and the host ``chunks`` (r0, r1, a0, a1) of
     ``qchunk`` query rows with the 64-aligned anchor rows they read, ``amax`` the widest."""
-    key = (layout, page, str(dev), B, qchunk)
+    key = (layout, page, str(dev), B, qchunk, fixed)
     hit = _TOKEN_TABLES.get(key)
     if hit is not None:
         return hit
@@ -1185,9 +1230,20 @@ def _token_tables(layout, page: int, dev, B: int = 1, qchunk: int = 0):
     # selected): every layout then allocates one of a few sizes, which the caching allocator reuses -- exact lengths
     # differed with every layout and fragmented the pool (the v4b main run's reserved memory grew ~9 GB above dense's
     # until the device was full, p264.2085 2026-11-22)
-    if TOKEN_PACKED_BUCKET > 0:
-        Sq_b = -(-Sq // TOKEN_PACKED_BUCKET) * TOKEN_PACKED_BUCKET
-        Pk_b = -(-Pk // (TOKEN_PACKED_BUCKET // page)) * (TOKEN_PACKED_BUCKET // page)
+    # ``fixed`` (rows, keys): the constant-size layout (_token_fixed_lengths) -- the packed rows / keys of the spans
+    # gathered by index (dst_q / dst_k: each span's tokens' packed slots, in span order)
+    extra_fixed = []
+    if fixed is not None:
+        dst_q = (qoff[rs] + tl_)[tl_ < n[rs]]
+        dst_k = (c[ks] * page + tk)[tk < L[ks]]
+        extra_fixed = [dst_q, dst_k]
+    if fixed is not None or TOKEN_PACKED_BUCKET > 0:
+        if fixed is not None:
+            Sq_b, Pk_b = fixed[0], fixed[1] // page
+            assert Sq_b >= Sq and Pk_b >= Pk, (fixed, Sq, Pk * page)
+        else:
+            Sq_b = -(-Sq // TOKEN_PACKED_BUCKET) * TOKEN_PACKED_BUCKET
+            Pk_b = -(-Pk // (TOKEN_PACKED_BUCKET // page)) * (TOKEN_PACKED_BUCKET // page)
         q_abs = F.pad(q_abs, (0, Sq_b - Sq), value=-1)
         k_abs = F.pad(k_abs, (0, (Pk_b - Pk) * page), value=2**30)
         tile_p0 = F.pad(tile_p0, (0, (Sq_b - Sq) // 64), value=0)
@@ -1225,6 +1281,7 @@ def _token_tables(layout, page: int, dev, B: int = 1, qchunk: int = 0):
             amax = max(amax, a1 - a0)
         ints += [a_qrow, a_pos, a_tile_p0, a_tile_np, arow]
         extra = dict(chunks=chunks, amax=amax, Ra=Ra)
+    ints += extra_fixed
     sizes = [x.numel() for x in ints]
     host = torch.cat(ints).to(torch.int32)
     if dev.type == "cuda":
@@ -1235,7 +1292,9 @@ def _token_tables(layout, page: int, dev, B: int = 1, qchunk: int = 0):
                span_end_q=span_end_q.to(dev, non_blocking=True), qoff=[0] + torch.cumsum(qlen, 0).tolist(),
                koff=[0] + (torch.cumsum(P, 0) * page).tolist(), Sq=Sq, Pk=Pk, PM=int(P.max()), **extra)
     if B > 1:
-        out.update(zip(("a_qrow", "a_pos", "a_tile_p0", "a_tile_np", "arow"), parts[4:]))
+        out.update(zip(("a_qrow", "a_pos", "a_tile_p0", "a_tile_np", "arow"), parts[4:9]))
+    if fixed is not None:
+        out["dst_q"], out["dst_k"] = (t_.long() for t_ in parts[-2:])
     _TOKEN_TABLES[key] = out
     while len(_TOKEN_TABLES) > 4:
         _TOKEN_TABLES.pop(next(iter(_TOKEN_TABLES)))
@@ -1274,7 +1333,17 @@ def warm_token_kernels(cfg: PageSparseConfig, hq: int, hk: int, d: int, device, 
 TOKEN_PACKED_SCORE_BYTES = 128 << 20  # the packed per-token selection's score buffer [G, chunk, PM] fp32
 
 
-def _token_packed_select_attention(spans, cfg: PageSparseConfig, scale: float, tq: int):
+def _fixed_packed(xs, dst, total: int):
+    """The spans' tensors xs [1, h, n_i, d] gathered into ONE zero tensor [1, h, total, d] of a fixed length at the
+    packed slots ``dst`` (in span order): two allocations of constant size (the concatenation, the packed tensor)
+    instead of a padded copy per span."""
+    cat = torch.cat(xs, 2)[0]  # [h, sum n, d]
+    out = cat.new_zeros(cat.shape[0], total, cat.shape[2])
+    out.index_copy_(1, dst, cat)
+    return out[None]
+
+
+def _token_packed_select_attention(spans, cfg: PageSparseConfig, scale: float, tq: int, fixed=None):
     """:func:`_token_packed_attention` with every span's selection in one pass over the packed layout
     (rowmask_attention.token_lists_packed: the scores, one top-k and the lists per row chunk, no per-span or per-group
     launches; the per-span loop made many-document ranks CPU-bound). Same lists as the per-span path."""
@@ -1289,12 +1358,18 @@ def _token_packed_select_attention(spans, cfg: PageSparseConfig, scale: float, t
     if B > 1:  # the anchors' score rows per chunk within the budget; B x as many query rows read them
         PM0 = max(-(-sp[1].shape[2] // page) for sp in spans)
         qchunk = max(64, TOKEN_PACKED_SCORE_BYTES // (4 * g * PM0) // 64 * 64) * B
-    tb = _token_tables(layout, page, dev, B, qchunk)
+    tb = _token_tables(layout, page, dev, B, qchunk, fixed)
     qoff, koff, Sq, Pk, PM = tb["qoff"], tb["koff"], tb["Sq"], tb["Pk"], tb["PM"]
-    qp, kp, vp = _packed_qkv(spans, qoff, koff)
-    if qp.shape[2] < Sq or kp.shape[2] < Pk * page:  # the bucketed lengths (padding rows / keys at the end)
-        qp = F.pad(qp, (0, 0, 0, Sq - qp.shape[2]))
-        kp, vp = (F.pad(t, (0, 0, 0, Pk * page - t.shape[2])) for t in (kp, vp))
+    if fixed is not None:  # constant sizes: the longest span bound by the layout, the spans gathered by index
+        PM = Pk
+        qp = _fixed_packed([sp[0] for sp in spans], tb["dst_q"], Sq)
+        kp = _fixed_packed([sp[1] for sp in spans], tb["dst_k"], Pk * page)
+        vp = _fixed_packed([sp[2] for sp in spans], tb["dst_k"], Pk * page)
+    else:
+        qp, kp, vp = _packed_qkv(spans, qoff, koff)
+        if qp.shape[2] < Sq or kp.shape[2] < Pk * page:  # the bucketed lengths (padding rows / keys at the end)
+            qp = F.pad(qp, (0, 0, 0, Sq - qp.shape[2]))
+            kp, vp = (F.pad(t, (0, 0, 0, Pk * page - t.shape[2])) for t in (kp, vp))
     with torch.no_grad():
         acc = torch.float64 if qp.dtype == torch.float64 else torch.float32
         qsum = qp[0].view(g, rep, Sq, d).sum(1, dtype=acc) * scale  # [G, Sq, d]
@@ -1306,7 +1381,8 @@ def _token_packed_select_attention(spans, cfg: PageSparseConfig, scale: float, t
             nsel = min(tq, -(-tq // B) + 1)
             nb = min(PM, nsel * cfg.topk + cfg.sink_pages + wp + 2)
         else:
-            nb = min(PM, tq * (cfg.topk + cfg.sink_pages + wp + 1))
+            nb = tq * (cfg.topk + cfg.sink_pages + wp + 1)
+            nb = nb if fixed is not None else min(PM, nb)  # fixed: independent of the layout
         nt = Sq // tq
         idx = torch.zeros(g, nt, nb, dtype=torch.int32, device=dev)
         bits = torch.zeros(g, nt, nb, dtype=torch.int64, device=dev)

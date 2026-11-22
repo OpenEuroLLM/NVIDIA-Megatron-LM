@@ -752,3 +752,38 @@ def test_token_packed_select_equals_per_span(hq, select_block):
 
         for a, b in zip(run(True), run(False)):
             torch.testing.assert_close(a, b, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2, 3])
+def test_token_fixed_layout_matches_reference(seed, exact_scores):
+    """Pure per-token selection on the constant-size packed layout (every span, short ones included, gathered into a
+    fixed length per micro-batch shape: _token_fixed_lengths) equals the gathered per-span reference, forward and
+    backward; the layout's tensors have the same sizes for every layout of the same token count."""
+    import random
+
+    rng = random.Random(seed)
+    torch.manual_seed(seed)
+    hq, g, d = 8, 2, 64
+    total = 6144
+    cuts = sorted(rng.sample(range(1, total), rng.randint(0, 8)))
+    segs = [b - a for a, b in zip([0] + cuts, cuts + [total])]
+    cfg = ps.PageSparseConfig(selector="page_maxpool", page=64, topk=rng.choice([2, 8]), window=128, sink_pages=1,
+                              per_group=True, select_block=1)
+    q = torch.randn(1, hq, total, d, device="cuda", requires_grad=True)
+    k = torch.randn(1, g, total, d, device="cuda", requires_grad=True)
+    v = torch.randn(1, g, total, d, device="cuda", requires_grad=True)
+
+    def spans():
+        return [(a, b, c, 0, None) for a, b, c in zip(q.split(segs, 2), k.split(segs, 2), v.split(segs, 2))]
+
+    assert ps._token_fixed_applies(spans(), cfg)
+    assert ps._token_fixed_lengths(spans(), cfg) == ps._token_fixed_lengths([(q, k, v, 0, None)], cfg)
+    out = ps.flex_packed_page_attention(spans(), cfg, d**-0.5, 64, kernel="rowmask")
+    ref = [ps.page_sparse_attention(sp[0], sp[1], sp[2], cfg, sp[3], d**-0.5) for sp in spans()]
+    w = [torch.randn_like(o) for o in ref]
+    g_out = torch.autograd.grad(sum((o * w_).sum() for o, w_ in zip(out, w)), (q, k, v))
+    g_ref = torch.autograd.grad(sum((o * w_).sum() for o, w_ in zip(ref, w)), (q, k, v))
+    for o, r in zip(out, ref):  # the kernel's dots run in TF32
+        torch.testing.assert_close(o, r, atol=2e-2, rtol=2e-2)
+    for a, b in zip(g_out, g_ref):
+        torch.testing.assert_close(a, b, atol=3e-2 * b.abs().max().item(), rtol=0)
