@@ -295,31 +295,35 @@ def _dkv_hp_kernel(Q, K, V, DO, LSE, DELTA, DK, DV, CSR_OFF, CSR_R, CSR_B, ORDER
     for e in range(e0, e1):
         r = tl.load(CSR_R + e)
         b = tl.load(CSR_B + e)
-        # the tile's TQ * REPP rows in chunks of MC: [MC, D] operand tiles instead of [TQ * REPP, D] (register
-        # spills at head dim 256 grow the context's local memory for good -- non-PyTorch memory, 2026-11-21)
-        for c in tl.static_range(TQ * REPP // MC):
-            m = c * MC + tl.arange(0, MC)
-            qi = m // REPP
-            hh = m % REPP
-            h = hk * REP + hh
-            rows = r * TQ + qi
-            rin = rows < Sq
-            rmask = rin & (hh < REP)
-            qpos = tl.load(QPOS + rows, mask=rin, other=-1)
-            qlo = tl.load(QLO + rows, mask=rin, other=0)
-            rowbit = ((b >> qi.to(tl.int64)) & 1) != 0
-            ok = (rowbit & rmask)[:, None] & (kpos[None, :] <= qpos[:, None]) & (kpos[None, :] >= qlo[:, None])
-            q = tl.load(Q + h[:, None] * sqh + rows[:, None] * sqs + dd[None, :], mask=rmask[:, None], other=0.0)
-            do = tl.load(DO + h[:, None] * soh + rows[:, None] * sos + dd[None, :], mask=rmask[:, None], other=0.0)
-            lse = tl.load(LSE + h * Sq + rows, mask=rmask, other=float("-inf"))
-            lse2 = tl.where(lse == float("-inf"), float("inf"), lse) * 1.4426950408889634
-            delta = tl.load(DELTA + h * Sq + rows, mask=rmask, other=0.0)
-            s = tl.dot(q, tl.trans(kb)) * (scale * 1.4426950408889634)
-            pij = tl.where(ok, tl.exp2(s - lse2[:, None]), 0.0)  # [MC rows, BN keys]
-            dv += tl.dot(tl.trans(pij.to(do.dtype)), do)
-            dp = tl.dot(do, tl.trans(vb))
-            ds = pij * (dp - delta[:, None])
-            dk += tl.dot(tl.trans(ds.to(q.dtype)), q)
+        # the tile's TQ * REPP rows in chunks of MC (MC // REPP queries each), a RUNTIME loop that skips the chunks whose
+        # queries do not list this key block: scattered per-token selections set 1-2 of a tile's 16 query bits per
+        # block, and the full 128-row chunk did up to 16x the needed work (the scattered worst case's dk / dv kernel,
+        # 2026-11-22). (A static_range over chunks unrolled them and spilled registers at head dim 256.)
+        QC: tl.constexpr = MC // REPP
+        for c in range(TQ * REPP // MC):
+            if ((b >> (c * QC)) & ((1 << QC) - 1)) != 0:
+                m = c * MC + tl.arange(0, MC)
+                qi = m // REPP
+                hh = m % REPP
+                h = hk * REP + hh
+                rows = r * TQ + qi
+                rin = rows < Sq
+                rmask = rin & (hh < REP)
+                qpos = tl.load(QPOS + rows, mask=rin, other=-1)
+                qlo = tl.load(QLO + rows, mask=rin, other=0)
+                rowbit = ((b >> qi.to(tl.int64)) & 1) != 0
+                ok = (rowbit & rmask)[:, None] & (kpos[None, :] <= qpos[:, None]) & (kpos[None, :] >= qlo[:, None])
+                q = tl.load(Q + h[:, None] * sqh + rows[:, None] * sqs + dd[None, :], mask=rmask[:, None], other=0.0)
+                do = tl.load(DO + h[:, None] * soh + rows[:, None] * sos + dd[None, :], mask=rmask[:, None], other=0.0)
+                lse = tl.load(LSE + h * Sq + rows, mask=rmask, other=float("-inf"))
+                lse2 = tl.where(lse == float("-inf"), float("inf"), lse) * 1.4426950408889634
+                delta = tl.load(DELTA + h * Sq + rows, mask=rmask, other=0.0)
+                s = tl.dot(q, tl.trans(kb)) * (scale * 1.4426950408889634)
+                pij = tl.where(ok, tl.exp2(s - lse2[:, None]), 0.0)  # [MC rows, BN keys]
+                dv += tl.dot(tl.trans(pij.to(do.dtype)), do)
+                dp = tl.dot(do, tl.trans(vb))
+                ds = pij * (dp - delta[:, None])
+                dk += tl.dot(tl.trans(ds.to(q.dtype)), q)
     tl.store(DK + hk * skh + cols[:, None] * sks + dd[None, :], (dk * scale).to(DK.dtype.element_ty),
              mask=cmask[:, None])
     tl.store(DV + hk * skh + cols[:, None] * sks + dd[None, :], dv.to(DV.dtype.element_ty), mask=cmask[:, None])
