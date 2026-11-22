@@ -199,6 +199,16 @@ def _same_sample(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
     )
 
 
+def _build_datasets(args: Any, num_samples, config: GPTDatasetConfig):
+    """The datasets as pretrain_gpt.py / pretrain_hybrid.py build them (--fixed-valid-data-path:
+    the training blend plus the fixed validation sets, each at its own sequence length)."""
+    if getattr(args, "fixed_valid_data_path", None):
+        from megatron.training.datasets.fixed_valid import build_with_fixed_valid_sets
+
+        return build_with_fixed_valid_sets(GPTDataset, num_samples, lambda: True, config, args)
+    return BlendedMegatronDatasetBuilder(GPTDataset, num_samples, lambda: True, config).build()
+
+
 def write_and_check_index_bundle(args: Any, prefix: str, num_samples, file_datasets) -> None:
     """Write the cached indices of the run's datasets as index bundle ``prefix`` and check it.
 
@@ -211,14 +221,14 @@ def write_and_check_index_bundle(args: Any, prefix: str, num_samples, file_datas
 
     index_bundle.start_recording()
     config = core_gpt_dataset_config_from_args(args)
-    BlendedMegatronDatasetBuilder(GPTDataset, num_samples, lambda: True, config).build()
+    _build_datasets(args, num_samples, config)
     paths = index_bundle.recorded_paths()
     meta = index_bundle.write_bundle(prefix, paths, args.data_cache_path)
     print(f"> index bundle {prefix}: {len(paths)} cached indices, {meta['nbytes'] / 2**30:.2f} GiB")
 
     before = index_bundle.load_counts()
     config = core_gpt_dataset_config_from_args(args, index_bundle=prefix)
-    bundled = BlendedMegatronDatasetBuilder(GPTDataset, num_samples, lambda: True, config).build()
+    bundled = _build_datasets(args, num_samples, config)
     after = index_bundle.load_counts()
     from_files = after["file"] - before["file"]
     assert from_files == 0, f"{from_files} cached indices were not taken from the bundle"
@@ -259,9 +269,7 @@ def build_dataset_caches(args: Any) -> Dict[str, Any]:
         compile_helpers()
 
         config = core_gpt_dataset_config_from_args(args)
-        train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
-            GPTDataset, train_valid_test_num_samples, lambda: True, config
-        ).build()
+        train_ds, valid_ds, test_ds = _build_datasets(args, train_valid_test_num_samples, config)
         bundle = getattr(args, "write_index_bundle", None)
         if bundle:
             write_and_check_index_bundle(

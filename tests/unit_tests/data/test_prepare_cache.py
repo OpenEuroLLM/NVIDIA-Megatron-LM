@@ -288,3 +288,37 @@ def test_prepare_cache_builds_with_train_samples(tmp_path_dist_ckpt):
 
         assert args.train_iters == 32 // args.global_batch_size
         assert summary["train_valid_test_num_samples"][0] == 32
+
+
+def test_prepare_cache_writes_and_checks_index_bundle(tmp_path_dist_ckpt):
+    """--write-index-bundle with fixed validation sets (each at its own sequence length), as the
+    v4b main run builds its datasets: every cached index ends up in the bundle, and the datasets
+    built from the bundle alone equal the file-built ones (checked inside build_dataset_caches)."""
+    from megatron.core.datasets import index_bundle
+
+    _initialize_test_environment()
+
+    tokenizer = _build_null_tokenizer()
+
+    with TempNamedDir(
+        tmp_path_dist_ckpt / "test_prepare_cache_writes_and_checks_index_bundle", sync=True
+    ) as temp_dir:
+        file_prefixes = _create_shared_file_prefixes(tokenizer, os.path.join(temp_dir, "dataset"))
+        prefix = str(temp_dir / "bundle" / "run")
+        args = _build_prepare_cache_args(
+            file_prefixes[:2],
+            temp_dir / "cache",
+            split="90,10,0",
+            full_validation=True,
+            multiple_validation_sets=True,
+            fixed_valid_data_path=file_prefixes[2:],
+            fixed_valid_seq_lengths=[8, 16],
+            valid_seq_length=None,
+            write_index_bundle=prefix,
+            index_bundle_check_samples=8,
+        )
+
+        build_dataset_caches(args)
+
+        meta = index_bundle.IndexBundle(prefix)
+        assert len(meta.entries) == len(list((temp_dir / "cache").glob("*.npy")))
