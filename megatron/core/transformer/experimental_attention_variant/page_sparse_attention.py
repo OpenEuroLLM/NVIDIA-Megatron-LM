@@ -436,13 +436,15 @@ class PageSparseCoreAttention(MegatronModule):
                 else:
                     o, loss = self._attend(q, kd[:, :, :end], vd[:, :, :end], off - h, xq, kpc, kfc, key=(a, off),
                                            drop=h)
-                    pieces.append(o[0, :, h:].permute(1, 0, 2).reshape(n, hq * d))
+                    pieces.append(o[0, :, h:].permute(1, 0, 2))  # [n, hq, d] view: one copy, in the cat
                 if loss is not None:
                     losses.append((loss, n))
             local += L // cp
         if flex_spans:
             for (i, n, h), o in zip(flex_rows, self._packed_flex(flex_spans, flex_keys)):
-                pieces[i] = o[0, :, h:].permute(1, 0, 2).reshape(n, hq * d)
+                pieces[i] = o[0, :, h:].permute(1, 0, 2)
         if local < t:  # padding after the last document
-            pieces.append(query.new_zeros(t - local, hq * d))
-        return torch.cat(pieces, 0), losses
+            pieces.append(query.new_zeros(t - local, hq, d))
+        # the permuted [n, hq, d] views concatenated once (a reshape per piece copied every output twice: +0.5 GB per
+        # layer at v4b's 64k, 2026-11-22)
+        return torch.cat(pieces, 0).view(t, hq * d), losses
