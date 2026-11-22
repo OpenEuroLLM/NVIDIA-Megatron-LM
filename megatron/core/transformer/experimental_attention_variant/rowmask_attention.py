@@ -337,9 +337,10 @@ def _dkv_hp_kernel(Q, K, V, DO, LSE, DELTA, DK, DV, CSR_OFF, CSR_R, CSR_B, ORDER
 _HP_CONFIG = {
     "fwd": {"default": (8, 2)},  # H100, d 256, 128 rows: 254 regs, no spills (4 warps: 344 spills, 12 % slower)
     "dq": {"default": (8, 1)},  # 64 spills (4 warps: 496; 2 stages exceed shared memory)
-    # MC = the tile's rows (no chunking): at head dim 256 / 128 rows on H100 chunks of 64 / 32 rows were 5x slower
-    # (more spills, not fewer); 8 warps: 76 spills, 4 warps: 814 (t20_token_memory, 2026-11-21)
-    "dkv": {"default": (8, 1, 128)},
+    # MC = 16-row chunks, skipped when none of their queries lists the key block (runtime loop): H100, head dim 256,
+    # 128-row tiles over the real cross-document layouts, backward mean smooth / scattered inputs: MC 128 95 / 244 ms,
+    # 64 196 / 469, 32 89 / 164, 16 89 / 136 ms (t25b, 2026-11-22; the earlier static_range chunks were 5x slower)
+    "dkv": {"default": (8, 1, 16)},
 }
 
 
