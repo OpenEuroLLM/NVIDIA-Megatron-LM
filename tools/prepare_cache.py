@@ -45,6 +45,15 @@ def add_prepare_cache_args(parser: argparse.ArgumentParser) -> argparse.Argument
         ),
     )
     group.add_argument(
+        "--prepare-cache-iteration",
+        type=int,
+        default=0,
+        help=(
+            "The training iteration whose datasets to prepare (with --phase-transition-iterations it "
+            "selects the phase and so its dataset sizes; the training takes it from the checkpoint)."
+        ),
+    )
+    group.add_argument(
         "--write-index-bundle",
         default=None,
         help=(
@@ -73,6 +82,10 @@ def _normalize_prepare_cache_args(args: Any) -> None:
     """Apply cache-preparation specific argument normalization."""
 
     args.rank = 0
+    # what the training knows from its checkpoint: the phase of the data position
+    args.iteration = getattr(args, "prepare_cache_iteration", 0) or 0
+    if getattr(args, "consumed_train_samples", None) is None:
+        args.consumed_train_samples = args.iteration * (getattr(args, "global_batch_size", None) or 0)
 
     if args.prepare_cache_world_size is not None:
         if args.prepare_cache_world_size <= 0:
