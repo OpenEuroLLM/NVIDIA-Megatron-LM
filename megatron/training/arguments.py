@@ -3936,6 +3936,12 @@ def _add_data_args(parser):
                        help='Path to a json file with the sequences per dataset. Check the tools/build_sequences_per_dataset.py script to build this file.')
     group.add_argument('--dataloader-fast-cache-load', action='store_true',
                        help='Option to use the fast cache loading path when building the datasets. Requires all the dataset caches to be built and stored in --data-cache-path.')
+    group.add_argument('--dataloader-index-bundle', default=None,
+                       help='Prefix of an index bundle (<prefix>.bin + <prefix>.json, built by '
+                       'tools/prepare_cache.py --write-index-bundle): the cached dataset indices '
+                       'it holds are byte-identical views of one file instead of one file each, '
+                       'and no rank waits for rank 0 to build first. An index it lacks is loaded '
+                       'from --data-cache-path.')
     group.add_argument('--dataloader-defer-npy-index-mmap', action='store_true',
                        help='Defer the mmap of the dataset indexes (.npy files) until the first access. Requires all the dataset caches to be built and stored in --data-cache-path.')
     group.add_argument('--data-cache-path', default=None,

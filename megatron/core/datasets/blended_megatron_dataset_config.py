@@ -96,6 +96,12 @@ class BlendedMegatronDatasetConfig:
        Requires all the dataset caches to be built.
     """
 
+    index_bundle: Optional[str] = None
+    """Prefix of an index bundle (megatron/core/datasets/index_bundle.py): the cached indices it
+       holds are views of one file, a cache hit without file checks, and no rank waits for rank 0
+       to build first. Byte-identical to the cache files; not part of any dataset's description.
+    """
+
     def __post_init__(self) -> None:
         """Do asserts and set fields post init"""
         if self.fast_cache_load:

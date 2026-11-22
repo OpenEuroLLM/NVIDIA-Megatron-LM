@@ -12,6 +12,7 @@ import torch
 from megatron.core.datasets.blended_dataset import BlendedDataset
 from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatronDatasetConfig
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
+from megatron.core.datasets.index_bundle import load_counts
 from megatron.core.datasets.megatron_dataset import LowLevelDataset, MegatronDataset
 from megatron.core.datasets.utils import Split, normalize
 from megatron.core.utils import log_single_rank
@@ -126,7 +127,18 @@ class BlendedMegatronDatasetBuilder(object):
             List[Optional[TopLevelDataset]]: A list containing a dataset instance (or None) per
                 split
         """
+        t0 = time.time()
         datasets = self._build_blended_dataset_splits()
+        if self.config.index_bundle:
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            world = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+            if rank in (0, world - 1):
+                n = load_counts()
+                _print_timing(
+                    f"rank {rank}: index bundle {self.config.index_bundle}: {n['bundle']} cached "
+                    f"indices from the bundle, {n['file']} from files",
+                    t0,
+                )
 
         for dataset in datasets:
             if dataset is not None and len(dataset) > 0:
@@ -401,9 +413,11 @@ class BlendedMegatronDatasetBuilder(object):
         num_dataset_builder_threads = self.config.num_dataset_builder_threads
 
         # NOTE(asolergi-nv): Skip rank-0 first dataset building if we are using --dataloader-fast-cache-load # pylint: disable=C0301
+        # An index bundle is built from the complete cache ahead of the run: nothing to build, so
+        # all ranks load at once (a missing index still fails loudly on the ranks that load it).
         if torch.distributed.is_initialized() and not (
             isinstance(self.config, GPTDatasetConfig) and self.config.fast_cache_load
-        ):
+        ) and not self.config.index_bundle:
             rank = torch.distributed.get_rank()
             last = rank == torch.distributed.get_world_size() - 1
             t0 = time.time()

@@ -13,6 +13,7 @@ import numpy
 import torch
 
 from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatronDatasetConfig
+from megatron.core.datasets.index_bundle import in_bundle, load_cached_index
 from megatron.core.datasets.megatron_dataset import MegatronDataset
 from megatron.core.datasets.utils import (
     normalize,
@@ -147,6 +148,9 @@ class BlendedDataset(torch.utils.data.Dataset):
             cache_hit = (
                 True
                 if self.config.fast_cache_load
+                or in_bundle(
+                    self.config.index_bundle, [path_to_dataset_index, path_to_dataset_sample_index]
+                )
                 else all(
                     map(
                         os.path.isfile,
@@ -240,7 +244,7 @@ class BlendedDataset(torch.utils.data.Dataset):
             logger, logging.INFO, f"\tLoad the dataset index from {path_to_dataset_index}"
         )
         t_beg = time.time()
-        dataset_index = safe_numpy_load(path_to_dataset_index, allow_pickle=True, mmap_mode="r")
+        dataset_index = load_cached_index(path_to_dataset_index, self.config.index_bundle)
         t_end = time.time()
         log_single_rank(logger, logging.DEBUG, f"\t> time elapsed: {t_end - t_beg:4f} seconds")
 
@@ -250,8 +254,8 @@ class BlendedDataset(torch.utils.data.Dataset):
             f"\tLoad the dataset sample index from {path_to_dataset_sample_index}",
         )
         t_beg = time.time()
-        dataset_sample_index = safe_numpy_load(
-            path_to_dataset_sample_index, allow_pickle=True, mmap_mode="r"
+        dataset_sample_index = load_cached_index(
+            path_to_dataset_sample_index, self.config.index_bundle
         )
         t_end = time.time()
         log_single_rank(logger, logging.DEBUG, f"\t> time elapsed: {t_end - t_beg:4f} seconds")

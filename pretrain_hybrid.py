@@ -579,6 +579,7 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
         fast_cache_load=args.dataloader_fast_cache_load,
         sequences_per_dataset=sequences_per_dataset,
         defer_npy_index_mmap=args.dataloader_defer_npy_index_mmap,
+        index_bundle=getattr(args, "dataloader_index_bundle", None),
         context_parallel_size=args.context_parallel_size,
         data_parallel_size=args.data_parallel_size,
         sequence_parallel_size=args.tensor_model_parallel_size * args.sequence_parallel,

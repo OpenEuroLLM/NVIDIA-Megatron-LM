@@ -10,6 +10,9 @@ import argparse
 import json
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy
+
+from megatron.core.datasets.blended_dataset import BlendedDataset
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig
 from megatron.core.datasets.utils import compile_helpers
@@ -40,6 +43,21 @@ def add_prepare_cache_args(parser: argparse.ArgumentParser) -> argparse.Argument
             "Optional override for the effective world size used to derive data-parallel size and "
             "dataset sample counts during cache preparation."
         ),
+    )
+    group.add_argument(
+        "--write-index-bundle",
+        default=None,
+        help=(
+            "After preparing the cache, write every cached index the datasets load into one index "
+            "bundle <prefix>.bin + <prefix>.json (megatron/core/datasets/index_bundle.py) and check "
+            "that the datasets built from it equal those built from the cache files."
+        ),
+    )
+    group.add_argument(
+        "--index-bundle-check-samples",
+        type=int,
+        default=64,
+        help="Random samples per dataset split compared token by token in the bundle check.",
     )
     return parser
 
@@ -117,7 +135,7 @@ def _print_effective_configuration(
         print("> ignoring --dataloader-defer-npy-index-mmap during cache preparation")
 
 
-def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
+def core_gpt_dataset_config_from_args(args: Any, index_bundle: Optional[str] = None) -> GPTDatasetConfig:
     """Build the explicit GPTDatasetConfig used for offline cache preparation."""
 
     tokenizer = build_tokenizer(args)
@@ -157,7 +175,70 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
         data_parallel_size=args.data_parallel_size,
         sequence_parallel_size=args.tensor_model_parallel_size * args.sequence_parallel,
         hybrid_context_parallel=args.hybrid_context_parallel,
+        # as pretrain_gpt.py / pretrain_hybrid.py: add_bos is part of the cache key
+        inter_document_masking=getattr(args, "dataloader_inter_document_masking", False),
+        add_bos=getattr(args, "dataloader_add_bos", False),
+        document_segment_length=getattr(args, "dataloader_document_segment_length", None),
+        index_bundle=index_bundle,
     )
+
+
+def _splits(datasets) -> List[Tuple[str, Any]]:
+    """(name, dataset) for every built split; a list of validation sets is flattened."""
+    out = []
+    for name, ds in zip(("train", "valid", "test"), datasets):
+        for i, d in enumerate(ds if isinstance(ds, list) else [ds]):
+            if d is not None:
+                out.append((f"{name}{i}" if isinstance(ds, list) else name, d))
+    return out
+
+
+def _same_sample(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+    return a.keys() == b.keys() and all(
+        numpy.array_equal(numpy.asarray(a[k]), numpy.asarray(b[k])) for k in a
+    )
+
+
+def write_and_check_index_bundle(args: Any, prefix: str, num_samples, file_datasets) -> None:
+    """Write the cached indices of the run's datasets as index bundle ``prefix`` and check it.
+
+    The datasets are built once more from the (now complete) cache while recording every index
+    they load; those files become the bundle (each compared byte for byte by write_bundle). Then
+    the datasets are built from the bundle alone and compared with ``file_datasets``: the same
+    splits and lengths, the same blend indices, and the same tokens for random samples.
+    """
+    from megatron.core.datasets import index_bundle
+
+    index_bundle.start_recording()
+    config = core_gpt_dataset_config_from_args(args)
+    BlendedMegatronDatasetBuilder(GPTDataset, num_samples, lambda: True, config).build()
+    paths = index_bundle.recorded_paths()
+    meta = index_bundle.write_bundle(prefix, paths, args.data_cache_path)
+    print(f"> index bundle {prefix}: {len(paths)} cached indices, {meta['nbytes'] / 2**30:.2f} GiB")
+
+    before = index_bundle.load_counts()
+    config = core_gpt_dataset_config_from_args(args, index_bundle=prefix)
+    bundled = BlendedMegatronDatasetBuilder(GPTDataset, num_samples, lambda: True, config).build()
+    after = index_bundle.load_counts()
+    from_files = after["file"] - before["file"]
+    assert from_files == 0, f"{from_files} cached indices were not taken from the bundle"
+
+    rng = numpy.random.default_rng(1234)
+    ref, got = _splits(file_datasets), _splits(bundled)
+    assert [n for n, _ in ref] == [n for n, _ in got], "the bundle builds other splits"
+    for (name, a), (_, b) in zip(ref, got):
+        assert len(a) == len(b), f"{name}: {len(a)} != {len(b)} samples"
+        for attr in ("dataset_index", "dataset_sample_index"):
+            if hasattr(a, attr):
+                assert numpy.array_equal(getattr(a, attr), getattr(b, attr)), f"{name}: {attr} differs"
+        if len(a):  # all samples of a blend's first split, a few of every other one
+            n = min(len(a), args.index_bundle_check_samples if name in ("train", "valid0") else 4)
+            for i in [0, len(a) - 1] + rng.integers(0, len(a), n).tolist():
+                assert _same_sample(a[int(i)], b[int(i)]), f"{name}: sample {i} differs"
+        if isinstance(a, BlendedDataset):
+            print(f"  {name}: BlendedDataset {a.unique_description_hash}, {len(a)} samples: identical")
+    print(f"> index bundle check passed: {len(ref)} splits, "
+          f"{after['bundle'] - before['bundle']} indices from the bundle, 0 from files")
 
 
 def build_dataset_caches(args: Any) -> Dict[str, Any]:
@@ -181,6 +262,11 @@ def build_dataset_caches(args: Any) -> Dict[str, Any]:
         train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
             GPTDataset, train_valid_test_num_samples, lambda: True, config
         ).build()
+        bundle = getattr(args, "write_index_bundle", None)
+        if bundle:
+            write_and_check_index_bundle(
+                args, bundle, train_valid_test_num_samples, (train_ds, valid_ds, test_ds)
+            )
 
         print("> finished preparing dataset cache")
         print(f"  train dataset length:      {_get_dataset_length(train_ds)}")

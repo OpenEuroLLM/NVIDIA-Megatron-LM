@@ -14,6 +14,7 @@ import numpy
 import torch
 
 from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatronDatasetConfig
+from megatron.core.datasets.index_bundle import in_bundle, load_cached_index
 from megatron.core.datasets.indexed_dataset import IndexedDataset
 from megatron.core.datasets.megatron_dataset import MegatronDataset
 from megatron.core.datasets.object_storage_utils import ObjectStorageConfig, is_object_storage_path
@@ -549,6 +550,10 @@ class GPTDataset(MegatronDataset):
             cache_hit = (
                 True
                 if self.config.fast_cache_load
+                or in_bundle(
+                    self.config.index_bundle,
+                    [path_to_document_index, path_to_sample_index, path_to_shuffle_index],
+                )
                 else all(
                     map(
                         os.path.isfile,
@@ -719,7 +724,7 @@ class GPTDataset(MegatronDataset):
             f"\tLoad the document index from {os.path.basename(path_to_document_index)}",
         )
         t_beg = time.time()
-        document_index = safe_numpy_load(path_to_document_index, allow_pickle=True, mmap_mode="r")
+        document_index = load_cached_index(path_to_document_index, self.config.index_bundle)
         t_end = time.time()
         log_single_rank(logger, logging.DEBUG, f"\t> time elapsed: {t_end - t_beg:4f} seconds")
 
@@ -729,7 +734,7 @@ class GPTDataset(MegatronDataset):
             f"\tLoad the sample index from {os.path.basename(path_to_sample_index)}",
         )
         t_beg = time.time()
-        sample_index = safe_numpy_load(path_to_sample_index, allow_pickle=True, mmap_mode="r")
+        sample_index = load_cached_index(path_to_sample_index, self.config.index_bundle)
         t_end = time.time()
         log_single_rank(logger, logging.DEBUG, f"\t> time elapsed: {t_end - t_beg:4f} seconds")
 
@@ -739,7 +744,7 @@ class GPTDataset(MegatronDataset):
             f"\tLoad the shuffle index from {os.path.basename(path_to_shuffle_index)}",
         )
         t_beg = time.time()
-        shuffle_index = safe_numpy_load(path_to_shuffle_index, allow_pickle=True, mmap_mode="r")
+        shuffle_index = load_cached_index(path_to_shuffle_index, self.config.index_bundle)
         t_end = time.time()
         log_single_rank(logger, logging.DEBUG, f"\t> time elapsed: {t_end - t_beg:4f} seconds")
 
