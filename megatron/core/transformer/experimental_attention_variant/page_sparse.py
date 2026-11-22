@@ -1230,13 +1230,7 @@ def _token_tables(layout, page: int, dev, B: int = 1, qchunk: int = 0, fixed=Non
     # selected): every layout then allocates one of a few sizes, which the caching allocator reuses -- exact lengths
     # differed with every layout and fragmented the pool (the v4b main run's reserved memory grew ~9 GB above dense's
     # until the device was full, p264.2085 2026-11-22)
-    # ``fixed`` (rows, keys): the constant-size layout (_token_fixed_lengths) -- the packed rows / keys of the spans
-    # gathered by index (dst_q / dst_k: each span's tokens' packed slots, in span order)
-    extra_fixed = []
-    if fixed is not None:
-        dst_q = (qoff[rs] + tl_)[tl_ < n[rs]]
-        dst_k = (c[ks] * page + tk)[tk < L[ks]]
-        extra_fixed = [dst_q, dst_k]
+    # ``fixed`` (rows, keys): the constant-size layout (_token_fixed_lengths)
     if fixed is not None or TOKEN_PACKED_BUCKET > 0:
         if fixed is not None:
             Sq_b, Pk_b = fixed[0], fixed[1] // page
@@ -1281,7 +1275,6 @@ def _token_tables(layout, page: int, dev, B: int = 1, qchunk: int = 0, fixed=Non
             amax = max(amax, a1 - a0)
         ints += [a_qrow, a_pos, a_tile_p0, a_tile_np, arow]
         extra = dict(chunks=chunks, amax=amax, Ra=Ra)
-    ints += extra_fixed
     sizes = [x.numel() for x in ints]
     host = torch.cat(ints).to(torch.int32)
     if dev.type == "cuda":
@@ -1293,8 +1286,6 @@ def _token_tables(layout, page: int, dev, B: int = 1, qchunk: int = 0, fixed=Non
                koff=[0] + (torch.cumsum(P, 0) * page).tolist(), Sq=Sq, Pk=Pk, PM=int(P.max()), **extra)
     if B > 1:
         out.update(zip(("a_qrow", "a_pos", "a_tile_p0", "a_tile_np", "arow"), parts[4:9]))
-    if fixed is not None:
-        out["dst_q"], out["dst_k"] = (t_.long() for t_ in parts[-2:])
     _TOKEN_TABLES[key] = out
     while len(_TOKEN_TABLES) > 4:
         _TOKEN_TABLES.pop(next(iter(_TOKEN_TABLES)))
@@ -1333,14 +1324,14 @@ def warm_token_kernels(cfg: PageSparseConfig, hq: int, hk: int, d: int, device, 
 TOKEN_PACKED_SCORE_BYTES = 128 << 20  # the packed per-token selection's score buffer [G, chunk, PM] fp32
 
 
-def _fixed_packed(xs, dst, total: int):
-    """The spans' tensors xs [1, h, n_i, d] gathered into ONE zero tensor [1, h, total, d] of a fixed length at the
-    packed slots ``dst`` (in span order): two allocations of constant size (the concatenation, the packed tensor)
-    instead of a padded copy per span."""
-    cat = torch.cat(xs, 2)[0]  # [h, sum n, d]
-    out = cat.new_zeros(cat.shape[0], total, cat.shape[2])
-    out.index_copy_(1, dst, cat)
-    return out[None]
+def _fixed_packed(xs, offs, total: int):
+    """The spans' tensors xs [1, h, n_i, d] copied into ONE zero tensor [1, h, total, d] of a fixed length, span i at
+    rows offs[i]: a single allocation of constant size (no concatenation, no padded copy per span); the backward hands
+    each span a view of the packed gradient."""
+    out = xs[0].new_zeros(1, xs[0].shape[1], total, xs[0].shape[3])
+    for x, o in zip(xs, offs):
+        out[:, :, o:o + x.shape[2]].copy_(x)
+    return out
 
 
 def _token_packed_select_attention(spans, cfg: PageSparseConfig, scale: float, tq: int, fixed=None):
@@ -1362,9 +1353,9 @@ def _token_packed_select_attention(spans, cfg: PageSparseConfig, scale: float, t
     qoff, koff, Sq, Pk, PM = tb["qoff"], tb["koff"], tb["Sq"], tb["Pk"], tb["PM"]
     if fixed is not None:  # constant sizes: the longest span bound by the layout, the spans gathered by index
         PM = Pk
-        qp = _fixed_packed([sp[0] for sp in spans], tb["dst_q"], Sq)
-        kp = _fixed_packed([sp[1] for sp in spans], tb["dst_k"], Pk * page)
-        vp = _fixed_packed([sp[2] for sp in spans], tb["dst_k"], Pk * page)
+        qp = _fixed_packed([sp[0] for sp in spans], qoff, Sq)
+        kp = _fixed_packed([sp[1] for sp in spans], koff, Pk * page)
+        vp = _fixed_packed([sp[2] for sp in spans], koff, Pk * page)
     else:
         qp, kp, vp = _packed_qkv(spans, qoff, koff)
         if qp.shape[2] < Sq or kp.shape[2] < Pk * page:  # the bucketed lengths (padding rows / keys at the end)
