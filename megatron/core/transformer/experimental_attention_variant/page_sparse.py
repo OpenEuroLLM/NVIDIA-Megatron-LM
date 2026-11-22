@@ -1146,6 +1146,7 @@ def token_span_lists(q, k, cfg: PageSparseConfig, q_offset: int, scale: float, i
 
 
 _TOKEN_TABLES: dict = {}
+TOKEN_PACKED_BUCKET = 2048  # rows / keys the packed per-token layout is rounded up to (0: exact lengths)
 
 
 def _token_tables(layout, page: int, dev, B: int = 1, qchunk: int = 0):
@@ -1180,6 +1181,21 @@ def _token_tables(layout, page: int, dev, B: int = 1, qchunk: int = 0):
     k_abs = torch.where(tk < L[ks], tk, 2**30)
     ts = rs[::64]
     tile_p0, tile_np = c[ts], P[ts]
+    # the packed lengths rounded up to fixed buckets (padding rows: position -1, no pages; padding keys: zero, never
+    # selected): every layout then allocates one of a few sizes, which the caching allocator reuses -- exact lengths
+    # differed with every layout and fragmented the pool (the v4b main run's reserved memory grew ~9 GB above dense's
+    # until the device was full, p264.2085 2026-11-22)
+    if TOKEN_PACKED_BUCKET > 0:
+        Sq_b = -(-Sq // TOKEN_PACKED_BUCKET) * TOKEN_PACKED_BUCKET
+        Pk_b = -(-Pk // (TOKEN_PACKED_BUCKET // page)) * (TOKEN_PACKED_BUCKET // page)
+        q_abs = F.pad(q_abs, (0, Sq_b - Sq), value=-1)
+        k_abs = F.pad(k_abs, (0, (Pk_b - Pk) * page), value=2**30)
+        tile_p0 = F.pad(tile_p0, (0, (Sq_b - Sq) // 64), value=0)
+        tile_np = F.pad(tile_np, (0, (Sq_b - Sq) // 64), value=1)
+        rs = F.pad(rs, (0, Sq_b - Sq), value=int(rs[-1]))
+        tl_ = F.pad(tl_, (0, Sq_b - Sq), value=2**30)  # padding: beyond every span's length
+        Sq, Pk = Sq_b, Pk_b
+        Sk = Pk * page
     span_end_q = torch.zeros(4 * Pk, dtype=torch.bool)
     span_end_q[4 * c[1:] - 1] = True
     ints = [q_abs, k_abs, tile_p0, tile_np]
@@ -1276,6 +1292,9 @@ def _token_packed_select_attention(spans, cfg: PageSparseConfig, scale: float, t
     tb = _token_tables(layout, page, dev, B, qchunk)
     qoff, koff, Sq, Pk, PM = tb["qoff"], tb["koff"], tb["Sq"], tb["Pk"], tb["PM"]
     qp, kp, vp = _packed_qkv(spans, qoff, koff)
+    if qp.shape[2] < Sq or kp.shape[2] < Pk * page:  # the bucketed lengths (padding rows / keys at the end)
+        qp = F.pad(qp, (0, 0, 0, Sq - qp.shape[2]))
+        kp, vp = (F.pad(t, (0, 0, 0, Pk * page - t.shape[2])) for t in (kp, vp))
     with torch.no_grad():
         acc = torch.float64 if qp.dtype == torch.float64 else torch.float32
         qsum = qp[0].view(g, rep, Sq, d).sum(1, dtype=acc) * scale  # [G, Sq, d]
@@ -1306,7 +1325,7 @@ def _token_packed_select_attention(spans, cfg: PageSparseConfig, scale: float, t
         del qsum, qq, nxt, win
     out = rm.rowmask_head_packed_attention(qp[0], kp[0], vp[0], idx, bits, cnt, tb["q_abs"], tb["k_abs"], scale, tq,
                                            page)[None]
-    segs = out.split([qoff[i + 1] - qoff[i] for i in range(len(spans))], dim=2)
+    segs = out[:, :, :qoff[-1]].split([qoff[i + 1] - qoff[i] for i in range(len(spans))], dim=2)  # bucket padding off
     return [seg[:, :, :sp[0].shape[2]] for seg, sp in zip(segs, spans)]
 
 
