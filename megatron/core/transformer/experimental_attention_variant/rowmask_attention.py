@@ -173,12 +173,15 @@ def _dkv_kernel(Q, K, V, DO, LSE, DELTA, DK, DV, CSR_OFF, CSR_R, CSR_B, QPOS, KP
 # TQ queries instead of 64 -- pure per-token selection (every query its own pages) has a much smaller union per 8
 # queries than per 64. Row m = query m // REPP, head m % REPP; a bit word per (tile, key block) has TQ bits.
 @triton.jit(do_not_specialize=['scale', 'Sq', 'Sk', 'NT', 'NB'])
-def _fwd_hp_kernel(Q, K, V, O, LSE, IDX, BITS, CNT, QPOS, KPOS, QLO, scale,
+def _fwd_hp_kernel(Q, K, V, O, LSE, IDX, BITS, CNT, ORDER, QPOS, KPOS, QLO, scale,
                    Sq, Sk, NT, NB,
                    sqh, sqs, skh, sks, soh, sos,
                    REP: tl.constexpr, REPP: tl.constexpr, TQ: tl.constexpr, D: tl.constexpr, BN: tl.constexpr):
-    t = tl.program_id(0)
-    hk = tl.program_id(1)
+    # tiles in descending order of their list length (longest first): the wide-union tiles do not end up as the
+    # kernel's tail on a few SMs
+    tid = tl.load(ORDER + tl.program_id(0))
+    t = tid % NT
+    hk = tid // NT
     m = tl.arange(0, TQ * REPP)
     qi = m // REPP
     hh = m % REPP
@@ -223,12 +226,15 @@ def _fwd_hp_kernel(Q, K, V, O, LSE, IDX, BITS, CNT, QPOS, KPOS, QLO, scale,
 
 
 @triton.jit(do_not_specialize=['scale', 'Sq', 'Sk', 'NT', 'NB'])
-def _dq_hp_kernel(Q, K, V, DO, LSE, DELTA, DQ, IDX, BITS, CNT, QPOS, KPOS, QLO, scale,
+def _dq_hp_kernel(Q, K, V, DO, LSE, DELTA, DQ, IDX, BITS, CNT, ORDER, QPOS, KPOS, QLO, scale,
                   Sq, Sk, NT, NB,
                   sqh, sqs, skh, sks, soh, sos,
                   REP: tl.constexpr, REPP: tl.constexpr, TQ: tl.constexpr, D: tl.constexpr, BN: tl.constexpr):
-    t = tl.program_id(0)
-    hk = tl.program_id(1)
+    # tiles in descending order of their list length (longest first): the wide-union tiles do not end up as the
+    # kernel's tail on a few SMs
+    tid = tl.load(ORDER + tl.program_id(0))
+    t = tid % NT
+    hk = tid // NT
     m = tl.arange(0, TQ * REPP)
     qi = m // REPP
     hh = m % REPP
@@ -268,13 +274,14 @@ def _dq_hp_kernel(Q, K, V, DO, LSE, DELTA, DQ, IDX, BITS, CNT, QPOS, KPOS, QLO, 
 
 
 @triton.jit(do_not_specialize=['scale', 'Sq', 'Sk', 'NKB'])
-def _dkv_hp_kernel(Q, K, V, DO, LSE, DELTA, DK, DV, CSR_OFF, CSR_R, CSR_B, QPOS, KPOS, QLO, scale,
+def _dkv_hp_kernel(Q, K, V, DO, LSE, DELTA, DK, DV, CSR_OFF, CSR_R, CSR_B, ORDER, QPOS, KPOS, QLO, scale,
                    Sq, Sk, NKB,
                    sqh, sqs, skh, sks, soh, sos,
                    REP: tl.constexpr, REPP: tl.constexpr, TQ: tl.constexpr, D: tl.constexpr, BN: tl.constexpr,
                    MC: tl.constexpr):
-    pb = tl.program_id(0)  # key block
-    hk = tl.program_id(1)
+    tid = tl.load(ORDER + tl.program_id(0))  # key blocks in descending order of their entry count
+    pb = tid % NKB
+    hk = tid // NKB
     cols = pb * BN + tl.arange(0, BN)
     cmask = cols < Sk
     dd = tl.arange(0, D)
@@ -438,16 +445,17 @@ class _RowMaskHeadPacked(torch.autograd.Function):
         o = torch.empty_like(q)
         lse = torch.empty(Hq, Sq, device=q.device, dtype=torch.float32)
         w, st = _hp_config("fwd", D, tq * repp)[:2]
-        _fwd_hp_kernel[(nt, Hk)](q, k, v, o, lse, idx, bits, cnt, q_pos, k_pos, q_lo, scale, Sq, Sk, nt, NB,
+        order = torch.argsort(cnt.reshape(-1), descending=True).to(torch.int32)  # longest lists first
+        _fwd_hp_kernel[(nt * Hk,)](q, k, v, o, lse, idx, bits, cnt, order, q_pos, k_pos, q_lo, scale, Sq, Sk, nt, NB,
                                  q.stride(0), q.stride(1), k.stride(0), k.stride(1), o.stride(0), o.stride(1),
                                  REP=rep, REPP=repp, TQ=tq, D=D, BN=bn, num_warps=w, num_stages=st)
-        ctx.save_for_backward(q, k, v, o, lse, idx, bits, cnt, q_pos, k_pos, q_lo)
+        ctx.save_for_backward(q, k, v, o, lse, idx, bits, cnt, order, q_pos, k_pos, q_lo)
         ctx.scale, ctx.tq, ctx.bn, ctx.rep, ctx.repp = scale, tq, bn, rep, repp
         return o
 
     @staticmethod
     def backward(ctx, do):
-        q, k, v, o, lse, idx, bits, cnt, q_pos, k_pos, q_lo = ctx.saved_tensors
+        q, k, v, o, lse, idx, bits, cnt, order, q_pos, k_pos, q_lo = ctx.saved_tensors
         Hq, Sq, D = q.shape
         Hk, Sk, _ = k.shape
         do = do.contiguous()
@@ -457,16 +465,17 @@ class _RowMaskHeadPacked(torch.autograd.Function):
         dq = torch.empty_like(q)
         rows = ctx.tq * ctx.repp
         w, st = _hp_config("dq", D, rows)[:2]
-        _dq_hp_kernel[(nt, Hk)](q, k, v, do, lse, delta, dq, idx, bits, cnt, q_pos, k_pos, q_lo, ctx.scale, Sq, Sk,
-                                nt, NB, q.stride(0), q.stride(1), k.stride(0), k.stride(1), do.stride(0),
-                                do.stride(1), **kw, num_warps=w, num_stages=st)
+        _dq_hp_kernel[(nt * Hk,)](q, k, v, do, lse, delta, dq, idx, bits, cnt, order, q_pos, k_pos, q_lo, ctx.scale,
+                                  Sq, Sk, nt, NB, q.stride(0), q.stride(1), k.stride(0), k.stride(1), do.stride(0),
+                                  do.stride(1), **kw, num_warps=w, num_stages=st)
         nkb = -(-Sk // ctx.bn)
         off, rr, bb = _csr(idx, bits, cnt, nkb)
         dk, dv = torch.empty_like(k), torch.empty_like(v)
         w, st, mc = _hp_config("dkv", D, rows)
-        _dkv_hp_kernel[(nkb, Hk)](q, k, v, do, lse, delta, dk, dv, off, rr, bb, q_pos, k_pos, q_lo, ctx.scale, Sq,
-                                  Sk, nkb, q.stride(0), q.stride(1), k.stride(0), k.stride(1), do.stride(0),
-                                  do.stride(1), **kw, MC=min(mc, rows), num_warps=w, num_stages=st)
+        korder = torch.argsort((off[:, 1:] - off[:, :-1]).reshape(-1), descending=True).to(torch.int32)
+        _dkv_hp_kernel[(nkb * Hk,)](q, k, v, do, lse, delta, dk, dv, off, rr, bb, korder, q_pos, k_pos, q_lo,
+                                    ctx.scale, Sq, Sk, nkb, q.stride(0), q.stride(1), k.stride(0), k.stride(1),
+                                    do.stride(0), do.stride(1), **kw, MC=min(mc, rows), num_warps=w, num_stages=st)
         return dq, dk, dv, None, None, None, None, None, None, None, None, None
 
 
