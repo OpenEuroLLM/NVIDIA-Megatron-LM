@@ -145,72 +145,103 @@ def _owners(rows: Sequence[Sequence[int]]) -> List[int]:
     return [max(range(len(r)), key=lambda k: (r[k], -k)) for r in rows]
 
 
-def _exchange_round(params, updates, metas, group, ns_fn) -> List[torch.Tensor]:
-    world = torch.distributed.get_world_size(group)
-    me = torch.distributed.get_rank(group)
-    rows = _ROW_COUNTS.get(params, group)
-    cols = [p.shape[1] for p in params]
-    owner = _owners(rows)
-    n = len(params)
-    device = updates[0].device if updates else torch.device("cuda")
-    first = [[0] * (world + 1) for _ in range(n)]  # first[i][r]: rank r's first row of matrix i
-    for i in range(n):
+class _Plan:
+    """This rank's side of one round's exchange: index bookkeeping only, fixed by the row layout
+    (the same every step), so it is built once per parameter set. Building it walks every
+    (matrix, rank) pair -- ~0.3 s of Python per optimizer step for the v4b experts (8640 matrices
+    over an expert-DP group of 256) when it was redone at every step."""
+
+    def __init__(self, params, group):
+        world = torch.distributed.get_world_size(group)
+        me = torch.distributed.get_rank(group)
+        rows = _ROW_COUNTS.get(params, group)
+        cols = [p.shape[1] for p in params]
+        owner = _owners(rows)
+        n = len(params)
+        first = [[0] * (world + 1) for _ in range(n)]  # first[i][r]: rank r's first row of i
+        for i in range(n):
+            for r in range(world):
+                first[i][r + 1] = first[i][r] + rows[i][r]
+        self.mine = [i for i in range(n) if owner[i] == me]
+        by_owner: Dict[int, List[int]] = {}
+        for i in range(n):
+            by_owner.setdefault(owner[i], []).append(i)
+        # rows -> owners (send order: owner, then matrix)
+        self.send, self.send_splits = [], [0] * world
+        for o in range(world):
+            for i in by_owner.get(o, ()):
+                if rows[i][me]:
+                    self.send.append(i)
+                    self.send_splits[o] += rows[i][me] * cols[i]
+        self.recv_splits = [sum(rows[i][r] * cols[i] for i in self.mine) for r in range(world)]
+        # owners: each full matrix from rank-ordered pieces of the received buffer
+        self.pieces: Dict[int, List[Tuple[int, int]]] = {i: [] for i in self.mine}
+        offset = 0
         for r in range(world):
-            first[i][r + 1] = first[i][r] + rows[i][r]
-    mine = [i for i in range(n) if owner[i] == me]
-    by_owner: Dict[int, List[int]] = {}
-    for i in range(n):
-        by_owner.setdefault(owner[i], []).append(i)
+            for i in self.mine:
+                k = rows[i][r] * cols[i]
+                if k:
+                    self.pieces[i].append((offset, k))
+                    offset += k
+        self.shape = {i: (params[i].shape[0], cols[i]) for i in self.mine}
+        # full directions -> rows (back order: destination, then matrix)
+        self.back, self.back_splits = [], [0] * world
+        for r in range(world):
+            for i in self.mine:
+                if rows[i][r]:
+                    self.back.append((i, first[i][r], first[i][r + 1]))
+                    self.back_splits[r] += rows[i][r] * cols[i]
+        # this rank's rows of every matrix in the returned buffer
+        self.got = []
+        offset = 0
+        for o in range(world):
+            for i in by_owner.get(o, ()):
+                k = rows[i][me] * cols[i]
+                if k:
+                    self.got.append((i, offset, k, rows[i][me]))
+                    offset += k
+        self.cols = cols
+
+
+_PLANS: Dict[Tuple, _Plan] = {}
+
+
+def _exchange_round(params, updates, metas, group, ns_fn) -> List[torch.Tensor]:
+    key = (id(group), tuple(id(p) for p in params))
+    plan = _PLANS.get(key)
+    if plan is None:
+        plan = _PLANS[key] = _Plan(params, group)
+    cols = plan.cols
+    device = updates[0].device if updates else torch.device("cuda")
     empty = torch.empty(0, dtype=EXCHANGE_DTYPE, device=device)
 
-    # rows -> owners (send order: owner, then matrix)
-    send_parts, send_splits = [], [0] * world
-    for o in range(world):
-        for i in by_owner.get(o, ()):
-            if rows[i][me]:
-                send_parts.append(updates[i].reshape(-1).to(EXCHANGE_DTYPE))
-                send_splits[o] += rows[i][me] * cols[i]
-    recv_splits = [sum(rows[i][r] * cols[i] for i in mine) for r in range(world)]
+    send_parts = [updates[i].reshape(-1).to(EXCHANGE_DTYPE) for i in plan.send]
     send = torch.cat(send_parts) if send_parts else empty
-    recv = torch.empty(sum(recv_splits), dtype=EXCHANGE_DTYPE, device=device)
-    torch.distributed.all_to_all_single(recv, send, recv_splits, send_splits, group=group)
+    recv = torch.empty(sum(plan.recv_splits), dtype=EXCHANGE_DTYPE, device=device)
+    torch.distributed.all_to_all_single(
+        recv, send, plan.recv_splits, plan.send_splits, group=group
+    )
 
     # owners: full matrices (rank-ordered pieces, one cat each), batched Newton-Schulz
-    pieces: Dict[int, List[torch.Tensor]] = {i: [] for i in mine}
-    offset = 0
-    for r in range(world):
-        for i in mine:
-            k = rows[i][r] * cols[i]
-            if k:
-                pieces[i].append(recv[offset : offset + k])
-                offset += k
-    full = {i: torch.cat(pieces[i]).view(params[i].shape[0], cols[i]).float() for i in mine}
+    full = {
+        i: torch.cat([recv[a : a + k] for a, k in plan.pieces[i]]).view(plan.shape[i]).float()
+        for i in plan.mine
+    }
     batches: Dict[Tuple, List[int]] = {}
-    for i in mine:
+    for i in plan.mine:
         batches.setdefault(metas[i][0], []).append(i)
     for idx in batches.values():
         out = ns_fn(torch.stack([full[i] for i in idx]), metas[idx[0]][1])
         for j, i in enumerate(idx):
             full[i] = out[j]
 
-    # full directions -> rows (back order: destination, then matrix)
-    back_parts, back_splits = [], [0] * world
-    for r in range(world):
-        for i in mine:
-            if rows[i][r]:
-                back_parts.append(full[i][first[i][r] : first[i][r + 1]].reshape(-1))
-                back_splits[r] += rows[i][r] * cols[i]
+    back_parts = [full[i][a:b].reshape(-1) for i, a, b in plan.back]
     back = torch.cat(back_parts).to(EXCHANGE_DTYPE) if back_parts else empty
-    got = torch.empty(sum(send_splits), dtype=EXCHANGE_DTYPE, device=device)
-    torch.distributed.all_to_all_single(got, back, send_splits, back_splits, group=group)
-    out: List[torch.Tensor] = [updates[i].new_empty((0, cols[i])) for i in range(n)]
-    offset = 0
-    for o in range(world):
-        for i in by_owner.get(o, ()):
-            k = rows[i][me] * cols[i]
-            if k:
-                out[i] = got[offset : offset + k].view(rows[i][me], cols[i]).float()
-                offset += k
+    got = torch.empty(sum(plan.send_splits), dtype=EXCHANGE_DTYPE, device=device)
+    torch.distributed.all_to_all_single(got, back, plan.send_splits, plan.back_splits, group=group)
+    out: List[torch.Tensor] = [updates[i].new_empty((0, cols[i])) for i in range(len(params))]
+    for i, a, k, r in plan.got:
+        out[i] = got[a : a + k].view(r, cols[i]).float()
     return out
 
 
