@@ -3,6 +3,7 @@
 """Input/output checkpointing."""
 
 import contextlib
+import dataclasses
 import hashlib
 import inspect
 import multiprocessing
@@ -995,7 +996,7 @@ def save_checkpoint(
                 _save_phase("preprocess_fsdp_dtensor_state_dict")
 
             if args.async_save:
-                planner = torch.distributed.checkpoint.DefaultSavePlanner()
+                planner = _SharedPlannerDataSavePlanner()
                 coordinator_rank = 0
                 _, async_modules = get_async_strategy(args.async_strategy)
                 FileSystemWriterAsync = async_modules['FileSystemWriterAsync']
@@ -1551,6 +1552,41 @@ def generate_state_dict(
         state_dict['rng_state'] = rng_state
 
     return state_dict
+
+
+class _SharedPlannerDataSavePlanner(default_planner.DefaultSavePlanner):
+    """DefaultSavePlanner whose local plans carry the flattening map (``planner_data``) only on
+    one rank per distinct map.
+
+    Every rank's plan holds the map of all keys of its local state dict, and the coordinator
+    gathers every plan: at 1024 ranks the 84B v4b checkpoint's ~86k keys per rank (~12 MB) made a
+    ~12 GB gather, ~100 s for each of the first two saves after a start (the plan cache takes
+    over from the third). The maps differ only between expert-parallel ranks; data-parallel
+    replicas hold identical ones. The coordinator merges the maps into the metadata
+    (``ChainMap``), so the merged map, the metadata and the written data are unchanged.
+    """
+
+    def create_local_plan(self):
+        plan = super().create_local_plan()
+        if plan.planner_data and torch.distributed.is_initialized():
+            items = sorted(plan.planner_data.items(), key=lambda kv: kv[0])
+            digest = hashlib.sha1(repr(items).encode()).digest()
+            mine = int.from_bytes(digest[:8], "little", signed=True)
+            world = torch.distributed.get_world_size()
+            device = (
+                torch.device("cuda", torch.cuda.current_device())
+                if torch.distributed.get_backend() == "nccl"
+                else torch.device("cpu")
+            )
+            gathered = [torch.zeros(1, dtype=torch.int64, device=device) for _ in range(world)]
+            torch.distributed.all_gather(
+                gathered, torch.tensor([mine], dtype=torch.int64, device=device)
+            )
+            hashes = torch.cat(gathered).tolist()
+            if hashes.index(mine) != torch.distributed.get_rank():
+                plan = dataclasses.replace(plan, planner_data={})
+                self.plan = plan
+        return plan
 
 
 def _save_phase(tag, t0=[None]):
