@@ -34,22 +34,7 @@ from megatron.core.transformer.module import MegatronModule
 # the shared selection of the current micro-batch: (document start, query offset) -> the source layer's selection
 _SHARED_SELECTION: dict = {}
 
-
-
 _BOUNDS: dict = {}
-_ZEROS: dict = {}
-
-
-def _zero_rows(n: int, hq: int, d: int, like: torch.Tensor) -> torch.Tensor:
-    """[n, hq, d] zeros as a view of one persistent buffer per (device, dtype, hq, d), grown to the largest n seen: the
-    padding rows after a micro-batch's last document vary in number, and a fresh tensor per layout is a
-    layout-dependent allocation (the per-token path keeps every size constant, 2026-11-22). Read only (a cat input)."""
-    key = (str(like.device), like.dtype, hq, d)
-    buf = _ZEROS.get(key)
-    if buf is None or buf.shape[0] < n:
-        buf = like.new_zeros(max(n, 64), hq, d)
-        _ZEROS[key] = buf
-    return buf[:n]
 
 
 def _host_bounds(cu: torch.Tensor) -> list:
@@ -457,7 +442,7 @@ class PageSparseCoreAttention(MegatronModule):
             for (i, n, h), o in zip(flex_rows, self._packed_flex(flex_spans, flex_keys)):
                 pieces[i] = o[0, :, h:].permute(1, 0, 2)
         if local < t:  # padding after the last document
-            pieces.append(_zero_rows(t - local, hq, d, query))
+            pieces.append(query.new_zeros(t - local, hq, d))
         # the permuted [n, hq, d] views concatenated once (a reshape per piece copied every output twice: +0.5 GB per
         # layer at v4b's 64k, 2026-11-22)
         return torch.cat(pieces, 0).view(t, hq * d), losses

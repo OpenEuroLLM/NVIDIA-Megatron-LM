@@ -787,3 +787,64 @@ def test_token_fixed_layout_matches_reference(seed, exact_scores):
         torch.testing.assert_close(o, r, atol=2e-2, rtol=2e-2)
     for a, b in zip(g_out, g_ref):
         torch.testing.assert_close(a, b, atol=3e-2 * b.abs().max().item(), rtol=0)
+
+
+def test_token_path_stress_recompute_deterministic(single):
+    """Stress of the per-token THD path as training runs it: several layers per step under activation checkpointing
+    (forward, then recompute in the backward), over many random packed layouts (many tiny documents, long ones, the
+    constant-size layout and its bucketed fallback), each step run twice: outputs and q / k / v gradients finite and
+    bit-identical (a race, an uninitialized read or a buffer reused across layers / recompute shows up here or as an
+    illegal address -- the v4b main run's crash on 2026-11-23). PAGE_SPARSE_STRESS_STEPS scales it up."""
+    import random
+
+    from torch.utils.checkpoint import checkpoint
+
+    steps = int(os.environ.get("PAGE_SPARSE_STRESS_STEPS", "12"))
+    hq, g, d, total = 8, 2, 64, 8192
+    kw = dict(page_sparse_selector="page_maxpool", page_sparse_per_group=True, page_sparse_select_block=1,
+              page_sparse_backend="rowmask", page_sparse_page=64, page_sparse_topk=8, page_sparse_window=128,
+              page_sparse_flex_q_block=64)
+    cfg = TransformerConfig(num_layers=3, hidden_size=hq * d, num_attention_heads=hq, num_query_groups=g,
+                            kv_channels=d, **kw)
+    layers = [PageSparseCoreAttention(cfg, i + 1, pg_collection=single).cuda() for i in range(3)]
+    rng = random.Random(0)
+
+    def layout(i):
+        kind = i % 4
+        if kind == 0:  # many tiny documents (the constant-size layout's worst padding)
+            cuts = sorted(rng.sample(range(1, total), 40))
+        elif kind == 1:  # one long document
+            cuts = []
+        elif kind == 2:  # past the fixed padding budget: the bucketed fallback
+            cuts = sorted(rng.sample(range(1, total), 200))
+        else:
+            cuts = sorted(rng.sample(range(1, total), rng.randint(1, 12)))
+        return [b - a for a, b in zip([0] + cuts, cuts + [total])]
+
+    def run(segs, seed, ckpt=True):
+        cu = torch.tensor([0, *torch.tensor(segs).cumsum(0).tolist()], dtype=torch.int32, device="cuda")
+        psp = PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu, cu_seqlens_q_padded=cu,
+                              cu_seqlens_kv_padded=cu, max_seqlen_q=max(segs), max_seqlen_kv=max(segs))
+        gen = torch.Generator(device="cuda").manual_seed(seed)
+        ins = [tuple(torch.randn(total, n, d, generator=gen, device="cuda").to(torch.bfloat16).requires_grad_()
+                     for n in (hq, g, g)) for _ in layers]
+        outs = []
+        for att, (q, k, v) in zip(layers, ins):
+            fn = lambda q_, k_, v_, att=att: att(q_, k_, v_, packed_seq_params=psp)
+            outs.append(checkpoint(fn, q, k, v, use_reentrant=False) if ckpt else fn(q, k, v))
+        sum(o.float().square().mean() for o in outs).backward()
+        return [o.detach() for o in outs] + [t.grad for qkv in ins for t in qkv]
+
+    old_pad = ps.TOKEN_FIXED_PAD
+    ps.TOKEN_FIXED_PAD = 2048  # the 200-document layouts exceed it
+    try:
+        run(layout(1), 0, ckpt=False)  # kernel warm-up outside the checkpoint
+        for i in range(steps):
+            segs = layout(i)
+            a, b = run(segs, i), run(segs, i)
+            torch.cuda.synchronize()
+            for x, y in zip(a, b):
+                assert bool(torch.isfinite(x).all())
+                assert torch.equal(x, y), f"step {i}: not deterministic ({len(segs)} documents)"
+    finally:
+        ps.TOKEN_FIXED_PAD = old_pad
