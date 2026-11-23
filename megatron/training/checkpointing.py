@@ -1009,6 +1009,13 @@ def save_checkpoint(
                         in inspect.signature(FileSystemWriterAsync.__init__).parameters
                     ):
                         _writer_kwargs['use_cpu_shm_for_gpu_tensors'] = True
+                        # reuse the shared-memory buffers across saves (the values are copied
+                        # into them on every save; the writer drains the previous save first).
+                        # Not on the GPU IPC path: there the cache keeps the first save's GPU
+                        # tensors, and this state dict holds per-save copies (split states)
+                        _writer_kwargs['use_cached_data_structure'] = bool(
+                            args.ckpt_assume_constant_structure
+                        )
                     else:
                         raise AssertionError(
                             'Installed nvidia-resiliency-ext does not support '
