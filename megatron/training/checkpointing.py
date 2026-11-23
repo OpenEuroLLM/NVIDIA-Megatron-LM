@@ -1690,6 +1690,55 @@ def _drop_metadata_cache():
     _METADATA_CACHE.clear()
 
 
+def _broadcast_metadata(checkpoint_name):
+    """FSDP_DCP_BCAST_METADATA=1: rank 0 reads ``.metadata`` and broadcasts its bytes (NCCL); every
+    rank unpickles them into _METADATA_CACHE, so DCP's per-rank read_metadata hits the cache.
+
+    The first read otherwise opens the 327 MB file on all 1024 ranks at once (~320 GB from GPFS;
+    the args-only load took 94 s at 256 nodes). The bytes are the file's, so the metadata is the
+    same object a direct read gives. Collective: every rank calls it at the same point.
+    """
+    if os.environ.get("FSDP_DCP_BCAST_METADATA", "0") != "1":
+        return
+    if not torch.distributed.is_initialized() or torch.distributed.get_world_size() == 1:
+        return
+    reader = _MetadataOnceReader(checkpoint_name)
+    try:
+        path = reader._get_metadata_path(None)
+    except Exception:  # a reader layout without _get_metadata_path: leave it to DCP
+        return
+    key = os.path.realpath(str(path))
+    device = torch.device("cuda", torch.cuda.current_device())
+    # every rank takes the same branch (a rank with the entry cached would skip the broadcast)
+    missing = torch.tensor([0 if key in _METADATA_CACHE else 1], device=device)
+    torch.distributed.all_reduce(missing, op=torch.distributed.ReduceOp.MAX)
+    if missing.item() == 0:
+        return
+    if torch.distributed.get_rank() == 0:
+        with open(path, "rb") as f:
+            data = f.read()
+        size = torch.tensor([len(data)], dtype=torch.int64, device=device)
+    else:
+        size = torch.zeros(1, dtype=torch.int64, device=device)
+    torch.distributed.broadcast(size, src=0)
+    if torch.distributed.get_rank() == 0:
+        buf = torch.frombuffer(bytearray(data), dtype=torch.uint8).to(device)
+        del data
+    else:
+        buf = torch.empty(int(size.item()), dtype=torch.uint8, device=device)
+    torch.distributed.broadcast(buf, src=0)
+    raw = buf.cpu().numpy().tobytes()
+    del buf
+    metadata = pickle.loads(raw)
+    del raw
+    if getattr(metadata, "storage_meta", None) is None:
+        from torch.distributed.checkpoint.metadata import StorageMeta
+
+        metadata.storage_meta = StorageMeta()
+    _METADATA_CACHE.clear()  # one checkpoint at a time
+    _METADATA_CACHE[key] = metadata
+
+
 class _MetadataOnceReader(FileSystemReader):
     """A FileSystemReader that reads a checkpoint's ``.metadata`` once per process (see
     _METADATA_CACHE)."""
@@ -1708,13 +1757,75 @@ class _MetadataOnceReader(FileSystemReader):
         return metadata
 
     def read_data(self, plan, planner):
+        read = (
+            self._read_data_sequential
+            if os.environ.get("FSDP_DCP_SEQUENTIAL_READ", "0") == "1"
+            else super().read_data
+        )
         if not _load_timing_on():
-            return super().read_data(plan, planner)
+            return read(plan, planner)
         t0 = time()
-        fut = super().read_data(plan, planner)
+        fut = read(plan, planner)
         fut.wait()
         tag = "  of_which_read_data"
         _LOAD_TIMES[tag] = _LOAD_TIMES.get(tag, 0.0) + (time() - t0)
+        return fut
+
+    def _read_data_sequential(self, plan, planner):
+        """FileSystemReader.read_data with the requests of a file in offset order, and a file whose
+        requests cover at least half of it read in one sequential pass (FSDP_DCP_SEQUENTIAL_READ=1).
+
+        DCP reads the items of a file one by one in plan order (a seek + read each, ~1,100 per
+        rank for the 84B v4b checkpoint: 52-200 s for ~1.1 GB per rank at 1024 ranks). The bytes
+        and their handling per item are DCP's (the same _slice_file, transforms, torch.load,
+        narrow and commit), so the loaded state is the same.
+        """
+        import io
+
+        from torch.distributed._shard._utils import narrow_tensor_by_index
+        from torch.distributed.checkpoint.planner import LoadItemType
+
+        per_file = {}
+        for read_item in plan.items:
+            item_md = self.storage_data[read_item.storage_index]
+            per_file.setdefault(item_md.relative_path, []).append(read_item)
+
+        for relative_path, reqs in per_file.items():
+            reqs.sort(key=lambda r: self.storage_data[r.storage_index].offset)
+            new_path = self.fs.concat_path(self.path, relative_path)
+            wanted = sum(self.storage_data[r.storage_index].length for r in reqs)
+            with self.fs.create_stream(new_path, "rb") as stream:
+                size = os.fstat(stream.fileno()).st_size if hasattr(stream, "fileno") else None
+                if size is not None and 2 * wanted >= size:
+                    stream = io.BytesIO(stream.read())
+                for req in reqs:
+                    item_md = self.storage_data[req.storage_index]
+                    file_slice = self._slice_file(stream, item_md)
+                    transform_from = self.transforms.transform_load_stream(
+                        req, item_md.transform_descriptors or (), file_slice
+                    )
+                    if req.type == LoadItemType.BYTE_IO:
+                        read_bytes = io.BytesIO(transform_from.read(-1))
+                        read_bytes.seek(0)
+                        planner.load_bytes(req, read_bytes)
+                    else:
+                        if transform_from.seekable():
+                            seekable = transform_from
+                        else:
+                            seekable = io.BytesIO(transform_from.read(-1))
+                            seekable.seek(0)
+                        tensor = torch.load(seekable, map_location="cpu", weights_only=True)
+                        tensor = narrow_tensor_by_index(tensor, req.storage_offsets, req.lengths)
+                        target_tensor = planner.resolve_tensor(req).detach()
+                        assert target_tensor.size() == tensor.size(), (
+                            f"req {req.storage_index} mismatch sizes "
+                            f"{target_tensor.size()} vs {tensor.size()}"
+                        )
+                        target_tensor.copy_(tensor)
+                        planner.commit_tensor(req, target_tensor)
+
+        fut = torch.futures.Future()
+        fut.set_result(None)
         return fut
 
 
@@ -2326,6 +2437,9 @@ def _load_base_checkpoint(
     elif ckpt_format == 'fsdp_dtensor':
         assert HAVE_MEGATRON_FSDP, 'Should not be called if Megatron-FSDP is not available.'
         if rank0:
+            # load_checkpoint's args-only load runs on every rank (load_args_from_checkpoint's runs
+            # before torch.distributed is initialized and skips this)
+            _broadcast_metadata(checkpoint_name)
             state_dict = {'args': None, 'iteration': None, 'checkpoint_version': None}
             torch.distributed.checkpoint.load(
                 state_dict=state_dict, storage_reader=_MetadataOnceReader(checkpoint_name)
