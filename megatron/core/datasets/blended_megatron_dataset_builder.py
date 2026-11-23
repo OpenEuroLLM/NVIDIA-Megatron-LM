@@ -14,7 +14,7 @@ from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatr
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
 from megatron.core.datasets.index_bundle import load_counts
 from megatron.core.datasets.megatron_dataset import LowLevelDataset, MegatronDataset
-from megatron.core.datasets.utils import Split, normalize
+from megatron.core.datasets.utils import Split, node_staggered, normalize
 from megatron.core.utils import log_single_rank
 
 logger = logging.getLogger(__name__)
@@ -450,8 +450,10 @@ class BlendedMegatronDatasetBuilder(object):
                 if last:  # one of the ranks that wait for rank 0, then all load at once
                     _print_timing(f"rank {rank}: waited for rank 0 {t1 - t0:.1f} s, own pass", t1)
         else:
-            _threading_helper(
-                megatron_datasets, num_dataset_builder_threads, prefixes, split, sizes_per_dataset
+            node_staggered(
+                lambda: _threading_helper(
+                    megatron_datasets, num_dataset_builder_threads, prefixes, split, sizes_per_dataset
+                )
             )
 
         return megatron_datasets

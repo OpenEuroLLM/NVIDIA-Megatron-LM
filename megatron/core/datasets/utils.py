@@ -14,6 +14,41 @@ from ..utils import log_single_rank
 logger = logging.getLogger(__name__)
 
 
+_NODE_STAGGER_CALLS = [0]
+
+
+def node_staggered(fn):
+    """Run ``fn()``; under MEGATRON_DATASET_NODE_STAGGER=1 the node's local rank 0 first, its other
+    ranks after it (a store key per node and call).
+
+    A 256-node start builds the 531-dataset blend on all 1024 ranks at once: every rank opens
+    and maps each dataset's .idx / .bin and reads the packing plans' lookup arrays from GPFS
+    (68-180 s at 1024 ranks, 9 s for one process alone). The node's first rank fills the node's
+    file-system cache for the others. Only the order changes: every rank builds the same objects.
+    No collective may run inside ``fn`` (the other local ranks are waiting on the store).
+    """
+    import torch
+
+    if os.environ.get("MEGATRON_DATASET_NODE_STAGGER", "0") != "1" or not (
+        torch.distributed.is_available() and torch.distributed.is_initialized()
+    ):
+        return fn()
+    local_world = int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
+    if local_world <= 1:
+        return fn()
+    _NODE_STAGGER_CALLS[0] += 1
+    node = torch.distributed.get_rank() // local_world
+    key = f"megatron_dataset_node_stagger/{_NODE_STAGGER_CALLS[0]}/{node}"
+    store = torch.distributed.distributed_c10d._get_default_store()
+    if int(os.environ.get("LOCAL_RANK", "0")) != 0:
+        store.wait([key])
+        return fn()
+    try:
+        return fn()
+    finally:
+        store.set(key, "1")
+
+
 class Split(Enum):
     train = 0
     valid = 1

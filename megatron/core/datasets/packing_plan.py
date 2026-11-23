@@ -33,6 +33,8 @@ from typing import Dict, List, Optional
 import numpy
 import torch
 
+from megatron.core.datasets.utils import node_staggered
+
 logger = logging.getLogger(__name__)
 
 BOUNDARY_MODES = ("doc", "group", "none")
@@ -206,10 +208,16 @@ def wrap_with_packing_plans(train_ds, args):
             assert subs, f"--packing-plan-path {p}: no plan directory"
             expanded.extend(subs)
     ds = PackingPlanDataset(train_ds, expanded, getattr(args, "packing_plan_boundaries", "doc"))
-    check_plan_geometry(ds.plans, args)
-    at_end = getattr(args, "packing_plan_at_end", "exit")
     start = int(getattr(args, "iteration", 0) or 0)
-    end = plan_coverage(ds.plans, start)
+
+    def read_plans():  # every array read of the plans happens here (the lookup tables included)
+        check_plan_geometry(ds.plans, args)
+        coverage = plan_coverage(ds.plans, start)
+        ds._lookup_tables()
+        return coverage
+
+    end = node_staggered(read_plans)
+    at_end = getattr(args, "packing_plan_at_end", "exit")
     if end is None:
         msg = (f"--packing-plan-path: the step after checkpoint {start} is not planned "
                f"(plans cover {[(p.meta['from_ckpt'], p.meta['to_ckpt']) for p in ds.plans]})")
