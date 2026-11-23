@@ -517,6 +517,13 @@ def save_routed_expert_stat(
     routed output in the eager expert compute, the layer output in the postprocess graph."""
     if layer_number is None or is_graph_warmup():
         return
+    from megatron.core.tensor_parallel.random import is_checkpointing
+
+    if torch.is_grad_enabled() and is_checkpointing():
+        # The recompute of a checkpointed layer (its first forward ran without grad and recorded
+        # the same tensor): recording it again doubles squared sum and count alike, which leaves
+        # every reported RMS unchanged and costs the reductions twice.
+        return
     tracker = _MOE_EXPERT_VIABILITY_TRACKER
     if "routed_sq_sum" not in tracker or tracker["routed_sq_sum"].shape[0] != num_layers:
         device = tensor.device
@@ -524,7 +531,11 @@ def save_routed_expert_stat(
             tracker[f"{key}_sq_sum"] = torch.zeros(num_layers, device=device, dtype=torch.float32)
             tracker[f"{key}_count"] = torch.zeros(num_layers, device=device, dtype=torch.float32)
     index = layer_number - 1
-    tracker[f"{part}_sq_sum"][index] += tensor.detach().float().square().sum()
+    # one fp32-accumulating reduction over the bf16 tensor: .float().square().sum() wrote two fp32
+    # copies of it (2 x 0.5 GiB per [64k, 2048] tensor) and ran 3 kernels, ~9x the time
+    tracker[f"{part}_sq_sum"][index] += torch.linalg.vector_norm(
+        tensor.detach(), dtype=torch.float32
+    ).square()
     tracker[f"{part}_count"][index] += tensor.numel()
 
 
