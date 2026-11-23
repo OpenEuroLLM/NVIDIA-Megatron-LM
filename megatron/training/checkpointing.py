@@ -996,7 +996,13 @@ def save_checkpoint(
                 _save_phase("preprocess_fsdp_dtensor_state_dict")
 
             if args.async_save:
-                planner = _SharedPlannerDataSavePlanner()
+                # FSDP_DCP_SHARED_PLANNER_DATA=1: the planner_data map from one rank per distinct map
+                # (off until checked multi-node; the stock planner otherwise)
+                planner = (
+                    _SharedPlannerDataSavePlanner()
+                    if os.environ.get("FSDP_DCP_SHARED_PLANNER_DATA", "0") == "1"
+                    else torch.distributed.checkpoint.DefaultSavePlanner()
+                )
                 coordinator_rank = 0
                 _, async_modules = get_async_strategy(args.async_strategy)
                 FileSystemWriterAsync = async_modules['FileSystemWriterAsync']
