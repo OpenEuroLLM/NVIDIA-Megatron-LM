@@ -39,6 +39,50 @@ from megatron.training.utils import is_rank0, print_rank_0, warn_rank_0
 logger = logging.getLogger(__name__)
 
 
+# MEGATRON_DEBUG_INIT_TIMING=1: per-rank wall time of the initialize_megatron phases, reported as
+# min / max over all ranks at its end (as MEGATRON_DEBUG_LOAD_TIMING does for a checkpoint load).
+_INIT_TAGS = (
+    "init_process_group",
+    "initialize_model_parallel",
+    "random_seeds",
+    "autoresume",
+    "compile_dependencies_barrier",
+)
+_INIT_TIMES: dict = {}
+
+
+def _init_timing_on() -> bool:
+    return os.environ.get("MEGATRON_DEBUG_INIT_TIMING", "0") == "1"
+
+
+def _init_phase(tag, t0):
+    """Add the time since ``t0`` to phase ``tag``; return the current time."""
+    now = time.time()
+    if _init_timing_on():
+        _INIT_TIMES[tag] = _INIT_TIMES.get(tag, 0.0) + (now - t0)
+    return now
+
+
+def _report_init_timing():
+    if not _init_timing_on() or not torch.distributed.is_initialized():
+        return
+    n, total, slowest, slowest_desc = mpu.group_creation_timing()
+    vals = [_INIT_TIMES.get(tag, 0.0) for tag in _INIT_TAGS] + [float(n), total, slowest]
+    t = torch.tensor(vals, dtype=torch.float64, device=torch.cuda.current_device())
+    t_max = t.clone()
+    torch.distributed.all_reduce(t_max, op=torch.distributed.ReduceOp.MAX)
+    t_min = t.clone()
+    torch.distributed.all_reduce(t_min, op=torch.distributed.ReduceOp.MIN)
+    for i, tag in enumerate(_INIT_TAGS):
+        print_rank_0(f"[init-timing] {tag}: min {t_min[i].item():.1f} s, max {t_max[i].item():.1f} s")
+    k = len(_INIT_TAGS)
+    print_rank_0(
+        f"[init-timing] group creations: {int(t_max[k].item())} per rank, "
+        f"{t_min[k + 1].item():.1f}-{t_max[k + 1].item():.1f} s in total, slowest one "
+        f"{t_max[k + 2].item():.2f} s (rank 0: {slowest_desc})"
+    )
+
+
 def initialize_megatron(
     allow_no_cuda=False,
     skip_mpu_initialization=False,
@@ -109,6 +153,7 @@ def initialize_megatron(
         )
 
         # Random seeds for reproducibility; multimodal MiMo seeds per module in its builder.
+        t_mpu = time.time()
         if not skip_random_seed:
             print_rank_0("> setting random seeds to {} ...".format(args.seed))
             _set_random_seed(
@@ -129,6 +174,7 @@ def initialize_megatron(
             from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
 
             MoEAuxLossAutoScaler.set_loss_scale(torch.ones(1, device=torch.cuda.current_device()))
+        _init_phase("random_seeds", t_mpu)
 
     if skip_mpu_initialization:
         return None
@@ -149,14 +195,19 @@ def initialize_megatron(
         finish_mpu_init()
 
         # Autoresume.
+        t_init = time.time()
         _init_autoresume()
+        t_init = _init_phase("autoresume", t_init)
 
         # Compile dependencies.
         _compile_dependencies()
+        _init_phase("compile_dependencies_barrier", t_init)
 
         if args.tp_comm_overlap:
             # TODO: Should this be activated with just decoder-tp-comm-overlap too?
             _initialize_tp_communicators()
+
+        _report_init_timing()
 
         # No continuation function
         return None
@@ -363,9 +414,11 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
 
         if device_count > 0:
             mem_breakdown.baseline("cuda_context")
+        t_pg = time.time()
         with mem_breakdown.measure("nccl_default_pg"):
             torch.distributed.init_process_group(**init_process_group_kwargs)
             inprocess_restart.maybe_force_nccl_backend_init(device_id)
+        _init_phase("init_process_group", t_pg)
 
     # Set the tensor model-parallel, pipeline model-parallel, and
     # data-parallel communicators.
@@ -384,6 +437,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 )
             from megatron.core import mem_breakdown
 
+            t_mp = time.time()
             with mem_breakdown.measure("nccl_model_parallel_groups"):
                 mpu.initialize_model_parallel(
                     args.tensor_model_parallel_size,
@@ -410,6 +464,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                     high_priority_stream_groups=args.high_priority_stream_groups,
                     sharp_enabled_group=args.sharp_enabled_group,
                 )
+            _init_phase("initialize_model_parallel", t_mp)
             print_rank_0(
                 f"> initialized tensor model parallel with size "
                 f"{mpu.get_tensor_model_parallel_world_size()}"
