@@ -407,7 +407,15 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         return tuple(shapes)
 
     def _batch_key_for(self, p: torch.Tensor) -> tuple[tuple, dict]:
-        """Build a key for parameters that share all batched-step semantics."""
+        """Build a key for parameters that share all batched-step semantics (fixed per parameter:
+        computed once -- every step asks for all of them, 8640 expert matrices per rank in v4b)."""
+        cache = self.__dict__.setdefault("_batch_key_cache", {})
+        hit = cache.get(id(p))
+        if hit is None or hit[0] is not p:
+            hit = cache[id(p)] = (p, *self._batch_key_uncached(p))
+        return hit[1], dict(hit[2])
+
+    def _batch_key_uncached(self, p: torch.Tensor) -> tuple[tuple, dict]:
         if self.pg_collection:
             tp_group = (
                 self.pg_collection.expt_tp
