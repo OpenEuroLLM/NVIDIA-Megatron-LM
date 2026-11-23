@@ -5755,6 +5755,7 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
         args.consumed_train_samples = int(args.diag_consumed_train_samples)
 
     (train_dataloader, valid_dataloaders, test_dataloader) = (None, None, None)
+    data_times = [0.0, 0.0]  # datasets, data loaders (MEGATRON_DEBUG_INIT_TIMING)
 
     print_rank_0('> building train, validation, and test datasets ...')
 
@@ -5807,7 +5808,10 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
 
         else:
             # Build datasets.
+            t_data = time.time()
             train_ds, valid_ds, test_ds = build_train_valid_test_datasets(build_train_valid_test_datasets_provider)
+            data_times[0] = time.time() - t_data
+            t_data = time.time()
             valid_ds = [valid_ds] if not isinstance(valid_ds, list) else valid_ds
             if args.skip_train:
                 train_dataloader = None
@@ -5829,12 +5833,22 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
             do_train = train_dataloader is not None and (args.skip_train or args.train_iters > 0)
             do_valid = valid_dataloaders is not None and (args.full_validation or args.eval_iters > 0)
             do_test = test_dataloader is not None and (args.full_validation or args.eval_iters > 0)
+            data_times[1] = time.time() - t_data
 
         flags = torch.tensor(
             [int(do_train), int(do_valid), int(do_test)], dtype=torch.long, device='cuda'
         )
     else:
         flags = torch.tensor([0, 0, 0], dtype=torch.long, device='cuda')
+
+    if os.environ.get("MEGATRON_DEBUG_INIT_TIMING", "0") == "1":
+        # every rank reaches this point (the broadcast below is collective as well)
+        t = torch.tensor(data_times, dtype=torch.float64, device='cuda')
+        t_min, t_max = t.clone(), t.clone()
+        torch.distributed.all_reduce(t_min, op=torch.distributed.ReduceOp.MIN)
+        torch.distributed.all_reduce(t_max, op=torch.distributed.ReduceOp.MAX)
+        for i, tag in enumerate(("datasets", "data loaders")):
+            print_rank_0(f"[init-timing] {tag}: min {t_min[i].item():.1f} s, max {t_max[i].item():.1f} s")
 
     torch.distributed.broadcast(flags, 0)
 
