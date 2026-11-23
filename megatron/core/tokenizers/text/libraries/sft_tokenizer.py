@@ -38,6 +38,36 @@ def _load_qwen3p5_tools_template():
         return f.read()
 
 
+_QWEN3P5_TOOLS_NOTHINK_TEMPLATE_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "qwen3p5_tools_nothink_chat_template.jinja"
+)
+
+
+def _load_qwen3p5_tools_nothink_template():
+    with open(_QWEN3P5_TOOLS_NOTHINK_TEMPLATE_PATH) as f:
+        return f.read()
+
+
+_QWEN3P5_TOOLS_LASTTURN_TEMPLATE_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "qwen3p5_tools_lastturn_chat_template.jinja"
+)
+
+
+def _load_qwen3p5_tools_lastturn_template():
+    with open(_QWEN3P5_TOOLS_LASTTURN_TEMPLATE_PATH) as f:
+        return f.read()
+
+
+_QWEN3P5_TOOLS_MASKTHINK_TEMPLATE_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "qwen3p5_tools_maskthink_chat_template.jinja"
+)
+
+
+def _load_qwen3p5_tools_maskthink_template():
+    with open(_QWEN3P5_TOOLS_MASKTHINK_TEMPLATE_PATH) as f:
+        return f.read()
+
+
 IGNORE_INDEX = -100
 
 
@@ -169,6 +199,42 @@ class SFTTokenizer:
                 has_bos=False,
                 has_system_role=True,
             )
+        elif prompt_format == "qwen3p5-tools-nothink":
+            # Same as qwen3p5-tools (tool calling + {% generation %} loss mask) but
+            # renders NO <think> tags at all (not even an empty block). gen_body is the
+            # assistant content only; any residual <think>...</think> in the data is
+            # stripped. Loss is on assistant content only, no reasoning scaffold.
+            self._prompt_config = PromptConfig(
+                assistant_prefix_len=0,
+                pad_token_id=tokenizer.convert_tokens_to_ids("<|endoftext|>"),
+                custom_chat_template=_load_qwen3p5_tools_nothink_template(),
+                has_bos=False,
+                has_system_role=True,
+            )
+        elif prompt_format == "qwen3p5-tools-lastturn":
+            # Same as qwen3p5-tools but the template emits {% generation %} markers ONLY on
+            # the last assistant turn -> loss on the target (final) turn only. Used for the
+            # turn-unrolled agentic data (train intermediate-turn reasoning with stripped
+            # context, matching stock-template inference).
+            self._prompt_config = PromptConfig(
+                assistant_prefix_len=0,
+                pad_token_id=tokenizer.convert_tokens_to_ids("<|endoftext|>"),
+                custom_chat_template=_load_qwen3p5_tools_lastturn_template(),
+                has_bos=False,
+                has_system_role=True,
+            )
+        elif prompt_format == "qwen3p5-tools-maskthink":
+            # Same as qwen3p5-tools but the {% generation %} markers wrap ONLY the post-
+            # </think> answer (not the <think>...</think> reasoning). Loss is on the final
+            # answer while the (English) reasoning is rendered as context but MASKED. Used
+            # for the Finnish enreason data (fi-question / English-reason / fi-answer).
+            self._prompt_config = PromptConfig(
+                assistant_prefix_len=0,
+                pad_token_id=tokenizer.convert_tokens_to_ids("<|endoftext|>"),
+                custom_chat_template=_load_qwen3p5_tools_maskthink_template(),
+                has_bos=False,
+                has_system_role=True,
+            )
         else:
             raise NotImplementedError("unknown SFT prompt format", prompt_format)
 
@@ -202,7 +268,7 @@ class SFTTokenizer:
         # {% generation %} markers via return_assistant_tokens_mask, because its render
         # is context-dependent (reasoning history, multi-turn tool grouping) and cannot
         # be reconstructed by the per-turn re-tokenization path used below.
-        if self._prompt_format == "qwen3p5-tools":
+        if self._prompt_format in ("qwen3p5-tools", "qwen3p5-tools-nothink", "qwen3p5-tools-lastturn", "qwen3p5-tools-maskthink"):
             return self._tokenize_conversation_with_generation_mask(
                 conversation, return_target, add_generation_prompt, tools
             )
