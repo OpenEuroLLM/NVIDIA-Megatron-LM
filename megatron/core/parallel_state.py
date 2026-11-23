@@ -239,11 +239,41 @@ def update_pg_timeout(
 # GPU (the multi-node device-guess bug the binding fixes). Every rank takes the same path: the
 # group sizes are the same on all ranks.
 _LAZY_SINGLETON_GROUPS = os.environ.get("MEGATRON_LAZY_SINGLETON_GROUPS", "0") == "1"
+# MEGATRON_LAZY_GROUPS=1: every group the same way (created unbound, then bound to the device).
+# With the default group bound, each new_group is an eager ncclCommSplit over ALL ranks -- the
+# non-members join it with NO_COLOR -- so a 1024-rank start runs one world-wide collective per
+# group of every kind (hundreds: one per EP group, per expert-DP group, ...). Unbound, a group
+# costs a store entry, and its communicator is built at its first collective among its members
+# only. The bound device keeps the lazy init on the right GPU, as for the singletons.
+_LAZY_GROUPS = os.environ.get("MEGATRON_LAZY_GROUPS", "0") == "1"
+# MEGATRON_DEBUG_INIT_TIMING=1: wall time and count of the group creations (see group_creation_timing()).
+_GROUP_TIMES = {"n": 0, "s": 0.0, "max": 0.0, "max_desc": ""}
 
 
 def _new_group(ranks, kwargs):
+    if os.environ.get("MEGATRON_DEBUG_INIT_TIMING", "0") != "1":
+        return _new_group_impl(ranks, kwargs)
+    import time
+
+    t0 = time.time()
+    group = _new_group_impl(ranks, kwargs)
+    dt = time.time() - t0
+    _GROUP_TIMES["n"] += 1
+    _GROUP_TIMES["s"] += dt
+    if dt > _GROUP_TIMES["max"]:
+        _GROUP_TIMES["max"], _GROUP_TIMES["max_desc"] = dt, str(kwargs.get("group_desc"))
+    return group
+
+
+def group_creation_timing():
+    """(count, total seconds, slowest seconds, slowest group_desc) of this rank's group creations."""
+    return _GROUP_TIMES["n"], _GROUP_TIMES["s"], _GROUP_TIMES["max"], _GROUP_TIMES["max_desc"]
+
+
+def _new_group_impl(ranks, kwargs):
     default_pg = None
-    if _LAZY_SINGLETON_GROUPS and ranks is not None and len(ranks) == 1:
+    lazy_all = _LAZY_GROUPS and kwargs.get("backend") in (None, "nccl")
+    if ranks is not None and (lazy_all or (_LAZY_SINGLETON_GROUPS and len(ranks) == 1)):
         default_pg = torch.distributed.distributed_c10d._get_default_group()
     bound = getattr(default_pg, "bound_device_id", None)
     if bound is None:
