@@ -80,6 +80,17 @@ def test_batched_matches_per_dtensor(meshes):
     assert [tuple(m.sizes) for m in batched] == [tuple(d.to_local().shape) for d in cases]
 
 
+def test_batched_matches_per_dtensor_in_chunks(meshes):
+    # the size gather split into many small collectives (as for ~80k DTensors at 256 ranks)
+    from megatron.core.distributed.fsdp.src.megatron_fsdp import uneven_dtensor
+
+    cases = _cases(meshes) * 3
+    expected = [_reference(d) for d in cases]
+    with patch.object(uneven_dtensor, "_SIZE_GATHER_ELEMENTS", 8):
+        batched = gather_and_compute_chunk_metadata_batched(cases)
+    assert [tuple(m.offsets) for m in batched] == expected
+
+
 def test_preprocess_state_dict(meshes):
     cases = _cases(meshes)
     expected = [_reference(d) for d in cases]

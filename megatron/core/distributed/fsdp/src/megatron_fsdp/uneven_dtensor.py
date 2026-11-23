@@ -58,13 +58,52 @@ def gather_and_compute_chunk_metadata(dtensor: DTensor) -> ChunkStorageMetadata:
     return gather_and_compute_chunk_metadata_batched([dtensor])[0]
 
 
+# entries per gathered size tensor: bounds the [world_size, chunk] int64 gather output to 32 MB
+_SIZE_GATHER_ELEMENTS = 1 << 22
+
+
+def _exclusive_and_total_sums(sizes: List[int], group) -> tuple:
+    """For each position j: the sum of ``sizes[j]`` over the group ranks below this one, and over
+    all of them. Only the shard-dimension extent is exchanged, as an int64 tensor (``all_gather``
+    on the group's device), not every rank's shape lists as pickled objects: at 1024 ranks the
+    84B v4b save unpickled 256 copies of ~80k shapes and summed them in Python (~13 s per save).
+    The ``fake`` backend keeps the object gather (fake collectives return no data)."""
+    world_size = dist.get_world_size(group)
+    rank = dist.get_rank(group)
+    if not sizes:
+        return [], []
+    if dist.get_backend(group) == "fake":
+        gathered = [None] * world_size
+        dist.all_gather_object(gathered, sizes, group=group)
+        before = [sum(g[j] for g in gathered[:rank]) for j in range(len(sizes))]
+        total = [sum(g[j] for g in gathered) for j in range(len(sizes))]
+        return before, total
+    device = (
+        torch.device("cuda", torch.cuda.current_device())
+        if dist.get_backend(group) == "nccl"
+        else torch.device("cpu")
+    )
+    local = torch.tensor(sizes, dtype=torch.int64, device=device)
+    chunk = max(1, _SIZE_GATHER_ELEMENTS // world_size)
+    before, total = [], []
+    for start in range(0, len(sizes), chunk):
+        part = local[start : start + chunk].contiguous()
+        parts = [torch.empty_like(part) for _ in range(world_size)]
+        dist.all_gather(parts, part, group=group)
+        stacked = torch.stack(parts)
+        before.append(stacked[:rank].sum(0))
+        total.append(stacked.sum(0))
+    return torch.cat(before).tolist(), torch.cat(total).tolist()
+
+
 def gather_and_compute_chunk_metadata_batched(
     dtensors: List[DTensor],
 ) -> List[ChunkStorageMetadata]:
-    """:func:`gather_and_compute_chunk_metadata` for many DTensors at once: one
-    ``all_gather_object`` per process group and mesh-dimension round instead of one per DTensor
-    and sharded mesh dimension. A checkpoint of the 50B hybrid holds ~25k DTensors (parameters and
-    their optimizer states); at 512 ranks the per-DTensor collectives took ~24 min per save.
+    """:func:`gather_and_compute_chunk_metadata` for many DTensors at once: one size gather
+    (:func:`_exclusive_and_total_sums`) per process group and mesh-dimension round instead of one
+    ``all_gather_object`` per DTensor and sharded mesh dimension. A checkpoint of the 50B hybrid
+    holds ~25k DTensors (parameters and their optimizer states); at 512 ranks the per-DTensor
+    collectives took ~24 min per save.
 
     Every rank must pass the same DTensors in the same order (as the per-DTensor collectives
     already required). Groups are ordered by the first DTensor using them, so all ranks issue the
@@ -97,15 +136,12 @@ def gather_and_compute_chunk_metadata_batched(
             groups.setdefault(group, []).append(i)
         for group in sorted(groups, key=lambda g: first_use[g]):
             members = groups[group]
-            world_size = dist.get_world_size(group)
-            gathered = [None] * world_size
-            dist.all_gather_object(gathered, [cumulative[i] for i in members], group=group)
-            rank = dist.get_rank(group)
+            sizes = [cumulative[i][steps[i][round_index][1]] for i in members]
+            before, total = _exclusive_and_total_sums(sizes, group)
             for j, i in enumerate(members):
                 shard_dim = steps[i][round_index][1]
-                shapes = [gathered[r][j] for r in range(world_size)]
-                offsets[i][shard_dim] += sum(s[shard_dim] for s in shapes[:rank])
-                cumulative[i][shard_dim] = sum(s[shard_dim] for s in shapes)
+                offsets[i][shard_dim] += before[j]
+                cumulative[i][shard_dim] = total[j]
 
     return [
         ChunkStorageMetadata(offsets=tuple(o), sizes=tuple(d.to_local().shape))
