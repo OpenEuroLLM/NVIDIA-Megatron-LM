@@ -107,15 +107,30 @@ def set_row_state_chunk_metadata(states: Sequence[DTensor]) -> None:
         _set_uneven_chunk_metadata(state, meta)
 
 
+def _cache_get(cache: dict, group, params):
+    """An entry of an id-keyed per-(group, parameter set) cache, or None. Entries hold the group and
+    parameters themselves: while cached their ids cannot be recycled for new objects (fresh
+    parameters / meshes reusing a dead one's id would hit a stale entry on some ranks only, and
+    those ranks would skip a collective the others run -- a hang seen in the unit tests)."""
+    hit = cache.get((id(group), tuple(id(p) for p in params)))
+    if hit is None or hit[0] is not group or any(a is not b for a, b in zip(hit[1], params)):
+        return None
+    return hit[2]
+
+
+def _cache_put(cache: dict, group, params, value):
+    cache[(id(group), tuple(id(p) for p in params))] = (group, tuple(params), value)
+    return value
+
+
 class _RowCounts:
     """Rows of each matrix on each rank of its group: one all_gather per parameter set, cached."""
 
     def __init__(self):
-        self._cache: Dict[Tuple, List[List[int]]] = {}
+        self._cache: Dict[Tuple, Tuple] = {}
 
     def get(self, params: Sequence[torch.Tensor], group) -> List[List[int]]:
-        key = (id(group), tuple(id(p) for p in params))
-        counts = self._cache.get(key)
+        counts = _cache_get(self._cache, group, params)
         if counts is None:
             mine = torch.tensor(
                 [local(p).shape[0] for p in params], dtype=torch.long, device="cuda"
@@ -131,7 +146,7 @@ class _RowCounts:
                         f"row-sharded parameter {tuple(p.shape)}: shards hold "
                         f"{sum(counts[i])} rows"
                     )
-            self._cache[key] = counts
+            _cache_put(self._cache, group, params, counts)
         return counts
 
 
@@ -203,14 +218,13 @@ class _Plan:
         self.cols = cols
 
 
-_PLANS: Dict[Tuple, _Plan] = {}
+_PLANS: Dict[Tuple, Tuple] = {}
 
 
 def _exchange_round(params, updates, metas, group, ns_fn) -> List[torch.Tensor]:
-    key = (id(group), tuple(id(p) for p in params))
-    plan = _PLANS.get(key)
+    plan = _cache_get(_PLANS, group, params)
     if plan is None:
-        plan = _PLANS[key] = _Plan(params, group)
+        plan = _cache_put(_PLANS, group, params, _Plan(params, group))
     cols = plan.cols
     device = updates[0].device if updates else torch.device("cuda")
     empty = torch.empty(0, dtype=EXCHANGE_DTYPE, device=device)
