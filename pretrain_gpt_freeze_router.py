@@ -1,21 +1,23 @@
 #!/usr/bin/env python
-"""Thin wrapper around the SHARED Megatron pretrain_gpt.py that freezes the MoE
-router (gating) weights before training. Does NOT modify the shared repo.
+"""Thin wrapper around Megatron's pretrain_gpt.py that freezes the MoE
+router (gating) weights before training. Does NOT modify pretrain_gpt.py.
 
-It imports the shared pretrain_gpt module (so identical code/version as the
-normal runs), then wraps its model_provider to set requires_grad=False on every
+It imports the pretrain_gpt module (so identical code/version as the normal
+runs), then wraps its model_provider to set requires_grad=False on every
 parameter whose name contains '.router.' (the token->expert router). Everything
 else is passed through to the stock pretrain() call verbatim.
 
-Invoke exactly like pretrain_gpt.py (same CLI args). MEGATRON_ROOT env must point
-at the shared Megatron checkout (the sbatch already exports it).
+Invoke exactly like pretrain_gpt.py (same CLI args). By default MEGATRON_ROOT
+is this script's own directory (so cloning this repo is enough to run it);
+set the MEGATRON_ROOT env var to point at a different Megatron checkout
+instead (e.g. a cluster-local shared repo).
 """
 import os, sys, time
 
 MEGATRON_ROOT = os.environ.get(
-    "MEGATRON_ROOT", "/shared_silo/scratch/shared/sft/repos/NVIDIA-Megatron-LM"
+    "MEGATRON_ROOT", os.path.dirname(os.path.abspath(__file__))
 )
-# Make the SHARED repo win for `import pretrain_gpt`, `gpt_builders`, `megatron.*`.
+# Make MEGATRON_ROOT win for `import pretrain_gpt`, `gpt_builders`, `megatron.*`.
 sys.path.insert(0, MEGATRON_ROOT)
 sys.argv[0] = os.path.join(MEGATRON_ROOT, "pretrain_gpt.py")
 
