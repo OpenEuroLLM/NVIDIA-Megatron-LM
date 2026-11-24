@@ -2088,18 +2088,32 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     if pg_collection is None:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
-        if args.create_all_gather_group:
-            timeout = timedelta(minutes=args.distributed_timeout_minutes) if args.distributed_timeout_minutes else None
-            dp_cp_ag, expt_dp_ag = create_all_gather_groups(
-                for_expert_parallelism=(args.expert_model_parallel_size > 1),
-                timeout=timeout,
-            )
-            pg_collection.dp_cp_ag = dp_cp_ag
-            pg_collection.expt_dp_ag = expt_dp_ag
+    # Also when the caller passes its pg_collection (setup_model_and_optimizer always does): the
+    # groups were only created for pg_collection=None, so --create-all-gather-group did nothing in
+    # pretraining and every parameter all-gather queued behind the gradient reduce-scatters on the
+    # same communicator.
+    if args.create_all_gather_group and getattr(pg_collection, "dp_cp_ag", None) is None:
+        timeout = timedelta(minutes=args.distributed_timeout_minutes) if args.distributed_timeout_minutes else None
+        dp_cp_ag, expt_dp_ag = create_all_gather_groups(
+            for_expert_parallelism=(args.expert_model_parallel_size > 1),
+            timeout=timeout,
+        )
+        # An all-gather's output layout is its group's rank order: the AG communicators must
+        # list exactly the ranks of the groups they stand in for, in the same order.
+        for ag, ref in ((dp_cp_ag, getattr(pg_collection, "dp_cp", None)),
+                        (expt_dp_ag, getattr(pg_collection, "expt_dp", None))):
+            if ag is not None and ref is not None:
+                ag_ranks = torch.distributed.get_process_group_ranks(ag)
+                ref_ranks = torch.distributed.get_process_group_ranks(ref)
+                assert ag_ranks == ref_ranks, (
+                    f"all-gather group ranks {ag_ranks} != data-parallel group ranks {ref_ranks}"
+                )
+        pg_collection.dp_cp_ag = dp_cp_ag
+        pg_collection.expt_dp_ag = expt_dp_ag
 
-            print_rank_0("> created all-gather process groups for AG/RS overlap")
-            if expt_dp_ag is not None:
-                print_rank_0(">   including expert parallelism AG group")
+        print_rank_0("> created all-gather process groups for AG/RS overlap")
+        if expt_dp_ag is not None:
+            print_rank_0(">   including expert parallelism AG group")
 
     if has_nvidia_modelopt:
         maybe_enable_modelopt(args)
