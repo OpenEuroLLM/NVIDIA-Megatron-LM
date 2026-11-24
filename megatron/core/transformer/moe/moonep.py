@@ -705,6 +705,42 @@ class MoonEPGroupedMLP(MegatronModule):
         pass
 
 
+def dense_topk_from_routing(probs, routing_map, topk):
+    """MoonEP's dense [S, topk] view of the router's assignment, plus its per-expert counts.
+
+    Returns ``(indices [S, topk] int64, weights [S, topk] fp32, tokens_per_expert [E] int32)``.
+
+    The planner gives every token exactly ``topk`` slots and derives each expert's offset from
+    ``tokens_per_expert``, so the indices have to name every expert exactly as often as the map
+    does. ``probs.masked_fill(~routing_map, -1.0).topk(topk)`` only guarantees that for a row
+    holding ``topk`` routed experts: on a short row the missing slots are filled from the -1.0
+    tie, i.e. from the lowest expert indices, which the map says are empty. The plan then stores
+    tokens past an expert's allocation -- cudaErrorIllegalAddress on the ec3eb8b build, the
+    planner's trap on e9e8238. A short row's missing slots are re-pointed here at one of its
+    routed experts with weight 0: the token contributes nothing through them, exactly as if it
+    had been dispatched to its routed experts alone (the expert's activation is scaled by the
+    slot's weight, moonep.py ``_MoonEPExperts``), and the combine's extra term is an exact +0.
+    A row with no routed expert at all sends every slot to expert 0 with weight 0. The counts
+    are taken from the (padded) indices, so the planner's histogram and offsets agree by
+    construction; on a k-hot row that is bit-identical to ``routing_map.sum(0)``, and the
+    indices / weights themselves are untouched (same ``topk`` order), so well-formed rows keep
+    the exact numerics they had.
+    """
+    masked = probs.masked_fill(~routing_map, -1.0)
+    indices = masked.topk(topk, dim=-1).indices
+    n_routed = routing_map.sum(dim=-1)  # [S]
+    # slots [n_routed, topk) are the -1.0 fill: pad them
+    missing = torch.arange(topk, device=indices.device).unsqueeze(0) >= n_routed.unsqueeze(1)
+    # slot 0 holds a routed expert whenever the row has one (a routed prob is >= 0 > -1.0)
+    fill = indices[:, :1].expand(-1, topk)
+    fill = torch.where(n_routed.unsqueeze(1) > 0, fill, torch.zeros_like(fill))
+    indices = torch.where(missing, fill, indices)
+    weights = probs.gather(-1, indices).float()
+    weights = torch.where(missing, torch.zeros_like(weights), weights)
+    counts = torch.bincount(indices.reshape(-1), minlength=probs.shape[-1]).to(torch.int32)
+    return indices, weights, counts
+
+
 class MoEMoonEPTokenDispatcher(MoETokenDispatcher):
     """Token dispatcher of the MoonEP backend; pairs with :class:`MoonEPGroupedMLP`."""
 
@@ -760,13 +796,13 @@ class MoEMoonEPTokenDispatcher(MoETokenDispatcher):
     def dispatch_preprocess(self, hidden_states, routing_map, probs):
         self.hidden_shape = hidden_states.shape
         hidden_states = hidden_states.reshape(-1, self.hidden_shape[-1])
-        k = self.config.moe_router_topk
-        topk = probs.masked_fill(~routing_map, -1.0).topk(k, dim=-1).indices
-        self.topk = topk.to(torch.int32).contiguous()
+        indices, weights_sk, counts = dense_topk_from_routing(
+            probs, routing_map, self.config.moe_router_topk
+        )
+        self.topk = indices.to(torch.int32).contiguous()
         self.routing_map = routing_map
-        self.tokens_per_expert = routing_map.sum(dim=0, dtype=torch.int32).contiguous()
-        weights_sk = probs.gather(-1, topk).float().contiguous()
-        return hidden_states, weights_sk
+        self.tokens_per_expert = counts.contiguous()
+        return hidden_states, weights_sk.contiguous()
 
     def token_dispatch(self, hidden_states, probs):
         state = self._state(hidden_states.shape[0], hidden_states.shape[-1])
@@ -824,8 +860,13 @@ class MoEMoonEPTokenDispatcher(MoETokenDispatcher):
         # every input of the communication stream is produced on this stream BEFORE the wait
         # (a chunk histogram computed after it raced the dispatch's planning: illegal address /
         # instruction in training, invisible with CUDA_LAUNCH_BLOCKING or one stream)
+        # counts from the padded indices, as dispatch_preprocess (routing_map's column sums
+        # undercount a chunk whose rows hold fewer than k routed experts)
         tpes = [
-            r.sum(dim=0, dtype=torch.int32).contiguous() for r in self.routing_map.split(S // n)
+            torch.bincount(t.reshape(-1), minlength=self.config.num_moe_experts)
+            .to(torch.int32)
+            .contiguous()
+            for t in self.topk.split(S // n)
         ]
         tks = [t.contiguous() for t in self.topk.split(S // n)]
         wss = [w.contiguous() for w in weights_sk.split(S // n)]
