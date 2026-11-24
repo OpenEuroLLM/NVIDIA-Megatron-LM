@@ -29,7 +29,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Type, TypeVar, Un
 import numpy
 import torch
 
-from megatron.core import config
+from megatron.core import config, packed_doc_static
 from megatron.core._rank_utils import log_single_rank
 from megatron.core.package_info import __version__ as mcore_version
 
@@ -2583,6 +2583,17 @@ def _merge_cu_seqlens_across_micro_batch(cu_seqlens: torch.Tensor, seq_length: i
         return row
 
     micro_batch_size = cu_seqlens.shape[0]
+    if packed_doc_static.STATIC_SEGMENTS > 0:
+        # Static mode (PACKED_DOC_STATIC_SEGMENTS): keep every padded row instead of stripping it,
+        # so the merged tensor is micro_batch_size * N + 1 entries for every iteration and a CUDA
+        # graph can be replayed. The rows' trailing entries stay at sequence_length (shifted with
+        # the sample offset), i.e. they are zero-length segments for the attention kernel.
+        if micro_batch_size == 1:
+            return cu_seqlens[0]
+        parts = [cu_seqlens[0]]
+        for i in range(1, micro_batch_size):
+            parts.append(cu_seqlens[i][1:] + i * seq_length)
+        return torch.cat(parts)
     if micro_batch_size == 1:
         return _strip_padding(cu_seqlens[0])
 

@@ -13,6 +13,7 @@ from typing import Dict, Optional, Tuple
 import numpy
 import torch
 
+from megatron.core import packed_doc_static
 from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatronDatasetConfig
 from megatron.core.datasets.index_bundle import in_bundle, load_cached_index
 from megatron.core.datasets.indexed_dataset import IndexedDataset
@@ -372,9 +373,17 @@ class GPTDataset(MegatronDataset):
             # Pad cu_seqlens to a fixed length so that default_collate can
             # stack samples with different numbers of documents. Trailing
             # entries are filled with sequence_length; the merge helper
-            # strips them later.
+            # strips them later -- except in static mode
+            # (PACKED_DOC_STATIC_SEGMENTS), where the merge keeps them so that
+            # the merged length is the same for every microbatch.
+            n_pad = packed_doc_static.padded_length(self.config.sequence_length)
+            assert cu_seqlens.numel() <= n_pad, (
+                f"cu_seqlens for this sample has {cu_seqlens.numel()} entries but "
+                f"PACKED_DOC_STATIC_SEGMENTS={packed_doc_static.STATIC_SEGMENTS} allows "
+                f"{n_pad}: raise the bound or set document_segment_length"
+            )
             padded_cu_seqlens = torch.full(
-                (self.config.sequence_length + 1,), self.config.sequence_length, dtype=torch.int32
+                (n_pad,), self.config.sequence_length, dtype=torch.int32
             )
             padded_cu_seqlens[: cu_seqlens.numel()] = cu_seqlens
 

@@ -13,6 +13,7 @@ import types
 import torch
 
 from megatron.core.rerun_state_machine import RerunStateMachine
+from megatron.core import packed_doc_static
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.transformer.cuda_graph_config import (
@@ -421,15 +422,24 @@ def _validate_packed_doc_attention(args):
     # The MoE router / preprocess partial graphs see the packed tokens only (a fixed [t, 1, h]),
     # never cu_seqlens: they are allowed; the attention / mixer layers are not.
     graph_modules = {str(getattr(m, 'name', m)) for m in (args.cuda_graph_modules or [])}
-    assert args.cuda_graph_impl == 'none' or (
-        args.cuda_graph_impl == 'local'
-        and graph_modules
-        and graph_modules <= {'moe_router', 'moe_preprocess'}
+    # With PACKED_DOC_STATIC_SEGMENTS the cu_seqlens tensor keeps a fixed length (N + 1 entries per
+    # sample, micro_batch_size * N + 1 merged), so whole-layer capture no longer needs a recapture
+    # per step: allow the empty module scope (whole layer) in that mode.
+    static_cu_seqlens = packed_doc_static.STATIC_SEGMENTS > 0
+    assert (
+        args.cuda_graph_impl == 'none'
+        or (
+            args.cuda_graph_impl == 'local'
+            and graph_modules
+            and graph_modules <= {'moe_router', 'moe_preprocess'}
+        )
+        or (args.cuda_graph_impl == 'local' and not graph_modules and static_cu_seqlens)
     ), (
         '--dataloader-inter-document-masking builds a cu_seqlens tensor whose length changes '
         'with the document count of every microbatch, which would force CUDA graph recapture '
-        'each step. Set --cuda-graph-impl none, or graph only the MoE router: '
-        '--cuda-graph-impl local --cuda-graph-modules moe_router moe_preprocess.'
+        'each step. Set --cuda-graph-impl none, graph only the MoE router '
+        '(--cuda-graph-impl local --cuda-graph-modules moe_router moe_preprocess), or set '
+        'PACKED_DOC_STATIC_SEGMENTS=N so cu_seqlens has a fixed length.'
     )
 
     # === ROPE VARIANTS =======================================================
