@@ -1720,6 +1720,7 @@ def _broadcast_metadata(checkpoint_name):
     torch.distributed.all_reduce(missing, op=torch.distributed.ReduceOp.MAX)
     if missing.item() == 0:
         return
+    t0 = time()
     if torch.distributed.get_rank() == 0:
         with open(path, "rb") as f:
             data = f.read()
@@ -1727,6 +1728,7 @@ def _broadcast_metadata(checkpoint_name):
     else:
         size = torch.zeros(1, dtype=torch.int64, device=device)
     torch.distributed.broadcast(size, src=0)
+    t1 = time()
     if torch.distributed.get_rank() == 0:
         buf = torch.frombuffer(bytearray(data), dtype=torch.uint8).to(device)
         del data
@@ -1735,8 +1737,14 @@ def _broadcast_metadata(checkpoint_name):
     torch.distributed.broadcast(buf, src=0)
     raw = buf.cpu().numpy().tobytes()
     del buf
+    t2 = time()
     metadata = pickle.loads(raw)
     del raw
+    if _load_timing_on():
+        print_rank_0(
+            f"[load-timing] metadata broadcast (rank 0): read {t1 - t0:.1f} s, broadcast "
+            f"{t2 - t1:.1f} s, unpickle {time() - t2:.1f} s, {int(size.item()) / 2**20:.0f} MiB, {key}"
+        )
     if getattr(metadata, "storage_meta", None) is None:
         from torch.distributed.checkpoint.metadata import StorageMeta
 
@@ -1756,8 +1764,15 @@ class _MetadataOnceReader(FileSystemReader):
             return super().read_metadata(*args, **kwargs)
         metadata = _METADATA_CACHE.get(key)
         if metadata is None:
+            cached = list(_METADATA_CACHE)
             _METADATA_CACHE.clear()  # one checkpoint at a time
+            t0 = time()
             metadata = _METADATA_CACHE[key] = super().read_metadata(*args, **kwargs)
+            if _load_timing_on():
+                print_rank_0(
+                    f"[load-timing] .metadata read from storage: {time() - t0:.1f} s, {key} "
+                    f"(cache held {cached})"
+                )
         if getattr(metadata, "storage_meta", None) is not None:
             metadata.storage_meta.load_id = self.load_id  # as FileSystemReader sets it per reader
         return metadata
