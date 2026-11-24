@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Qwen3.5-35B-A3B SFT/CPT with a frozen MoE router, 32k sequence length.
+# Poro 3 (Qwen3.5-35B-A3B based) SFT/CPT with a frozen MoE router, 32k sequence length.
 #
 # Loads from an existing Megatron checkpoint (base or an earlier CPT stage) and
 # continues training with the router (token->expert gate) weights frozen, via
@@ -26,7 +26,7 @@
 #                               your ROCm build needs one bind-mounted over the
 #                               container's copy.
 #
-#SBATCH --job-name=qwen3_5_35b_a3b_frozerouter_32k
+#SBATCH --job-name=poro3_35b_a3b_frozerouter_32k
 #SBATCH --partition=<your-partition>
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=8
@@ -53,7 +53,7 @@ set -euo pipefail
 TRAIN_ITERS=${TRAIN_ITERS:-11279}   # 1 epoch = ceil(packed_rows / global_batch_size)
 WARMUP_ITERS=${WARMUP_ITERS:-338}   # ~3% of TRAIN_ITERS
 
-RUN_NAME=${RUN_NAME:-qwen3_5_35B_A3B_frozerouter_32k}
+RUN_NAME=${RUN_NAME:-poro3_35B_A3B_frozerouter_32k}
 OUTPUT_DIR=$EXPERIMENT/output/$RUN_NAME
 LOG_DIR=$EXPERIMENT/logs
 CACHE_DIR=$EXPERIMENT/cache/$RUN_NAME
