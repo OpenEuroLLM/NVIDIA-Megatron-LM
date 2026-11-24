@@ -1,4 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+import os
 from contextlib import nullcontext
 from typing import List, Optional, Set, Tuple, Union
 
@@ -31,6 +32,35 @@ def _skip_chunks() -> int:
     counts = [int(c) for c in spec.split(",")]
     rank = parallel_state.get_pipeline_model_parallel_rank()
     return counts[rank] if rank < len(counts) else 0
+
+
+def _tag_recompute_order(self, order, bounds, num_checkpointed: int) -> None:
+    """Tell Megatron-FSDP's parameter prefetch (FSDP_RECOMPUTE_PREFETCH=1) the backward execution
+    order under full recompute. The backward runs chunk by chunk from the last: the recompute
+    forward of a chunk walks its layers upwards, then their backward downwards. So after the
+    backward of a chunk's FIRST layer, the next unit to run is the first layer of the previous
+    chunk (``_recompute_bwd_next``), and inside a recompute forward each layer is followed by the
+    next one of its chunk (``_recompute_fwd_next``). Without these tags the prefetch walks layers
+    in plain reverse order: it gathers the previous chunk's last layer, and the previous chunk's
+    first layer -- needed first -- is gathered just in time. Only checkpointed chunks are tagged
+    (the others are not recomputed); the tags are plain attributes, refreshed every forward."""
+    if os.environ.get("FSDP_RECOMPUTE_PREFETCH", "0") != "1":
+        return
+    for i, (start, end) in enumerate(bounds):
+        checkpointed = i < num_checkpointed
+        for position in range(start, end):
+            layer = self.layers[order[position]]
+            if not checkpointed:
+                layer.__dict__.pop("_recompute_bwd_next", None)
+                layer.__dict__.pop("_recompute_fwd_next", None)
+                continue
+            # first layer: the previous chunk's first layer (if checkpointed); others: none to
+            # prefetch (the rest of the chunk is still resident from its recompute forward)
+            prev = self.layers[order[bounds[i - 1][0]]] if position == start and i > 0 else None
+            layer.__dict__["_recompute_bwd_next"] = prev
+            layer.__dict__["_recompute_fwd_next"] = (
+                self.layers[order[position + 1]] if position + 1 < end else None
+            )
 
 
 def checkpointed_forward(
@@ -239,6 +269,7 @@ def checkpointed_forward(
                     chunk_end += 1
             bounds.append((layer_idx, chunk_end))
             layer_idx = chunk_end
+        _tag_recompute_order(self, order, bounds, len(bounds) - skip)
         for i, (start, end) in enumerate(bounds):
             chunk_runner(start, end, i < len(bounds) - skip)
     elif self.config.recompute_method == 'block':

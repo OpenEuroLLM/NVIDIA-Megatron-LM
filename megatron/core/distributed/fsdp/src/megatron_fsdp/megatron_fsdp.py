@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.import functools
+import os
 
 import functools
 import importlib
@@ -776,6 +777,26 @@ class MegatronFSDP(torch.nn.Module):
             for param in param_list:
                 self._params_require_handle_grad.discard(param)
 
+        _NO_TAG = object()
+        recompute_prefetch = os.environ.get("FSDP_RECOMPUTE_PREFETCH", "0") == "1"
+
+        def _recompute_next(module: nn.Module, tag: str):
+            """The unit tagged to run after ``module`` (None: nothing to prefetch), or _NO_TAG
+            when the feature is off or the module is not in a tagged (checkpointed) chunk."""
+            if not recompute_prefetch or tag not in module.__dict__:
+                return _NO_TAG
+            return module.__dict__[tag]
+
+        def _prefetch_unit(unit: Optional[nn.Module]) -> None:
+            """Start the all-gather of ``unit``'s parameters (async, no wait)."""
+            if unit is None:
+                return
+            params = _param_list_for_submodule_unshard(unit, "forward")
+            if params:
+                self.all_gather_and_wait_parameters_ready(
+                    params=params, prefetch=False, wait_bucket_ready=False
+                )
+
         @torch.compiler.disable
         def _pre_forward_param_unshard(module: nn.Module, *unused):
             # Unshard the parameters before the forward pass.
@@ -788,6 +809,15 @@ class MegatronFSDP(torch.nn.Module):
                 module._training_state = TrainingState.FORWARD
 
             param_list = _param_list_for_submodule_unshard(module, "forward")
+
+            # FSDP_RECOMPUTE_PREFETCH: in a recompute forward, gather this layer and start the
+            # next layer of its chunk (megatron/core/recompute.py tags it), which runs next.
+            nxt = _recompute_next(module, "_recompute_fwd_next") if (
+                input_training_state == TrainingState.PRE_BACKWARD) else _NO_TAG
+            if nxt is not _NO_TAG:
+                self.all_gather_and_wait_parameters_ready(params=param_list, prefetch=False)
+                _prefetch_unit(nxt)
+                return None
 
             # All-gather the parameters before the forward pass.
             self.all_gather_and_wait_parameters_ready(
@@ -904,6 +934,16 @@ class MegatronFSDP(torch.nn.Module):
                 sub_module._training_state = TrainingState.PRE_BACKWARD
 
             param_list = _param_list_for_submodule_unshard(module, "backward")
+
+            # FSDP_RECOMPUTE_PREFETCH: under full recompute the next unit to run after this
+            # layer's backward is the first layer of the previous chunk (its recompute forward),
+            # not the layer below: prefetch that one (or nothing inside a chunk, whose layers are
+            # still resident from its recompute forward).
+            nxt = _recompute_next(module, "_recompute_bwd_next")
+            if nxt is not _NO_TAG:
+                self.all_gather_and_wait_parameters_ready(param_list, prefetch=False, bwd=True)
+                _prefetch_unit(nxt)
+                return
 
             # All-gather / unshard the module parameters before the backward pass.
             self.all_gather_and_wait_parameters_ready(
