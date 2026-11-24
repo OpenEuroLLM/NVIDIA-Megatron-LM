@@ -167,3 +167,38 @@ class TestEngramBranchGates:
             self._layer(engram_branch_gates=True, mhc=False)
         with pytest.raises(ValueError):
             self._layer(engram_branch_gates=True, engram_branch_query="mean")
+
+    def test_logit_scale_parameter_and_single_gate_invariance(self):
+        """engram_gate_logit_scale: the query norm is scale-invariant (eps ~1e-12), and the scalar
+        scales the logit before the signed square root."""
+        layer = self._layer(engram_gate_logit_scale=True, engram_gate_query_eps=1e-12)
+        assert torch.equal(layer.gate_terms.logit_scale, torch.ones(1, device="cuda"))
+        with torch.no_grad():
+            layer.gate_terms.logit_scale.fill_(0.5)
+        ids, x = self._inputs(4)
+        h = x[:, :, 0]
+        out1 = layer._engram(h, ids, None)
+        for c in (3.0, 1e-4):
+            torch.testing.assert_close(layer._engram(h * c, ids, None), out1, rtol=1e-5, atol=1e-5)
+        # the scalar is applied before the sqrt, so a larger value changes the gate
+        with torch.no_grad():
+            layer.gate_terms.logit_scale.fill_(8.0)
+        assert not torch.allclose(layer._engram(h, ids, None), out1)
+
+    def test_branch_query_scale_invariant(self):
+        layer = self._layer(engram_branch_gates=True, engram_gate_query_eps=1e-12)
+        ids, x = self._inputs(5)
+        e = layer._memory(ids, None).to(x.dtype)
+        want = layer._branch_gate_logits(x, e)
+        torch.testing.assert_close(layer._branch_gate_logits(x * 3.0, e), want, rtol=1e-5, atol=1e-5)
+        # hn ~ 1e-4: mean(q^2) ~ 1e-8, so eps=1e-12 leaves a ~1e-4 relative residual
+        torch.testing.assert_close(layer._branch_gate_logits(x * 1e-4, e), want, rtol=1e-3, atol=1e-4)
+
+    def test_logit_scale_learns(self):
+        base = self._base()
+        layer = self._warm(base, engram_branch_query="read", engram_gate_logit_scale=True)
+        assert torch.equal(layer.gate_terms.logit_scale, torch.ones(N, device="cuda"))
+        ids, x = self._inputs(6)
+        layer.set_input_ids(ids)
+        layer(x).square().sum().backward()
+        assert layer.gate_terms.logit_scale.grad.abs().sum() > 0

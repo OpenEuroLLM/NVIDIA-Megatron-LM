@@ -253,12 +253,14 @@ class _RMSNorm(nn.Module):
 
 class _GateTerms(nn.Module):
     """The optional scalars of the Engram gates, one per gate: ``query_mix`` (lambda of
-    ``engram_branch_query="learned"``, from 0) and ``scale`` (``engram_gate_scale``, from 1)."""
+    ``engram_branch_query="learned"``, from 0), ``scale`` (``engram_gate_scale``, from 1) and
+    ``logit_scale`` (``engram_gate_logit_scale``, from 1, applied before the signed square root)."""
 
-    def __init__(self, n_gates: int, query_mix: bool, scale: bool, device):
+    def __init__(self, n_gates: int, query_mix: bool, scale: bool, logit_scale: bool, device):
         super().__init__()
         self.query_mix = nn.Parameter(torch.zeros(n_gates, device=device)) if query_mix else None
         self.scale = nn.Parameter(torch.ones(n_gates, device=device)) if scale else None
+        self.logit_scale = nn.Parameter(torch.ones(n_gates, device=device)) if logit_scale else None
 
 
 class EngramLayer(MegatronModule):
@@ -390,7 +392,7 @@ class EngramLayer(MegatronModule):
         self.value_proj = nn.Linear(
             mem_dim, h, bias=False, device=device, dtype=config.params_dtype
         )
-        self.hidden_norm = _RMSNorm(h, config.layernorm_epsilon).to(device)
+        self.hidden_norm = _RMSNorm(h, float(getattr(config, "engram_gate_query_eps", config.layernorm_epsilon))).to(device)
         self.key_norm = _RMSNorm(h, config.layernorm_epsilon).to(device)
         # engram_branch_gates: the key projections and norms of mHC streams 1 .. n - 1 (stream 0 has
         # the ones above, so a checkpoint without per-stream gates loads after copying them in).
@@ -414,6 +416,7 @@ class EngramLayer(MegatronModule):
             self.n_gates,
             query_mix=self.branch_gates and self.branch_query == "learned",
             scale=bool(getattr(config, "engram_gate_scale", False)),
+            logit_scale=bool(getattr(config, "engram_gate_logit_scale", False)),
             device=device,
         )
         self.conv_norm = (
@@ -854,13 +857,14 @@ class EngramLayer(MegatronModule):
             ]
         )  # [n, h]
         dot = ((q * w.to(q.dtype)) * k).sum(-1, keepdim=True, dtype=torch.float32)
-        dim, eps = q.shape[-1], self.hidden_norm.eps
+        dim = q.shape[-1]
+        eps_q, eps_k = self.hidden_norm.eps, self.key_norm.eps
 
-        def inv_rms(x):
+        def inv_rms(x, eps):
             ms = torch.linalg.vector_norm(x, dim=-1, keepdim=True, dtype=torch.float32).square() / dim
             return torch.rsqrt(ms + eps)
 
-        return dot * inv_rms(q) * inv_rms(k)
+        return dot * inv_rms(q, eps_q) * inv_rms(k, eps_k)
 
     def _norm_gated(self, v: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
         """``conv_norm(alpha_m * v)`` for ``v`` [s, b, 1, h] and the gates ``alpha`` [s, b, n, 1], from one
@@ -889,6 +893,8 @@ class EngramLayer(MegatronModule):
             gate = (self.hidden_norm(h).float() * self.key_norm(k).float()).sum(-1, keepdim=True)
         v = self.value_proj(e)
         gate = gate / math.sqrt(h.shape[-1])
+        if self.gate_terms.logit_scale is not None:
+            gate = gate * self.gate_terms.logit_scale.to(gate.dtype).view(-1, 1)
         if self.config.engram_gate_signed_sqrt:
             gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
         if self.gate_terms.scale is not None:
@@ -898,6 +904,7 @@ class EngramLayer(MegatronModule):
 
         if arch_metrics.active():
             n = arch_metrics.num_layers_of(self.config)
+            arch_metrics.record_mean("engram/query_rms", self.layer_number, n, h.float().pow(2).mean(-1).sqrt())
             arch_metrics.record_mean("engram/gate", self.layer_number, n, alpha)
             arch_metrics.record_mean("engram/gate_closed", self.layer_number, n, alpha < 0.05)
             arch_metrics.record_mean("engram/gate_open", self.layer_number, n, alpha > 0.95)

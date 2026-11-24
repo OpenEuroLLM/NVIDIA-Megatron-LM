@@ -663,6 +663,7 @@ class MHCMixer(nn.Module):
         arch_metrics.record_share(
             f"{p}/read_share", layer, num_layers, read / read.sum(-1, keepdim=True).clamp(min=1e-12)
         )
+        arch_metrics.record_mean(f"{p}/read_sum", layer, num_layers, read.sum(-1))
         arch_metrics.record_mean(f"{p}/write", layer, num_layers, h_post)
         arch_metrics.record_streams(f"{p}/stream_rms", layer, num_layers, streams)
         arch_metrics.record_mean(
