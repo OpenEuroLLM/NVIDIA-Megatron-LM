@@ -521,15 +521,24 @@ def make_workspace(config, total_edges: int):
             span=config.depth_memory_window,
             running_covariance_dtype=config.depth_memory_covariance_dtype,
         )
-        if getattr(config, "fp16", False):
-            # FP16 training: the kernels' 16-bit tapes and state (M, residuals, reads, DY / DV)
-            # in FP16, the stream's type (cute_kernels with storage_dtype)
-            settings["storage_dtype"] = "float16"
+        fp16 = getattr(config, "fp16", False)
+        # the kernels' 16-bit tapes and state (M, residuals, reads, DY / DV): the training type's
+        # unless depth_memory_storage_dtype says otherwise
+        storage = getattr(config, "depth_memory_storage_dtype", None) or (
+            "float16" if fp16 else "bfloat16")
+        settings["storage_dtype"] = storage
+        if storage == "float16" and not fp16:
+            # FP16 tapes without FP16 training's loss scale: the workspace scales its backward
+            settings["grad_scaling"] = True
         if getattr(config, "depth_memory_unwind", False):
             # full recompute: the per-edge tapes travel in the stream as records, the recomputed
-            # layers read from the running state, nothing of the state is checkpointed; the
-            # HybridStack sets the recompute groups (CuteRecomputeWorkspace.layout)
-            return CuteRecomputeWorkspace(**settings)
+            # layers read from the running state, M copied every checkpoint interval (if any);
+            # the HybridStack sets the recompute groups (CuteRecomputeWorkspace.layout)
+            return CuteRecomputeWorkspace(
+                **settings,
+                checkpoint_interval=getattr(config, "depth_memory_checkpoint_interval", 0),
+                checkpoint_offload=getattr(config, "depth_memory_checkpoint_offload", True),
+                checkpoint_prefetch=getattr(config, "depth_memory_checkpoint_prefetch", False))
         return CuteDepthMemoryWorkspace(**settings)
     if getattr(config, "depth_memory_unwind", False):
         return UnwindingDepthMemoryWorkspace(total_edges, groups, key_dim, value_dim,
