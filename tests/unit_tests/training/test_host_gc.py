@@ -31,6 +31,19 @@ def test_cli_flags_are_real_arguments():
     assert "'--gc-before-val'" in group
 
 
+def test_gc_before_val_runs_after_args_are_bound():
+    """Regression for 2026-11-25: the hook was inserted before `args = get_args()`, so `args` was a
+    local referenced before assignment and the first validation killed the run (pjob .2502, rc=143)."""
+    source = (_MEGATRON / "megatron" / "training" / "training.py").read_text()
+    body = source[source.index("def evaluate_and_print_results("):]
+    body = body[: body.index("\ndef ", 1)] if "\ndef " in body[1:] else body
+    bound = body.find("args = get_args()")
+    used = body.find("gc_before_val")
+    assert bound != -1, "evaluate_and_print_results must bind args"
+    assert used != -1, "the gc-before-val hook is missing"
+    assert bound < used, "gc_before_val must be read AFTER args = get_args()"
+
+
 def test_gc_and_trim_reports_what_it_did():
     report = host_gc.gc_and_trim("before_save")
     assert "host_gc[before_save]" in report

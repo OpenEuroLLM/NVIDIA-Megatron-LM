@@ -5433,13 +5433,15 @@ def evaluate_and_print_results(
     pg_collection=None,
     p2p_communicator=None,
 ):
+    """Helper function to evaluate and dump results on screen."""
+    args = get_args()
     # Host-RAM release before validation (--gc-before-val): the eval forward allocates on top of the
-    # training footprint, and the v4b main run runs close to the node's host-memory limit.
+    # training footprint. AFTER args = get_args(): using args before that assignment made it a local
+    # referenced before assignment, which killed the run at its first validation (pjob .2502,
+    # UnboundLocalError, rc=143, 2026-11-25).
     if getattr(args, 'gc_before_val', False):
         print_rank_0(host_gc.gc_and_trim('before_val'))
 
-    """Helper function to evaluate and dump results on screen."""
-    args = get_args()
     if write_to_tensorboard:
         writer = get_tensorboard_writer()
     else:
