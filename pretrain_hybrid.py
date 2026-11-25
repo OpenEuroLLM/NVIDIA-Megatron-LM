@@ -56,7 +56,7 @@ from megatron.core.utils import (
 )
 from megatron.training import get_args, get_timers, inprocess_restart
 from megatron.training import packed_doc_attention as pda
-from megatron.training import pretrain, print_rank_0, set_startup_timestamps
+from megatron.training import nan_trace, pretrain, print_rank_0, set_startup_timestamps
 from megatron.training.argument_utils import (
     hybrid_config_from_args,
     pretrain_cfg_container_from_args,
@@ -328,103 +328,6 @@ def _build_cached_logits_loss_func(
     )
 
 
-# ---------------------------------------------------------------------------------------------------
-# NaN source tracing (2026-11-25)
-#
-# Why: the v4b main run dies about once per 175 steps with "found NaN in local forward loss
-# calculation" on ONE rank, on a different node every time (9 events, 9 distinct nodes, each node
-# once). The check that fires looks at one rank's loss before the DP all-reduce, so the bad value is
-# local to that rank; the question is where it first appears. A mask/packing bug would be
-# deterministic and would recur at the same point on a retry, and it does not: the same iteration
-# passes on the next attempt. That leaves a transient, so the report has to name the first tensor
-# that went bad in the failing process.
-#
-# MEGATRON_NAN_TRACE=1 enables it. Every module output is counted for non-finite elements once per
-# forward (counts only, no references: it cannot change what autograd retains or frees), the trail is
-# bounded to the most recent 128 bad module outputs, and on a NaN loss the failing rank prints:
-#   * the trail in REVERSE (loss -> input), i.e. the module closest to the loss first,
-#   * the first bad module in FORWARD order -- the origin, the one whose input was clean,
-#   * a reverse scan of the parameters, so a corrupted LM head or expert weight is named directly.
-# If no module output is bad while the loss is NaN, the NaN was produced after the last module
-# (the fused cross-entropy), which is itself a decisive answer.
-_NAN_TRACE: dict = {}
-_NAN_TRACE_MAX = 128
-
-
-def _nan_trace_install(model) -> None:
-    """Install the counting forward hooks once (no-op unless MEGATRON_NAN_TRACE=1)."""
-    if model is None or _NAN_TRACE.get("installed"):
-        return
-    if os.environ.get("MEGATRON_NAN_TRACE") != "1":
-        return
-    trail: list = []
-    handles = []
-    for depth, (name, mod) in enumerate(model.named_modules()):
-        handles.append(mod.register_forward_hook(_nan_trace_hook(name, depth, trail)))
-    _NAN_TRACE.update(installed=True, trail=trail, handles=handles)
-    print_rank_0(f"nan_trace: {len(handles)} forward hook(s) installed (MEGATRON_NAN_TRACE=1)")
-
-
-def _nan_trace_hook(name, depth, trail):
-    def hook(mod, inp, out):
-        tensor = out[0] if isinstance(out, (tuple, list)) else out
-        if not torch.is_tensor(tensor) or tensor.numel() == 0:
-            return
-        bad = int((~torch.isfinite(tensor)).sum())
-        if bad:
-            trail.append((depth, name, type(mod).__name__, bad, tensor.numel()))
-            del trail[:-_NAN_TRACE_MAX]
-
-    return hook
-
-
-def _nan_trace_report(model, output_tensor, loss_mask) -> None:
-    """Print this rank's NaN trail: reverse layer walk, origin, and a reverse parameter scan."""
-    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-    trail = list(_NAN_TRACE.get("trail") or [])
-    logits_bad = int((~torch.isfinite(output_tensor)).sum())
-    lines = [
-        f"[rank{rank}] NAN TRACE: loss is NaN; logits {tuple(output_tensor.shape)} "
-        f"non-finite {logits_bad}/{output_tensor.numel()}, masked tokens {int(loss_mask.sum())}"
-    ]
-    if trail:
-        lines.append(
-            f"[rank{rank}] bad module outputs, reverse (loss -> input), {len(trail)} recorded:"
-        )
-        for depth, name, cls, bad, numel in reversed(trail):
-            lines.append(f"[rank{rank}]   depth={depth} {cls} '{name}' non-finite={bad}/{numel}")
-        first = trail[0]
-        lines.append(
-            f"[rank{rank}] ORIGIN (first bad module in forward order): depth={first[0]} "
-            f"{first[2]} '{first[1]}' non-finite={first[3]}/{first[4]}"
-        )
-    else:
-        lines.append(
-            f"[rank{rank}] no module output was non-finite: the NaN was produced after the last "
-            f"module output (fused cross-entropy / loss kernel), not by a layer"
-        )
-    bad_params = []
-    try:
-        for name, param in reversed(list(model.named_parameters())):
-            if param.numel() and not torch.isfinite(param).all():
-                bad_params.append(name)
-                if len(bad_params) >= 8:
-                    break
-    except Exception as err:  # a DTensor / sharded parameter that isfinite cannot reduce
-        lines.append(f"[rank{rank}] parameter scan failed: {err}")
-    if bad_params:
-        lines.append(
-            f"[rank{rank}] non-finite PARAMETERS (reverse order, closest to the loss first): "
-            f"{bad_params}"
-        )
-    else:
-        lines.append(f"[rank{rank}] all parameters finite: the weights are clean, so the NaN "
-                     f"entered through an activation on this device")
-    for line in lines:
-        print(line, flush=True)
-    _NAN_TRACE["trail"] = []
-
-
 def loss_func(
     loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optional[HybridModel] = None
 ):
@@ -465,11 +368,14 @@ def loss_func(
     # Check individual rank losses are not NaN prior to DP all-reduce.
     rerun_state_machine = get_rerun_state_machine()
     if args.check_for_nan_in_loss_and_grad:
-        # Hooks are installed on the first micro-batch and count from the next forward on; the report
-        # prints from the rank whose loss is NaN (the only rank for which isnan(loss) is true).
-        _nan_trace_install(model)
+        # --nan-trace: counting hooks only (no retained references); the report prints from the rank
+        # whose loss is NaN, since isnan(loss) is true only there. Installed on the first micro-batch,
+        # so the trail covers the next forward on.
+        nan_trace.install(model, getattr(args, 'nan_trace', False))
         if torch.isnan(loss) and model is not None:
-            _nan_trace_report(model, output_tensor, loss_mask)
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            for line in nan_trace.report(model, output_tensor, loss_mask, rank=rank):
+                print(line, flush=True)
         rerun_state_machine.validate_result(
             result=loss,
             rejection_func=torch.isnan,

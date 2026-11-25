@@ -2806,6 +2806,15 @@ def _add_diagnostics_args(parser):
                             'offending parameter names. Unlike '
                             '--check-for-nan-in-loss-and-grad this localises the '
                             'problem instead of only aborting on it.')
+    group.add_argument('--nan-trace', action='store_true',
+                       help='On a NaN loss, name the first module whose output went non-finite: '
+                            'print the bad module outputs in reverse (loss -> input), the origin in '
+                            'forward order, and a reverse scan of the parameters (see '
+                            'megatron/training/nan_trace.py). Counting hooks only, no retained '
+                            'references, so autograd retention and host memory are unchanged. '
+                            'Unlike --diag-nonfinite, which scans weights and gradients at the '
+                            'diagnostics interval, this reports at the moment of failure and '
+                            'includes the activations of the failing rank.')
     group.add_argument('--diag-norm-gains', action='store_true',
                        help='Log mean/std/min/max of every RMSNorm/LayerNorm gain, per '
                             'layer. Norm gains get wd_mult=0 by default, so nothing '
