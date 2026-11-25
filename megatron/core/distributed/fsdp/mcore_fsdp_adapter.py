@@ -152,6 +152,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
             main_params_dtype=ddp_config.megatron_fsdp_main_params_dtype,
             main_grads_dtype=ddp_config.megatron_fsdp_main_grads_dtype,
             grad_comm_dtype=ddp_config.megatron_fsdp_grad_comm_dtype,
+            grad_comm_dtype_experts_only=ddp_config.megatron_fsdp_grad_comm_dtype_experts_only,
         )
         log_single_rank(
             logger,

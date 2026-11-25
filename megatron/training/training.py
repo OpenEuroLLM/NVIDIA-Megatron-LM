@@ -2426,6 +2426,9 @@ def get_megatron_ddp_config(args: argparse.Namespace) -> DistributedDataParallel
         kwargs["megatron_fsdp_main_params_dtype"] = args.megatron_fsdp_main_params_dtype
         kwargs["megatron_fsdp_main_grads_dtype"] = args.megatron_fsdp_main_grads_dtype
         kwargs["megatron_fsdp_grad_comm_dtype"] = args.megatron_fsdp_grad_comm_dtype
+        kwargs["megatron_fsdp_grad_comm_dtype_experts_only"] = (
+            args.megatron_fsdp_grad_comm_dtype_experts_only
+        )
         kwargs["megatron_fsdp_use_decoupled_grad"] = args.use_precision_aware_optimizer
         if args.use_megatron_fsdp and args.cuda_graph_impl != "none":
             # Run Megatron-FSDP in CUDA graph-safe mode. Avoids some graph-unsafe host-side

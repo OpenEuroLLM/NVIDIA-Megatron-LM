@@ -22,7 +22,6 @@ import inspect
 import logging
 import math
 import operator
-import os
 import time
 import traceback
 import warnings
@@ -2010,15 +2009,13 @@ class ParamAndGradBuffer:
     def grad_comm_dtype_for(self, group: "ParameterGroup") -> Optional[torch.dtype]:
         """Gradient communication dtype of one parameter group, None = the main grad dtype.
 
-        With FSDP_GRAD_COMM_EXPERTS_ONLY=1, `grad_comm_dtype` applies to the expert groups only and the
-        dense groups reduce in their main grad dtype. Reasoning: the reduce-scatter sums IN the wire dtype,
-        hop by hop around the ring. Expert grads sum over the expert-DP group (DP / EP ranks) and carry
-        most of the bytes; dense grads sum over every DP rank, where a bf16 ring sum loses most precision.
+        With `MixedPrecisionPolicy.grad_comm_dtype_experts_only`, `grad_comm_dtype` applies to the expert
+        groups only and the dense groups reduce in their main grad dtype (see the policy field).
         """
         dtype = self.mp_policy.grad_comm_dtype
         if (
             dtype is not None
-            and os.environ.get("FSDP_GRAD_COMM_EXPERTS_ONLY", "0") == "1"
+            and self.mp_policy.grad_comm_dtype_experts_only
             and not group.is_expert_param
         ):
             return None

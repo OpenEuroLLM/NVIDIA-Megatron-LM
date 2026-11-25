@@ -1291,6 +1291,7 @@ class MegatronFSDP(torch.nn.Module):
                 if self.ddp_config.nccl_ub or self.ddp_config.fsdp_double_buffer
                 else self.mp_policy.grad_comm_dtype
             ),
+            grad_comm_dtype_experts_only=self.mp_policy.grad_comm_dtype_experts_only,
         )
         self.mp_policy = mp_policy_reset
         self.param_and_grad_buffer.mp_policy = mp_policy_reset
