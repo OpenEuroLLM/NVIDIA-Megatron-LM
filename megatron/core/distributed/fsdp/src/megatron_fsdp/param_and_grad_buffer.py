@@ -22,6 +22,7 @@ import inspect
 import logging
 import math
 import operator
+import os
 import time
 import traceback
 import warnings
@@ -2006,6 +2007,23 @@ class ParamAndGradBuffer:
             for parameters that require gradients. Default is True.
     """
 
+    def grad_comm_dtype_for(self, group: "ParameterGroup") -> Optional[torch.dtype]:
+        """Gradient communication dtype of one parameter group, None = the main grad dtype.
+
+        With FSDP_GRAD_COMM_EXPERTS_ONLY=1, `grad_comm_dtype` applies to the expert groups only and the
+        dense groups reduce in their main grad dtype. Reasoning: the reduce-scatter sums IN the wire dtype,
+        hop by hop around the ring. Expert grads sum over the expert-DP group (DP / EP ranks) and carry
+        most of the bytes; dense grads sum over every DP rank, where a bf16 ring sum loses most precision.
+        """
+        dtype = self.mp_policy.grad_comm_dtype
+        if (
+            dtype is not None
+            and os.environ.get("FSDP_GRAD_COMM_EXPERTS_ONLY", "0") == "1"
+            and not group.is_expert_param
+        ):
+            return None
+        return dtype
+
     def __init__(
         self,
         ddp_config: DistributedDataParallelConfig,
@@ -2545,9 +2563,10 @@ class ParamAndGradBuffer:
             # Resolve gradient bucket dtype used for MaxPoolAllocator bucket allocation
             # planning and FixedPoolAllocator unit symmetries. Falls back to each
             # parameter group's main `grad_dtype` when no comm-dtype override is set.
-            grad_comm_dtype = self.mp_policy.grad_comm_dtype
-            if grad_comm_dtype is not None:
-                grad_dtype_fn = lambda pg: grad_comm_dtype  # noqa: E731
+            if self.mp_policy.grad_comm_dtype is not None:
+                grad_dtype_fn = lambda pg: (  # noqa: E731
+                    self.grad_comm_dtype_for(pg) or pg.grad_dtype
+                )
             else:
                 grad_dtype_fn = operator.attrgetter("grad_dtype")
             self.main_grad_alloc = FIXED_POOL_ALLOC_TYPE(
@@ -3105,7 +3124,9 @@ class ParamAndGradBuffer:
                     # support un-sharded gradient accumulation at high precision.
                     bucket = gbuf.fetch_bucket(
                         dtype=(
-                            self.mp_policy.grad_comm_dtype if p._gbuf.is_data_distributed else None
+                            self.grad_comm_dtype_for(self.parameter_groups[gbuf.bucket_id])
+                            if p._gbuf.is_data_distributed
+                            else None
                         )
                     )
                     # View it as p.shape so you can insert the param.grad into
@@ -4086,7 +4107,13 @@ class GradReducePipeline:
 
                     # Get the unreduced gradients associated with the gradient buffer.
                     unreduced_grad_bucket = gbuf.fetch_bucket(
-                        dtype=mp_policy.grad_comm_dtype if gbuf.is_data_distributed else None
+                        dtype=(
+                            self.buffer.grad_comm_dtype_for(
+                                self.buffer.parameter_groups[bucket_id]
+                            )
+                            if gbuf.is_data_distributed
+                            else None
+                        )
                     )
                     # NOTE(@cspades): `no_shard` or `optim`
                     # Un-sharded gradient buffers accumulate un-reduced gradients locally
