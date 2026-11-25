@@ -47,6 +47,7 @@ from megatron.core.utils import get_pg_rank, get_pg_size, unwrap_model
 
 from ..core.dist_checkpointing.utils import _clean_metadata_for_serialization
 from . import ft_integration, wandb_utils
+from . import host_gc
 from .async_utils import get_save_and_finalize_callbacks, is_empty_async_queue, schedule_async_save
 from .global_vars import get_args
 from .one_logger_utils import on_save_checkpoint_start, on_save_checkpoint_success
@@ -734,29 +735,14 @@ def save_checkpoint(
     start_ckpt = time()
     args = get_args()
 
-    # Host-RAM release immediately before a PERSISTENT save (2026-11-24).
-    # Why: the persistent save at iteration 57000 was killed by the host OOM killer, not by CUDA --
-    # Slurm logged 13 oom_kill events in step 48867560.587 and 9 ranks died with exitcode -9. The
-    # save is the one moment where the process allocates on top of a ~40-50 GB steady state.
-    # gc.collect() drops unreachable Python objects; malloc_trim(0) then returns the freed glibc
-    # arenas to the OS, which gc.collect() alone never does. It cannot free memory held live by the
-    # dataloader worker processes, so treat this as headroom, not as a fix for a 10x spike.
-    # Gated by an env var and only for persistent saves (a non-persistent save runs every 50 steps
-    # and must not pay a full collection each time).
-    if not non_persistent_ckpt and os.environ.get('MEGATRON_GC_BEFORE_SAVE') == '1':
-        import ctypes
-        import gc as _gc
-
-        _gc_start = time()
-        _gc_collected = _gc.collect()
-        try:
-            ctypes.CDLL('libc.so.6').malloc_trim(0)
-        except Exception as _gc_err:  # not glibc, or trim unavailable: keep the save going
-            print_rank_0(f'gc_before_save: malloc_trim unavailable ({_gc_err})')
-        print_rank_0(
-            f'gc_before_save: collected {_gc_collected} unreachable object(s), '
-            f'malloc_trim(0) done in {time() - _gc_start:.2f} s'
-        )
+    # Host-RAM release immediately before a checkpoint save (--gc-before-save).
+    # Why: the v4b main run was killed twice by the host OOM killer at a 1000-step save (pjob .2407 at
+    # 57000, pjob .2470 at 59000). This covers non-persistent saves too: the 59000 OOM happened while
+    # the rolling save of that same iteration was in flight, so gating on persistent saves only would
+    # have missed it. gc.collect() frees unreachable objects and malloc_trim(0) returns the freed glibc
+    # arenas to the OS; it cannot free memory held live by the dataloader workers.
+    if getattr(args, 'gc_before_save', False):
+        print_rank_0(host_gc.gc_and_trim('before_save'))
 
     if args.async_save and not is_empty_async_queue():
         print_rank_0(

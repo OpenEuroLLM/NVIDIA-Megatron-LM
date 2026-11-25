@@ -144,6 +144,7 @@ from .async_utils import maybe_finalize_async_save
 from .dgrad_logging import (disable_dgrad_logging, enable_dgrad_logging,
                             save_dgrads)
 from .diagnostics import get_diagnostics, setup_diagnostics
+from . import host_gc
 from .global_vars import (destroy_global_vars, get_args, get_energy_monitor,
                           get_one_logger, get_signal_handler,
                           get_tensorboard_writer, get_timers, get_tokenizer,
@@ -5432,6 +5433,11 @@ def evaluate_and_print_results(
     pg_collection=None,
     p2p_communicator=None,
 ):
+    # Host-RAM release before validation (--gc-before-val): the eval forward allocates on top of the
+    # training footprint, and the v4b main run runs close to the node's host-memory limit.
+    if getattr(args, 'gc_before_val', False):
+        print_rank_0(host_gc.gc_and_trim('before_val'))
+
     """Helper function to evaluate and dump results on screen."""
     args = get_args()
     if write_to_tensorboard:

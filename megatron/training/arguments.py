@@ -2806,6 +2806,15 @@ def _add_diagnostics_args(parser):
                             'offending parameter names. Unlike '
                             '--check-for-nan-in-loss-and-grad this localises the '
                             'problem instead of only aborting on it.')
+    group.add_argument('--gc-before-save', action='store_true',
+                       help='Run gc.collect() and malloc_trim(0) immediately before every checkpoint '
+                            'save (persistent and non-persistent), so the save allocates on top of a '
+                            'smaller host footprint (megatron/training/host_gc.py). The v4b main run '
+                            'was OOM-killed by the host kernel at 1000-step saves. Off by default; '
+                            'costs a few seconds per save.')
+    group.add_argument('--gc-before-val', action='store_true',
+                       help='Run gc.collect() and malloc_trim(0) before validation, which allocates '
+                            'on top of the training footprint. Off by default.')
     group.add_argument('--nan-trace', action='store_true',
                        help='On a NaN loss, name the first module whose output went non-finite: '
                             'print the bad module outputs in reverse (loss -> input), the origin in '
