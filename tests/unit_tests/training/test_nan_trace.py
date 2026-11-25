@@ -1,28 +1,23 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-"""Tests for megatron/training/nan_trace.py, the --nan-trace diagnostic.
+"""Tests for megatron/training/nan_trace.py -- the retrospective NaN source report.
 
-The run that motivates it: the v4b main run dies about once per 175 steps with "found NaN in local
-forward loss calculation" on one rank, on a different node every time. --nan-trace answers *where* the
-value first went non-finite, so the tests pin the three answers it can give: the origin module, the
-reverse (loss -> input) order, and a non-finite parameter instead of an activation.
+Design constraint that the tests pin: the diagnostic must cost NOTHING while training runs. The first
+version installed forward hooks that synchronised at every module boundary and doubled the step time
+(39.1 s against 19.0 s, pjob .2492 vs .2470). So the tests check that the module exposes no hook
+installation at all, and that the report is built from the activations already saved for the backward.
 
-Written for pytest (every function is a ``test_*``), and also runnable without it, because the
-training container ships torch but no pytest:
+Written for pytest (every function is ``test_*``) and runnable without it (the training container has
+torch but no pytest):
 
     python submodules/Megatron-LM/tests/unit_tests/training/test_nan_trace.py
 """
 
-import argparse
 import importlib.util
 import pathlib
 import traceback
 
 import torch
 
-# Load nan_trace.py by path instead of `from megatron.training import nan_trace`: the package
-# __init__ pulls megatron.core's compiled extensions (packed_doc_static and friends), which exist in
-# the container and in CI but not on a CPU login node. Loading the file needs torch only, so the same
-# test runs in both places.
 _MEGATRON = pathlib.Path(__file__).resolve().parents[3]
 _spec = importlib.util.spec_from_file_location(
     "nan_trace_under_test", _MEGATRON / "megatron" / "training" / "nan_trace.py"
@@ -31,143 +26,79 @@ nan_trace = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(nan_trace)
 
 
-class _Poison(torch.nn.Module):
-    """Identity until poisoned, then adds NaN: a layer that introduces the NaN."""
+class _PoisonSaved(torch.autograd.Function):
+    """Saves a NaN tensor for the backward: the shape of a layer that produced a bad activation."""
 
-    def __init__(self):
-        super().__init__()
-        self.poison = False
+    @staticmethod
+    def forward(ctx, x):
+        ctx.save_for_backward(torch.full_like(x, float("nan")))
+        return x * 2
 
-    def forward(self, x):
-        if self.poison:
-            return x + float("nan")
-        return x
-
-
-def test_cli_flag_is_a_real_argument():
-    """The diagnostic is switched on by --nan-trace, not by an environment variable."""
-    nan_trace.reset()
-    source = (_MEGATRON / "megatron" / "training" / "arguments.py").read_text()
-    group = source[source.index("def _add_diagnostics_args"):]
-    assert "'--nan-trace'" in group, "the flag must be registered in the diagnostics group"
-    try:  # the real parser needs megatron.core's compiled extensions
-        from megatron.training import arguments
-    except Exception:
-        return
-    parser = argparse.ArgumentParser()
-    arguments._add_diagnostics_args(parser)
-    assert parser.parse_args([]).nan_trace is False
-    assert parser.parse_args(["--nan-trace"]).nan_trace is True
+    @staticmethod
+    def backward(ctx, grad_out):
+        return grad_out * 2
 
 
-def test_install_disabled_installs_nothing():
-    nan_trace.reset()
-    model = torch.nn.Sequential(torch.nn.Linear(4, 4))
-    assert nan_trace.install(model, enabled=False) == 0
-    lines = nan_trace.report(model, torch.zeros(1, 4), torch.ones(1), rank=0)
-    assert any("no module output was non-finite" in line for line in lines)
+def test_no_hooks_are_installed():
+    """The diagnostic must be retrospective: no forward hooks, no per-step synchronisation."""
+    assert not hasattr(nan_trace, "install"), "install() would observe every forward"
+    assert not hasattr(nan_trace, "_hook"), "a forward hook would synchronise every module output"
 
 
-def test_install_counts_modules_and_is_idempotent():
-    nan_trace.reset()
-    model = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.Linear(4, 2))
-    assert nan_trace.install(model, enabled=True) >= 2
-    assert nan_trace.install(model, enabled=True) == 0
+def test_bad_saved_activations_finds_the_poisoned_node():
+    x = torch.ones(4, requires_grad=True)
+    out = _PoisonSaved.apply(x).sum()
+    bad = nan_trace.bad_saved_activations(out)
+    assert bad, "the saved NaN must be found"
+    depth, node_type, count, numel = bad[0]
+    assert "_PoisonSaved" in node_type, bad
+    assert count == numel == 4, bad
 
 
 def test_report_names_the_origin_and_walks_in_reverse():
-    nan_trace.reset()
-    model = torch.nn.Sequential(torch.nn.Linear(4, 4), _Poison(), torch.nn.Linear(4, 2))
-    assert nan_trace.install(model, enabled=True) >= 3
-    model[1].poison = True
-    logits = model(torch.zeros(1, 4))
-    assert not torch.isfinite(logits).all()
-
-    lines = nan_trace.report(model, logits, torch.ones(1), rank=7)
+    x = torch.ones(4, requires_grad=True)
+    out = _PoisonSaved.apply(x).sum()
+    lines = nan_trace.report(out, torch.ones(4), model=None, rank=3)
     text = "\n".join(lines)
 
-    # only the failing rank reports, and every line is attributed to it
-    assert lines and all(line.startswith("[rank7]") for line in lines)
-    # the origin is the first bad module in FORWARD order: the _Poison layer, not the linear after it
+    assert lines and all(line.startswith("[rank3]") for line in lines), text
+    assert "bad saved activations, reverse (loss -> input)" in text
     origin = next(line for line in lines if "ORIGIN" in line)
-    assert "_Poison" in origin and "depth=2" in origin
-    # reverse order: the outermost module (the Sequential, whose output is the logits and therefore
-    # closest to the loss) is listed first, then '2', and the poison layer last
-    trail = [line for line in lines if "non-finite=" in line and "ORIGIN" not in line]
-    assert trail, text
-    assert "Sequential" in trail[0], trail
-    after_poison = next(i for i, line in enumerate(trail) if "'2'" in line)
-    at_poison = next(i for i, line in enumerate(trail) if "'1'" in line)
-    assert after_poison < at_poison, trail
+    assert "_PoisonSaved" in origin, origin
+    # the parameter scan is skipped, and the report says so rather than pretending
+    assert any("no model reference" in line for line in lines), text
+
+
+def test_report_blames_the_loss_kernel_when_nothing_saved_is_bad():
+    x = torch.ones(4, requires_grad=True)
+    out = (x * 3).sum()  # every saved tensor is finite
+    lines = nan_trace.report(torch.full((2,), float("nan")), torch.ones(2), model=None, rank=0)
+    text = "\n".join(lines)
+    assert any("after the last saved tensor" in line for line in lines), text
+    assert "ORIGIN" not in text
 
 
 def test_report_names_a_nonfinite_parameter():
-    nan_trace.reset()
     model = torch.nn.Sequential(torch.nn.Linear(2, 2))
     with torch.no_grad():
         model[0].weight[0, 0] = float("nan")
-    nan_trace.install(model, enabled=True)
-
-    lines = nan_trace.report(model, torch.full((1, 2), float("nan")), torch.ones(1), rank=0)
+    out = torch.zeros(2, requires_grad=True).sum()
+    lines = nan_trace.report(out, torch.ones(2), model=model, rank=0)
     text = "\n".join(lines)
     assert "non-finite PARAMETERS" in text
     assert "0.weight" in text
     assert "all parameters finite" not in text
 
 
-def test_report_blames_the_loss_kernel_when_no_module_is_bad():
-    """A NaN that no module produced came from the fused cross-entropy, and the report says so."""
-    nan_trace.reset()
-    model = torch.nn.Sequential(torch.nn.Linear(2, 2))
-    nan_trace.install(model, enabled=True)
-
-    lines = nan_trace.report(model, torch.full((1, 2), float("nan")), torch.ones(1), rank=0)
-    assert any("after the last module output" in line for line in lines)
-    assert any("all parameters finite" in line for line in lines)
-
-
-def test_report_clears_the_trail():
-    nan_trace.reset()
-    model = torch.nn.Sequential(_Poison())
-    nan_trace.install(model, enabled=True)
-    model[0].poison = True
-    logits = model(torch.zeros(1, 4))
-    nan_trace.report(model, logits, torch.ones(1), rank=0)
-    # a second report cannot repeat the previous iteration's modules
-    again = nan_trace.report(model, logits, torch.ones(1), rank=0)
-    assert any("no module output was non-finite" in line for line in again)
-
-
-def test_report_uses_the_model_kept_by_install():
-    """Megatron calls loss_func(output_tensor) without a model, so report(None) must still scan."""
-    nan_trace.reset()
-    model = torch.nn.Sequential(_Poison())
-    nan_trace.install(model, enabled=True)
-    model[0].poison = True
-    logits = model(torch.zeros(1, 4))
-
-    lines = nan_trace.report(None, logits, torch.ones(1), rank=0)
-    assert any("ORIGIN" in line for line in lines), lines
-    assert not any("no model reference" in line for line in lines), lines
-
-
-def test_report_without_any_model_says_the_scan_is_skipped():
-    nan_trace.reset()
-    lines = nan_trace.report(None, torch.zeros(1, 2), torch.ones(1), rank=0)
-    assert any("no model reference" in line for line in lines), lines
-
-
-def test_trail_is_bounded():
-    """A long run without a NaN must not grow the trail without limit."""
-    nan_trace.reset()
-    model = torch.nn.Sequential(_Poison())
-    nan_trace.install(model, enabled=True)
-    model[0].poison = True
-    for _ in range(nan_trace.MAX_TRAIL + 20):
-        model(torch.zeros(1, 4))
-    lines = nan_trace.report(model, torch.zeros(1, 4), torch.ones(1), rank=0)
-    recorded = next(line for line in lines if "recorded:" in line)
-    assert f"{nan_trace.MAX_TRAIL} recorded" in recorded
+def test_ordering_is_by_distance_from_the_loss():
+    """Two poisoned nodes at different depths: the shallow one comes first in the reverse walk."""
+    x = torch.ones(4, requires_grad=True)
+    shallow = _PoisonSaved.apply(x)
+    out = (_PoisonSaved.apply(shallow)).sum()
+    bad = nan_trace.bad_saved_activations(out)
+    assert len(bad) >= 2, bad
+    depths = [entry[0] for entry in bad]
+    assert depths == sorted(depths), bad
 
 
 if __name__ == "__main__":  # runnable in the training container, which has torch but no pytest

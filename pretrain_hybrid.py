@@ -368,12 +368,12 @@ def loss_func(
     # Check individual rank losses are not NaN prior to DP all-reduce.
     rerun_state_machine = get_rerun_state_machine()
     if args.check_for_nan_in_loss_and_grad:
-        # --nan-trace: the hooks were installed in forward_step (this function gets no model from
-        # the schedule), and report() falls back to the model install() kept. Only the rank whose
-        # loss is NaN prints, since isnan(loss) is true only there.
+        # --nan-trace: retrospective. Nothing is observed while training runs; when the loss is NaN
+        # this walks the autograd graph backwards over the activations already saved for the backward.
+        # Only the rank whose loss is NaN prints, since isnan(loss) is true only there.
         if torch.isnan(loss):
             rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-            for line in nan_trace.report(model, output_tensor, loss_mask, rank=rank):
+            for line in nan_trace.report(output_tensor, loss_mask, model=model, rank=rank):
                 print(line, flush=True)
         rerun_state_machine.validate_result(
             result=loss,
@@ -449,10 +449,6 @@ def forward_step(data_iterator, model: HybridModel, return_schedule_plan: bool =
         return_schedule_plan (bool): Return the EP-overlap (combined 1F1B) schedule plan
             instead of the output tensor (overlap_moe_expert_parallel_comm).
     """
-    # --nan-trace: counting forward hooks (no retained references). Installed here because this is
-    # where the model is in scope; loss_func() is called by the pipeline schedule without one.
-    nan_trace.install(model, getattr(get_args(), 'nan_trace', False))
-
     timers = get_timers()
 
     # Get the batch.

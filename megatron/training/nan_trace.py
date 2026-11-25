@@ -1,103 +1,97 @@
-"""Name the layer that first goes non-finite when a NaN loss fires.
+"""Name the layer that first went non-finite when a NaN loss fires -- retrospectively, at no cost.
 
-Why this exists (2026-11-25): the v4b main run dies about once per 175 steps with "found NaN in local
-forward loss calculation" on ONE rank, on a different node every time (9 events, 9 distinct nodes,
-each node once). The check that fires looks at one rank's loss before the DP all-reduce, so the bad
-value is local to that rank; the open question is where it first appears. A mask or packing bug would
-be deterministic and would recur at the same point, and it does not -- the same iteration passes on
-the next attempt -- so the answer has to come from the failing process itself.
+Why this shape (2026-11-25): the first version installed counting forward hooks on every module. That
+worked but it ran `(~isfinite(x)).sum()` and `int()` on every module output of every forward, which
+forces a host synchronisation at every module boundary: measured pjob .2492 at 39.1 s/step against
+19.0 s/step without it (.2470), a 2x slowdown for a diagnostic that is only ever needed once.
 
-``--nan-trace`` installs counting forward hooks: each module's output is counted for non-finite
-elements once per forward, and only the counts are kept (never a reference), so autograd retention
-and the host-memory profile are unchanged. When a NaN loss is detected, ``report()`` returns lines
-that name, in this order:
+The activations are already retained for the backward, so nothing has to be observed while training
+runs. On a NaN loss this module walks the autograd graph backwards from the loss, inspects the tensors
+each node saved for backward, and reports:
 
-* the bad module outputs in reverse (loss -> input), i.e. the module closest to the loss first,
-* the first bad module in forward order -- the origin, the one whose input was still clean,
+* the bad saved activations in reverse (loss -> input), i.e. the node closest to the loss first,
+* the ORIGIN: the bad node furthest from the loss, which is the earliest layer in forward order that
+  held a non-finite value,
 * a reverse scan of the parameters, so a corrupted LM head or expert weight is named outright.
 
-If no module output is bad while the loss is NaN, the NaN was produced after the last module (the
-fused cross-entropy), which is itself a decisive answer.
+If no saved activation is bad while the loss is NaN, the NaN was produced after the last saved tensor
+(the fused cross-entropy), which is itself a decisive answer.
 
-Off by default; ``install(..., enabled=False)`` does nothing.
+Steady-state cost: zero. The whole module is only called when the loss check fires.
 """
 
 import torch
 
-# Bound the trail to the most recent bad module outputs: a run that never hits a NaN must not grow
-# this list without limit.
-MAX_TRAIL = 128
-
-_state: dict = {"installed": False, "trail": [], "handles": [], "model": None}
+MAX_NODES = 4000  # bound the walk; a 64-layer MoE graph is well under this
 
 
-def install(model, enabled: bool = True) -> int:
-    """Register the counting hooks once. Returns how many were installed (0 when disabled)."""
-    if not enabled or model is None or _state["installed"]:
-        return 0
-    trail: list = []
-    handles = []
-    for depth, (name, module) in enumerate(model.named_modules()):
-        handles.append(module.register_forward_hook(_hook(name, depth, trail)))
-    _state.update(installed=True, trail=trail, handles=handles, model=model)
-    return len(handles)
+def _bad_count(tensor) -> int:
+    return int((~torch.isfinite(tensor)).sum())
 
 
-def reset() -> None:
-    """Remove the hooks and forget the trail (tests, and a model replaced mid-run)."""
-    for handle in _state["handles"]:
-        handle.remove()
-    _state.update(installed=False, trail=[], handles=[], model=None)
-
-
-def _hook(name: str, depth: int, trail: list):
-    def hook(module, inputs, output):
-        tensor = output[0] if isinstance(output, (tuple, list)) else output
-        if not torch.is_tensor(tensor) or tensor.numel() == 0:
-            return
-        bad = int((~torch.isfinite(tensor)).sum())
+def bad_saved_activations(output_tensor, limit: int = MAX_NODES) -> list[tuple[int, str, int, int]]:
+    """(depth, node type, bad elements, elements) of every graph node whose saved tensors are not
+    finite. ``depth`` is the distance from the loss, so sorting by it gives the reverse walk order."""
+    if not torch.is_tensor(output_tensor) or output_tensor.grad_fn is None:
+        return []
+    found: list[tuple[int, str, int, int]] = []
+    seen: set[int] = set()
+    stack = [(output_tensor.grad_fn, 0)]
+    while stack:
+        node, depth = stack.pop()
+        if node is None or id(node) in seen:
+            continue
+        seen.add(id(node))
+        if len(seen) > limit:
+            break
+        bad = numel = 0
+        try:
+            saved = node.saved_tensors or ()
+        except Exception:  # a node whose saved tensors were freed (recompute) or are unavailable
+            saved = ()
+        for tensor in saved:
+            if torch.is_tensor(tensor) and tensor.numel():
+                numel += tensor.numel()
+                bad += _bad_count(tensor)
         if bad:
-            trail.append((depth, name, type(module).__name__, bad, tensor.numel()))
-            del trail[: -MAX_TRAIL]
+            found.append((depth, type(node).__name__, bad, numel))
+        for entry in node.next_functions or ():
+            stack.append((entry[0], depth + 1))
+    found.sort(key=lambda item: item[0])
+    return found
 
-    return hook
 
-
-def report(model, output_tensor, loss_mask, rank: int = 0) -> list[str]:
+def report(output_tensor, loss_mask, model=None, rank: int = 0) -> list[str]:
     """The lines naming the NaN source. Pure: returns text, prints nothing, so it is testable.
 
-    ``model`` may be None: Megatron calls ``loss_func(output_tensor)`` from the pipeline schedule
-    without a model, so the model that ``install()`` saw is used in that case. Without either, the
-    parameter scan is skipped and the report says so.
+    ``model`` may be None (Megatron calls loss_func(output_tensor) from the pipeline schedule without
+    one); the parameter scan is then skipped and the report says so.
     """
-    model = model if model is not None else _state.get("model")
-    trail = list(_state["trail"])
-    logits_bad = int((~torch.isfinite(output_tensor)).sum())
     lines = [
-        f"[rank{rank}] NAN TRACE: loss is NaN; logits {tuple(output_tensor.shape)} "
-        f"non-finite {logits_bad}/{output_tensor.numel()}, "
+        f"[rank{rank}] NAN TRACE: loss is NaN; output {tuple(output_tensor.shape)} "
+        f"non-finite {_bad_count(output_tensor)}/{output_tensor.numel()}, "
         f"masked tokens {int(loss_mask.sum())}"
     ]
-    if trail:
-        lines.append(f"[rank{rank}] bad module outputs, reverse (loss -> input), {len(trail)} recorded:")
-        for depth, name, cls, bad, numel in reversed(trail):
-            lines.append(f"[rank{rank}]   depth={depth} {cls} '{name}' non-finite={bad}/{numel}")
-        first = trail[0]
+    bad = bad_saved_activations(output_tensor)
+    if bad:
+        lines.append(f"[rank{rank}] bad saved activations, reverse (loss -> input), {len(bad)} node(s):")
+        for depth, node_type, count, numel in bad:
+            lines.append(f"[rank{rank}]   depth={depth} {node_type} non-finite={count}/{numel}")
+        depth, node_type, count, numel = bad[-1]
         lines.append(
-            f"[rank{rank}] ORIGIN (first bad module in forward order): depth={first[0]} "
-            f"{first[2]} '{first[1]}' non-finite={first[3]}/{first[4]}"
+            f"[rank{rank}] ORIGIN (furthest from the loss = earliest in forward order): "
+            f"depth={depth} {node_type} non-finite={count}/{numel}"
         )
     else:
         lines.append(
-            f"[rank{rank}] no module output was non-finite: the NaN was produced after the last "
-            f"module output (fused cross-entropy / loss kernel), not by a layer"
+            f"[rank{rank}] no saved activation was non-finite: the NaN was produced after the last "
+            f"saved tensor (fused cross-entropy / loss kernel), not by a layer"
         )
-    bad_params: list[str] = []
-    scan_error = None
     if model is None:
         lines.append(f"[rank{rank}] no model reference: parameter scan skipped")
-        _state["trail"].clear()
         return lines
+    bad_params: list[str] = []
+    scan_error = None
     try:
         for name, param in reversed(list(model.named_parameters())):
             if param.numel() and not torch.isfinite(param).all():
@@ -115,8 +109,7 @@ def report(model, output_tensor, loss_mask, rank: int = 0) -> list[str]:
         lines.append(f"[rank{rank}] parameter scan failed: {scan_error}")
     else:
         lines.append(
-            f"[rank{rank}] all parameters finite: the weights are clean, so the NaN entered "
-            f"through an activation on this device"
+            f"[rank{rank}] all parameters finite: the weights are clean, so the NaN entered through "
+            f"an activation on this device"
         )
-    _state["trail"].clear()
     return lines
