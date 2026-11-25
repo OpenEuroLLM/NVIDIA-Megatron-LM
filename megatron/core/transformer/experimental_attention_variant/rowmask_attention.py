@@ -701,6 +701,52 @@ def _token_lists_kernel(SC, V, IDX, BITS, CNT, S, P, NB, q_offset, page, sink, w
     tl.store(CNT + t + tl.arange(0, 1), count)
 
 
+@triton.jit(do_not_specialize=['R', 'PM', 'n'])
+def _kth_largest_kernel(SC, V, R, PM, n, scg, scs, svg, BR: tl.constexpr, BPM: tl.constexpr):
+    pr = tl.program_id(0)
+    g = tl.program_id(1)
+    rows = pr * BR + tl.arange(0, BR)
+    rm = rows < R
+    p = tl.arange(0, BPM)
+    s = tl.load(SC + g * scg + rows[:, None] * scs + p[None, :], mask=rm[:, None] & (p < PM)[None, :],
+                other=float("-inf"))
+    b = s.to(tl.int32, bitcast=True)
+    key = tl.where(b < 0, b ^ 0x7FFFFFFF, b)  # order-preserving fp32 -> int32 (signed compare)
+    # radix select: the largest key t with count(key >= t) >= n, built from the top bit down
+    ans = tl.full([BR], -2147483648, tl.int32)
+    for bit in tl.static_range(31, -1, -1):
+        if bit == 31:
+            cand = ans ^ (-2147483648)
+        else:
+            cand = ans | (1 << bit)
+        c = tl.sum((key >= cand[:, None]).to(tl.int32), 1)
+        ans = tl.where(c >= n, cand, ans)
+    vb = tl.where(ans < 0, ans ^ 0x7FFFFFFF, ans)
+    tl.store(V + g * svg + rows, vb.to(tl.float32, bitcast=True), mask=rm)
+
+
+KTH_LARGEST_MAX_COLS = 2048  # wider rows (spans beyond 128k at page 64) keep torch.topk
+
+
+def kth_largest(sc: torch.Tensor, n: int) -> torch.Tensor:
+    """Each row's n-th largest value (0 < n <= sc.shape[-1]) of sc [..., R, C] fp32 (inner dim contiguous) as
+    [..., R]: the same values as sc.topk(n).values[..., -1] (ties, -inf rows), by a 32-step radix select over the
+    row held in registers -- the selection's torch.topk (sort-based, ~10 ms per layer at v4b's 64k on H100, twice
+    per step under full recompute) was its largest part; 5.4x faster on [2, 16384, 1024] (3090 Ti, 2026-11-25)."""
+    C = sc.shape[-1]
+    if C > KTH_LARGEST_MAX_COLS or not sc.is_cuda or sc.dtype != torch.float32 or sc.stride(-1) != 1:
+        return sc.topk(n, dim=-1).values[..., -1].contiguous()
+    lead = sc.shape[:-2]
+    sc3 = sc.reshape(-1, *sc.shape[-2:]) if sc.dim() != 3 else sc
+    G, R, _ = sc3.shape
+    v = torch.empty(G, R, device=sc.device, dtype=torch.float32)
+    BPM = triton.next_power_of_2(C)
+    BR = max(1, 4096 // BPM)
+    _kth_largest_kernel[(triton.cdiv(R, BR), G)](sc3, v, R, C, n, sc3.stride(0), sc3.stride(1), v.stride(0),
+                                                 BR=BR, BPM=BPM, num_warps=4)
+    return v.reshape(*lead, R)
+
+
 def token_lists_triton(sc: torch.Tensor, n: int, q_offset: int, page: int, sink: int, wp: int, tq: int, nb: int):
     """One KV group's per-token selection straight into head-packed lists: sc [s, P] fp32 page scores with -inf
     outside the candidates (:func:`maxpool_page_scores_triton`) -> (idx [ceil(s / tq), nb] int32, bits int64 tq-bit
@@ -710,7 +756,7 @@ def token_lists_triton(sc: torch.Tensor, n: int, q_offset: int, page: int, sink:
     s, P = sc.shape
     nt = -(-s // tq)
     n = min(n, P)
-    v = sc.topk(n, dim=-1).values[:, -1].contiguous() if n > 0 else torch.full((s,), float("inf"), device=sc.device)
+    v = kth_largest(sc, n) if n > 0 else torch.full((s,), float("inf"), device=sc.device)
     idx = torch.zeros(nt, nb, dtype=torch.int32, device=sc.device)
     bits = torch.zeros(nt, nb, dtype=torch.int64, device=sc.device)
     cnt = torch.empty(nt, dtype=torch.int32, device=sc.device)
@@ -838,7 +884,7 @@ def token_lists_packed(qsum: torch.Tensor, win: torch.Tensor, q_pos: torch.Tenso
             qs, win, scr, qp, tp0, tpn, rc, PM, win.shape[1], page, sink, wp,
             qs.stride(0), qs.stride(1), win.stride(0), win.stride(1), scr.stride(0), scr.stride(1),
             D=d, BQ=BQ, BP=BP, IEEE=ieee, num_warps=4)
-        v = scr.topk(nn_, dim=-1).values[..., -1].contiguous()  # [G, rc]
+        v = kth_largest(scr, nn_)  # [G, rc]
         t0 = r0 // tq
         _token_lists_packed_kernel[(rc // tq, G)](
             scr, v, idx[:, t0:], bits[:, t0:], cnt[:, t0:], qp, tp0, tpn, qp, rc, PM, NB, page, sink, wp, nn_,
@@ -871,7 +917,7 @@ def token_lists_packed_anchor(qsum_a: torch.Tensor, win: torch.Tensor, a_pos: to
             win.shape[1], page, sink, wp,
             qs.stride(0), qs.stride(1), win.stride(0), win.stride(1), scr.stride(0), scr.stride(1),
             D=d, BQ=BQ, BP=BP, IEEE=ieee, num_warps=4)
-        v = scr.topk(nn_, dim=-1).values[..., -1].contiguous()  # [G, ra]
+        v = kth_largest(scr, nn_)  # [G, ra]
         anc = (arow[r0:r1] - a0).contiguous()
         t0 = r0 // tq
         _token_lists_packed_kernel[(rc // tq, G)](
