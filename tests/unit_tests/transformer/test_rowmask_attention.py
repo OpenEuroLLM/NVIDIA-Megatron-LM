@@ -264,3 +264,25 @@ def test_head_packed_matches_dense_masked(rep, tq, D):
     gr = torch.autograd.grad((ref * go.double()).sum(), (qd, kd, vd))
     for x, y in zip(g, gr):
         assert float((x.double() - y).abs().max() / y.abs().max()) < 3e-2
+
+
+@pytest.mark.parametrize("C", [1, 7, 64, 1000, 1024, 2048])
+def test_kth_largest_equals_topk(C):
+    """The radix-select threshold is torch.topk(n).values[..., -1] exactly: ties, negative and all -inf rows, a
+    strided [G, R, C] view (the selection's score buffer slice) and a 2-D input."""
+    from megatron.core.transformer.experimental_attention_variant.rowmask_attention import kth_largest
+
+    torch.manual_seed(0)
+    G, R = 2, 301
+    buf = torch.randn(G, R + 50, C, device="cuda") * 3
+    cur = torch.randint(0, C + 1, (R + 50,), device="cuda")
+    buf = buf.masked_fill(torch.arange(C, device="cuda")[None, None, :] >= cur[None, :, None], float("-inf"))
+    buf[:, :40] = buf[:, :40].round()  # ties
+    buf[:, 40:60] = -buf[:, 40:60].abs()  # negative rows
+    buf[:, 60] = float("-inf")
+    buf[:, 61, 0] = -0.0
+    sc = buf[:, :R]  # strided like the chunked score buffer
+    for n in sorted({1, min(3, C), min(32, C), C}):
+        ref = sc.topk(n, dim=-1).values[..., -1]
+        assert torch.equal(kth_largest(sc, n), ref), n
+        assert torch.equal(kth_largest(sc[0].contiguous(), n), ref[0]), n
