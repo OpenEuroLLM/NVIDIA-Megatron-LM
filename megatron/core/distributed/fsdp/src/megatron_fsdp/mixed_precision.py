@@ -405,3 +405,11 @@ class MixedPrecisionPolicy:
       communication buffers (per FSDP group) adds memory overhead. Defaults to None.
       No additional memory is allocated when `grad_comm_dtype == main_grads_dtype`.
     """
+
+    grad_comm_dtype_experts_only: bool = False
+    """Apply `grad_comm_dtype` to the expert parameter groups only; the dense groups
+      reduce in their main gradient dtype. The reduce-scatter sums in the wire dtype, hop by hop around
+      the ring: a bf16 sum over the expert-DP group (DP / EP ranks) stays at a few percent relative
+      error, a bf16 sum over all DP ranks does not. The expert buckets carry most of the bytes in a
+      large MoE, so this keeps most of the bandwidth saving. Defaults to False.
+    """

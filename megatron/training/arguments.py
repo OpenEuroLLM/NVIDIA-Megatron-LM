@@ -4414,6 +4414,12 @@ def _add_experimental_args(parser):
                              "model gradients during FSDP. If 'auto', then the main gradient data-type will "
                              "be used for the gradient communication / reduction data-type. When using NCCL "
                              "v2.27+, reduction is always computed in FP32 if using NCCL Symmetric kernels.")
+    group.add_argument('--megatron-fsdp-grad-comm-dtype-experts-only', action='store_true', default=False,
+                       help="Apply --megatron-fsdp-grad-comm-dtype to the expert parameter groups only; the "
+                            "dense groups reduce in the main gradient dtype. The reduce-scatter sums in the "
+                            "wire dtype around the ring: bf16 over the expert-DP group (DP / EP ranks) stays "
+                            "at a few percent relative error, bf16 over all DP ranks does not, and the expert "
+                            "buckets carry most of the bytes.")
     group.add_argument(
             '--megatron-fsdp-enable-fine-grained-param-gather',
             action='store_true',
