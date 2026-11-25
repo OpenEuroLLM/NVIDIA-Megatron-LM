@@ -301,3 +301,84 @@ def test_moonep_sharded_state_dict_expert_dp_replicas():
     assert len(tensors) == 3 * epn  # fc1 split into its gate / up halves, fc2
     for st in tensors:
         assert st.replica_id[-1] == rank // 2, (st.key, st.replica_id)
+
+
+@pytest.mark.parametrize("overwrite", [False, True])
+@pytest.mark.parametrize("skew", [0.0, 4.0])
+def test_moonep_bf16_main_grads(overwrite, skew):
+    """bf16 expert main grads (Megatron-FSDP --megatron-fsdp-grad-comm-dtype bf16): the experts' wgrad and the
+    prefetched copies' reduce run on an fp32 scratch and land in the bf16 grads once -- accumulated onto what the
+    grads held, or overwriting it (FSDP's fresh buckets, ``overwrite_main_grad``)."""
+    rank, R = _init()
+    if R != 4:
+        pytest.skip("needs 4 ranks (torchrun --nproc-per-node 4)")
+    S, H, Fh, E, K = 1024, 512, 256, 32, 4
+    epn = E // R
+    group = dist.new_group(list(range(R)))
+    singles = [dist.new_group([r]) for r in range(R)]
+    cfg = _config(H, Fh, E, K, R)
+    pgc = SimpleNamespace(ep=group, expt_tp=singles[rank], tp_ep=group, tp=singles[rank],
+                          expt_dp=singles[rank])
+
+    torch.manual_seed(0)
+    w1 = torch.randn(E, 2 * Fh, H, device="cuda") / H**0.5
+    w2 = torch.randn(E, H, Fh, device="cuda") / Fh**0.5
+    torch.manual_seed(100 + rank)
+    x = torch.randn(S, H, device="cuda")
+    logits = torch.randn(S, E, device="cuda")
+    logits[:, :3] += skew
+    top = logits.topk(K, dim=-1)
+    routing_map = torch.zeros(S, E, dtype=torch.bool, device="cuda").scatter_(1, top.indices, True)
+    probs = torch.zeros(S, E, device="cuda").scatter_(1, top.indices, torch.sigmoid(top.values))
+
+    experts = MoonEPGroupedMLP(epn, cfg)
+    prior = []
+    for i in range(epn):
+        for mod, w in ((experts.linear_fc1, w1), (experts.linear_fc2, w2)):
+            p = getattr(mod, f"weight{i}")
+            p.data.copy_(w[rank * epn + i])
+            g = torch.randn(p.shape, device="cuda").to(torch.bfloat16)  # what the bucket held
+            prior.append(g.clone())
+            p.main_grad = g
+            p.overwrite_main_grad = overwrite
+    disp = MoEMoonEPTokenDispatcher(epn, list(range(rank * epn, (rank + 1) * epn)), cfg, pgc)
+    disp.attach_experts(experts)
+    xb = x.to(torch.bfloat16).requires_grad_(True)
+    pb = probs.clone().requires_grad_(True)
+    h, w_sk = disp.dispatch_preprocess(xb, routing_map, pb)
+    h, w_nvs = disp.token_dispatch(h, w_sk)
+    h, cu, w_nvs = disp.dispatch_postprocess(h, w_nvs)
+    y, _ = experts(h, cu, w_nvs)
+    out = disp.combine_postprocess(disp.token_combine(disp.combine_preprocess(y)))
+    torch.manual_seed(7 + rank)
+    gout = torch.randn_like(x)
+    out.float().backward(gout.to(torch.bfloat16).float())
+    torch.cuda.synchronize()
+
+    w1r = w1.clone().requires_grad_(True)
+    w2r = w2.clone().requires_grad_(True)
+    _reference(x.clone(), probs.clone(), routing_map, w1r, w2r).backward(gout.to(torch.bfloat16).float())
+    gw1, gw2 = w1r.grad.clone(), w2r.grad.clone()
+    dist.all_reduce(gw1, group=group)
+    dist.all_reduce(gw2, group=group)
+    gw1, gw2 = gw1[rank * epn : (rank + 1) * epn], gw2[rank * epn : (rank + 1) * epn]
+
+    main1, main2 = experts.main_grads()
+    assert main1[0].dtype == torch.bfloat16
+    p1 = torch.stack(prior[0::2]).float()
+    p2 = torch.stack(prior[1::2]).float()
+    got1 = torch.stack(main1).float() - (0 if overwrite else p1)
+    got2 = torch.stack(main2).float() - (0 if overwrite else p2)
+
+    def rel(a, b):
+        return ((a - b).norm() / b.norm().clamp_min(1e-12)).item()
+
+    errs = {"dw1": rel(got1, gw1), "dw2": rel(got2, gw2)}
+    remote = int((disp.holder.plan.experts_to_copy >= 0).sum().item())
+    print(f"rank {rank} skew {skew} overwrite {overwrite}: copies {remote}, rel errors {errs}", flush=True)
+    # bf16 grads: the prior's rounding when accumulating dominates (|prior| ~ 1 vs grads ~ 0.1-1)
+    tol = 2e-2 if overwrite else 6e-2
+    for k, v in errs.items():
+        assert v < tol, (k, v)
+    if skew > 0:
+        assert remote > 0, "skewed routing should create redundant experts"

@@ -478,12 +478,23 @@ class _MoonEPExperts(torch.autograd.Function):
         main1, main2 = module.main_grads()
         # Megatron-FSDP: the wgrad overwrites the fresh bucket (the copies' grads are added after)
         overwrite = all(getattr(w, "overwrite_main_grad", False) for w in weights[: 2 * epn])
+        # bf16 main grads (Megatron-FSDP --megatron-fsdp-grad-comm-dtype bf16 hands the experts its
+        # bf16 reduce-scatter bucket): the wgrad GEMMs and MoonEP's copy reduce (fp32 only) run on a
+        # fresh fp32 scratch shared by all layers, folded into the bucket once at the end -- one bf16
+        # rounding per element, as the wire's own cast would do
+        lowp = main1[0].dtype != torch.float32
+        if lowp:
+            dev = main1[0].device
+            tgt1 = list(_shared("wg1", (epn, *main1[0].shape), torch.float32, dev)["t"].unbind(0))
+            tgt2 = list(_shared("wg2", (epn, *main2[0].shape), torch.float32, dev)["t"].unbind(0))
+        else:
+            tgt1, tgt2 = main1, main2
 
         probs = w_nvs.unsqueeze(-1)
         # fc2: dgrad + wgrad (into the local main grads and this rank's reduce slots)
         grad_a = torch.empty(x.shape[0], ffn, dtype=x.dtype, device=x.device)
         _gemm(w2, grad_y, hidden, grad_a, ffn, splits, offsets, "NN")
-        _wgrad(main2, gpools[1], a, ffn, grad_y, hidden, splits, offsets, overwrite)
+        _wgrad(tgt2, gpools[1], a, ffn, grad_y, hidden, splits, offsets, overwrite or lowp)
         grad_h, grad_probs = _weighted_act_back(
             grad_a, h, probs, getattr(module.config, "activation_func_clamp_value", None),
             _norm_eps(module.config), _norm_floor(module.config), _norm_smooth(module.config),
@@ -492,9 +503,16 @@ class _MoonEPExperts(torch.autograd.Function):
         # zero copy: the dispatch backward (a combine) reads fc1's dgrad from the shard
         grad_x = state.buffer.hidden_nvsh_buffer_view
         _gemm(w1, grad_h, ffn2, grad_x, hidden, splits, offsets, "NN")
-        _wgrad(main1, gpools[0], x, hidden, grad_h, ffn2, splits, offsets, overwrite)
+        _wgrad(tgt1, gpools[0], x, hidden, grad_h, ffn2, splits, offsets, overwrite or lowp)
         # the prefetched copies' grads -> their home ranks' main grads (collective)
-        module.reduce_copies_grad(state, plan, main1, main2)
+        module.reduce_copies_grad(state, plan, tgt1, tgt2)
+        if lowp:
+            for main, tgt in ((main1, tgt1), (main2, tgt2)):
+                if overwrite:
+                    torch._foreach_copy_(main, tgt)
+                else:
+                    for m, t in zip(main, tgt):
+                        m.add_(t)
         grad_w = grad_probs.squeeze(-1).to(w_nvs.dtype)
         if ctx.streams is not None:  # chunked: the dispatch backward reads it on the comm stream
             _record(state, ctx.streams[1], grad_w)
@@ -597,7 +615,8 @@ class MoonEPGroupedMLP(MegatronModule):
         return [*out, self._dummy_w]
 
     def main_grads(self):
-        """Per-expert fp32 main grads ([2F, H] list, [H, F] list)."""
+        """Per-expert main grads ([2F, H] list, [H, F] list): fp32, or bf16 under Megatron-FSDP's
+        bf16 gradient communication (the backward then works on an fp32 scratch)."""
         out = []
         for mod in (self.linear_fc1, self.linear_fc2):
             mg = []
@@ -611,7 +630,9 @@ class MoonEPGroupedMLP(MegatronModule):
                     if getattr(p, "_moonep_grad", None) is None:
                         p._moonep_grad = torch.zeros(p.shape, dtype=torch.float32, device=p.device)
                     g = p._moonep_grad
-                assert g.dtype == torch.float32, "MoonEP experts need fp32 main grads"
+                assert g.dtype in (torch.float32, torch.bfloat16), (
+                    f"MoonEP experts need fp32 or bf16 main grads, got {g.dtype}"
+                )
                 mg.append(g.view(p.shape))
             out.append(mg)
         return out
