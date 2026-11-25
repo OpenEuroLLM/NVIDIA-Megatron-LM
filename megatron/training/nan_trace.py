@@ -28,7 +28,7 @@ import torch
 # this list without limit.
 MAX_TRAIL = 128
 
-_state: dict = {"installed": False, "trail": [], "handles": []}
+_state: dict = {"installed": False, "trail": [], "handles": [], "model": None}
 
 
 def install(model, enabled: bool = True) -> int:
@@ -39,7 +39,7 @@ def install(model, enabled: bool = True) -> int:
     handles = []
     for depth, (name, module) in enumerate(model.named_modules()):
         handles.append(module.register_forward_hook(_hook(name, depth, trail)))
-    _state.update(installed=True, trail=trail, handles=handles)
+    _state.update(installed=True, trail=trail, handles=handles, model=model)
     return len(handles)
 
 
@@ -47,7 +47,7 @@ def reset() -> None:
     """Remove the hooks and forget the trail (tests, and a model replaced mid-run)."""
     for handle in _state["handles"]:
         handle.remove()
-    _state.update(installed=False, trail=[], handles=[])
+    _state.update(installed=False, trail=[], handles=[], model=None)
 
 
 def _hook(name: str, depth: int, trail: list):
@@ -64,7 +64,13 @@ def _hook(name: str, depth: int, trail: list):
 
 
 def report(model, output_tensor, loss_mask, rank: int = 0) -> list[str]:
-    """The lines naming the NaN source. Pure: returns text, prints nothing, so it is testable."""
+    """The lines naming the NaN source. Pure: returns text, prints nothing, so it is testable.
+
+    ``model`` may be None: Megatron calls ``loss_func(output_tensor)`` from the pipeline schedule
+    without a model, so the model that ``install()`` saw is used in that case. Without either, the
+    parameter scan is skipped and the report says so.
+    """
+    model = model if model is not None else _state.get("model")
     trail = list(_state["trail"])
     logits_bad = int((~torch.isfinite(output_tensor)).sum())
     lines = [
@@ -88,6 +94,10 @@ def report(model, output_tensor, loss_mask, rank: int = 0) -> list[str]:
         )
     bad_params: list[str] = []
     scan_error = None
+    if model is None:
+        lines.append(f"[rank{rank}] no model reference: parameter scan skipped")
+        _state["trail"].clear()
+        return lines
     try:
         for name, param in reversed(list(model.named_parameters())):
             if param.numel() and not torch.isfinite(param).all():

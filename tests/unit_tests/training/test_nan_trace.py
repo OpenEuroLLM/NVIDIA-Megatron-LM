@@ -138,6 +138,25 @@ def test_report_clears_the_trail():
     assert any("no module output was non-finite" in line for line in again)
 
 
+def test_report_uses_the_model_kept_by_install():
+    """Megatron calls loss_func(output_tensor) without a model, so report(None) must still scan."""
+    nan_trace.reset()
+    model = torch.nn.Sequential(_Poison())
+    nan_trace.install(model, enabled=True)
+    model[0].poison = True
+    logits = model(torch.zeros(1, 4))
+
+    lines = nan_trace.report(None, logits, torch.ones(1), rank=0)
+    assert any("ORIGIN" in line for line in lines), lines
+    assert not any("no model reference" in line for line in lines), lines
+
+
+def test_report_without_any_model_says_the_scan_is_skipped():
+    nan_trace.reset()
+    lines = nan_trace.report(None, torch.zeros(1, 2), torch.ones(1), rank=0)
+    assert any("no model reference" in line for line in lines), lines
+
+
 def test_trail_is_bounded():
     """A long run without a NaN must not grow the trail without limit."""
     nan_trace.reset()
