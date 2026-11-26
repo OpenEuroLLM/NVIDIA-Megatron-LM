@@ -1324,14 +1324,29 @@ def warm_token_kernels(cfg: PageSparseConfig, hq: int, hk: int, d: int, device, 
 TOKEN_PACKED_SCORE_BYTES = 128 << 20  # the packed per-token selection's score buffer [G, chunk, PM] fp32
 
 
+class _FixedPack(torch.autograd.Function):
+    """Spans copied into one zero tensor; the backward returns each span's rows of the packed gradient as a view.
+    (In-place slice copies under autograd made a CopySlices node per span whose backward cloned the WHOLE packed
+    gradient: 568 device-to-device copies, 72 ms per step in the 2-attention-layer v4b slice, 2026-11-26.)"""
+
+    @staticmethod
+    def forward(ctx, offs, total, *xs):
+        out = xs[0].new_zeros(1, xs[0].shape[1], total, xs[0].shape[3])
+        for x, o in zip(xs, offs):
+            out[:, :, o:o + x.shape[2]].copy_(x)
+        ctx.spans = [(o, x.shape[2]) for x, o in zip(xs, offs)]
+        return out
+
+    @staticmethod
+    def backward(ctx, grad):
+        return (None, None, *[grad[:, :, o:o + n] for o, n in ctx.spans])
+
+
 def _fixed_packed(xs, offs, total: int):
     """The spans' tensors xs [1, h, n_i, d] copied into ONE zero tensor [1, h, total, d] of a fixed length, span i at
     rows offs[i]: a single allocation of constant size (no concatenation, no padded copy per span); the backward hands
     each span a view of the packed gradient."""
-    out = xs[0].new_zeros(1, xs[0].shape[1], total, xs[0].shape[3])
-    for x, o in zip(xs, offs):
-        out[:, :, o:o + x.shape[2]].copy_(x)
-    return out
+    return _FixedPack.apply([int(o) for o in offs[: len(xs)]], int(total), *xs)
 
 
 def _token_packed_select_attention(spans, cfg: PageSparseConfig, scale: float, tq: int, fixed=None):

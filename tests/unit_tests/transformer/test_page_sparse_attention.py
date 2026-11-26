@@ -848,3 +848,32 @@ def test_token_path_stress_recompute_deterministic(single):
                 assert torch.equal(x, y), f"step {i}: not deterministic ({len(segs)} documents)"
     finally:
         ps.TOKEN_FIXED_PAD = old_pad
+
+
+def test_fixed_packed_gradients_are_views():
+    """_fixed_packed: the packed tensor and the spans' gradients equal a padded concatenation's, and autograd records
+    no CopySlices (whose backward cloned the whole packed gradient once per span)."""
+    from megatron.core.transformer.experimental_attention_variant.page_sparse import _fixed_packed
+
+    torch.manual_seed(0)
+    lens, offs, total = [5, 64, 1, 30], [0, 64, 128, 192], 256
+    base = torch.randn(1, 3, sum(lens), 8, dtype=torch.float64, requires_grad=True)
+    xs = list(base.split(lens, dim=2))
+    out = _fixed_packed(xs, offs, total)
+    names, todo, seen = set(), [out.grad_fn], set()
+    while todo:
+        fn = todo.pop()
+        if fn is None or fn in seen:
+            continue
+        seen.add(fn)
+        names.add(type(fn).__name__)
+        todo.extend(f for f, _ in fn.next_functions)
+    assert "CopySlices" not in names, names
+    ref = torch.zeros(1, 3, total, 8, dtype=torch.float64)
+    for x, o in zip(xs, offs):
+        ref[:, :, o:o + x.shape[2]] = x.detach()
+    assert torch.equal(out.detach(), ref)
+    w = torch.randn_like(ref)
+    (out * w).sum().backward()
+    want = torch.cat([w[:, :, o:o + n] for o, n in zip(offs, lens)], dim=2)
+    assert torch.equal(base.grad, want)
