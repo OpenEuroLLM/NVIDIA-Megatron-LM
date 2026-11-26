@@ -218,6 +218,9 @@ class TopKRouter(Router):
         else:
             self.global_tokens_per_expert = None
             self.ga_steps = None
+        # moe_global_aux_counts_from_forward: (counts, async handle, local token count) per checkpointed
+        # first forward, consumed in order by the recomputes
+        self._fwd_global_counts = []
 
         # Quantile balancing replaces the aux loss with a per-expert bias `qb_beta`.
         # `qb_beta_accum`/`qb_beta_count` collect the per-microbatch quantile, reduced
@@ -606,15 +609,25 @@ class TopKRouter(Router):
         if global_aux_loss_coeff == 0:
             return probs
 
-        # Use unified function to compute tokens_per_expert and num_tokens
-        global_tokens_per_expert, local_num_tokens, total_num_tokens = (
-            get_tokens_per_expert_and_token_count(
-                routing_map=routing_map,
-                reduce_group=self.tp_dp_cp_group,
-                with_padding_mask=with_padding_mask,
-                topk=self.topk,
+        if self._fwd_global_counts and self._prefetches_global_counts():
+            # the recompute: the first forward already all-reduced these counts (same routing)
+            global_tokens_per_expert, handle, local_num_tokens = self._fwd_global_counts.pop(0)
+            handle.wait()
+            if with_padding_mask:
+                total_num_tokens = global_tokens_per_expert.sum() / self.topk
+            else:
+                local_num_tokens = routing_map.shape[0]
+                total_num_tokens = local_num_tokens * self.tp_dp_cp_group.size()
+        else:
+            # Use unified function to compute tokens_per_expert and num_tokens
+            global_tokens_per_expert, local_num_tokens, total_num_tokens = (
+                get_tokens_per_expert_and_token_count(
+                    routing_map=routing_map,
+                    reduce_group=self.tp_dp_cp_group,
+                    with_padding_mask=with_padding_mask,
+                    topk=self.topk,
+                )
             )
-        )
 
         self.global_tokens_per_expert += global_tokens_per_expert
         self.ga_steps += 1
@@ -927,6 +940,27 @@ class TopKRouter(Router):
                 pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
             )
 
+        # The first (no-grad) forward of a checkpointed layer: launch the global aux loss's count all-reduce now,
+        # so its recompute needs no blocking collective (moe_global_aux_counts_from_forward)
+        if (
+            self.training
+            and not torch.is_grad_enabled()
+            and self._prefetches_global_counts()
+        ):
+            routing_map_for_aux_loss, _ = compute_routing_scores_for_aux_loss(
+                logits,
+                self.topk,
+                self.score_function,
+                fused=self.config.moe_router_fusion,
+                padding_mask=padding_mask,
+            )
+            counts = routing_map_for_aux_loss.sum(dim=0)
+            local_num_tokens = counts.sum() / self.topk if padding_mask is not None else None
+            handle = torch.distributed.all_reduce(counts, group=self.tp_dp_cp_group, async_op=True)
+            if len(self._fwd_global_counts) >= 16:  # never consumed (no backward): drop the oldest
+                self._fwd_global_counts.pop(0)[1].wait()
+            self._fwd_global_counts.append((counts, handle, local_num_tokens))
+
         # Apply each aux loss type and attach aux loss autograd function to probs
         if self.training and torch.is_grad_enabled() and self.is_aux_loss_enabled():
             # Calculate scores and routing_map for aux loss
@@ -993,6 +1027,17 @@ class TopKRouter(Router):
             )
 
         return probs, routing_map
+
+    def _prefetches_global_counts(self) -> bool:
+        """Inside a checkpointed region with moe_global_aux_counts_from_forward and a global aux loss."""
+        from megatron.core.tensor_parallel.random import is_checkpointing
+
+        return (
+            self.config.moe_global_aux_counts_from_forward
+            and is_checkpointing()
+            and self.global_tokens_per_expert is not None
+            and self.get_aux_loss_coeff("global_aux_loss") > 0
+        )
 
     def reset_global_aux_loss_tracker(self):
         """Reset the global aux loss tracker."""

@@ -659,6 +659,13 @@ class TransformerConfig(ModelParallelConfig):
     """Log moe/stay_rate: the share of a token's selected experts the previous token selected too (per MoE layer,
     averaged) -- the expert reuse an offload cache sees."""
 
+    moe_global_aux_counts_from_forward: bool = False
+    """Under activation recompute, the global aux loss's token counts come from the checkpointed layer's first
+    (no-grad) forward: it launches their all-reduce over the TP x DP x CP group asynchronously, and the recompute
+    reuses the result instead of a blocking collective. The aux loss runs only with grad enabled, i.e. in the
+    recompute, where each MoE layer's count all-reduce stalled every rank until the slowest arrived (48 global
+    syncs per backward at v4b). Same routing, same counts; layers outside a checkpoint keep the synchronous path."""
+
     page_sparse_selector: Optional[str] = None
     """Page-sparse attention for the self-attention layers (experimental_attention_variant/page_sparse.py):
     every query attends to the sink pages, a local window and ``page_sparse_topk`` earlier pages chosen by
