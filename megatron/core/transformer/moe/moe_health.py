@@ -590,6 +590,11 @@ def report_moe_health_metrics(
             if reduce_group is not None:
                 all_reduce_skip_singleton(values, group=reduce_group)
             all_reduce_skip_singleton(values, group=dp_group, op=torch.distributed.ReduceOp.AVG)
+        # the per-layer statistics below on host copies: one transfer per tracker instead of a
+        # device op + host sync per layer and metric (~1300 .item() calls per step at v4b)
+        selected_values, dispatched_values = selected_values.cpu(), dispatched_values.cpu()
+        if weight_values is not None:
+            weight_values = weight_values.cpu()
 
         active_layers = selected_values.sum(dim=-1) > 0
         selected_means = selected_values.mean(dim=-1, keepdim=True)
@@ -598,7 +603,11 @@ def report_moe_health_metrics(
             selected_values < 0.1 * selected_means
         ) & active_layers.unsqueeze(-1)
         near_dead_streaks = util_tracker.get("selected_near_dead_streaks")
-        if near_dead_streaks is None or near_dead_streaks.shape != selected_values.shape:
+        if (
+            near_dead_streaks is None
+            or near_dead_streaks.shape != selected_values.shape
+            or near_dead_streaks.device != selected_values.device
+        ):
             near_dead_streaks = torch.zeros_like(selected_values, dtype=torch.int32)
             util_tracker["selected_near_dead_streaks"] = near_dead_streaks
         update_expert_near_dead_streaks(near_dead_streaks, selected_near_dead_mask)
@@ -720,6 +729,8 @@ def report_moe_health_metrics(
                 all_reduce_skip_singleton(t, group=rs_tracker["reduce_group"])
         for t in (sum_max_score, sum_score_entropy, sum_logits, token_count):
             all_reduce_skip_singleton(t, group=dp_group, op=torch.distributed.ReduceOp.AVG)
+        sum_max_score, sum_score_entropy = sum_max_score.cpu(), sum_score_entropy.cpu()
+        sum_logits, token_count = sum_logits.cpu(), token_count.cpu()
 
         have_wandb_rs = per_layer_logging and (wandb_writer is not None)
         logit_spread_list = []
@@ -819,23 +830,24 @@ def report_moe_health_metrics(
             (_tp_cp_group(pg_collection), _pp_group(pg_collection), _dp_group(pg_collection)),
             avg_last=True,
         )
+        vt = {k: v.cpu() if torch.is_tensor(v) else v for k, v in viability_tracker.items()}
         layer_log = {}
         wandb_layer_log = {}
         routed_rms_list, routed_to_input, routed_to_output = [], [], []
         have_wandb_viability = wandb_writer is not None
-        for i in range(viability_tracker["routed_sq_sum"].numel()):
-            routed_count = viability_tracker["routed_count"][i]
+        for i in range(vt["routed_sq_sum"].numel()):
+            routed_count = vt["routed_count"][i]
             if routed_count.item() == 0:
                 continue
-            routed_rms = torch.sqrt(viability_tracker["routed_sq_sum"][i] / routed_count).item()
+            routed_rms = torch.sqrt(vt["routed_sq_sum"][i] / routed_count).item()
             input_rms = torch.sqrt(
-                viability_tracker["input_sq_sum"][i] / viability_tracker["input_count"][i]
+                vt["input_sq_sum"][i] / vt["input_count"][i]
             ).item()
             input_ratio = routed_rms / max(input_rms, 1.0e-12)
             output_ratio = None
-            if viability_tracker["output_count"][i].item() > 0:
+            if vt["output_count"][i].item() > 0:
                 output_rms = torch.sqrt(
-                    viability_tracker["output_sq_sum"][i] / viability_tracker["output_count"][i]
+                    vt["output_sq_sum"][i] / vt["output_count"][i]
                 ).item()
                 output_ratio = routed_rms / max(output_rms, 1.0e-12)
             if writer is not None:
@@ -889,6 +901,9 @@ def report_moe_health_metrics(
             value = viability_tracker[name]
             for group in groups:
                 all_reduce_skip_singleton(value, group=group)
+        viability_tracker = {
+            k: v.cpu() if torch.is_tensor(v) else v for k, v in viability_tracker.items()
+        }
         weight_rms = torch.sqrt(
             viability_tracker["weight_sq_sum"] / viability_tracker["weight_count"].clamp_min(1)
         )
