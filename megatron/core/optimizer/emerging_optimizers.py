@@ -709,9 +709,10 @@ _COMPACT_ROW_STATES = os.environ.get("ANGULAR_MUOWN_COMPACT_CKPT", "0") == "1"
 ANGULAR_MUOWN_KAPPA: Dict[str, float] = {}
 
 
-@torch.compile
 def _local_grad(p: torch.Tensor) -> torch.Tensor:
-    """The local gradient rows of p; zeros where Megatron-FSDP left none (an empty shard)."""
+    """The local gradient rows of p; zeros where Megatron-FSDP left none (an empty shard). Plain Python:
+    called once per parameter, where torch.compile's per-call guard / wrapper overhead was ~13 % of the
+    row-sharded optimizer step's CPU time (v4b slice profile, 2026-11-26) for a branch and a view."""
     if p.grad is not None:
         return local(p.grad)
     return torch.zeros_like(local(p))

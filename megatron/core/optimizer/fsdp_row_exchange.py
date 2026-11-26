@@ -66,7 +66,16 @@ def local(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
 
 
 def shard_group(p: torch.Tensor) -> "torch.distributed.ProcessGroup":
-    return p.device_mesh.get_group(_shard_dim(p))
+    """The process group sharding p's rows (cached on p: the mesh lookup cost ~13 us per parameter and
+    step, ~8.6k row-sharded matrices per rank at v4b)."""
+    group = getattr(p, "_row_shard_group", None)
+    if group is None:
+        group = p.device_mesh.get_group(_shard_dim(p))
+        try:
+            p._row_shard_group = group
+        except (AttributeError, TypeError):
+            pass
+    return group
 
 
 def row_state_like(
