@@ -333,6 +333,13 @@ class DepthMemoryMixer(nn.Module):
         _, gate = self.next_query.net(x)
         arch_metrics.record_mean("ldm/write_weight", layer, n, weight.float())
         arch_metrics.record_mean("ldm/read_gate", layer, n, gate.float())
+        workspace = self._workspace[0] if self._workspace else None
+        if self.edge == 1 and getattr(workspace, "grad_scaling", False):
+            # FP16 storage under BF16 training: the last backward's gradient scale and the
+            # non-finite input gradients the workspace has zeroed so far (once, on the first site)
+            stats = workspace.numerics_stats()
+            arch_metrics.record_mean("ldm/grad_scale_log2", layer, n, stats["grad_scale"].log2())
+            arch_metrics.record_mean("ldm/grad_nonfinite", layer, n, stats["grad_nonfinite"].float())
 
     def write(self, streams, sublayer_out, h_post=None, h_res=None, lerp=None) -> torch.Tensor:
         if self.edge is None:

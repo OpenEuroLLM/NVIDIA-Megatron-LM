@@ -133,3 +133,56 @@ def test_cute_recompute_matches_one_sequence(pattern, chunk):
                 torch.testing.assert_close(grads[k], oracle_grads[k], **tol, msg=k)
     finally:
         Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("chunk", [1, 2])
+@pytest.mark.parametrize("storage,interval,prefetch", [
+    ("float16", 0, False), ("float16", 4, False), ("float16", 4, True), ("bfloat16", 4, False)])
+def test_cute_recompute_fp16_checkpoints_match_oracle(storage, interval, prefetch, chunk):
+    """depth_memory_unwind with the CuTe kernels, FP16 storage (the workspace scales its own
+    backward: no FP16 training) and M checkpoints every ``interval`` edges: within the CuTe
+    tolerance of the torch oracle; two micro-batches in a row (the second scales from the
+    first's cotangents)."""
+    pytest.importorskip("cute_ldm.workspace")
+    if torch.cuda.get_device_capability()[0] < 9:
+        pytest.skip("cute_ldm needs Hopper / Blackwell")
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        pattern = "*-*-*-*-"
+        ids = [torch.randint(0, VOCAB, (B, S), device="cuda") for _ in range(2)]
+        oracle = _model(pattern, "torch")
+        model = _model(pattern, "cute", depth_memory_unwind=True, recompute_granularity="full",
+                       recompute_method="uniform", recompute_num_layers=chunk,
+                       depth_memory_storage_dtype=storage,
+                       depth_memory_checkpoint_interval=interval,
+                       depth_memory_checkpoint_prefetch=prefetch)
+        ws = model.decoder.ldm_workspace
+        assert ws.checkpoint_prefetch == prefetch
+        assert ws.storage == getattr(torch, storage)
+        assert ws.grad_scaling == (storage == "float16")
+        edges = len(pattern) + 1
+        assert ws.checkpoints == (list(range(interval, edges, interval)) if interval else [])
+        tol = dict(rtol=3e-2, atol=3e-3)
+        for batch in ids:
+            oracle_out, oracle_grads = _fwd_bwd(oracle, batch)
+            out, grads = _fwd_bwd(model, batch)
+            assert set(grads) == set(oracle_grads)
+            torch.testing.assert_close(out, oracle_out, **tol)
+            for k in oracle_grads:
+                torch.testing.assert_close(grads[k], oracle_grads[k], **tol, msg=k)
+        assert int(ws.grad_nonfinite) == 0
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_depth_memory_fp16_checkpoint_config():
+    base = dict(num_layers=4, hidden_size=64, num_attention_heads=4, is_hybrid_model=True,
+                depth_memory=True, depth_memory_groups=4)
+    with pytest.raises(ValueError, match="needs depth_memory_impl cute"):
+        TransformerConfig(**base, depth_memory_impl="torch", depth_memory_storage_dtype="float16")
+    with pytest.raises(ValueError, match="depth_memory_checkpoint_interval needs"):
+        TransformerConfig(**base, depth_memory_impl="cute", depth_memory_checkpoint_interval=4)
+    with pytest.raises(ValueError, match="multiple of depth_memory_window"):
+        TransformerConfig(**base, depth_memory_impl="cute", depth_memory_unwind=True,
+                          recompute_granularity="full", recompute_method="uniform",
+                          recompute_num_layers=2, depth_memory_checkpoint_interval=6)

@@ -2575,6 +2575,30 @@ class TransformerConfig(ModelParallelConfig):
     """LDM "cute": dtype of the running covariance P ("float32" or "bfloat16"; the paper's BF16
     default can drift indefinite in deep stacks)."""
 
+    depth_memory_storage_dtype: Optional[str] = None
+    """LDM "cute": the 16-bit type of M, its gradient and the kernels' tapes ("bfloat16" or
+    "float16"); None: the training type's (FP16 under ``fp16``, else BF16). "float16" under BF16
+    training gives the M the backward unwinds by subtraction three more mantissa bits (~8x less
+    unwinding error); the workspace then scales its backward's gradients into FP16's range
+    itself (cute_kernels ``grad_scaling``), since there is no loss scale."""
+
+    depth_memory_checkpoint_interval: int = 0
+    """LDM "cute" with ``depth_memory_unwind``: every this many edges (a multiple of
+    ``depth_memory_window``) the forward copies M and the backward restores it, so the unwinding
+    by subtraction never runs across more than one interval -- a burst of large writes deep in the
+    stack no longer degrades every state before it. 0: no checkpoints. Each holds
+    tokens x hidden_size x depth_memory_key_dim x 2 bytes (2 GiB at 64k tokens per GPU, hidden
+    2048, K 8)."""
+
+    depth_memory_checkpoint_offload: bool = True
+    """Keep the ``depth_memory_checkpoint_interval`` copies of M in pinned host memory (copied on
+    a side stream) instead of on the GPU."""
+
+    depth_memory_checkpoint_prefetch: bool = False
+    """With offloaded checkpoints: copy the next checkpoint the backward needs into a GPU staging
+    buffer (one checkpoint's size) an interval ahead, so the restore is a device copy instead of
+    a host-to-device copy the backward waits for."""
+
     # ---- Looped (weight-tied) depth ----
     # A prelude/loop/coda stack: the middle block is built once and applied
     # ``loop_iterations`` times, so effective depth exceeds parameter depth. The
@@ -2760,6 +2784,18 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError("depth_memory_segments: recompute_method must be uniform")
             if not 0 < self.depth_memory_lambda_init < 1:
                 raise ValueError("depth_memory_lambda_init must be in (0, 1)")
+            if self.depth_memory_storage_dtype not in (None, "bfloat16", "float16"):
+                raise ValueError("depth_memory_storage_dtype must be None, bfloat16 or float16")
+            if self.depth_memory_storage_dtype is not None and self.depth_memory_impl != "cute":
+                raise ValueError("depth_memory_storage_dtype needs depth_memory_impl cute")
+            if self.depth_memory_checkpoint_interval:
+                if not (self.depth_memory_impl == "cute" and self.depth_memory_unwind):
+                    raise ValueError("depth_memory_checkpoint_interval needs depth_memory_impl "
+                                     "cute and depth_memory_unwind")
+                if (self.depth_memory_checkpoint_interval < 0
+                        or self.depth_memory_checkpoint_interval % self.depth_memory_window):
+                    raise ValueError("depth_memory_checkpoint_interval must be a positive multiple "
+                                     "of depth_memory_window")
         if self.mhc_routed_topk:
             if not self.mhc:
                 raise ValueError("mhc_routed_topk requires mhc=True")
