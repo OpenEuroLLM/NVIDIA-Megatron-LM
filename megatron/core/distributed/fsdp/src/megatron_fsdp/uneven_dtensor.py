@@ -14,6 +14,8 @@
 
 from typing import Iterable, List, Union
 
+import os
+
 import torch
 import torch.distributed as dist
 from torch.distributed._tensor import DTensor
@@ -286,11 +288,12 @@ def get_unflattened_state_dict(state_dict, key_chain=[]):
     return current
 
 
-def preprocess_state_dict_for_uneven_dtensor(state_dict: dict) -> dict:
+def preprocess_state_dict_for_uneven_dtensor(state_dict: dict, reuse_metadata: bool = False) -> dict:
     """
     Preprocess the state_dict to prepare it for saving or loading unevenly sharded DTensors.
     This function modifies the DTensors in the state_dict to include chunk metadata
-    and write items closures.
+    and write items closures. ``reuse_metadata`` (the save path): skip the gather when every DTensor
+    on every rank still carries its metadata from an earlier save.
     """
     visit_dtensor = filter_unflattened_state_dict(
         state_dict, visit_condition=lambda x: isinstance(x, DTensor)
@@ -298,6 +301,19 @@ def preprocess_state_dict_for_uneven_dtensor(state_dict: dict) -> dict:
     # Sort the keys, since some state dictionaries are mocked
     # and extended to include empty global keys. One batched metadata gather for all of them.
     dtensors = [get_unflattened_state_dict(state_dict, k) for k in sorted(visit_dtensor)]
+    if reuse_metadata and os.environ.get("MEGATRON_FSDP_SAVE_CACHE", "1") == "1" and dist.is_initialized():
+        # the chunk metadata is a property of the shard's layout: a DTensor reused across saves (the cached
+        # SwiGLU splits, the parameters themselves) keeps it. Skip the batched gather only if EVERY rank has it
+        # for every DTensor (one flag all-reduce), so no rank leaves the others in the collective.
+        missing = any(not hasattr(d._local_tensor, "__create_chunk_list__") for d in dtensors)
+        flag = torch.tensor(
+            [1 if missing else 0],
+            dtype=torch.int32,
+            device=torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else "cpu",
+        )
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+        if int(flag.item()) == 0:
+            return state_dict
     for dtensor, chunk_meta in zip(dtensors, gather_and_compute_chunk_metadata_batched(dtensors)):
         _set_uneven_chunk_metadata(dtensor, chunk_meta)
     return state_dict

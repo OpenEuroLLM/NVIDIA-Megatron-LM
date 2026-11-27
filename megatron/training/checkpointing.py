@@ -1001,7 +1001,9 @@ def save_checkpoint(
 
             if ckpt_format == 'fsdp_dtensor':
                 _save_phase("generate_state_dict")
-                state_dict = preprocess_fsdp_dtensor_state_dict(args, state_dict, model[0])
+                state_dict = preprocess_fsdp_dtensor_state_dict(
+                    args, state_dict, model[0], for_save=True
+                )
                 state_dict, _ = pack_fsdp_dtensor_optimizer_scalars(state_dict)
                 _save_phase("preprocess_fsdp_dtensor_state_dict")
 
@@ -1948,8 +1950,11 @@ def pack_fsdp_dtensor_optimizer_scalars(state_dict, checkpoint_keys=None):
             meta_blob = None
             if isinstance(group_meta, dict):
                 groups, index, param_group = [], {}, {}
+                by_id = {}  # the parameters of one group share its meta object: pickle it once
                 for name, meta in group_meta.items():
-                    blob = pickle.dumps(meta)
+                    blob = by_id.get(id(meta))
+                    if blob is None:
+                        blob = by_id[id(meta)] = pickle.dumps(meta)
                     if blob not in index:
                         index[blob] = len(groups)
                         groups.append(meta)
@@ -2048,7 +2053,19 @@ def _restore_loaded_scalars(raw, loaded):
                 raw[i] = src
 
 
-def preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model):
+def preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model, for_save: bool = False):
+    """The checkpoint layout of an fsdp_dtensor state dict (SwiGLU fc1 split, expert keys, uneven DTensor
+    metadata). ``for_save``: reuse the splits and the chunk metadata of the previous save (the layout is the
+    same every time; MEGATRON_FSDP_SAVE_CACHE=0 turns it off)."""
+    from megatron.core.transformer.fsdp_dtensor_checkpoint import save_cache_active
+
+    if for_save:
+        with save_cache_active():
+            return _preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model, True)
+    return _preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model, False)
+
+
+def _preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model, for_save):
     state_dict = raw_state_dict.copy()
     handle_fp8_extra_state_case(state_dict['model'])
     if args.swiglu:
@@ -2083,7 +2100,7 @@ def preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model):
             state_dict['model'] = model_state_dict
     if args.num_experts:
         state_dict['model'] = handle_experts_in_state_dict(state_dict['model'], args.num_experts)
-    preprocess_state_dict_for_uneven_dtensor(state_dict)
+    preprocess_state_dict_for_uneven_dtensor(state_dict, reuse_metadata=for_save)
 
     return state_dict
 

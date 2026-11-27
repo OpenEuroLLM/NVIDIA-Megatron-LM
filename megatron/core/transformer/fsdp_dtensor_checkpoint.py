@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import logging
+import os
 import re
 
 import torch
@@ -48,6 +50,82 @@ from megatron.core.tensor_parallel.layers import copy_tensor_model_parallel_attr
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import get_attr_wrapped_model
 
+# Save-path caches (MEGATRON_FSDP_SAVE_CACHE=0: off). Every save rebuilt the same checkpoint layout: the SwiGLU fc1
+# split (DTensor views of the weight and of its optimizer states), the per-key regex / GLU-layer decisions and the
+# uneven-DTensor chunk metadata (one collective) -- 8.2 s of the synchronous part of every async save on the 84B
+# v4b (2026-11-27). The split DTensors are views of the live parameter / optimizer storage, so a cached one shows
+# the current values; a split is reused only while its source is the same storage with the same layout, and a key
+# whose source ever changes falls back to the uncached path for good (no stale or growing references).
+SAVE_CACHE = os.environ.get("MEGATRON_FSDP_SAVE_CACHE", "1") == "1"
+_SPLIT_CACHE: dict = {}  # scope -> (source signature, split result)
+_SPLIT_UNCACHEABLE: set = set()
+_SPLIT_MOVES: dict = {}  # scope -> how often its source moved
+_GLU_LAYERS: dict = {}  # id(model) -> {layer path: gated_linear_unit}
+_GLU_KEY_CACHE: dict = {}  # (id(model), key) -> the key's layer uses a GLU
+_ACTIVE = False  # set by save_cache_active(): only the save path fills / reads the split cache
+
+
+class save_cache_active:
+    """The save path's preprocessing (the load path builds its template uncached: nothing it holds is pinned)."""
+
+    def __enter__(self):
+        global _ACTIVE
+        _ACTIVE = SAVE_CACHE
+        return self
+
+    def __exit__(self, *exc):
+        global _ACTIVE
+        _ACTIVE = False
+        return False
+
+
+def _source_signature(value, dist_param):
+    """Storage and layout of a split's source (a DTensor's local shard or a tensor)."""
+    local = value.to_local() if hasattr(value, "to_local") else value
+    return (
+        local.data_ptr(),
+        tuple(local.shape),
+        tuple(local.stride()),
+        local.dtype,
+        local.device,
+        id(dist_param),
+    )
+
+
+def cached_split(scope, value, dist_param, compute):
+    """``compute()`` (a split of ``value``) reused while ``value`` is the same storage / layout."""
+    if not _ACTIVE or scope in _SPLIT_UNCACHEABLE:
+        return compute()
+    sig = _source_signature(value, dist_param)
+    hit = _SPLIT_CACHE.get(scope)
+    if hit is not None:
+        if hit[0] == sig:
+            return hit[1]
+        # the source moved: once is expected (the optimizer states allocated / replaced at the load), more
+        # often means a fresh tensor per save -- never cache this key again (no stale or growing references)
+        del _SPLIT_CACHE[scope]
+        _SPLIT_MOVES[scope] = _SPLIT_MOVES.get(scope, 0) + 1
+        if _SPLIT_MOVES[scope] > 1:
+            _SPLIT_UNCACHEABLE.add(scope)
+            return compute()
+    result = compute()
+    if _shares_storage(result, value):
+        _SPLIT_CACHE[scope] = (sig, result)
+    else:  # a copy (e.g. a non-contiguous source made contiguous): would go stale
+        _SPLIT_UNCACHEABLE.add(scope)
+    return result
+
+
+def _shares_storage(result, value):
+    """Every non-empty piece of ``result`` is a view of ``value``'s storage."""
+    src = value.to_local() if hasattr(value, "to_local") else value
+    base = src.untyped_storage().data_ptr()
+    for piece in result:
+        local = piece.to_local() if hasattr(piece, "to_local") else piece
+        if local.numel() and local.untyped_storage().data_ptr() != base:
+            return False
+    return True
+
 
 def get_ep_layer_offset(num_experts: int | None = None) -> int:
     """
@@ -80,6 +158,7 @@ def get_total_num_experts(num_experts: int | None = None) -> int:
     return num_experts if num_experts else 0
 
 
+@functools.lru_cache(maxsize=None)
 def get_expert_index_from_key(key):
     """Extract expert index from various expert key formats.
 
@@ -191,7 +270,9 @@ def expert_param_local_key(key: str, num_experts: int | None = None) -> str:
     return key
 
 
-def _split_optimizer_state(state, dist_param, split_param_shaped, row_sizes, is_expert_param):
+def _split_optimizer_state(
+    state, dist_param, split_param_shaped, row_sizes, is_expert_param, cache_scope=None
+):
     """Split one parameter's optimizer state the way its weight is split: every tensor of the
     parameter's shape with ``split_param_shaped`` (Adam's exp_avg / exp_avg_sq, Muon's
     momentum_buffer, Muown's m_u); the per-row ``[rows, 1]`` states (Muown's g / m_g / v_g / v_norm,
@@ -204,9 +285,21 @@ def _split_optimizer_state(state, dist_param, split_param_shaped, row_sizes, is_
             out[subkey] = None
             continue
         if tuple(value.shape) == tuple(dist_param.shape):
-            out[subkey] = split_param_shaped(value)
+            compute = lambda value=value: split_param_shaped(value)  # noqa: E731
+            kind = "param"
         elif value.dim() == 2 and value.shape == (dist_param.shape[0], 1) and row_sizes:
-            out[subkey] = _split_row_state(value, dist_param, row_sizes, is_expert_param)
+            compute = lambda value=value: _split_row_state(  # noqa: E731
+                value, dist_param, row_sizes, is_expert_param
+            )
+            kind = "rows"
+        else:
+            compute = None
+        if compute is not None:
+            out[subkey] = (
+                compute()
+                if cache_scope is None
+                else cached_split((cache_scope, subkey, kind), value, dist_param, compute)
+            )
         else:
             out[subkey] = None
         if out[subkey] is not None:
@@ -246,6 +339,27 @@ def _split_row_state(data, dist_param, row_sizes, is_expert_param):
     return results
 
 
+_SWIGLU_PATTERNS = [
+    re.compile(pat)
+    for pat in [
+        r"(.*)\.mlp\.linear_fc1\.weight$",
+        r"(.*)\.mlp\.linear_fc1\.bias$",
+        r"(.*)\.mlp\.experts\.linear_fc1\.weight(\d+)$",
+        r"(.*)\.mlp\.experts\.linear_fc1\.bias(\d+)$",
+        r"(.*)\.mlp\.experts\.local_experts\.(\d+)\.linear_fc1\.weight$",
+        r"(.*)\.mlp\.experts\.local_experts\.(\d+)\.linear_fc1\.bias$",
+        r"(.*)\.mlp\.shared_experts\.linear_fc1\.weight$",
+        r"(.*)\.mlp\.shared_experts\.linear_fc1\.bias$",
+    ]
+]
+
+
+@functools.lru_cache(maxsize=None)
+def _is_swiglu_key(key):
+    """A SwiGLU linear_fc1 weight / bias key (non-expert, GroupedMLP, SequentialMLP, shared experts)."""
+    return any(pat.search(key) for pat in _SWIGLU_PATTERNS)
+
+
 def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
     """
     Handle SWiGLU in model and optimizer state dicts.
@@ -277,13 +391,28 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
             parts = parts[1:]
         return '.'.join(parts)
 
-    _layer_glu = {}
-    for name, module in model.named_modules():
-        if isinstance(module, TransformerLayer):
-            _layer_glu[_strip_wrappers(name)] = getattr(module.config, 'gated_linear_unit', False)
+    _layer_glu = _GLU_LAYERS.get(id(model)) if SAVE_CACHE else None
+    if _layer_glu is None:
+        _layer_glu = {}
+        for name, module in model.named_modules():
+            if isinstance(module, TransformerLayer):
+                _layer_glu[_strip_wrappers(name)] = getattr(
+                    module.config, 'gated_linear_unit', False
+                )
+        if SAVE_CACHE:
+            _GLU_LAYERS[id(model)] = _layer_glu
 
     def _key_in_glu_layer(key):
         """Return True if *key* belongs to a TransformerLayer with gated_linear_unit=True."""
+        if not SAVE_CACHE:
+            return _key_in_glu_layer_uncached(key)
+        ck = (id(model), key)
+        hit = _GLU_KEY_CACHE.get(ck)
+        if hit is None:
+            hit = _GLU_KEY_CACHE[ck] = _key_in_glu_layer_uncached(key)
+        return hit
+
+    def _key_in_glu_layer_uncached(key):
         norm_key = _strip_wrappers(key)
         best_glu, best_len = None, -1
         for layer_path, uses_glu in _layer_glu.items():
@@ -308,23 +437,7 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
         """
         Check if this key should be handled as SwiGLU linear_fc1 weight or bias.
         """
-        # Non-expert MLP: 'mlp.linear_fc1.weight', 'mlp.linear_fc1.bias'
-        # GroupedMLP: 'mlp.experts.linear_fc1.weight0', 'mlp.experts.linear_fc1.bias0'
-        # SequentialMLP: 'mlp.experts.local_experts.0.linear_fc1.weight',
-        #   'mlp.experts.local_experts.0.linear_fc1.bias'
-        return any(
-            re.search(pat, key)
-            for pat in [
-                r"(.*)\.mlp\.linear_fc1\.weight$",
-                r"(.*)\.mlp\.linear_fc1\.bias$",
-                r"(.*)\.mlp\.experts\.linear_fc1\.weight(\d+)$",
-                r"(.*)\.mlp\.experts\.linear_fc1\.bias(\d+)$",
-                r"(.*)\.mlp\.experts\.local_experts\.(\d+)\.linear_fc1\.weight$",
-                r"(.*)\.mlp\.experts\.local_experts\.(\d+)\.linear_fc1\.bias$",
-                r"(.*)\.mlp\.shared_experts\.linear_fc1\.weight$",
-                r"(.*)\.mlp\.shared_experts\.linear_fc1\.bias$",
-            ]
-        )
+        return _is_swiglu_key(key)
 
     def split_swiglu_linear_fc1(data, dist_param, swiglu_shard_axis, is_expert_param):
         """
@@ -396,11 +509,16 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
                 _swiglu_skip_count += 1
                 continue
             dist_param = model.get_parameter(f"module.{key}")
-            weight_w, weight_v = split_swiglu_linear_fc1(
+            weight_w, weight_v = cached_split(
+                ("model", key),
                 model_state_dict[key],
                 dist_param,
-                swiglu_shard_axis=0,
-                is_expert_param='mlp.experts' in key,
+                lambda: split_swiglu_linear_fc1(
+                    model_state_dict[key],
+                    dist_param,
+                    swiglu_shard_axis=0,
+                    is_expert_param='mlp.experts' in key,
+                ),
             )
 
             # Update the model state dict with the new keys
@@ -437,6 +555,7 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
                     ),
                     (rows // 2, rows // 2) if dist_param.dim() == 2 else None,
                     is_expert,
+                    cache_scope=("opt", key),
                 )
                 new_opt_state_dict[f"{key}_w"] = part_w
                 new_opt_state_dict[f"{key}_v"] = part_v
