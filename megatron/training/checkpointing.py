@@ -2061,8 +2061,60 @@ def preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model, for_save: bo
 
     if for_save:
         with save_cache_active():
-            return _preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model, True)
+            out = _preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model, True)
+        if os.environ.get("MEGATRON_FSDP_SAVE_CACHE_VERIFY", "0") == "1":
+            # the uncached layout of the same state, compared item by item (every rank: the metadata gather of
+            # the reference is a collective)
+            ref = _preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model, False)
+            _verify_same_layout(out, ref)
+        return out
     return _preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model, False)
+
+
+def _verify_same_layout(cached, ref):
+    """MEGATRON_FSDP_SAVE_CACHE_VERIFY: the cached save layout equals the uncached one -- the same keys, equal
+    tensor values (local shards), global shapes and chunk offsets, equal non-tensor leaves. Raises otherwise."""
+    from torch.distributed._tensor import DTensor
+
+    def leaves(d, prefix=()):
+        if isinstance(d, dict):
+            for k, v in d.items():
+                yield from leaves(v, prefix + (str(k),))
+        else:
+            yield prefix, d
+
+    a, b = dict(leaves(cached)), dict(leaves(ref))
+    if a.keys() != b.keys():
+        raise RuntimeError(
+            f"save-cache verify: keys differ (only cached {sorted(a.keys() - b.keys())[:5]}, "
+            f"only reference {sorted(b.keys() - a.keys())[:5]})"
+        )
+    n_tensors = 0
+    for key, x in a.items():
+        y = b[key]
+        if isinstance(x, torch.Tensor) or isinstance(y, torch.Tensor):
+            xl = x.to_local() if isinstance(x, DTensor) else x
+            yl = y.to_local() if isinstance(y, DTensor) else y
+            same = type(x) is type(y) and tuple(x.shape) == tuple(y.shape) and torch.equal(xl, yl)
+            if same and isinstance(x, DTensor):
+                cx = x.__create_chunk_list__() if hasattr(x._local_tensor, "__create_chunk_list__") else None
+                cy = y.__create_chunk_list__() if hasattr(y._local_tensor, "__create_chunk_list__") else None
+                if (cx is None) != (cy is None):
+                    same = False
+                elif cx is not None:
+                    same = [tuple(c.offsets) for c in cx] == [tuple(c.offsets) for c in cy] and [
+                        tuple(c.sizes) for c in cx
+                    ] == [tuple(c.sizes) for c in cy]
+            n_tensors += 1
+        else:
+            try:
+                same = bool(x == y)
+            except Exception:  # an object without a plain equality (e.g. an array): not part of the layout
+                same = True
+        if not same:
+            raise RuntimeError(f"save-cache verify: {'.'.join(key)} differs between the cached and uncached layout")
+    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+        print(f"save-cache verify: OK ({n_tensors} tensors, {len(a)} leaves)", flush=True)
 
 
 def _preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model, for_save):
